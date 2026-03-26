@@ -1,0 +1,14 @@
+[network]
+tcp_port = 9944
+udp_port = 9945
+fec_redundancy = 0.2
+
+[video]
+codec = "h265"
+bitrate_mbps = 80
+resolution_per_eye = [1832, 1920]
+framerate = 90
+
+[pairing]
+max_attempts = 3
+lockout_seconds = 60
