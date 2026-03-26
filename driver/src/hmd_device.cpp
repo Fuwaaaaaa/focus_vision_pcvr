@@ -1,5 +1,7 @@
 #include "hmd_device.h"
+extern "C" {
 #include "streaming_engine.h"
+}
 #include <cstring>
 
 // Display properties — VIVE Focus Vision native resolution
