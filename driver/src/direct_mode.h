@@ -35,7 +35,6 @@ public:
     void SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2]) override;
     void Present(vr::SharedTextureHandle_t syncTexture) override;
 
-    void PostPresent() override;
     void GetFrameTiming(vr::DriverDirectMode_FrameTiming* pFrameTiming) override;
 
 private:

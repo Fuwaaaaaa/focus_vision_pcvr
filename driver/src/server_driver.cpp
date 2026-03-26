@@ -2,13 +2,12 @@
 #include "streaming_engine.h"
 #include <cstdio>
 
-// Required macro to initialize the driver context
-VR_INIT_DRIVER_CONTEXT(CServerDriver)
+static vr::IVRDriverContext* s_pDriverContext = nullptr;
 
 vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
 {
-    // Initialize driver context (sets up VRDriverLog, VRServerDriverHost, etc.)
-    vr::EVRInitError err = InitServerDriverContext(pDriverContext);
+    s_pDriverContext = pDriverContext;
+    vr::EVRInitError err = vr::InitServerDriverContext(pDriverContext);
     if (err != vr::VRInitError_None)
         return err;
 
@@ -63,7 +62,7 @@ void CServerDriver::Cleanup()
     // Shut down the Rust streaming engine
     fvp_shutdown();
 
-    CleanupDriverContext();
+    vr::CleanupDriverContext();
 }
 
 const char* const* CServerDriver::GetInterfaceVersions()
