@@ -1,5 +1,7 @@
 #include "controller_device.h"
+extern "C" {
 #include "streaming_engine.h"
+}
 #include <cstring>
 #include <cstdio>
 
