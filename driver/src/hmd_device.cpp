@@ -4,12 +4,6 @@ extern "C" {
 }
 #include <cstring>
 
-// Display properties — VIVE Focus Vision native resolution
-static constexpr uint32_t kRenderWidth = 1832;
-static constexpr uint32_t kRenderHeight = 1920;
-static constexpr float kRefreshRate = 90.0f;
-static constexpr float kIPD = 0.063f; // meters
-
 CHmdDevice::CHmdDevice()
 {
     memset(&m_pose, 0, sizeof(m_pose));
@@ -111,6 +105,23 @@ void CHmdDevice::SetupProperties()
 {
     auto props = vr::VRProperties();
 
+    // Load display config from Rust streaming engine
+    FvpConfig fvpConfig{};
+    float ipd = 0.063f;
+    float refreshRate = 90.0f;
+    float vsyncToPhotons = 0.011f;
+    if (fvp_get_config(&fvpConfig) == 0)
+    {
+        ipd = fvpConfig.ipd;
+        refreshRate = fvpConfig.refresh_rate;
+        vsyncToPhotons = fvpConfig.seconds_from_vsync_to_photons;
+        vr::VRDriverLog()->Log("Focus Vision PCVR: Config loaded from streaming engine\n");
+    }
+    else
+    {
+        vr::VRDriverLog()->Log("Focus Vision PCVR: Using default display config\n");
+    }
+
     // Device identification
     props->SetStringProperty(m_propertyContainer,
         vr::Prop_ModelNumber_String, "Focus Vision PCVR");
@@ -121,13 +132,13 @@ void CHmdDevice::SetupProperties()
     props->SetStringProperty(m_propertyContainer,
         vr::Prop_TrackingSystemName_String, "focus_vision_pcvr");
 
-    // Display properties
+    // Display properties — from shared config
     props->SetFloatProperty(m_propertyContainer,
-        vr::Prop_UserIpdMeters_Float, kIPD);
+        vr::Prop_UserIpdMeters_Float, ipd);
     props->SetFloatProperty(m_propertyContainer,
-        vr::Prop_DisplayFrequency_Float, kRefreshRate);
+        vr::Prop_DisplayFrequency_Float, refreshRate);
     props->SetFloatProperty(m_propertyContainer,
-        vr::Prop_SecondsFromVsyncToPhotons_Float, 0.011f);
+        vr::Prop_SecondsFromVsyncToPhotons_Float, vsyncToPhotons);
 
     props->SetUint64Property(m_propertyContainer,
         vr::Prop_CurrentUniverseId_Uint64, 2);

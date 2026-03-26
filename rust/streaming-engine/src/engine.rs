@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::AppConfig;
 use crate::control::tcp_server::TcpControlServer;
@@ -28,6 +29,7 @@ pub struct StreamingEngine {
     latest_tracking: Arc<StdMutex<Option<TrackingData>>>,
     latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
+    cancel_token: CancellationToken,
     config: AppConfig,
 }
 
@@ -46,15 +48,24 @@ impl StreamingEngine {
             Arc::new(StdMutex::new([None, None]));
         let latency_tracker = Arc::new(StdMutex::new(LatencyTracker::new(90)));
 
+        let cancel_token = CancellationToken::new();
         let tracking_clone = latest_tracking.clone();
         let controllers_clone = latest_controllers.clone();
         let tracker_clone = latency_tracker.clone();
         let config_clone = config.clone();
 
         // Spawn the main streaming task
+        let cancel = cancel_token.clone();
         runtime.spawn(async move {
-            if let Err(e) = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone).await {
-                log::error!("Streaming engine error: {}", e);
+            tokio::select! {
+                result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone) => {
+                    if let Err(e) = result {
+                        log::error!("Streaming engine error: {}", e);
+                    }
+                }
+                _ = cancel.cancelled() => {
+                    log::info!("Streaming task cancelled");
+                }
             }
         });
 
@@ -62,11 +73,19 @@ impl StreamingEngine {
         let tracking_head = latest_tracking.clone();
         let tracking_ctrl = latest_controllers.clone();
         let tracking_port = config.network.udp_port + 2; // 9947
+        let cancel = cancel_token.clone();
         runtime.spawn(async move {
             let receiver = TrackingReceiver::new(tracking_head, tracking_ctrl);
             let addr: SocketAddr = format!("0.0.0.0:{}", tracking_port).parse().unwrap();
-            if let Err(e) = receiver.run(addr).await {
-                log::error!("Tracking receiver error: {}", e);
+            tokio::select! {
+                result = receiver.run(addr) => {
+                    if let Err(e) = result {
+                        log::error!("Tracking receiver error: {}", e);
+                    }
+                }
+                _ = cancel.cancelled() => {
+                    log::info!("Tracking receiver cancelled");
+                }
             }
         });
 
@@ -76,6 +95,7 @@ impl StreamingEngine {
             latest_tracking,
             latest_controllers,
             latency_tracker,
+            cancel_token,
             config,
         })
     }
@@ -97,15 +117,20 @@ impl StreamingEngine {
 
     /// Get latest tracking data. Called from C++ thread.
     pub fn get_tracking(&self) -> Option<TrackingData> {
-        self.latest_tracking.lock().ok()?.clone()
+        self.latest_tracking.lock().map_err(|e| log::error!("Tracking lock poisoned: {}", e)).ok()?.clone()
     }
 
     /// Get latest controller state. Called from C++ thread.
     /// `id`: 0 = left, 1 = right.
     pub fn get_controller(&self, id: u8) -> Option<ControllerState> {
-        let guard = self.latest_controllers.lock().ok()?;
+        let guard = self.latest_controllers.lock().map_err(|e| log::error!("Controller lock poisoned: {}", e)).ok()?;
         let idx = id as usize;
         if idx < 2 { guard[idx] } else { None }
+    }
+
+    /// Cancel all async tasks for graceful shutdown.
+    pub fn shutdown(&self) {
+        self.cancel_token.cancel();
     }
 
     /// Log latency stats periodically.
@@ -131,13 +156,11 @@ async fn run_streaming(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Step 1: Wait for HMD to connect via TCP
     let tcp_server = TcpControlServer::new(config.clone());
-    let _tcp_stream = tcp_server.listen_and_accept().await?;
-    log::info!("HMD connected, starting video stream");
+    let (_tcp_stream, peer_addr) = tcp_server.listen_and_accept().await?;
+    log::info!("HMD connected from {}, starting video stream", peer_addr);
 
-    // Step 2: Create UDP sender for video
-    let udp_target: SocketAddr = format!("0.0.0.0:{}", config.network.udp_port + 1)
-        .parse()
-        .unwrap(); // Will be replaced with actual HMD IP
+    // Step 2: Create UDP sender for video — send to the HMD's IP
+    let udp_target: SocketAddr = SocketAddr::new(peer_addr.ip(), config.network.udp_port + 1);
     let udp_sender = UdpSender::new(udp_target).await?;
 
     // Step 3: Process frames
@@ -192,4 +215,88 @@ async fn run_streaming(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::metrics::latency::FrameTimestamps;
+
+    #[test]
+    fn test_engine_creation() {
+        let config = AppConfig::default();
+        let engine = StreamingEngine::new(config);
+        assert!(engine.is_ok());
+        let engine = engine.unwrap();
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_get_tracking_none_initially() {
+        let config = AppConfig::default();
+        let engine = StreamingEngine::new(config).unwrap();
+        assert!(engine.get_tracking().is_none());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_get_controller_none_initially() {
+        let config = AppConfig::default();
+        let engine = StreamingEngine::new(config).unwrap();
+        assert!(engine.get_controller(0).is_none());
+        assert!(engine.get_controller(1).is_none());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_get_controller_invalid_id() {
+        let config = AppConfig::default();
+        let engine = StreamingEngine::new(config).unwrap();
+        assert!(engine.get_controller(2).is_none());
+        assert!(engine.get_controller(255).is_none());
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_submit_frame_success() {
+        let config = AppConfig::default();
+        let engine = StreamingEngine::new(config).unwrap();
+        let frame = SubmittedFrame {
+            frame_index: 0,
+            data: vec![0u8; 100],
+            width: 10,
+            height: 10,
+            timestamps: FrameTimestamps::new(0),
+        };
+        assert!(engine.submit_frame(frame));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_submit_frame_channel_full() {
+        let config = AppConfig::default();
+        let engine = StreamingEngine::new(config).unwrap();
+        // Channel capacity is 4, so 5th frame should fail
+        for i in 0..4 {
+            let frame = SubmittedFrame {
+                frame_index: i,
+                data: vec![0u8; 100],
+                width: 10,
+                height: 10,
+                timestamps: FrameTimestamps::new(i),
+            };
+            assert!(engine.submit_frame(frame), "frame {} should succeed", i);
+        }
+        // 5th frame — channel full (receiver not consuming since TCP not connected)
+        let frame = SubmittedFrame {
+            frame_index: 4,
+            data: vec![0u8; 100],
+            width: 10,
+            height: 10,
+            timestamps: FrameTimestamps::new(4),
+        };
+        assert!(!engine.submit_frame(frame), "frame 4 should fail (channel full)");
+        engine.shutdown();
+    }
 }
