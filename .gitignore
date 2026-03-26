@@ -1,0 +1,43 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# C++ / CMake
+driver/build/
+*.obj
+*.o
+*.dll
+*.lib
+*.exp
+*.pdb
+CMakeCache.txt
+CMakeFiles/
+
+# Android
+client/.gradle/
+client/build/
+client/app/build/
+client/local.properties
+*.apk
+*.aab
+*.aar
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build output
+/out/
+
+# Generated headers
+rust/streaming-engine/include/
+
+# Config overrides (keep default.toml)
+config/local.toml
