@@ -1,0 +1,11 @@
+language = "C"
+include_guard = "FVP_STREAMING_ENGINE_H"
+tab_width = 4
+style = "both"
+
+[export]
+include = ["TrackingData", "ControllerState"]
+
+[parse]
+parse_deps = true
+include = ["fvp-common"]
