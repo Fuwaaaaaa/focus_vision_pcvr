@@ -25,8 +25,8 @@ impl TcpControlServer {
         }
     }
 
-    /// Start listening. Returns when a client connects and pairs successfully.
-    pub async fn listen_and_accept(&self) -> std::io::Result<TcpStream> {
+    /// Start listening. Returns the stream and the peer address when a client connects and pairs successfully.
+    pub async fn listen_and_accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
         let addr: SocketAddr = format!("0.0.0.0:{}", self.config.network.tcp_port)
             .parse()
             .unwrap();
@@ -41,7 +41,7 @@ impl TcpControlServer {
             match self.handle_handshake(stream).await {
                 Ok(stream) => {
                     *self.connected.lock().await = true;
-                    return Ok(stream);
+                    return Ok((stream, peer));
                 }
                 Err(e) => {
                     log::warn!("Handshake failed from {}: {}", peer, e);

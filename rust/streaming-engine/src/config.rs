@@ -9,6 +9,16 @@ pub struct AppConfig {
     pub video: VideoConfig,
     #[serde(default)]
     pub pairing: PairingConfig,
+    #[serde(default)]
+    pub display: DisplayConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayConfig {
+    #[serde(default = "default_ipd")]
+    pub ipd: f32,
+    #[serde(default = "default_vsync_to_photons")]
+    pub seconds_from_vsync_to_photons: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +57,8 @@ fn default_fec_redundancy() -> f32 { fvp_common::DEFAULT_FEC_REDUNDANCY }
 fn default_bitrate() -> u32 { 80 }
 fn default_resolution() -> [u32; 2] { [1832, 1920] }
 fn default_framerate() -> u32 { 90 }
+fn default_ipd() -> f32 { 0.063 }
+fn default_vsync_to_photons() -> f32 { 0.011 }
 fn default_max_attempts() -> u8 { fvp_common::MAX_PIN_ATTEMPTS }
 fn default_lockout_seconds() -> u64 { fvp_common::PIN_LOCKOUT_SECONDS }
 
@@ -65,9 +77,14 @@ impl Default for PairingConfig {
         Self { max_attempts: default_max_attempts(), lockout_seconds: default_lockout_seconds() }
     }
 }
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self { ipd: default_ipd(), seconds_from_vsync_to_photons: default_vsync_to_photons() }
+    }
+}
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { network: NetworkConfig::default(), video: VideoConfig::default(), pairing: PairingConfig::default() }
+        Self { network: NetworkConfig::default(), video: VideoConfig::default(), pairing: PairingConfig::default(), display: DisplayConfig::default() }
     }
 }
 

@@ -68,7 +68,7 @@ impl RtpPacketizer {
         packets
     }
 
-    fn next_sequence(&mut self) -> u16 {
+    pub fn next_sequence(&mut self) -> u16 {
         let seq = self.sequence;
         self.sequence = self.sequence.wrapping_add(1);
         seq
