@@ -7,9 +7,10 @@ use crate::config::AppConfig;
 use crate::control::tcp_server::TcpControlServer;
 use crate::metrics::latency::{FrameTimestamps, LatencyTracker};
 use crate::pipeline;
+use crate::tracking::receiver::TrackingReceiver;
 use crate::transport::rtp::RtpPacketizer;
 use crate::transport::udp::UdpSender;
-use fvp_common::protocol::TrackingData;
+use fvp_common::protocol::{ControllerState, TrackingData};
 
 /// Frame data submitted from the C++ OpenVR driver.
 pub struct SubmittedFrame {
@@ -25,6 +26,7 @@ pub struct StreamingEngine {
     runtime: Runtime,
     frame_tx: mpsc::Sender<SubmittedFrame>,
     latest_tracking: Arc<StdMutex<Option<TrackingData>>>,
+    latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
     config: AppConfig,
 }
@@ -38,11 +40,14 @@ impl StreamingEngine {
             .thread_name("fvp-stream")
             .build()?;
 
-        let (frame_tx, frame_rx) = mpsc::channel::<SubmittedFrame>(4); // Small buffer to avoid latency
+        let (frame_tx, frame_rx) = mpsc::channel::<SubmittedFrame>(4);
         let latest_tracking = Arc::new(StdMutex::new(None));
-        let latency_tracker = Arc::new(StdMutex::new(LatencyTracker::new(90))); // 1 second at 90fps
+        let latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>> =
+            Arc::new(StdMutex::new([None, None]));
+        let latency_tracker = Arc::new(StdMutex::new(LatencyTracker::new(90)));
 
         let tracking_clone = latest_tracking.clone();
+        let controllers_clone = latest_controllers.clone();
         let tracker_clone = latency_tracker.clone();
         let config_clone = config.clone();
 
@@ -53,10 +58,23 @@ impl StreamingEngine {
             }
         });
 
+        // Spawn tracking receiver (UDP, separate port)
+        let tracking_head = latest_tracking.clone();
+        let tracking_ctrl = latest_controllers.clone();
+        let tracking_port = config.network.udp_port + 2; // 9947
+        runtime.spawn(async move {
+            let receiver = TrackingReceiver::new(tracking_head, tracking_ctrl);
+            let addr: SocketAddr = format!("0.0.0.0:{}", tracking_port).parse().unwrap();
+            if let Err(e) = receiver.run(addr).await {
+                log::error!("Tracking receiver error: {}", e);
+            }
+        });
+
         Ok(Self {
             runtime,
             frame_tx,
             latest_tracking,
+            latest_controllers,
             latency_tracker,
             config,
         })
@@ -80,6 +98,14 @@ impl StreamingEngine {
     /// Get latest tracking data. Called from C++ thread.
     pub fn get_tracking(&self) -> Option<TrackingData> {
         self.latest_tracking.lock().ok()?.clone()
+    }
+
+    /// Get latest controller state. Called from C++ thread.
+    /// `id`: 0 = left, 1 = right.
+    pub fn get_controller(&self, id: u8) -> Option<ControllerState> {
+        let guard = self.latest_controllers.lock().ok()?;
+        let idx = id as usize;
+        if idx < 2 { guard[idx] } else { None }
     }
 
     /// Log latency stats periodically.
