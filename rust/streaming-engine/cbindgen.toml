@@ -2,6 +2,7 @@ language = "C"
 include_guard = "FVP_STREAMING_ENGINE_H"
 tab_width = 4
 style = "both"
+cpp_compat = true
 
 [export]
 include = ["TrackingData", "ControllerState"]

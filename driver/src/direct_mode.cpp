@@ -1,5 +1,7 @@
 #include "direct_mode.h"
+extern "C" {
 #include "streaming_engine.h"
+}
 #include <cstring>
 
 CDirectModeComponent::CDirectModeComponent()

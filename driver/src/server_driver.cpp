@@ -1,5 +1,7 @@
 #include "server_driver.h"
+extern "C" {
 #include "streaming_engine.h"
+}
 #include <cstdio>
 
 static vr::IVRDriverContext* s_pDriverContext = nullptr;
