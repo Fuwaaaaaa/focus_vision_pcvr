@@ -13,7 +13,7 @@ toml.workspace = true
 log.workspace = true
 env_logger.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
 bytes = "1"
 reed-solomon-erasure = "6"
 
