@@ -9,6 +9,10 @@ bitrate_mbps = 80
 resolution_per_eye = [1832, 1920]
 framerate = 90
 
+[display]
+ipd = 0.063
+seconds_from_vsync_to_photons = 0.011
+
 [pairing]
 max_attempts = 3
 lockout_seconds = 60

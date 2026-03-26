@@ -11,7 +11,7 @@ pub fn generate_nv12_frame(width: u32, height: u32, frame_num: u64) -> Vec<u8> {
     let shift = (frame_num % 256) as u8;
     for y in 0..h {
         for x in 0..w {
-            let luma = ((x as u16 * 255 / w.max(1) as u16) as u8).wrapping_add(shift);
+            let luma = ((x * 255 / w.max(1)) as u8).wrapping_add(shift);
             buf[y * w + x] = luma;
         }
     }

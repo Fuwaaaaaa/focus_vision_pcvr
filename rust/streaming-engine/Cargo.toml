@@ -16,6 +16,7 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
 bytes = "1"
 reed-solomon-erasure = "6"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [build-dependencies]
 cbindgen = "0.27"
