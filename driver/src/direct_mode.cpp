@@ -15,8 +15,6 @@ void CDirectModeComponent::CreateSwapTextureSet(
     const SwapTextureSetDesc_t* pSwapTextureSetDesc,
     SwapTextureSet_t* pOutSwapTextureSet)
 {
-    // Allocate a simple swap texture set
-    // In a full implementation, we'd create D3D11 textures here
     if (!pOutSwapTextureSet)
         return;
 
@@ -26,7 +24,6 @@ void CDirectModeComponent::CreateSwapTextureSet(
     m_swapTextures.push_back(tex);
 
     // Return 3 textures in the set (triple buffering)
-    pOutSwapTextureSet->unTextureCount = 3;
     for (uint32_t i = 0; i < 3; i++)
     {
         pOutSwapTextureSet->rSharedTextureHandles[i] = tex.handle + i;
@@ -94,11 +91,6 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
     // 1. Get the D3D11 texture from syncTexture
     // 2. CopyResource() to our staging texture (synchronous GPU copy)
     // 3. Call fvp_submit_frame() to pass to Rust for encoding
-}
-
-void CDirectModeComponent::PostPresent()
-{
-    // Called after Present() completes. Can be used for cleanup.
 }
 
 void CDirectModeComponent::GetFrameTiming(vr::DriverDirectMode_FrameTiming* pFrameTiming)

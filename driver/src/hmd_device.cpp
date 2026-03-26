@@ -127,15 +127,12 @@ void CHmdDevice::SetupProperties()
     props->SetFloatProperty(m_propertyContainer,
         vr::Prop_SecondsFromVsyncToPhotons_Float, 0.011f);
 
-    // Render target size (per eye)
-    props->SetInt32Property(m_propertyContainer,
-        vr::Prop_CurrentUniverseId_Int32, 2);
+    props->SetUint64Property(m_propertyContainer,
+        vr::Prop_CurrentUniverseId_Uint64, 2);
 
     // Report as a VR HMD (not a controller or tracker)
     props->SetBoolProperty(m_propertyContainer,
         vr::Prop_IsOnDesktop_Bool, false);
-    props->SetBoolProperty(m_propertyContainer,
-        vr::Prop_HasDriverDirectModeComponent_Bool, true);
 
     // Firmware version
     props->SetUint64Property(m_propertyContainer,
