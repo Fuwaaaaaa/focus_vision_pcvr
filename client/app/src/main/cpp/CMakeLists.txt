@@ -25,6 +25,7 @@ set(CLIENT_SOURCES
     tracking_sender.cpp
     controller_poller.cpp
     timewarp.cpp
+    fec_decoder.cpp
     ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c
 )
 
