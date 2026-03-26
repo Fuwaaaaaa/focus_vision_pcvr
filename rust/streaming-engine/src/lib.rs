@@ -1,4 +1,7 @@
 pub mod config;
+pub mod video;
+pub mod transport;
+pub mod pipeline;
 
 use std::ffi::c_void;
 use std::sync::Once;
