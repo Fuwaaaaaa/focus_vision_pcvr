@@ -10,6 +10,11 @@
 #include "renderer.h"
 #include "network_receiver.h"
 #include "video_decoder.h"
+#include "timewarp.h"
+#include "pose_history.h"
+#include "tracking_sender.h"
+#include "controller_poller.h"
+#include "tcp_client.h"
 
 #include <vector>
 #include <array>
@@ -65,7 +70,21 @@ private:
     // Renderer
     Renderer m_renderer;
 
-    // Network + decode stubs
+    // Network + decode
     NetworkReceiver m_networkReceiver;
     VideoDecoder m_videoDecoder;
+    TcpControlClient m_tcpClient;
+
+    // Tracking + controllers
+    TrackingSender m_trackingSender;
+    ControllerPoller m_controllerPoller;
+
+    // Timewarp
+    Timewarp m_timewarp;
+    PoseHistory m_poseHistory;
+
+    // State: last decoded frame
+    GLuint m_lastDecodedTexture = 0;
+    uint32_t m_lastFrameIndex = 0;
+    bool m_hasDecodedFrame = false;
 };
