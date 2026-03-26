@@ -6,6 +6,7 @@ pub mod control;
 pub mod metrics;
 pub mod engine;
 pub mod tracking;
+pub mod adaptive;
 
 use std::ffi::c_void;
 use std::sync::{Mutex, Once};
