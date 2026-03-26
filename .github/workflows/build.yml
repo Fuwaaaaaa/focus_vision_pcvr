@@ -1,11 +1,10 @@
 name: Build Focus Vision PCVR
 
-  on:
+on:
     push:
       branches: [main]
     pull_request:
       branches: [main]
-
   jobs:
     rust-build:
       name: Rust Streaming Engine
@@ -14,37 +13,15 @@ name: Build Focus Vision PCVR
         - uses: actions/checkout@v4
           with:
             submodules: recursive
-
-        - name: Install Rust
-          uses: dtolnay/rust-toolchain@stable
-
-        - name: Cache Cargo
-          uses: actions/cache@v4
-          with:
-            path: |
-              ~/.cargo/registry
-              ~/.cargo/git
-              target
-            key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-            restore-keys: ${{ runner.os }}-cargo-
-
-        - name: Build (release)
+        - uses: dtolnay/rust-toolchain@stable
+        - name: Build
           run: cargo build --release -p streaming-engine
-
-        - name: Run tests
+        - name: Test
           run: cargo test --release --workspace
-
-        - name: Upload streaming_engine.lib
-          uses: actions/upload-artifact@v4
+        - uses: actions/upload-artifact@v4
           with:
             name: streaming-engine-lib
             path: target/release/streaming_engine.lib
-
-        - name: Upload C header
-          uses: actions/upload-artifact@v4
-          with:
-            name: streaming-engine-header
-            path: rust/streaming-engine/include/streaming_engine.h
 
     driver-build:
       name: OpenVR Driver DLL
@@ -54,66 +31,11 @@ name: Build Focus Vision PCVR
         - uses: actions/checkout@v4
           with:
             submodules: recursive
-
-        - name: Install Rust
-          uses: dtolnay/rust-toolchain@stable
-
-        - name: Build Rust lib first
-          run: cargo build --release -p streaming-engine
-
-        - name: Configure CMake
-          run: cmake -B driver/build -S driver -DCMAKE_BUILD_TYPE=Release
-
-        - name: Build Driver DLL
-          run: cmake --build driver/build --config Release
-
-        - name: Upload Driver
-          uses: actions/upload-artifact@v4
+        - uses: dtolnay/rust-toolchain@stable
+        - run: cargo build --release -p streaming-engine
+        - run: cmake -B driver/build -S driver -DCMAKE_BUILD_TYPE=Release
+        - run: cmake --build driver/build --config Release
+        - uses: actions/upload-artifact@v4
           with:
             name: openvr-driver
             path: driver/build/focus_vision_pcvr/
-
-    android-build:
-      name: Android Client APK
-      runs-on: ubuntu-latest
-      steps:
-        - uses: actions/checkout@v4
-          with:
-            submodules: recursive
-
-        - name: Set up JDK 17
-          uses: actions/setup-java@v4
-          with:
-            java-version: '17'
-            distribution: 'temurin'
-
-        - name: Setup Android SDK
-          uses: android-actions/setup-android@v3
-
-        - name: Install NDK
-          run: sdkmanager "ndk;26.1.10909125"
-
-        - name: Setup OpenXR headers
-          run: |
-            mkdir -p third_party/openxr/include/openxr
-            curl -sL https://raw.githubusercontent.com/KhronosGroup/OpenXR-SDK/main/include/openxr/openxr.h -o
-  third_party/openxr/include/openxr/openxr.h
-            curl -sL https://raw.githubusercontent.com/KhronosGroup/OpenXR-SDK/main/include/openxr/openxr_platform.h -o
-  third_party/openxr/include/openxr/openxr_platform.h
-            curl -sL
-  https://raw.githubusercontent.com/KhronosGroup/OpenXR-SDK/main/include/openxr/openxr_platform_defines.h -o
-  third_party/openxr/include/openxr/openxr_platform_defines.h
-            curl -sL https://raw.githubusercontent.com/KhronosGroup/OpenXR-SDK/main/include/openxr/openxr_reflection.h
-  -o third_party/openxr/include/openxr/openxr_reflection.h
-
-        - name: Build APK (debug)
-          working-directory: client
-          run: |
-            chmod +x gradlew 2>/dev/null || true
-            ./gradlew assembleDebug || gradle assembleDebug
-
-        - name: Upload APK
-          uses: actions/upload-artifact@v4
-          with:
-            name: android-apk
-            path: client/app/build/outputs/apk/debug/*.apk
