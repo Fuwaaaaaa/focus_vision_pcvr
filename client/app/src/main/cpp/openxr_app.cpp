@@ -19,6 +19,7 @@ void OpenXRApp::initialize(android_app* app) {
     createReferenceSpace();
     createSwapchains();
     m_renderer.init();
+    m_timewarp.init();
     LOGI("OpenXR app initialized successfully");
 }
 
@@ -239,9 +240,35 @@ void OpenXRApp::renderFrame() {
             uint32_t width = m_swapchains[eye].getWidth();
             uint32_t height = m_swapchains[eye].getHeight();
 
-            // Render solid color (Step 4: blue, Step 5: video frame)
-            m_renderer.renderSolidColor(framebuffer, width, height,
-                0.05f, 0.05f, 0.2f); // Dark blue
+            // Rendering decision: new frame or timewarp
+            bool hasNewFrame = m_videoDecoder.getDecodedFrame();
+
+            if (hasNewFrame && m_lastDecodedTexture != 0) {
+                // Normal path: render the new decoded video frame
+                m_poseHistory.record(m_lastFrameIndex, views[eye].pose,
+                    frameState.predictedDisplayTime);
+                m_renderer.renderSolidColor(framebuffer, width, height,
+                    0.05f, 0.05f, 0.2f); // Placeholder until texture pipe ready
+                m_hasDecodedFrame = true;
+                m_lastFrameIndex++;
+            } else if (m_hasDecodedFrame && m_lastDecodedTexture != 0) {
+                // Timewarp path: re-render previous frame with rotation correction
+                auto record = m_poseHistory.latest();
+                if (record.has_value()) {
+                    m_timewarp.apply(framebuffer, width, height,
+                        m_lastDecodedTexture,
+                        record->pose,       // pose when frame was rendered
+                        views[eye].pose,     // current predicted pose
+                        views[eye].fov);
+                } else {
+                    m_renderer.renderSolidColor(framebuffer, width, height,
+                        0.05f, 0.05f, 0.2f);
+                }
+            } else {
+                // No frame yet: solid color
+                m_renderer.renderSolidColor(framebuffer, width, height,
+                    0.05f, 0.05f, 0.2f);
+            }
 
             m_swapchains[eye].releaseImage();
 
