@@ -43,7 +43,7 @@ pub fn encode_frame_to_packets(
 
     for (i, shard) in all_shards.iter().enumerate() {
         let is_last = i == total_shards - 1;
-        let seq = packetizer_next_seq(packetizer);
+        let seq = packetizer.next_sequence();
 
         let mut buf = Vec::with_capacity(12 + 8 + shard.len());
 
@@ -72,15 +72,6 @@ pub fn encode_frame_to_packets(
     }
 
     packets
-}
-
-// Helper to get next sequence number from packetizer
-fn packetizer_next_seq(_pkt: &mut RtpPacketizer) -> u16 {
-    // We use a dummy packetize call to get the sequence, but this is hacky.
-    // Better: expose sequence directly. For now, use the packetizer's internal counter.
-    // Since we're building packets manually in the FEC path, we'll track sequence ourselves.
-    static SEQ: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Decode FEC-protected RTP packets back into a frame.
