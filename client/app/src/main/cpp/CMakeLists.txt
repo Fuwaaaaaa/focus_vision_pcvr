@@ -22,6 +22,8 @@ set(CLIENT_SOURCES
     network_receiver.cpp
     video_decoder.cpp
     tcp_client.cpp
+    tracking_sender.cpp
+    controller_poller.cpp
     ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c
 )
 

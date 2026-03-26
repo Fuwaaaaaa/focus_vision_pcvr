@@ -3,6 +3,7 @@
 #include <openvr_driver.h>
 #include <memory>
 #include "hmd_device.h"
+#include "controller_device.h"
 
 /**
  * Server-side driver provider. SteamVR uses this to discover and manage devices.
@@ -21,4 +22,6 @@ public:
 
 private:
     std::unique_ptr<CHmdDevice> m_hmdDevice;
+    std::unique_ptr<CControllerDevice> m_leftController;
+    std::unique_ptr<CControllerDevice> m_rightController;
 };

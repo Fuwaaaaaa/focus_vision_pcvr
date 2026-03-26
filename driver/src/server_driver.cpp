@@ -32,6 +32,23 @@ vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
 
     vr::VRDriverLog()->Log("Focus Vision PCVR: HMD device added\n");
 
+    // Create and register controllers
+    m_leftController = std::make_unique<CControllerDevice>(true);
+    vr::VRServerDriverHost()->TrackedDeviceAdded(
+        m_leftController->GetSerialNumber(),
+        vr::TrackedDeviceClass_Controller,
+        m_leftController.get()
+    );
+
+    m_rightController = std::make_unique<CControllerDevice>(false);
+    vr::VRServerDriverHost()->TrackedDeviceAdded(
+        m_rightController->GetSerialNumber(),
+        vr::TrackedDeviceClass_Controller,
+        m_rightController.get()
+    );
+
+    vr::VRDriverLog()->Log("Focus Vision PCVR: Controllers added\n");
+
     return vr::VRInitError_None;
 }
 
@@ -39,6 +56,8 @@ void CServerDriver::Cleanup()
 {
     vr::VRDriverLog()->Log("Focus Vision PCVR: Driver Cleanup\n");
 
+    m_leftController.reset();
+    m_rightController.reset();
     m_hmdDevice.reset();
 
     // Shut down the Rust streaming engine
@@ -54,8 +73,7 @@ const char* const* CServerDriver::GetInterfaceVersions()
 
 void CServerDriver::RunFrame()
 {
-    if (m_hmdDevice)
-    {
-        m_hmdDevice->RunFrame();
-    }
+    if (m_hmdDevice) m_hmdDevice->RunFrame();
+    if (m_leftController) m_leftController->RunFrame();
+    if (m_rightController) m_rightController->RunFrame();
 }
