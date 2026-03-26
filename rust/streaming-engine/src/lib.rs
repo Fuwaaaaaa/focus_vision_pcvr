@@ -5,12 +5,13 @@ pub mod pipeline;
 pub mod control;
 pub mod metrics;
 pub mod engine;
+pub mod tracking;
 
 use std::ffi::c_void;
 use std::sync::{Mutex, Once};
 
 use engine::{StreamingEngine, SubmittedFrame};
-use fvp_common::protocol::TrackingData;
+use fvp_common::protocol::{ControllerState, TrackingData};
 use metrics::latency::FrameTimestamps;
 
 static INIT: Once = Once::new();
@@ -104,6 +105,33 @@ pub extern "C" fn fvp_get_tracking_data(out: *mut TrackingData) -> i32 {
     match engine.get_tracking() {
         Some(data) => {
             unsafe { *out = data; }
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Get the latest controller state.
+/// `controller_id`: 0 = left, 1 = right.
+/// Returns 0 on success, -1 if no data available.
+#[no_mangle]
+pub extern "C" fn fvp_get_controller_state(controller_id: u8, out: *mut ControllerState) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+
+    let guard = match ENGINE.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    let engine = match guard.as_ref() {
+        Some(e) => e,
+        None => return -1,
+    };
+
+    match engine.get_controller(controller_id) {
+        Some(state) => {
+            unsafe { *out = state; }
             0
         }
         None => -1,
