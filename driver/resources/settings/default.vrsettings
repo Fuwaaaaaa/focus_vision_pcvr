@@ -1,0 +1,9 @@
+{
+    "driver_focus_vision_pcvr": {
+        "enable": true,
+        "renderWidth": 1832,
+        "renderHeight": 1920,
+        "refreshRate": 90,
+        "ipd": 0.063
+    }
+}
