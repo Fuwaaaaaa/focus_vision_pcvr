@@ -13,19 +13,38 @@ use crate::transport::rtp::RtpPacketizer;
 use crate::transport::udp::UdpSender;
 use fvp_common::protocol::{ControllerState, TrackingData};
 
-/// Frame data submitted from the C++ OpenVR driver.
-pub struct SubmittedFrame {
+/// Callback type for IDR request notifications.
+/// Set via fvp_set_idr_callback() from C++.
+static IDR_CALLBACK: std::sync::RwLock<Option<extern "C" fn()>> = std::sync::RwLock::new(None);
+
+pub fn set_idr_callback(cb: extern "C" fn()) {
+    if let Ok(mut guard) = IDR_CALLBACK.write() {
+        *guard = Some(cb);
+    }
+}
+
+fn notify_idr_request() {
+    if let Ok(guard) = IDR_CALLBACK.read() {
+        if let Some(cb) = *guard {
+            cb();
+        }
+    }
+}
+
+/// H.265 encoded frame data submitted from the C++ OpenVR driver.
+/// The C++ driver handles D3D11 texture capture, NV12 conversion, and
+/// NVENC encoding. Rust receives only the encoded NAL units.
+pub struct EncodedFrame {
     pub frame_index: u32,
-    pub data: Vec<u8>, // Raw pixel data or pre-encoded NAL units
-    pub width: u32,
-    pub height: u32,
+    pub nal_data: Vec<u8>,
+    pub is_idr: bool,
     pub timestamps: FrameTimestamps,
 }
 
 /// The main streaming engine running on a tokio runtime.
 pub struct StreamingEngine {
     runtime: Runtime,
-    frame_tx: mpsc::Sender<SubmittedFrame>,
+    frame_tx: mpsc::Sender<EncodedFrame>,
     latest_tracking: Arc<StdMutex<Option<TrackingData>>>,
     latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
@@ -42,7 +61,7 @@ impl StreamingEngine {
             .thread_name("fvp-stream")
             .build()?;
 
-        let (frame_tx, frame_rx) = mpsc::channel::<SubmittedFrame>(4);
+        let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(4);
         let latest_tracking = Arc::new(StdMutex::new(None));
         let latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>> =
             Arc::new(StdMutex::new([None, None]));
@@ -56,9 +75,10 @@ impl StreamingEngine {
 
         // Spawn the main streaming task
         let cancel = cancel_token.clone();
+        let stream_cancel = cancel_token.clone();
         runtime.spawn(async move {
             tokio::select! {
-                result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone) => {
+                result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone, stream_cancel) => {
                     if let Err(e) = result {
                         log::error!("Streaming engine error: {}", e);
                     }
@@ -101,7 +121,7 @@ impl StreamingEngine {
     }
 
     /// Submit a frame for encoding and sending. Called from C++ thread.
-    pub fn submit_frame(&self, frame: SubmittedFrame) -> bool {
+    pub fn submit_frame(&self, frame: EncodedFrame) -> bool {
         match self.frame_tx.try_send(frame) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -148,16 +168,81 @@ impl StreamingEngine {
     }
 }
 
+/// Read TCP control messages after handshake (IDR_REQUEST, HEARTBEAT, DISCONNECT).
+/// When the connection closes or errors, cancels the provided token to stop streaming.
+async fn handle_tcp_control(
+    mut stream: tokio::net::TcpStream,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncReadExt;
+
+    const MAX_MSG_LEN: usize = 65536; // 64KB — control messages are small
+
+    loop {
+        // Read framed message: [length:u32 LE][type:u8][payload]
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            log::info!("TCP control connection closed — stopping stream");
+            cancel.cancel();
+            break;
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 { continue; }
+        if len > MAX_MSG_LEN {
+            log::error!("TCP message too large ({} bytes), closing connection", len);
+            cancel.cancel();
+            break;
+        }
+
+        let mut msg_buf = vec![0u8; len];
+        if stream.read_exact(&mut msg_buf).await.is_err() {
+            log::info!("TCP control read failed mid-message — stopping stream");
+            cancel.cancel();
+            break;
+        }
+        let msg_type = msg_buf[0];
+
+        match msg_type {
+            fvp_common::protocol::msg_type::IDR_REQUEST => {
+                log::info!("Received IDR_REQUEST from client");
+                notify_idr_request();
+            }
+            fvp_common::protocol::msg_type::HEARTBEAT => {
+                // Heartbeat handled by existing heartbeat module
+            }
+            fvp_common::protocol::msg_type::DISCONNECT => {
+                log::info!("Client sent DISCONNECT — stopping stream");
+                cancel.cancel();
+                break;
+            }
+            _ => {
+                log::debug!("Unknown TCP control message type: 0x{:02x}", msg_type);
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_streaming(
     config: AppConfig,
-    mut frame_rx: mpsc::Receiver<SubmittedFrame>,
+    mut frame_rx: mpsc::Receiver<EncodedFrame>,
     tracking: Arc<StdMutex<Option<TrackingData>>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
+    cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Step 1: Wait for HMD to connect via TCP
     let tcp_server = TcpControlServer::new(config.clone());
-    let (_tcp_stream, peer_addr) = tcp_server.listen_and_accept().await?;
+    let (tcp_stream, peer_addr) = tcp_server.listen_and_accept().await?;
     log::info!("HMD connected from {}, starting video stream", peer_addr);
+
+    // Spawn TCP control reader for IDR_REQUEST and other in-stream messages.
+    // When the TCP connection drops, cancel stops the streaming loop too.
+    let tcp_cancel = cancel.clone();
+    tokio::spawn(async move {
+        if let Err(e) = handle_tcp_control(tcp_stream, tcp_cancel).await {
+            log::warn!("TCP control reader ended: {}", e);
+        }
+    });
 
     // Step 2: Create UDP sender for video — send to the HMD's IP
     let udp_target: SocketAddr = SocketAddr::new(peer_addr.ip(), config.network.udp_port + 1);
@@ -165,27 +250,24 @@ async fn run_streaming(
 
     // Step 3: Process frames
     let mut packetizer = RtpPacketizer::new(0x46565000); // "FVP\0"
+    let mut fec_encoder = crate::transport::fec::FecEncoder::new(config.network.fec_redundancy);
     let mut frame_count: u64 = 0;
 
     while let Some(mut frame) = frame_rx.recv().await {
+        // NAL data arrives pre-encoded from C++ NVENC encoder.
+        // Mark encode timestamps for latency tracking (encode happened in C++,
+        // but we record receipt time here).
         frame.timestamps.mark_encode_start();
-
-        // In production: encode with NVENC via FFmpeg
-        // For now: treat frame.data as pre-encoded NAL units
-        let encoded_data = &frame.data;
-
         frame.timestamps.mark_encode_end();
 
-        // Packetize with FEC
-        let is_keyframe = frame_count % 90 == 0; // IDR every ~1 second
         let timestamp_90khz = (frame_count * (fvp_common::RTP_CLOCK_RATE as u64 / 90)) as u32;
 
-        let packets = pipeline::encode_frame_to_packets(
-            encoded_data,
+        let packets = pipeline::encode_frame_to_packets_with_fec(
+            &frame.nal_data,
             frame.frame_index,
             timestamp_90khz,
-            is_keyframe,
-            config.network.fec_redundancy,
+            frame.is_idr,
+            &mut fec_encoder,
             &mut packetizer,
         );
 
@@ -262,11 +344,10 @@ mod tests {
     fn test_submit_frame_success() {
         let config = AppConfig::default();
         let engine = StreamingEngine::new(config).unwrap();
-        let frame = SubmittedFrame {
+        let frame = EncodedFrame {
             frame_index: 0,
-            data: vec![0u8; 100],
-            width: 10,
-            height: 10,
+            nal_data: vec![0u8; 100],
+            is_idr: true,
             timestamps: FrameTimestamps::new(0),
         };
         assert!(engine.submit_frame(frame));
@@ -279,21 +360,19 @@ mod tests {
         let engine = StreamingEngine::new(config).unwrap();
         // Channel capacity is 4, so 5th frame should fail
         for i in 0..4 {
-            let frame = SubmittedFrame {
+            let frame = EncodedFrame {
                 frame_index: i,
-                data: vec![0u8; 100],
-                width: 10,
-                height: 10,
+                nal_data: vec![0u8; 100],
+                is_idr: i == 0,
                 timestamps: FrameTimestamps::new(i),
             };
             assert!(engine.submit_frame(frame), "frame {} should succeed", i);
         }
         // 5th frame — channel full (receiver not consuming since TCP not connected)
-        let frame = SubmittedFrame {
+        let frame = EncodedFrame {
             frame_index: 4,
-            data: vec![0u8; 100],
-            width: 10,
-            height: 10,
+            nal_data: vec![0u8; 100],
+            is_idr: false,
             timestamps: FrameTimestamps::new(4),
         };
         assert!(!engine.submit_frame(frame), "frame 4 should fail (channel full)");

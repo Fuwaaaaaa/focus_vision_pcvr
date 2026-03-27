@@ -120,12 +120,18 @@ impl TcpControlServer {
 
 /// Read a framed message: [length:u32 LE][type:u8][payload]
 async fn read_message(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    const MAX_MSG_LEN: usize = 65536; // 64KB — prevent OOM from malicious length
+
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
 
     if len == 0 {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty message"));
+    }
+    if len > MAX_MSG_LEN {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("message too large: {} bytes", len)));
     }
 
     let mut msg_buf = vec![0u8; len];
@@ -168,6 +174,50 @@ mod tests {
         let (msg_type, payload) = read_message(&mut client).await.unwrap();
         assert_eq!(msg_type, 0x43);
         assert_eq!(payload, vec![4, 5]);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_idr_request_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (msg_type, payload) = read_message(&mut stream).await.unwrap();
+            assert_eq!(msg_type, fvp_common::protocol::msg_type::IDR_REQUEST);
+            assert!(payload.is_empty());
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        send_message(&mut client, fvp_common::protocol::msg_type::IDR_REQUEST, &[]).await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_multiple_control_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read IDR_REQUEST
+            let (t1, _) = read_message(&mut stream).await.unwrap();
+            assert_eq!(t1, fvp_common::protocol::msg_type::IDR_REQUEST);
+            // Read HEARTBEAT
+            let (t2, _) = read_message(&mut stream).await.unwrap();
+            assert_eq!(t2, fvp_common::protocol::msg_type::HEARTBEAT);
+            // Read DISCONNECT
+            let (t3, _) = read_message(&mut stream).await.unwrap();
+            assert_eq!(t3, fvp_common::protocol::msg_type::DISCONNECT);
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        send_message(&mut client, fvp_common::protocol::msg_type::IDR_REQUEST, &[]).await.unwrap();
+        send_message(&mut client, fvp_common::protocol::msg_type::HEARTBEAT, &[]).await.unwrap();
+        send_message(&mut client, fvp_common::protocol::msg_type::DISCONNECT, &[]).await.unwrap();
 
         server.await.unwrap();
     }

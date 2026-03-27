@@ -20,6 +20,9 @@ public:
     void EnterStandby() override {}
     void LeaveStandby() override {}
 
+    /// Forward IDR request from TCP control to the NVENC encoder.
+    void requestIdr();
+
 private:
     std::unique_ptr<CHmdDevice> m_hmdDevice;
     std::unique_ptr<CControllerDevice> m_leftController;

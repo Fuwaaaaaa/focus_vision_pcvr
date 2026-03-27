@@ -26,6 +26,9 @@ public:
     const StreamConfig& getStreamConfig() const { return m_config; }
     bool isConnected() const { return m_connected; }
 
+    /// Request an IDR keyframe from the server (msg_type 0x30).
+    bool requestIdr();
+
     /// Send a framed message: [length:u32 LE][type:u8][payload]
     bool sendMessage(uint8_t type, const uint8_t* payload, int payloadLen);
 
