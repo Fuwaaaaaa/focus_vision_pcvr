@@ -20,6 +20,13 @@ frame_size_ms = 10
 sample_rate = 48000
 channels = 2
 
+[foveated]
+enabled = false
+fovea_radius = 0.15
+mid_radius = 0.35
+mid_qp_offset = 5
+peripheral_qp_offset = 15
+
 [pairing]
 max_attempts = 3
 lockout_seconds = 60
