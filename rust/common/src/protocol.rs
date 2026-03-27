@@ -28,6 +28,11 @@ pub struct TrackingData {
     pub position: [f32; 3],
     pub orientation: [f32; 4],
     pub timestamp_ns: u64,
+    /// Eye gaze normalized coords (0-1). x=0.5,y=0.5 means center.
+    /// gaze_valid=0 means no eye tracking data (use center fallback).
+    pub gaze_x: f32,
+    pub gaze_y: f32,
+    pub gaze_valid: u8,
 }
 
 /// Controller state sent from HMD to PC

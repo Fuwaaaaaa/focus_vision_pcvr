@@ -164,6 +164,12 @@ void NvencEncoder::requestIdr() {
     s_idrRequested.store(true);
 }
 
+void NvencEncoder::setGaze(float gazeX, float gazeY, bool valid) {
+    m_gazeX.store(gazeX);
+    m_gazeY.store(gazeY);
+    m_gazeValid.store(valid);
+}
+
 bool NvencEncoder::loadNvencApi() {
     HMODULE lib = LoadLibraryA("nvEncodeAPI64.dll");
     if (!lib) return false;

@@ -83,6 +83,15 @@ pub extern "C" fn fvp_set_idr_callback(callback: extern "C" fn()) {
     log::info!("IDR callback registered");
 }
 
+/// Register a gaze update callback. Called from C++ on init.
+/// When the HMD sends tracking data with gaze info, this callback
+/// forwards gaze coordinates to the C++ NVENC encoder for foveated encoding.
+#[no_mangle]
+pub extern "C" fn fvp_set_gaze_callback(callback: extern "C" fn(f32, f32, i32)) {
+    engine::set_gaze_callback(callback);
+    log::info!("Gaze callback registered");
+}
+
 /// Submit pre-encoded H.265 NAL units for RTP packetization and transmission.
 /// Called from the C++ driver after NVENC encoding.
 ///
@@ -264,6 +273,9 @@ mod tests {
             position: [0.0; 3],
             orientation: [0.0; 4],
             timestamp_ns: 0,
+            gaze_x: 0.5,
+            gaze_y: 0.5,
+            gaze_valid: 0,
         };
         let result = fvp_get_tracking_data(&mut data);
         assert_eq!(result, -1);

@@ -17,6 +17,10 @@ use fvp_common::protocol::{ControllerState, TrackingData};
 /// Set via fvp_set_idr_callback() from C++.
 static IDR_CALLBACK: std::sync::RwLock<Option<extern "C" fn()>> = std::sync::RwLock::new(None);
 
+/// Callback for gaze updates — forwards eye tracking data to NvencEncoder.
+/// Set via fvp_set_gaze_callback() from C++.
+static GAZE_CALLBACK: std::sync::RwLock<Option<extern "C" fn(f32, f32, i32)>> = std::sync::RwLock::new(None);
+
 pub fn set_idr_callback(cb: extern "C" fn()) {
     if let Ok(mut guard) = IDR_CALLBACK.write() {
         *guard = Some(cb);
@@ -27,6 +31,20 @@ fn notify_idr_request() {
     if let Ok(guard) = IDR_CALLBACK.read() {
         if let Some(cb) = *guard {
             cb();
+        }
+    }
+}
+
+pub fn set_gaze_callback(cb: extern "C" fn(f32, f32, i32)) {
+    if let Ok(mut guard) = GAZE_CALLBACK.write() {
+        *guard = Some(cb);
+    }
+}
+
+pub fn notify_gaze_update(x: f32, y: f32, valid: bool) {
+    if let Ok(guard) = GAZE_CALLBACK.read() {
+        if let Some(cb) = *guard {
+            cb(x, y, if valid { 1 } else { 0 });
         }
     }
 }
