@@ -8,7 +8,7 @@ bool VideoDecoder::init(int width, int height, const char* mimeType) {
     m_width = width;
     m_height = height;
 
-    // Create GL_TEXTURE_EXTERNAL_OES for zero-copy Surface output
+    // Create GL_TEXTURE_EXTERNAL_OES for Surface output
     glGenTextures(1, &m_outputTexture);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_outputTexture);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -22,6 +22,23 @@ bool VideoDecoder::init(int width, int height, const char* mimeType) {
         return false;
     }
 
+    // Create ASurfaceTexture from the GL texture (API level 28+).
+    // This bridges MediaCodec's decoded output directly to our GL texture.
+    m_surfaceTexture = ASurfaceTexture_create(m_outputTexture);
+    if (m_surfaceTexture) {
+        m_surface = ASurfaceTexture_acquireANativeWindow(m_surfaceTexture);
+        if (m_surface) {
+            m_useSurfaceOutput = true;
+            LOGI("VideoDecoder: Surface output enabled (zero-copy)");
+        } else {
+            LOGW("VideoDecoder: Failed to acquire ANativeWindow, falling back to buffer mode");
+            ASurfaceTexture_release(m_surfaceTexture);
+            m_surfaceTexture = nullptr;
+        }
+    } else {
+        LOGW("VideoDecoder: ASurfaceTexture_create failed, falling back to buffer mode");
+    }
+
     // Create MediaCodec decoder
     m_codec = AMediaCodec_createDecoderByType(mimeType);
     if (!m_codec) {
@@ -33,20 +50,14 @@ bool VideoDecoder::init(int width, int height, const char* mimeType) {
     AMediaFormat_setString(m_format, AMEDIAFORMAT_KEY_MIME, mimeType);
     AMediaFormat_setInt32(m_format, AMEDIAFORMAT_KEY_WIDTH, width);
     AMediaFormat_setInt32(m_format, AMEDIAFORMAT_KEY_HEIGHT, height);
-    AMediaFormat_setInt32(m_format, AMEDIAFORMAT_KEY_COLOR_FORMAT, 0x7F000789); // COLOR_FormatYUV420Flexible
     // Low latency mode for VR streaming
     AMediaFormat_setInt32(m_format, "low-latency", 1);
 
-    // Configure with Surface for zero-copy output to GL texture.
-    // The Surface is created from the GL texture via SurfaceTexture.
-    //
-    // Note: On Android NDK, creating a Surface from a GL texture requires
-    // ASurfaceTexture_* APIs (API level 28+). Focus Vision runs Android 12+
-    // so this is available.
-    //
-    // For the initial implementation, we use buffer output mode as a reliable
-    // fallback. Surface output will be added as an optimization.
-    media_status_t status = AMediaCodec_configure(m_codec, m_format, nullptr, nullptr, 0);
+    // Configure with Surface if available (zero-copy path), otherwise buffer mode
+    media_status_t status = AMediaCodec_configure(
+        m_codec, m_format,
+        m_useSurfaceOutput ? m_surface : nullptr,
+        nullptr, 0);
     if (status != AMEDIA_OK) {
         LOGE("Failed to configure MediaCodec: %d", (int)status);
         AMediaCodec_delete(m_codec);
@@ -63,7 +74,9 @@ bool VideoDecoder::init(int width, int height, const char* mimeType) {
     }
 
     m_initialized = true;
-    LOGI("VideoDecoder initialized: %s %dx%d (texture=%u)", mimeType, width, height, m_outputTexture);
+    LOGI("VideoDecoder initialized: %s %dx%d (texture=%u, surface=%s)",
+         mimeType, width, height, m_outputTexture,
+         m_useSurfaceOutput ? "yes" : "no");
     return true;
 }
 
@@ -77,14 +90,19 @@ void VideoDecoder::shutdown() {
         AMediaFormat_delete(m_format);
         m_format = nullptr;
     }
-    if (m_outputTexture) {
-        glDeleteTextures(1, &m_outputTexture);
-        m_outputTexture = 0;
-    }
     if (m_surface) {
         ANativeWindow_release(m_surface);
         m_surface = nullptr;
     }
+    if (m_surfaceTexture) {
+        ASurfaceTexture_release(m_surfaceTexture);
+        m_surfaceTexture = nullptr;
+    }
+    if (m_outputTexture) {
+        glDeleteTextures(1, &m_outputTexture);
+        m_outputTexture = 0;
+    }
+    m_useSurfaceOutput = false;
     m_initialized = false;
     LOGI("VideoDecoder shut down");
 }
@@ -111,14 +129,17 @@ bool VideoDecoder::getDecodedFrame() {
     ssize_t bufIdx = AMediaCodec_dequeueOutputBuffer(m_codec, &info, 0); // non-blocking
 
     if (bufIdx >= 0) {
-        // Got a decoded frame.
-        // In buffer output mode: read YUV data and upload to GL texture.
-        // In Surface output mode: the texture is updated automatically.
-        //
-        // For now, release the buffer. The GL texture upload path will be
-        // added when Surface output is implemented.
-        // Setting render=true would update the Surface texture automatically.
-        AMediaCodec_releaseOutputBuffer(m_codec, bufIdx, false);
+        if (m_useSurfaceOutput) {
+            // Surface output: release with render=true to update the SurfaceTexture.
+            // Then call updateTexImage() to make the new frame available in the GL texture.
+            AMediaCodec_releaseOutputBuffer(m_codec, bufIdx, true);
+            ASurfaceTexture_updateTexImage(m_surfaceTexture);
+        } else {
+            // Buffer output: release without rendering.
+            // In this fallback path, the GL texture stays empty.
+            // A full buffer-to-texture upload would be needed here for production.
+            AMediaCodec_releaseOutputBuffer(m_codec, bufIdx, false);
+        }
         return true;
     }
 
