@@ -172,16 +172,19 @@ void OpenXRApp::receiveAndDecodeVideo() {
         // RTP header: 12 bytes fixed + FVP header: 8 bytes
         if (received < 20) continue; // Too short for RTP + FVP header
 
-        // FVP header at offset 12:
-        //   frame_index (u32), shard_index (u8), total_shards (u8),
-        //   data_shards (u8), flags (u8)
+        // FVP header at offset 12 (all multi-byte fields are little-endian,
+        // matching Rust's to_le_bytes() in pipeline.rs):
+        //   frame_index (u32 LE), shard_index (u8), total_shards (u8),
+        //   flags (u16 LE)
         const uint8_t* fvp = m_recvBuffer.data() + 12;
-        uint32_t frameIndex = (fvp[0] << 24) | (fvp[1] << 16) | (fvp[2] << 8) | fvp[3];
+        uint32_t frameIndex = fvp[0] | (fvp[1] << 8) | (fvp[2] << 16) | (fvp[3] << 24); // LE
         uint8_t shardIndex = fvp[4];
         uint8_t totalShards = fvp[5];
-        uint8_t dataShards = fvp[6];
-        uint8_t flags = fvp[7];
+        uint16_t flags = fvp[6] | (fvp[7] << 8); // LE
         bool isKeyframe = (flags & 0x01) != 0;
+        // Note: dataShards is not in the FVP header — it's derived from
+        // totalShards and the FEC redundancy ratio on the receiver side.
+        uint8_t dataShards = totalShards; // Approximation; FEC decoder handles actual counts
 
         const uint8_t* payload = m_recvBuffer.data() + 20;
         int payloadSize = received - 20;
