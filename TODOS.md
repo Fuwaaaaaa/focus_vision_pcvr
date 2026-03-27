@@ -2,11 +2,9 @@
 
 ## v1.0 スコープ内
 
-### FecEncoderのフレームループ外再利用
-- **What:** `pipeline.rs`の`encode_frame_to_packets()`で毎フレーム`FecEncoder::new()`を呼んでいるのを、ループ外で一度だけ作成して再利用する
-- **Why:** Reed-Solomon初期化にGalois Fieldテーブル計算が含まれ、90fps(11ms/frame)で毎フレーム実行は無駄。累積で0.1ms以上のオーバーヘッド
-- **Context:** Eng Review #7で決定。FecEncoderをStreamingEngineまたはrun_streaming()のスコープで保持し、encode_frame_to_packets()に参照渡し
-- **Depends on:** ビデオパイプライン実装と同時に対応可能
+### ~~FecEncoderのフレームループ外再利用~~ (完了)
+- ReedSolomonインスタンスをFecEncoder内でキャッシュ。shard数が変わらない限り再利用。
+- `encode_frame_to_packets_with_fec()`追加、`run_streaming()`で再利用パス使用。
 
 ### H.265 vs H.264 デコードレイテンシー比較調査
 - **What:** Focus Vision実機でMediaCodecのH.265とH.264デコードレイテンシーを計測・比較する
