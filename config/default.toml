@@ -13,6 +13,13 @@ framerate = 90
 ipd = 0.063
 seconds_from_vsync_to_photons = 0.011
 
+[audio]
+enabled = true
+bitrate_kbps = 128
+frame_size_ms = 10
+sample_rate = 48000
+channels = 2
+
 [pairing]
 max_attempts = 3
 lockout_seconds = 60
