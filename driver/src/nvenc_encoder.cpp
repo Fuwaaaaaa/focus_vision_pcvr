@@ -3,63 +3,6 @@
 #include <cstring>
 #include <atomic>
 
-// NVENC API is loaded at runtime from nvEncodeAPI64.dll.
-// These are the minimal type definitions needed to call the API
-// without requiring the full SDK headers as a build dependency.
-//
-// Reference: NVIDIA Video Codec SDK - nvEncodeAPI.h
-// https://developer.nvidia.com/video-codec-sdk
-
-// NVENC GUIDs
-static const GUID NV_ENC_CODEC_H264_GUID =
-    { 0x6BC82762, 0x4E63, 0x4CA4, { 0xAA, 0x85, 0x1E, 0xA8, 0x9E, 0x37, 0x8C, 0x9B } };
-static const GUID NV_ENC_CODEC_HEVC_GUID =
-    { 0x790CDC88, 0x4522, 0x4D7B, { 0x94, 0x25, 0xBD, 0xA9, 0x97, 0x5F, 0x76, 0x03 } };
-static const GUID NV_ENC_PRESET_P4_GUID =
-    { 0xFC0A8D3E, 0x4545, 0x4B14, { 0xA1, 0x41, 0xB4, 0xB6, 0x72, 0xFD, 0x42, 0x27 } };
-
-// NVENC API version
-#define NVENCAPI_MAJOR_VERSION 12
-#define NVENCAPI_MINOR_VERSION 2
-#define NVENCAPI_VERSION (NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24))
-
-// Minimal NVENC structures
-// Full definitions in the NVIDIA Video Codec SDK nvEncodeAPI.h
-// We define only what we use to keep the build self-contained.
-
-typedef enum {
-    NV_ENC_SUCCESS = 0,
-    NV_ENC_ERR_GENERIC = 1,
-} NVENCSTATUS;
-
-typedef enum {
-    NV_ENC_DEVICE_TYPE_DIRECTX = 0,
-} NV_ENC_DEVICE_TYPE;
-
-typedef enum {
-    NV_ENC_BUFFER_FORMAT_NV12 = 0x00000001,
-} NV_ENC_BUFFER_FORMAT;
-
-typedef enum {
-    NV_ENC_PIC_TYPE_IDR = 4,
-} NV_ENC_PIC_TYPE;
-
-typedef enum {
-    NV_ENC_TUNING_INFO_LOW_LATENCY = 2,
-} NV_ENC_TUNING_INFO;
-
-typedef enum {
-    NV_ENC_PARAMS_RC_CBR = 2,
-} NV_ENC_PARAMS_RC_MODE;
-
-// ---- Placeholder NVENC implementation ----
-// The actual NVENC integration requires the NVIDIA Video Codec SDK.
-// This file provides the structure and API surface. The real encode()
-// path will be activated once the SDK is available.
-//
-// For now, encode() generates a synthetic NAL unit from the frame data
-// to validate the full pipeline (C++ -> C ABI -> Rust RTP -> UDP).
-
 static std::atomic<bool> s_idrRequested{false};
 
 NvencEncoder::~NvencEncoder() {
@@ -73,19 +16,24 @@ bool NvencEncoder::init(ID3D11Device* device, const Config& config) {
     device->GetImmediateContext(&m_context);
     m_config = config;
 
-    // Try to load NVENC DLL
-    if (!loadNvencApi()) {
-        // NVENC not available — fall back to test pattern mode.
-        // This allows the pipeline to work end-to-end without a GPU encoder.
+    if (loadNvencApi() && createEncoderSession() && createResources()) {
         char buf[256];
         snprintf(buf, sizeof(buf),
-            "NvencEncoder: nvEncodeAPI64.dll not found. "
-            "Running in test-pattern mode (no real encoding).\n");
+            "NvencEncoder: Real NVENC initialized (%s, %ux%u, %u Mbps)\n",
+            config.use_hevc ? "HEVC" : "H264",
+            config.width, config.height, config.bitrate_bps / 1'000'000);
         OutputDebugStringA(buf);
-    }
-
-    if (!createNv12Texture()) {
-        return false;
+    } else {
+        // NVENC not available — test pattern mode.
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "NvencEncoder: NVENC unavailable. Running in test-pattern mode.\n");
+        OutputDebugStringA(buf);
+        // Clean up partial init
+        if (m_encoder && m_nvencFns.nvEncDestroyEncoder) {
+            m_nvencFns.nvEncDestroyEncoder(m_encoder);
+            m_encoder = nullptr;
+        }
     }
 
     m_initialized = true;
@@ -96,26 +44,29 @@ bool NvencEncoder::init(ID3D11Device* device, const Config& config) {
 void NvencEncoder::shutdown() {
     if (!m_initialized) return;
 
-    // Destroy NVENC session
-    if (m_encoder && m_nvenc) {
-        // nvenc->nvEncDestroyEncoder(m_encoder);
+    if (m_encoder) {
+        if (m_bitstreamBuffer && m_nvencFns.nvEncDestroyBitstreamBuffer)
+            m_nvencFns.nvEncDestroyBitstreamBuffer(m_encoder, m_bitstreamBuffer);
+        if (m_registeredResource && m_nvencFns.nvEncUnregisterResource)
+            m_nvencFns.nvEncUnregisterResource(m_encoder, m_registeredResource);
+        if (m_nvencFns.nvEncDestroyEncoder)
+            m_nvencFns.nvEncDestroyEncoder(m_encoder);
         m_encoder = nullptr;
     }
 
-    // Free NVENC library
+    m_bitstreamBuffer = nullptr;
+    m_registeredResource = nullptr;
+
     if (m_nvencLib) {
         FreeLibrary(static_cast<HMODULE>(m_nvencLib));
         m_nvencLib = nullptr;
     }
 
-    delete m_nvenc;
-    m_nvenc = nullptr;
-
-    m_nv12Texture.Reset();
-    m_stagingTexture.Reset();
+    m_inputTexture.Reset();
     m_context.Reset();
     m_device.Reset();
     m_initialized = false;
+    memset(&m_nvencFns, 0, sizeof(m_nvencFns));
 }
 
 bool NvencEncoder::encode(ID3D11Texture2D* srcTexture,
@@ -124,59 +75,88 @@ bool NvencEncoder::encode(ID3D11Texture2D* srcTexture,
                           bool& outIsIdr) {
     if (!m_initialized) return false;
 
-    // Determine if this frame should be IDR
     bool isIdr = forceIdr || s_idrRequested.exchange(false) ||
                  (m_frameCount % m_idrInterval == 0);
     outIsIdr = isIdr;
-
     m_frameCount++;
 
-    // --- Real NVENC path (when SDK is available) ---
-    // 1. Convert BGRA texture to NV12 via compute shader or GPU copy
-    // 2. Register NV12 texture as NVENC input resource
-    // 3. Call nvEncEncodePicture() with IDR flag if needed
-    // 4. Lock output bitstream, copy NAL data
-    // 5. Unlock and return
-    //
-    // --- Test pattern path (current) ---
-    // Generate a synthetic H.265 NAL unit for pipeline validation.
-    // This allows testing the full path: C++ -> fvp_submit_encoded_nal() ->
-    // Rust RTP -> FEC -> UDP without requiring real GPU encoding.
-
+    // --- Real NVENC path ---
     if (m_encoder) {
-        // TODO: Real NVENC encode path
-        // This branch activates when the NVIDIA Video Codec SDK is integrated.
-        return false;
+        // Copy source texture to our registered input texture
+        if (srcTexture) {
+            m_context->CopyResource(m_inputTexture.Get(), srcTexture);
+            m_context->Flush();
+        }
+
+        // Map the registered resource
+        NV_ENC_MAP_INPUT_RESOURCE mapInput = {};
+        mapInput.version = NVENCAPI_STRUCT_VERSION(NV_ENC_MAP_INPUT_RESOURCE, 4);
+        mapInput.registeredResource = m_registeredResource;
+        NVENCSTATUS st = m_nvencFns.nvEncMapInputResource(m_encoder, &mapInput);
+        if (st != NV_ENC_SUCCESS) {
+            OutputDebugStringA("NvencEncoder: nvEncMapInputResource failed\n");
+            return false;
+        }
+
+        // Encode
+        NV_ENC_PIC_PARAMS picParams = {};
+        picParams.version = NVENCAPI_STRUCT_VERSION(NV_ENC_PIC_PARAMS, 6);
+        picParams.inputWidth = m_config.width;
+        picParams.inputHeight = m_config.height;
+        picParams.inputPitch = m_config.width;
+        picParams.inputBuffer = mapInput.mappedResource;
+        picParams.outputBitstream = m_bitstreamBuffer;
+        picParams.bufferFmt = NV_ENC_BUFFER_FORMAT_ARGB;
+        picParams.pictureStruct = 1; // Frame
+        picParams.frameIdx = m_frameCount - 1;
+        picParams.inputTimeStamp = m_frameCount - 1;
+
+        if (isIdr) {
+            picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+            picParams.pictureType = NV_ENC_PIC_TYPE_IDR;
+        }
+
+        st = m_nvencFns.nvEncEncodePicture(m_encoder, &picParams);
+        if (st != NV_ENC_SUCCESS && st != NV_ENC_ERR_NEED_MORE_INPUT) {
+            m_nvencFns.nvEncUnmapInputResource(m_encoder, mapInput.mappedResource);
+            char buf[128];
+            snprintf(buf, sizeof(buf), "NvencEncoder: nvEncEncodePicture failed: %d\n", st);
+            OutputDebugStringA(buf);
+            return false;
+        }
+
+        // Unmap input
+        m_nvencFns.nvEncUnmapInputResource(m_encoder, mapInput.mappedResource);
+
+        if (st == NV_ENC_ERR_NEED_MORE_INPUT) {
+            // B-frame delay — no output yet. We don't use B-frames for low latency,
+            // but handle gracefully.
+            outNalData.clear();
+            return true;
+        }
+
+        // Lock bitstream and copy NAL data
+        NV_ENC_LOCK_BITSTREAM lockBitstream = {};
+        lockBitstream.version = NVENCAPI_STRUCT_VERSION(NV_ENC_LOCK_BITSTREAM, 2);
+        lockBitstream.outputBitstream = m_bitstreamBuffer;
+        st = m_nvencFns.nvEncLockBitstream(m_encoder, &lockBitstream);
+        if (st != NV_ENC_SUCCESS) {
+            OutputDebugStringA("NvencEncoder: nvEncLockBitstream failed\n");
+            return false;
+        }
+
+        outNalData.resize(lockBitstream.bitstreamSizeInBytes);
+        memcpy(outNalData.data(), lockBitstream.bitstreamBufferPtr,
+               lockBitstream.bitstreamSizeInBytes);
+
+        outIsIdr = (lockBitstream.pictureType == NV_ENC_PIC_TYPE_IDR);
+
+        m_nvencFns.nvEncUnlockBitstream(m_encoder, m_bitstreamBuffer);
+        return true;
     }
 
-    // Test pattern: generate a fake NAL unit
-    // H.265 NAL header: forbidden_zero_bit(1) + nal_unit_type(6) + nuh_layer_id(6) + nuh_temporal_id_plus1(3)
-    // IDR: nal_unit_type = 19 (IDR_W_RADL), Non-IDR: nal_unit_type = 1 (TRAIL_R)
-    outNalData.clear();
-
-    // Start code prefix (Annex B format)
-    outNalData.push_back(0x00);
-    outNalData.push_back(0x00);
-    outNalData.push_back(0x00);
-    outNalData.push_back(0x01);
-
-    if (isIdr) {
-        // IDR_W_RADL: nal_unit_type = 19 -> (19 << 1) = 0x26, layer_id=0, tid=1 -> 0x01
-        outNalData.push_back(0x26);
-        outNalData.push_back(0x01);
-    } else {
-        // TRAIL_R: nal_unit_type = 1 -> (1 << 1) = 0x02, layer_id=0, tid=1 -> 0x01
-        outNalData.push_back(0x02);
-        outNalData.push_back(0x01);
-    }
-
-    // Fake payload — in production this is the actual encoded slice data.
-    // Use frame dimensions to generate a payload that exercises the RTP
-    // packetization (needs to be larger than one MTU for multi-packet frames).
-    size_t payloadSize = static_cast<size_t>(m_config.width) * m_config.height / 100;
-    if (payloadSize < 256) payloadSize = 256;
-    outNalData.resize(outNalData.size() + payloadSize, 0xAB);
-
+    // --- Test pattern fallback ---
+    generateTestPattern(isIdr, outNalData);
     return true;
 }
 
@@ -186,61 +166,156 @@ void NvencEncoder::requestIdr() {
 
 bool NvencEncoder::loadNvencApi() {
     HMODULE lib = LoadLibraryA("nvEncodeAPI64.dll");
-    if (!lib) {
-        return false;
-    }
+    if (!lib) return false;
     m_nvencLib = lib;
 
-    // In full implementation:
-    // 1. GetProcAddress for NvEncodeAPICreateInstance
-    // 2. Fill NV_ENCODE_API_FUNCTION_LIST
-    // 3. Call nvEncOpenEncodeSessionEx with D3D11 device
-    // 4. Configure encoder (HEVC/H264, CBR, low-latency tuning)
-    // 5. Allocate input/output buffers
-
-    return true;
-}
-
-bool NvencEncoder::createNv12Texture() {
-    if (!m_device) return false;
-
-    // NV12 texture for BGRA->NV12 conversion output
-    D3D11_TEXTURE2D_DESC nv12Desc = {};
-    nv12Desc.Width = m_config.width;
-    nv12Desc.Height = m_config.height;
-    nv12Desc.MipLevels = 1;
-    nv12Desc.ArraySize = 1;
-    nv12Desc.Format = DXGI_FORMAT_NV12;
-    nv12Desc.SampleDesc.Count = 1;
-    nv12Desc.Usage = D3D11_USAGE_DEFAULT;
-    nv12Desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-    HRESULT hr = m_device->CreateTexture2D(&nv12Desc, nullptr, &m_nv12Texture);
-    if (FAILED(hr)) {
-        // NV12 may not be supported on all GPUs — this is acceptable
-        // since we fall back to test pattern mode.
-        return true;
+    auto createInstance = (PFN_NvEncodeAPICreateInstance)
+        GetProcAddress(lib, "NvEncodeAPICreateInstance");
+    if (!createInstance) {
+        OutputDebugStringA("NvencEncoder: NvEncodeAPICreateInstance not found\n");
+        return false;
     }
 
-    // Staging texture for CPU readback (fallback path)
-    D3D11_TEXTURE2D_DESC stagingDesc = nv12Desc;
-    stagingDesc.Usage = D3D11_USAGE_STAGING;
-    stagingDesc.BindFlags = 0;
-    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    m_nvencFns.version = NVENCAPI_STRUCT_VERSION(NV_ENCODE_API_FUNCTION_LIST, 2);
+    NVENCSTATUS st = createInstance(&m_nvencFns);
+    if (st != NV_ENC_SUCCESS) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "NvencEncoder: NvEncodeAPICreateInstance failed: %d\n", st);
+        OutputDebugStringA(buf);
+        return false;
+    }
 
-    m_device->CreateTexture2D(&stagingDesc, nullptr, &m_stagingTexture);
     return true;
 }
 
-bool NvencEncoder::convertBgraToNv12(ID3D11Texture2D* srcBgra) {
-    // In full implementation: dispatch a compute shader that converts
-    // BGRA (DXGI_FORMAT_B8G8R8A8_UNORM) to NV12 on the GPU.
-    //
-    // Color space: BT.709
-    //   Y  =  0.2126*R + 0.7152*G + 0.0722*B
-    //   Cb = -0.1146*R - 0.3854*G + 0.5000*B + 128
-    //   Cr =  0.5000*R - 0.4542*G - 0.0458*B + 128
-    //
-    // The NV12 texture is then registered as NVENC input.
+bool NvencEncoder::createEncoderSession() {
+    if (!m_nvencFns.nvEncOpenEncodeSessionEx) return false;
+
+    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS sessionParams = {};
+    sessionParams.version = NVENCAPI_STRUCT_VERSION(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, 1);
+    sessionParams.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
+    sessionParams.device = m_device.Get();
+    sessionParams.apiVersion = NVENCAPI_VERSION;
+
+    NVENCSTATUS st = m_nvencFns.nvEncOpenEncodeSessionEx(&sessionParams, &m_encoder);
+    if (st != NV_ENC_SUCCESS) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "NvencEncoder: nvEncOpenEncodeSessionEx failed: %d\n", st);
+        OutputDebugStringA(buf);
+        m_encoder = nullptr;
+        return false;
+    }
+
+    // Configure encoder
+    NV_ENC_CONFIG encConfig = {};
+    encConfig.version = NVENCAPI_STRUCT_VERSION(NV_ENC_CONFIG, 8);
+    encConfig.gopLength = m_idrInterval;
+    encConfig.frameIntervalP = 1; // No B-frames (low latency)
+    encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR_LOWDELAY_HQ;
+    encConfig.rcParams.averageBitRate = m_config.bitrate_bps;
+    encConfig.rcParams.maxBitRate = m_config.bitrate_bps;
+
+    NV_ENC_INITIALIZE_PARAMS initParams = {};
+    initParams.version = NVENCAPI_STRUCT_VERSION(NV_ENC_INITIALIZE_PARAMS, 5);
+    initParams.encodeGUID = m_config.use_hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
+    initParams.presetGUID = NV_ENC_PRESET_P4_GUID;
+    initParams.encodeWidth = m_config.width;
+    initParams.encodeHeight = m_config.height;
+    initParams.darWidth = m_config.width;
+    initParams.darHeight = m_config.height;
+    initParams.frameRateNum = m_config.fps;
+    initParams.frameRateDen = 1;
+    initParams.enablePTD = 1; // Picture type decision by encoder
+    initParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
+    initParams.encodeConfig = &encConfig;
+
+    st = m_nvencFns.nvEncInitializeEncoder(m_encoder, &initParams);
+    if (st != NV_ENC_SUCCESS) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "NvencEncoder: nvEncInitializeEncoder failed: %d\n", st);
+        OutputDebugStringA(buf);
+        return false;
+    }
+
     return true;
+}
+
+bool NvencEncoder::createResources() {
+    if (!m_encoder) return false;
+
+    // Create input texture that NVENC will read from.
+    // We use BGRA format (matching SteamVR's compositor output).
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = m_config.width;
+    desc.Height = m_config.height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+    HRESULT hr = m_device->CreateTexture2D(&desc, nullptr, &m_inputTexture);
+    if (FAILED(hr)) {
+        OutputDebugStringA("NvencEncoder: Failed to create input texture\n");
+        return false;
+    }
+
+    // Register the D3D11 texture with NVENC
+    NV_ENC_REGISTER_RESOURCE regResource = {};
+    regResource.version = NVENCAPI_STRUCT_VERSION(NV_ENC_REGISTER_RESOURCE, 3);
+    regResource.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+    regResource.width = m_config.width;
+    regResource.height = m_config.height;
+    regResource.resourceToRegister = m_inputTexture.Get();
+    regResource.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
+    regResource.bufferUsage = 0; // encoder input
+
+    NVENCSTATUS st = m_nvencFns.nvEncRegisterResource(m_encoder, &regResource);
+    if (st != NV_ENC_SUCCESS) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "NvencEncoder: nvEncRegisterResource failed: %d\n", st);
+        OutputDebugStringA(buf);
+        return false;
+    }
+    m_registeredResource = regResource.registeredResource;
+
+    // Create output bitstream buffer
+    NV_ENC_CREATE_BITSTREAM_BUFFER createBitstream = {};
+    createBitstream.version = NVENCAPI_STRUCT_VERSION(NV_ENC_CREATE_BITSTREAM_BUFFER, 1);
+
+    st = m_nvencFns.nvEncCreateBitstreamBuffer(m_encoder, &createBitstream);
+    if (st != NV_ENC_SUCCESS) {
+        OutputDebugStringA("NvencEncoder: nvEncCreateBitstreamBuffer failed\n");
+        return false;
+    }
+    m_bitstreamBuffer = createBitstream.bitstreamBuffer;
+
+    return true;
+}
+
+void NvencEncoder::generateTestPattern(bool isIdr, std::vector<uint8_t>& outNalData) {
+    outNalData.clear();
+
+    // Annex B start code
+    outNalData.push_back(0x00);
+    outNalData.push_back(0x00);
+    outNalData.push_back(0x00);
+    outNalData.push_back(0x01);
+
+    if (isIdr) {
+        outNalData.push_back(0x26); // IDR_W_RADL: (19 << 1)
+        outNalData.push_back(0x01); // layer_id=0, tid=1
+    } else {
+        outNalData.push_back(0x02); // TRAIL_R: (1 << 1)
+        outNalData.push_back(0x01);
+    }
+
+    size_t payloadSize = static_cast<size_t>(m_config.width) * m_config.height / 100;
+    if (payloadSize < 256) payloadSize = 256;
+    outNalData.resize(outNalData.size() + payloadSize, 0xAB);
 }
