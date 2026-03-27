@@ -144,6 +144,8 @@ void OpenXRApp::createSwapchains() {
 }
 
 void OpenXRApp::mainLoop() {
+    m_recvBuffer.resize(2048); // Max RTP packet size
+
     while (m_running) {
         pollEvents();
 
@@ -152,7 +154,70 @@ void OpenXRApp::mainLoop() {
             continue;
         }
 
+        // Receive and decode video packets before rendering
+        receiveAndDecodeVideo();
         renderFrame();
+    }
+}
+
+void OpenXRApp::receiveAndDecodeVideo() {
+    if (!m_networkReceiver.isInitialized()) return;
+
+    // Drain all available UDP packets (non-blocking)
+    for (int i = 0; i < 64; i++) { // Process up to 64 packets per frame
+        int received = m_networkReceiver.receive(m_recvBuffer.data(), (int)m_recvBuffer.size());
+        if (received <= 0) break;
+
+        // Parse RTP header to extract FVP fields
+        // RTP header: 12 bytes fixed + FVP header: 8 bytes
+        if (received < 20) continue; // Too short for RTP + FVP header
+
+        // FVP header at offset 12:
+        //   frame_index (u32), shard_index (u8), total_shards (u8),
+        //   data_shards (u8), flags (u8)
+        const uint8_t* fvp = m_recvBuffer.data() + 12;
+        uint32_t frameIndex = (fvp[0] << 24) | (fvp[1] << 16) | (fvp[2] << 8) | fvp[3];
+        uint8_t shardIndex = fvp[4];
+        uint8_t totalShards = fvp[5];
+        uint8_t dataShards = fvp[6];
+        uint8_t flags = fvp[7];
+        bool isKeyframe = (flags & 0x01) != 0;
+
+        const uint8_t* payload = m_recvBuffer.data() + 20;
+        int payloadSize = received - 20;
+
+        // New frame? Start collecting shards.
+        if (frameIndex != m_fecDecoder.currentFrameIndex()) {
+            // Try to decode previous frame first
+            auto prevFrame = m_fecDecoder.tryDecode();
+            if (prevFrame.has_value()) {
+                // Validate NAL data before submitting to decoder
+                const uint8_t* nalData = prevFrame->data.data();
+                int nalSize = (int)prevFrame->data.size();
+
+                // Skip Annex B start code (0x00 0x00 0x00 0x01)
+                const uint8_t* nalStart = nalData;
+                int nalLen = nalSize;
+                if (nalSize >= 4 && nalData[0] == 0 && nalData[1] == 0 &&
+                    nalData[2] == 0 && nalData[3] == 1) {
+                    nalStart = nalData + 4;
+                    nalLen = nalSize - 4;
+                }
+
+                auto result = NalValidator::validate(nalStart, nalLen);
+                if (result == NalValidator::Result::Valid) {
+                    int64_t timestampUs = prevFrame->frameIndex * 11111; // ~90fps
+                    m_videoDecoder.submitPacket(nalData, nalSize, timestampUs);
+                } else {
+                    LOGW("NAL validation failed for frame %u, requesting IDR",
+                         prevFrame->frameIndex);
+                    // TODO: send IDR request via TCP control channel
+                }
+            }
+            m_fecDecoder.beginFrame(frameIndex, totalShards, dataShards, isKeyframe);
+        }
+
+        m_fecDecoder.addShard(shardIndex, payload, payloadSize);
     }
 }
 
@@ -243,12 +308,16 @@ void OpenXRApp::renderFrame() {
             // Rendering decision: new frame or timewarp
             bool hasNewFrame = m_videoDecoder.getDecodedFrame();
 
+            if (hasNewFrame) {
+                m_lastDecodedTexture = m_videoDecoder.getOutputTexture();
+            }
+
             if (hasNewFrame && m_lastDecodedTexture != 0) {
                 // Normal path: render the new decoded video frame
                 m_poseHistory.record(m_lastFrameIndex, views[eye].pose,
                     frameState.predictedDisplayTime);
-                m_renderer.renderSolidColor(framebuffer, width, height,
-                    0.05f, 0.05f, 0.2f); // Placeholder until texture pipe ready
+                m_renderer.renderVideoFrame(framebuffer, width, height,
+                    m_lastDecodedTexture);
                 m_hasDecodedFrame = true;
                 m_lastFrameIndex++;
             } else if (m_hasDecodedFrame && m_lastDecodedTexture != 0) {
