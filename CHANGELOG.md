@@ -5,8 +5,10 @@ All notable changes to Focus Vision PCVR will be documented in this file.
 ## [0.1.0.0] - 2026-03-27
 
 ### Added
-- **Video pipeline Phase 1 (PC):** NVENCエンコーダー (テストパターンモード付き)、D3D11テクスチャコピー、DirectMode統合
-- **Video pipeline Phase 2 (Android):** MediaCodecデコード (Surface出力対応)、OpenGL ESレンダリング (external OESシェーダー)、UDP受信パイプライン
+- **PCコンパニオンアプリ:** ドライバーインストール、PIN表示、ADB経由HMDデプロイをGUIで操作。`cargo run -p focus-vision-companion`で起動
+- **Real NVENCエンコード:** nvEncodeAPI64.dllをランタイムロード。SDK不要でビルド可能。NVIDIA非搭載環境はテストパターンに自動フォールバック
+- **Video pipeline Phase 1 (PC):** NVENCエンコーダー、D3D11テクスチャ入力、DirectMode統合
+- **Video pipeline Phase 2 (Android):** MediaCodecデコード (ASurfaceTexture zero-copy出力)、OpenGL ESレンダリング (external OESシェーダー)、UDP受信パイプライン
 - **NALバリデーション:** H.265 NALヘッダー検証。不正パケットをドロップしデコーダークラッシュを防止
 - **IDRキーフレーム制御:** TCP制御チャンネル経由のIDR_REQUESTメッセージ。E2E: Client→Rust→C++→NvencEncoder
 - **新C ABI:** `fvp_submit_encoded_nal()` — C++側でエンコード済みNALデータをRustに渡す
@@ -24,3 +26,4 @@ All notable changes to Focus Vision PCVR will be documented in this file.
 - **TCP切断検知:** CancellationToken連携。HMD切断時にストリーミングを停止
 - **コールバック安全性:** Cleanup()の順序修正。fvp_shutdown()をs_instance=nullptr前に呼び出し
 - **FVPヘッダーエンディアン:** Android側のframe_index/flags読み取りをLEに修正
+- **Adversarial review修正 (7件):** FEC shard count計算、最終フレームデコード、整数プロモーション、TCP mid-message cancel、タイムスタンプオーバーフロー、3byte Annex B対応、デッドコード除去
