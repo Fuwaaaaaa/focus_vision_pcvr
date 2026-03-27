@@ -30,6 +30,9 @@ public:
     /// Request an IDR keyframe on the next encode. Thread-safe.
     void requestIdr();
 
+    /// Update gaze for foveated encoding. Thread-safe.
+    void updateGaze(float x, float y, bool valid) { m_encoder.setGaze(x, y, valid); }
+
     // IVRDriverDirectModeComponent
     void CreateSwapTextureSet(
         uint32_t unPid,
