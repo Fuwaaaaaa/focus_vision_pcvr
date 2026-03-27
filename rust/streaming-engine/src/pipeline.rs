@@ -11,6 +11,21 @@ pub fn encode_frame_to_packets(
     fec_redundancy: f32,
     packetizer: &mut RtpPacketizer,
 ) -> Vec<RtpPacket> {
+    let mut fec = FecEncoder::new(fec_redundancy);
+    encode_frame_to_packets_with_fec(
+        frame_data, frame_index, timestamp_90khz, is_keyframe, &mut fec, packetizer,
+    )
+}
+
+/// Encode a frame using a reusable FecEncoder (avoids per-frame RS init).
+pub fn encode_frame_to_packets_with_fec(
+    frame_data: &[u8],
+    frame_index: u32,
+    timestamp_90khz: u32,
+    is_keyframe: bool,
+    fec: &mut FecEncoder,
+    packetizer: &mut RtpPacketizer,
+) -> Vec<RtpPacket> {
     // Step 1: Split frame into FEC shards
     let shard_size = FEC_SHARD_SIZE;
     let data_shards: Vec<Vec<u8>> = frame_data
@@ -27,8 +42,7 @@ pub fn encode_frame_to_packets(
         return vec![];
     }
 
-    // Step 2: FEC encode (add parity shards)
-    let fec = FecEncoder::new(fec_redundancy);
+    // Step 2: FEC encode (add parity shards, RS instance cached in FecEncoder)
     let all_shards = match fec.encode(&data_shards) {
         Ok(shards) => shards,
         Err(e) => {

@@ -144,6 +144,8 @@ void OpenXRApp::createSwapchains() {
 }
 
 void OpenXRApp::mainLoop() {
+    m_recvBuffer.resize(2048); // Max RTP packet size
+
     while (m_running) {
         pollEvents();
 
@@ -152,7 +154,112 @@ void OpenXRApp::mainLoop() {
             continue;
         }
 
+        // Receive and decode video packets before rendering
+        receiveAndDecodeVideo();
         renderFrame();
+    }
+}
+
+void OpenXRApp::receiveAndDecodeVideo() {
+    if (!m_networkReceiver.isInitialized()) return;
+
+    // Drain all available UDP packets (non-blocking)
+    for (int i = 0; i < 64; i++) { // Process up to 64 packets per frame
+        int received = m_networkReceiver.receive(m_recvBuffer.data(), (int)m_recvBuffer.size());
+        if (received <= 0) break;
+
+        // Parse RTP header to extract FVP fields
+        // RTP header: 12 bytes fixed + FVP header: 8 bytes
+        if (received < 20) continue; // Too short for RTP + FVP header
+
+        // FVP header at offset 12 (all multi-byte fields are little-endian,
+        // matching Rust's to_le_bytes() in pipeline.rs):
+        //   frame_index (u32 LE), shard_index (u8), total_shards (u8),
+        //   flags (u16 LE)
+        const uint8_t* fvp = m_recvBuffer.data() + 12;
+        uint32_t frameIndex = (uint32_t)fvp[0] | ((uint32_t)fvp[1] << 8) |
+                              ((uint32_t)fvp[2] << 16) | ((uint32_t)fvp[3] << 24); // LE, cast to avoid sign extension
+        uint8_t shardIndex = fvp[4];
+        uint8_t totalShards = fvp[5];
+        uint16_t flags = (uint16_t)fvp[6] | ((uint16_t)fvp[7] << 8); // LE
+        bool isKeyframe = (flags & 0x01) != 0;
+        // Derive data shard count from total shards and FEC redundancy (20%).
+        // FEC adds ceil(data_count * 0.2) parity shards, so:
+        //   total = data + ceil(data * 0.2) → data = floor(total / 1.2)
+        uint8_t dataShards = (uint8_t)(totalShards / 1.2f);
+
+        const uint8_t* payload = m_recvBuffer.data() + 20;
+        int payloadSize = received - 20;
+
+        // New frame? Start collecting shards.
+        if (frameIndex != m_fecDecoder.currentFrameIndex()) {
+            // Try to decode previous frame first
+            auto prevFrame = m_fecDecoder.tryDecode();
+            if (prevFrame.has_value()) {
+                // Validate NAL data before submitting to decoder
+                const uint8_t* nalData = prevFrame->data.data();
+                int nalSize = (int)prevFrame->data.size();
+
+                // Skip Annex B start code: 4-byte (00 00 00 01) or 3-byte (00 00 01)
+                const uint8_t* nalStart = nalData;
+                int nalLen = nalSize;
+                if (nalSize >= 4 && nalData[0] == 0 && nalData[1] == 0 &&
+                    nalData[2] == 0 && nalData[3] == 1) {
+                    nalStart = nalData + 4;
+                    nalLen = nalSize - 4;
+                } else if (nalSize >= 3 && nalData[0] == 0 && nalData[1] == 0 && nalData[2] == 1) {
+                    nalStart = nalData + 3;
+                    nalLen = nalSize - 3;
+                }
+
+                auto result = NalValidator::validate(nalStart, nalLen);
+                if (result == NalValidator::Result::Valid) {
+                    int64_t timestampUs = (int64_t)prevFrame->frameIndex * 11111; // cast before multiply
+                    m_videoDecoder.submitPacket(nalData, nalSize, timestampUs);
+                } else {
+                    LOGW("NAL validation failed for frame %u, requesting IDR",
+                         prevFrame->frameIndex);
+                    m_tcpClient.requestIdr();
+                    m_videoDecoder.flush();
+                }
+            }
+            m_fecDecoder.beginFrame(frameIndex, totalShards, dataShards, isKeyframe);
+        }
+
+        m_fecDecoder.addShard(shardIndex, payload, payloadSize);
+    }
+
+    // Flush: if we have a complete frame but no new frame triggered decode, decode it now.
+    // This handles the last frame in a sequence and prevents off-by-one at stream end.
+    if (m_fecDecoder.isComplete()) {
+        auto lastFrame = m_fecDecoder.tryDecode();
+        if (lastFrame.has_value()) {
+            const uint8_t* nalData = lastFrame->data.data();
+            int nalSize = (int)lastFrame->data.size();
+
+            const uint8_t* nalStart = nalData;
+            int nalLen = nalSize;
+            // Handle both 4-byte (00 00 00 01) and 3-byte (00 00 01) Annex B start codes
+            if (nalSize >= 4 && nalData[0] == 0 && nalData[1] == 0 &&
+                nalData[2] == 0 && nalData[3] == 1) {
+                nalStart = nalData + 4;
+                nalLen = nalSize - 4;
+            } else if (nalSize >= 3 && nalData[0] == 0 && nalData[1] == 0 && nalData[2] == 1) {
+                nalStart = nalData + 3;
+                nalLen = nalSize - 3;
+            }
+
+            auto result = NalValidator::validate(nalStart, nalLen);
+            if (result == NalValidator::Result::Valid) {
+                int64_t timestampUs = (int64_t)lastFrame->frameIndex * 11111; // cast before multiply to avoid overflow
+                m_videoDecoder.submitPacket(nalData, nalSize, timestampUs);
+            } else {
+                LOGW("NAL validation failed for frame %u, requesting IDR",
+                     lastFrame->frameIndex);
+                m_tcpClient.requestIdr();
+                m_videoDecoder.flush();
+            }
+        }
     }
 }
 
@@ -243,12 +350,16 @@ void OpenXRApp::renderFrame() {
             // Rendering decision: new frame or timewarp
             bool hasNewFrame = m_videoDecoder.getDecodedFrame();
 
+            if (hasNewFrame) {
+                m_lastDecodedTexture = m_videoDecoder.getOutputTexture();
+            }
+
             if (hasNewFrame && m_lastDecodedTexture != 0) {
                 // Normal path: render the new decoded video frame
                 m_poseHistory.record(m_lastFrameIndex, views[eye].pose,
                     frameState.predictedDisplayTime);
-                m_renderer.renderSolidColor(framebuffer, width, height,
-                    0.05f, 0.05f, 0.2f); // Placeholder until texture pipe ready
+                m_renderer.renderVideoFrame(framebuffer, width, height,
+                    m_lastDecodedTexture);
                 m_hasDecodedFrame = true;
                 m_lastFrameIndex++;
             } else if (m_hasDecodedFrame && m_lastDecodedTexture != 0) {

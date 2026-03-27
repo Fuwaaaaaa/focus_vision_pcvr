@@ -24,6 +24,9 @@ public:
 
     void RunFrame();
 
+    /// Forward IDR request to the DirectMode NVENC encoder.
+    void requestIdr() { m_directMode.requestIdr(); }
+
     uint32_t GetObjectId() const { return m_objectId; }
 
 private:
