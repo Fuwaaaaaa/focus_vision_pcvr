@@ -44,6 +44,10 @@ struct CompanionApp {
     fps: u32,
     bitrate_mbps: f32,
 
+    // Audio settings
+    audio_enabled: bool,
+    audio_bitrate_kbps: u32,
+
     // UI state
     active_tab: Tab,
     status_log: Arc<Mutex<Vec<String>>>,
@@ -93,6 +97,8 @@ impl CompanionApp {
             latency_ms: 0.0,
             fps: 0,
             bitrate_mbps: 0.0,
+            audio_enabled: true,
+            audio_bitrate_kbps: 128,
             active_tab: Tab::Home,
             status_log: Arc::new(Mutex::new(Vec::new())),
         }
@@ -403,6 +409,23 @@ impl CompanionApp {
 
             if let Some(ref dir) = self.steamvr_dir {
                 ui.label(egui::RichText::new(format!("SteamVR: {}", dir.display())).size(11.0).color(text_muted));
+            }
+        });
+
+        ui.add_space(16.0);
+
+        // Audio settings
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Audio").size(13.0).color(text_muted));
+
+            ui.checkbox(&mut self.audio_enabled, "Audio streaming enabled");
+
+            if self.audio_enabled {
+                ui.horizontal(|ui| {
+                    ui.label("Bitrate:");
+                    ui.add(egui::Slider::new(&mut self.audio_bitrate_kbps, 64..=256).suffix(" kbps"));
+                });
+                ui.label(egui::RichText::new("WASAPI loopback — no virtual device needed").size(11.0).color(text_muted));
             }
         });
 
