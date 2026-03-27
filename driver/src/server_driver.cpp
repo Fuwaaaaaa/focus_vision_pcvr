@@ -17,6 +17,13 @@ static void onIdrRequest() {
     }
 }
 
+static void onGazeUpdate(float gazeX, float gazeY, int valid) {
+    // Called from Rust tracking receiver when HMD sends gaze data
+    if (s_instance) {
+        s_instance->updateGaze(gazeX, gazeY, valid != 0);
+    }
+}
+
 vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
 {
     s_pDriverContext = pDriverContext;
@@ -61,9 +68,10 @@ vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
 
     vr::VRDriverLog()->Log("Focus Vision PCVR: Controllers added\n");
 
-    // Register IDR callback so TCP IDR_REQUEST reaches the NVENC encoder
+    // Register callbacks so Rust can notify C++ encoder
     s_instance = this;
     fvp_set_idr_callback(onIdrRequest);
+    fvp_set_gaze_callback(onGazeUpdate);
 
     return vr::VRInitError_None;
 }
@@ -98,6 +106,13 @@ void CServerDriver::requestIdr()
         // Forward to DirectMode's NVENC encoder via HMD device
         // HMD's DirectMode component handles the actual encoder
         m_hmdDevice->requestIdr();
+    }
+}
+
+void CServerDriver::updateGaze(float gazeX, float gazeY, bool valid)
+{
+    if (m_hmdDevice) {
+        m_hmdDevice->updateGaze(gazeX, gazeY, valid);
     }
 }
 
