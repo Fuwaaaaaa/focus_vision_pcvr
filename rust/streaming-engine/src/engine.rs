@@ -195,7 +195,11 @@ async fn handle_tcp_control(
         }
 
         let mut msg_buf = vec![0u8; len];
-        stream.read_exact(&mut msg_buf).await?;
+        if stream.read_exact(&mut msg_buf).await.is_err() {
+            log::info!("TCP control read failed mid-message — stopping stream");
+            cancel.cancel();
+            break;
+        }
         let msg_type = msg_buf[0];
 
         match msg_type {
