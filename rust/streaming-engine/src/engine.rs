@@ -13,19 +13,20 @@ use crate::transport::rtp::RtpPacketizer;
 use crate::transport::udp::UdpSender;
 use fvp_common::protocol::{ControllerState, TrackingData};
 
-/// Frame data submitted from the C++ OpenVR driver.
-pub struct SubmittedFrame {
+/// H.265 encoded frame data submitted from the C++ OpenVR driver.
+/// The C++ driver handles D3D11 texture capture, NV12 conversion, and
+/// NVENC encoding. Rust receives only the encoded NAL units.
+pub struct EncodedFrame {
     pub frame_index: u32,
-    pub data: Vec<u8>, // Raw pixel data or pre-encoded NAL units
-    pub width: u32,
-    pub height: u32,
+    pub nal_data: Vec<u8>,
+    pub is_idr: bool,
     pub timestamps: FrameTimestamps,
 }
 
 /// The main streaming engine running on a tokio runtime.
 pub struct StreamingEngine {
     runtime: Runtime,
-    frame_tx: mpsc::Sender<SubmittedFrame>,
+    frame_tx: mpsc::Sender<EncodedFrame>,
     latest_tracking: Arc<StdMutex<Option<TrackingData>>>,
     latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
@@ -42,7 +43,7 @@ impl StreamingEngine {
             .thread_name("fvp-stream")
             .build()?;
 
-        let (frame_tx, frame_rx) = mpsc::channel::<SubmittedFrame>(4);
+        let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(4);
         let latest_tracking = Arc::new(StdMutex::new(None));
         let latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>> =
             Arc::new(StdMutex::new([None, None]));
@@ -101,7 +102,7 @@ impl StreamingEngine {
     }
 
     /// Submit a frame for encoding and sending. Called from C++ thread.
-    pub fn submit_frame(&self, frame: SubmittedFrame) -> bool {
+    pub fn submit_frame(&self, frame: EncodedFrame) -> bool {
         match self.frame_tx.try_send(frame) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -150,7 +151,7 @@ impl StreamingEngine {
 
 async fn run_streaming(
     config: AppConfig,
-    mut frame_rx: mpsc::Receiver<SubmittedFrame>,
+    mut frame_rx: mpsc::Receiver<EncodedFrame>,
     tracking: Arc<StdMutex<Option<TrackingData>>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -168,23 +169,19 @@ async fn run_streaming(
     let mut frame_count: u64 = 0;
 
     while let Some(mut frame) = frame_rx.recv().await {
+        // NAL data arrives pre-encoded from C++ NVENC encoder.
+        // Mark encode timestamps for latency tracking (encode happened in C++,
+        // but we record receipt time here).
         frame.timestamps.mark_encode_start();
-
-        // In production: encode with NVENC via FFmpeg
-        // For now: treat frame.data as pre-encoded NAL units
-        let encoded_data = &frame.data;
-
         frame.timestamps.mark_encode_end();
 
-        // Packetize with FEC
-        let is_keyframe = frame_count % 90 == 0; // IDR every ~1 second
         let timestamp_90khz = (frame_count * (fvp_common::RTP_CLOCK_RATE as u64 / 90)) as u32;
 
         let packets = pipeline::encode_frame_to_packets(
-            encoded_data,
+            &frame.nal_data,
             frame.frame_index,
             timestamp_90khz,
-            is_keyframe,
+            frame.is_idr,
             config.network.fec_redundancy,
             &mut packetizer,
         );
@@ -262,11 +259,10 @@ mod tests {
     fn test_submit_frame_success() {
         let config = AppConfig::default();
         let engine = StreamingEngine::new(config).unwrap();
-        let frame = SubmittedFrame {
+        let frame = EncodedFrame {
             frame_index: 0,
-            data: vec![0u8; 100],
-            width: 10,
-            height: 10,
+            nal_data: vec![0u8; 100],
+            is_idr: true,
             timestamps: FrameTimestamps::new(0),
         };
         assert!(engine.submit_frame(frame));
@@ -279,21 +275,19 @@ mod tests {
         let engine = StreamingEngine::new(config).unwrap();
         // Channel capacity is 4, so 5th frame should fail
         for i in 0..4 {
-            let frame = SubmittedFrame {
+            let frame = EncodedFrame {
                 frame_index: i,
-                data: vec![0u8; 100],
-                width: 10,
-                height: 10,
+                nal_data: vec![0u8; 100],
+                is_idr: i == 0,
                 timestamps: FrameTimestamps::new(i),
             };
             assert!(engine.submit_frame(frame), "frame {} should succeed", i);
         }
         // 5th frame — channel full (receiver not consuming since TCP not connected)
-        let frame = SubmittedFrame {
+        let frame = EncodedFrame {
             frame_index: 4,
-            data: vec![0u8; 100],
-            width: 10,
-            height: 10,
+            nal_data: vec![0u8; 100],
+            is_idr: false,
             timestamps: FrameTimestamps::new(4),
         };
         assert!(!engine.submit_frame(frame), "frame 4 should fail (channel full)");
