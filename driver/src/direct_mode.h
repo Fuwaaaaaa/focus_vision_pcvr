@@ -3,22 +3,32 @@
 #include <openvr_driver.h>
 #include <vector>
 #include <cstdint>
+#include "nvenc_encoder.h"
+#include "frame_copy.h"
 
 /**
  * Direct Mode component — captures frames from SteamVR's compositor.
  *
- * SteamVR calls Present() each frame with the rendered textures.
- * In v1.0, we perform a synchronous GPU→GPU copy of the texture
- * then hand it to the Rust streaming engine for encoding.
+ * SubmitLayer() receives per-eye textures from SteamVR.
+ * Present() triggers encoding and submission to the Rust streaming engine:
  *
- * Step 2: Stub implementation (no actual encoding).
- * Step 5: Will integrate with NVENC via Rust FFI.
+ *   SubmitLayer() -> store texture handles
+ *   Present()     -> FrameCopy -> NvencEncoder -> fvp_submit_encoded_nal()
+ *
+ * Architecture (eng review #1): NVENC encoding runs in C++.
+ * Only NAL byte arrays cross the C ABI into Rust for RTP packetization.
  */
 class CDirectModeComponent : public vr::IVRDriverDirectModeComponent
 {
 public:
     CDirectModeComponent();
     ~CDirectModeComponent();
+
+    /// Initialize D3D11 device, frame copy, and NVENC encoder.
+    bool initEncoder(ID3D11Device* device, uint32_t width, uint32_t height);
+
+    /// Request an IDR keyframe on the next encode. Thread-safe.
+    void requestIdr();
 
     // IVRDriverDirectModeComponent
     void CreateSwapTextureSet(
@@ -39,6 +49,14 @@ public:
 
 private:
     uint32_t m_frameIndex = 0;
+
+    // Video encoding pipeline
+    NvencEncoder m_encoder;
+    FrameCopy m_frameCopy;
+    bool m_encoderReady = false;
+
+    // Latest submitted texture (from SubmitLayer, consumed by Present)
+    ID3D11Texture2D* m_pendingTexture = nullptr;
 
     // Swap texture set tracking
     struct SwapTexture {
