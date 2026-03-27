@@ -4,16 +4,24 @@ VIVE Focus Vision向けPCVRストリーミングツール。
 
 ## Architecture
 - `rust/streaming-engine/` — Rust static library (C ABI via cbindgen)
+- `rust/companion-app/` — PC companion GUI app (egui, single .exe)
+- `rust/common/` — Shared types and constants
 - `driver/` — C++ OpenVR driver DLL (loaded by SteamVR)
 - `client/` — Android OpenXR client (Kotlin + C++ NDK)
-- `rust/common/` — Shared types and constants
 
 ## Build
 ```bash
 ./build.bat   # Windows
-cargo build --release -p streaming-engine  # Rust only
+cargo build --release -p streaming-engine    # Rust streaming engine
+cargo build --release -p focus-vision-companion  # PC companion app
 cargo test --workspace  # Run tests
 ```
+
+## Companion App
+```bash
+cargo run -p focus-vision-companion  # Run the PC companion app
+```
+Features: SteamVR driver install, PIN display, ADB deploy to HMD, streaming stats.
 
 ## Config
 `config/default.toml` — override with `config/local.toml` (gitignored).
