@@ -75,9 +75,10 @@ impl StreamingEngine {
 
         // Spawn the main streaming task
         let cancel = cancel_token.clone();
+        let stream_cancel = cancel_token.clone();
         runtime.spawn(async move {
             tokio::select! {
-                result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone) => {
+                result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone, stream_cancel) => {
                     if let Err(e) = result {
                         log::error!("Streaming engine error: {}", e);
                     }
@@ -168,18 +169,30 @@ impl StreamingEngine {
 }
 
 /// Read TCP control messages after handshake (IDR_REQUEST, HEARTBEAT, DISCONNECT).
-async fn handle_tcp_control(mut stream: tokio::net::TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// When the connection closes or errors, cancels the provided token to stop streaming.
+async fn handle_tcp_control(
+    mut stream: tokio::net::TcpStream,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::AsyncReadExt;
+
+    const MAX_MSG_LEN: usize = 65536; // 64KB — control messages are small
 
     loop {
         // Read framed message: [length:u32 LE][type:u8][payload]
         let mut len_buf = [0u8; 4];
         if stream.read_exact(&mut len_buf).await.is_err() {
-            log::info!("TCP control connection closed");
+            log::info!("TCP control connection closed — stopping stream");
+            cancel.cancel();
             break;
         }
         let len = u32::from_le_bytes(len_buf) as usize;
         if len == 0 { continue; }
+        if len > MAX_MSG_LEN {
+            log::error!("TCP message too large ({} bytes), closing connection", len);
+            cancel.cancel();
+            break;
+        }
 
         let mut msg_buf = vec![0u8; len];
         stream.read_exact(&mut msg_buf).await?;
@@ -194,7 +207,8 @@ async fn handle_tcp_control(mut stream: tokio::net::TcpStream) -> Result<(), Box
                 // Heartbeat handled by existing heartbeat module
             }
             fvp_common::protocol::msg_type::DISCONNECT => {
-                log::info!("Client sent DISCONNECT");
+                log::info!("Client sent DISCONNECT — stopping stream");
+                cancel.cancel();
                 break;
             }
             _ => {
@@ -210,15 +224,18 @@ async fn run_streaming(
     mut frame_rx: mpsc::Receiver<EncodedFrame>,
     tracking: Arc<StdMutex<Option<TrackingData>>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
+    cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Step 1: Wait for HMD to connect via TCP
     let tcp_server = TcpControlServer::new(config.clone());
     let (tcp_stream, peer_addr) = tcp_server.listen_and_accept().await?;
     log::info!("HMD connected from {}, starting video stream", peer_addr);
 
-    // Spawn TCP control reader for IDR_REQUEST and other in-stream messages
+    // Spawn TCP control reader for IDR_REQUEST and other in-stream messages.
+    // When the TCP connection drops, cancel stops the streaming loop too.
+    let tcp_cancel = cancel.clone();
     tokio::spawn(async move {
-        if let Err(e) = handle_tcp_control(tcp_stream).await {
+        if let Err(e) = handle_tcp_control(tcp_stream, tcp_cancel).await {
             log::warn!("TCP control reader ended: {}", e);
         }
     });

@@ -120,12 +120,18 @@ impl TcpControlServer {
 
 /// Read a framed message: [length:u32 LE][type:u8][payload]
 async fn read_message(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    const MAX_MSG_LEN: usize = 65536; // 64KB — prevent OOM from malicious length
+
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
 
     if len == 0 {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty message"));
+    }
+    if len > MAX_MSG_LEN {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("message too large: {} bytes", len)));
     }
 
     let mut msg_buf = vec![0u8; len];
