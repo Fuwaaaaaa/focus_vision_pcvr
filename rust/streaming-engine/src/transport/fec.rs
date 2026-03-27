@@ -1,21 +1,31 @@
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 /// Forward Error Correction encoder using Reed-Solomon.
+///
+/// Caches the ReedSolomon instance across frames to avoid repeated
+/// Galois Field table computation. The cache is invalidated when the
+/// shard count changes (different frame sizes produce different shard counts).
 pub struct FecEncoder {
     redundancy: f32,
+    cached_rs: Option<ReedSolomon>,
+    cached_data_count: usize,
+    cached_parity_count: usize,
 }
 
 impl FecEncoder {
     pub fn new(redundancy: f32) -> Self {
         Self {
             redundancy: redundancy.clamp(0.0, 1.0),
+            cached_rs: None,
+            cached_data_count: 0,
+            cached_parity_count: 0,
         }
     }
 
     /// Encode data shards and produce parity shards.
     /// Input: list of equal-length data shards.
     /// Returns: data shards + parity shards concatenated.
-    pub fn encode(&self, data_shards: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, FecError> {
+    pub fn encode(&mut self, data_shards: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, FecError> {
         if data_shards.is_empty() {
             return Err(FecError::EmptyInput);
         }
@@ -29,8 +39,20 @@ impl FecEncoder {
             return Err(FecError::UnequalShards);
         }
 
-        let rs = ReedSolomon::new(data_count, parity_count)
-            .map_err(|e| FecError::ReedSolomon(format!("{e}")))?;
+        // Reuse cached ReedSolomon if shard counts match
+        if self.cached_rs.is_none()
+            || self.cached_data_count != data_count
+            || self.cached_parity_count != parity_count
+        {
+            self.cached_rs = Some(
+                ReedSolomon::new(data_count, parity_count)
+                    .map_err(|e| FecError::ReedSolomon(format!("{e}")))?,
+            );
+            self.cached_data_count = data_count;
+            self.cached_parity_count = parity_count;
+        }
+
+        let rs = self.cached_rs.as_ref().unwrap();
 
         // Build shard matrix: data + empty parity
         let mut shards: Vec<Vec<u8>> = data_shards.to_vec();
@@ -97,7 +119,7 @@ mod tests {
 
     #[test]
     fn test_fec_encode_decode_no_loss() {
-        let encoder = FecEncoder::new(0.5); // 50% redundancy
+        let mut encoder = FecEncoder::new(0.5); // 50% redundancy
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 100]).collect();
         let encoded = encoder.encode(&data).unwrap();
         assert_eq!(encoded.len(), 6); // 4 data + 2 parity
@@ -109,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_fec_recover_from_loss() {
-        let encoder = FecEncoder::new(0.5);
+        let mut encoder = FecEncoder::new(0.5);
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 100]).collect();
         let encoded = encoder.encode(&data).unwrap();
 
@@ -124,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_fec_too_much_loss() {
-        let encoder = FecEncoder::new(0.25); // 1 parity shard for 4 data
+        let mut encoder = FecEncoder::new(0.25); // 1 parity shard for 4 data
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 100]).collect();
         let encoded = encoder.encode(&data).unwrap();
         assert_eq!(encoded.len(), 5); // 4 data + 1 parity
@@ -140,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_fec_20_percent_default() {
-        let encoder = FecEncoder::new(0.2);
+        let mut encoder = FecEncoder::new(0.2);
         let data: Vec<Vec<u8>> = (0..10).map(|i| vec![i; 200]).collect();
         let encoded = encoder.encode(&data).unwrap();
         assert_eq!(encoded.len(), 12); // 10 data + 2 parity

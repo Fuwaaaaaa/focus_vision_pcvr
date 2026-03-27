@@ -166,6 +166,7 @@ async fn run_streaming(
 
     // Step 3: Process frames
     let mut packetizer = RtpPacketizer::new(0x46565000); // "FVP\0"
+    let mut fec_encoder = crate::transport::fec::FecEncoder::new(config.network.fec_redundancy);
     let mut frame_count: u64 = 0;
 
     while let Some(mut frame) = frame_rx.recv().await {
@@ -177,12 +178,12 @@ async fn run_streaming(
 
         let timestamp_90khz = (frame_count * (fvp_common::RTP_CLOCK_RATE as u64 / 90)) as u32;
 
-        let packets = pipeline::encode_frame_to_packets(
+        let packets = pipeline::encode_frame_to_packets_with_fec(
             &frame.nal_data,
             frame.frame_index,
             timestamp_90khz,
             frame.is_idr,
-            config.network.fec_redundancy,
+            &mut fec_encoder,
             &mut packetizer,
         );
 
