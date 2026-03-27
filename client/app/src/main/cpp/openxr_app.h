@@ -17,6 +17,7 @@
 #include "tracking_sender.h"
 #include "controller_poller.h"
 #include "tcp_client.h"
+#include "audio_player.h"
 
 #include <vector>
 #include <array>
@@ -81,6 +82,10 @@ private:
 
     // Video receive buffer
     std::vector<uint8_t> m_recvBuffer;
+
+    // Audio
+    AudioPlayer m_audioPlayer;
+    NetworkReceiver m_audioReceiver;
 
     // Tracking + controllers
     TrackingSender m_trackingSender;
