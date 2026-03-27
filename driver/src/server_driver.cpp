@@ -76,10 +76,13 @@ void CServerDriver::Cleanup()
     m_rightController.reset();
     m_hmdDevice.reset();
 
-    s_instance = nullptr;
-
-    // Shut down the Rust streaming engine
+    // SAFETY: fvp_shutdown() must be called BEFORE clearing s_instance.
+    // fvp_shutdown() cancels the Tokio runtime, which stops the TCP control
+    // reader task. That task is the only caller of the IDR callback (onIdrRequest),
+    // which accesses s_instance. By shutting down Tokio first, we guarantee
+    // no callback can fire after s_instance is nulled.
     fvp_shutdown();
+    s_instance = nullptr;
 
     vr::CleanupDriverContext();
 }
