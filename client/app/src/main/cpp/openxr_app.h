@@ -10,6 +10,8 @@
 #include "renderer.h"
 #include "network_receiver.h"
 #include "video_decoder.h"
+#include "fec_decoder.h"
+#include "nal_validator.h"
 #include "timewarp.h"
 #include "pose_history.h"
 #include "tracking_sender.h"
@@ -40,6 +42,7 @@ private:
     void pollEvents();
     void pollAndroidEvents(android_app* app);
     void renderFrame();
+    void receiveAndDecodeVideo();
 
     void handleSessionStateChange(XrSessionState newState);
 
@@ -70,10 +73,14 @@ private:
     // Renderer
     Renderer m_renderer;
 
-    // Network + decode
+    // Network + decode pipeline
     NetworkReceiver m_networkReceiver;
+    FecFrameDecoder m_fecDecoder;
     VideoDecoder m_videoDecoder;
     TcpControlClient m_tcpClient;
+
+    // Video receive buffer
+    std::vector<uint8_t> m_recvBuffer;
 
     // Tracking + controllers
     TrackingSender m_trackingSender;
