@@ -70,6 +70,8 @@ pub mod msg_type {
     pub const TRACKING_DATA: u8 = 0x20;
     pub const CONTROLLER_DATA: u8 = 0x21;
     pub const IDR_REQUEST: u8 = 0x30;
+    pub const AUDIO_CONFIG: u8 = 0x40;
+    pub const AUDIO_START: u8 = 0x41;
     pub const DISCONNECT: u8 = 0xFF;
 }
 

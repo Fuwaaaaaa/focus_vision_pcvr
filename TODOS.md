@@ -14,8 +14,12 @@
 
 ## v1.1 準備調査
 
-### オーディオパイプラインの仮想オーディオデバイス調査
-- **What:** Windowsでの仮想オーディオデバイス作成方法を調査
-- **Why:** v1.1のオーディオパイプラインはWASAPI仮想オーディオデバイスを前提としているが、カーネルモードドライバーが必要で巨大なスコープになる可能性
-- **Context:** 調査対象: (1) ALVRのalvr_audio (2) WASAPI loopback capture (3) VB-CABLE依存
-- **Depends on:** なし（v1.0と並行調査可能）
+### ~~オーディオパイプラインの仮想オーディオデバイス調査~~ (解決済み)
+- EUREKA: WASAPI loopback captureで仮想デバイス不要。カーネルモードドライバーなしでシステム音声をキャプチャ可能。
+- 実装済み: `audio/capture.rs` (cpal crate) + `audio/encoder.rs` (Opus)
+
+### Android側Opusデコード + AAudio再生
+- **What:** AudioPlayer (audio_player.cpp) のOpusデコード + AAudio低遅延再生を実装
+- **Why:** PC側のオーディオキャプチャ+エンコード+送信は完成。HMD側の受信+再生が未実装
+- **Context:** libopusをAndroid NDKビルドに追加、AAudioStreamでlow-latency再生
+- **Depends on:** Android NDKビルド環境
