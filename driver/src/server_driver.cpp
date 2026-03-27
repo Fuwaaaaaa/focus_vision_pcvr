@@ -6,6 +6,17 @@ extern "C" {
 
 static vr::IVRDriverContext* s_pDriverContext = nullptr;
 
+// Global pointer for IDR callback to reach the encoder.
+// Set during Init(), cleared during Cleanup().
+static CServerDriver* s_instance = nullptr;
+
+static void onIdrRequest() {
+    // Called from Rust TCP control thread when HMD sends IDR_REQUEST
+    if (s_instance) {
+        s_instance->requestIdr();
+    }
+}
+
 vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
 {
     s_pDriverContext = pDriverContext;
@@ -50,6 +61,10 @@ vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
 
     vr::VRDriverLog()->Log("Focus Vision PCVR: Controllers added\n");
 
+    // Register IDR callback so TCP IDR_REQUEST reaches the NVENC encoder
+    s_instance = this;
+    fvp_set_idr_callback(onIdrRequest);
+
     return vr::VRInitError_None;
 }
 
@@ -61,6 +76,8 @@ void CServerDriver::Cleanup()
     m_rightController.reset();
     m_hmdDevice.reset();
 
+    s_instance = nullptr;
+
     // Shut down the Rust streaming engine
     fvp_shutdown();
 
@@ -70,6 +87,15 @@ void CServerDriver::Cleanup()
 const char* const* CServerDriver::GetInterfaceVersions()
 {
     return vr::k_InterfaceVersions;
+}
+
+void CServerDriver::requestIdr()
+{
+    if (m_hmdDevice) {
+        // Forward to DirectMode's NVENC encoder via HMD device
+        // HMD's DirectMode component handles the actual encoder
+        m_hmdDevice->requestIdr();
+    }
 }
 
 void CServerDriver::RunFrame()

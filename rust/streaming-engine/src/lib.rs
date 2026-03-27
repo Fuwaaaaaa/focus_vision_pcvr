@@ -73,6 +73,15 @@ pub extern "C" fn fvp_shutdown() {
     }
 }
 
+/// Register an IDR request callback. Called from C++ on init.
+/// When the HMD sends an IDR_REQUEST over TCP, this callback fires
+/// so the C++ NVENC encoder can produce an IDR frame.
+#[no_mangle]
+pub extern "C" fn fvp_set_idr_callback(callback: extern "C" fn()) {
+    engine::set_idr_callback(callback);
+    log::info!("IDR callback registered");
+}
+
 /// Submit pre-encoded H.265 NAL units for RTP packetization and transmission.
 /// Called from the C++ driver after NVENC encoding.
 ///

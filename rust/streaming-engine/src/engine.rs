@@ -13,6 +13,24 @@ use crate::transport::rtp::RtpPacketizer;
 use crate::transport::udp::UdpSender;
 use fvp_common::protocol::{ControllerState, TrackingData};
 
+/// Callback type for IDR request notifications.
+/// Set via fvp_set_idr_callback() from C++.
+static IDR_CALLBACK: std::sync::RwLock<Option<extern "C" fn()>> = std::sync::RwLock::new(None);
+
+pub fn set_idr_callback(cb: extern "C" fn()) {
+    if let Ok(mut guard) = IDR_CALLBACK.write() {
+        *guard = Some(cb);
+    }
+}
+
+fn notify_idr_request() {
+    if let Ok(guard) = IDR_CALLBACK.read() {
+        if let Some(cb) = *guard {
+            cb();
+        }
+    }
+}
+
 /// H.265 encoded frame data submitted from the C++ OpenVR driver.
 /// The C++ driver handles D3D11 texture capture, NV12 conversion, and
 /// NVENC encoding. Rust receives only the encoded NAL units.
@@ -149,6 +167,44 @@ impl StreamingEngine {
     }
 }
 
+/// Read TCP control messages after handshake (IDR_REQUEST, HEARTBEAT, DISCONNECT).
+async fn handle_tcp_control(mut stream: tokio::net::TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncReadExt;
+
+    loop {
+        // Read framed message: [length:u32 LE][type:u8][payload]
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            log::info!("TCP control connection closed");
+            break;
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 { continue; }
+
+        let mut msg_buf = vec![0u8; len];
+        stream.read_exact(&mut msg_buf).await?;
+        let msg_type = msg_buf[0];
+
+        match msg_type {
+            fvp_common::protocol::msg_type::IDR_REQUEST => {
+                log::info!("Received IDR_REQUEST from client");
+                notify_idr_request();
+            }
+            fvp_common::protocol::msg_type::HEARTBEAT => {
+                // Heartbeat handled by existing heartbeat module
+            }
+            fvp_common::protocol::msg_type::DISCONNECT => {
+                log::info!("Client sent DISCONNECT");
+                break;
+            }
+            _ => {
+                log::debug!("Unknown TCP control message type: 0x{:02x}", msg_type);
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_streaming(
     config: AppConfig,
     mut frame_rx: mpsc::Receiver<EncodedFrame>,
@@ -157,8 +213,15 @@ async fn run_streaming(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Step 1: Wait for HMD to connect via TCP
     let tcp_server = TcpControlServer::new(config.clone());
-    let (_tcp_stream, peer_addr) = tcp_server.listen_and_accept().await?;
+    let (tcp_stream, peer_addr) = tcp_server.listen_and_accept().await?;
     log::info!("HMD connected from {}, starting video stream", peer_addr);
+
+    // Spawn TCP control reader for IDR_REQUEST and other in-stream messages
+    tokio::spawn(async move {
+        if let Err(e) = handle_tcp_control(tcp_stream).await {
+            log::warn!("TCP control reader ended: {}", e);
+        }
+    });
 
     // Step 2: Create UDP sender for video — send to the HMD's IP
     let udp_target: SocketAddr = SocketAddr::new(peer_addr.ip(), config.network.udp_port + 1);

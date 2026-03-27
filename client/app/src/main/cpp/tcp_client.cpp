@@ -17,6 +17,7 @@ static constexpr uint8_t MSG_PIN_RESPONSE = 0x04;
 static constexpr uint8_t MSG_PIN_RESULT = 0x05;
 static constexpr uint8_t MSG_STREAM_CONFIG = 0x06;
 static constexpr uint8_t MSG_STREAM_START = 0x07;
+static constexpr uint8_t MSG_IDR_REQUEST = 0x30;
 
 bool TcpControlClient::connect(const char* serverAddress, int port) {
     m_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -110,6 +111,11 @@ bool TcpControlClient::handshake(uint16_t pin) {
 
     LOGI("Handshake complete, ready to stream");
     return true;
+}
+
+bool TcpControlClient::requestIdr() {
+    LOGI("Sending IDR_REQUEST to server");
+    return sendMessage(MSG_IDR_REQUEST, nullptr, 0);
 }
 
 bool TcpControlClient::sendMessage(uint8_t type, const uint8_t* payload, int payloadLen) {
