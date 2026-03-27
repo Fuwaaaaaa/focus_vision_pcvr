@@ -1,5 +1,6 @@
 pub mod config;
 pub mod video;
+pub mod audio;
 pub mod transport;
 pub mod pipeline;
 pub mod control;
