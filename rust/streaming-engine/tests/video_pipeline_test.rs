@@ -75,7 +75,7 @@ async fn test_multi_frame_pipeline() {
 /// FEC test: encode with redundancy, drop some shards, verify recovery
 #[test]
 fn test_fec_pipeline_with_packet_loss() {
-    let encoder = FecEncoder::new(0.2);
+    let mut encoder = FecEncoder::new(0.2);
 
     // Create a "frame" of 5000 bytes
     let frame_data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
