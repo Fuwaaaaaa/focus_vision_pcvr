@@ -171,4 +171,48 @@ mod tests {
 
         server.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_idr_request_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (msg_type, payload) = read_message(&mut stream).await.unwrap();
+            assert_eq!(msg_type, fvp_common::protocol::msg_type::IDR_REQUEST);
+            assert!(payload.is_empty());
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        send_message(&mut client, fvp_common::protocol::msg_type::IDR_REQUEST, &[]).await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_multiple_control_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read IDR_REQUEST
+            let (t1, _) = read_message(&mut stream).await.unwrap();
+            assert_eq!(t1, fvp_common::protocol::msg_type::IDR_REQUEST);
+            // Read HEARTBEAT
+            let (t2, _) = read_message(&mut stream).await.unwrap();
+            assert_eq!(t2, fvp_common::protocol::msg_type::HEARTBEAT);
+            // Read DISCONNECT
+            let (t3, _) = read_message(&mut stream).await.unwrap();
+            assert_eq!(t3, fvp_common::protocol::msg_type::DISCONNECT);
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        send_message(&mut client, fvp_common::protocol::msg_type::IDR_REQUEST, &[]).await.unwrap();
+        send_message(&mut client, fvp_common::protocol::msg_type::HEARTBEAT, &[]).await.unwrap();
+        send_message(&mut client, fvp_common::protocol::msg_type::DISCONNECT, &[]).await.unwrap();
+
+        server.await.unwrap();
+    }
 }

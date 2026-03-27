@@ -211,7 +211,8 @@ void OpenXRApp::receiveAndDecodeVideo() {
                 } else {
                     LOGW("NAL validation failed for frame %u, requesting IDR",
                          prevFrame->frameIndex);
-                    // TODO: send IDR request via TCP control channel
+                    m_tcpClient.requestIdr();
+                    m_videoDecoder.flush();
                 }
             }
             m_fecDecoder.beginFrame(frameIndex, totalShards, dataShards, isKeyframe);
