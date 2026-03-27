@@ -82,7 +82,6 @@ private:
     // Encoder state
     Config m_config;
     bool m_initialized = false;
-    bool m_idrRequested = false;
     uint32_t m_frameCount = 0;
     uint32_t m_idrInterval = 180; // IDR every 2 seconds at 90fps
 
