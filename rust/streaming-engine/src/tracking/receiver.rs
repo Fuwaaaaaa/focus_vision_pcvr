@@ -44,6 +44,10 @@ impl TrackingReceiver {
             match packet_type {
                 PACKET_HEAD_POSE => {
                     if let Some(data) = parse_head_pose(payload) {
+                        // Forward gaze data to NVENC for foveated encoding
+                        if data.gaze_valid != 0 {
+                            crate::engine::notify_gaze_update(data.gaze_x, data.gaze_y, true);
+                        }
                         if let Ok(mut guard) = self.latest_head.lock() {
                             *guard = Some(data);
                         }
@@ -82,10 +86,23 @@ fn parse_head_pose(data: &[u8]) -> Option<TrackingData> {
     let oz = f32::from_le_bytes(data[28..32].try_into().ok()?);
     let ow = f32::from_le_bytes(data[32..36].try_into().ok()?);
 
+    // Gaze data (optional — appended after base 36 bytes)
+    let (gaze_x, gaze_y, gaze_valid) = if data.len() >= 45 {
+        let gx = f32::from_le_bytes(data[36..40].try_into().ok()?);
+        let gy = f32::from_le_bytes(data[40..44].try_into().ok()?);
+        let gv = data[44];
+        (gx, gy, gv)
+    } else {
+        (0.5, 0.5, 0) // Default center, not valid
+    };
+
     Some(TrackingData {
         position: [px, py, pz],
         orientation: [ox, oy, oz, ow],
         timestamp_ns,
+        gaze_x,
+        gaze_y,
+        gaze_valid,
     })
 }
 
