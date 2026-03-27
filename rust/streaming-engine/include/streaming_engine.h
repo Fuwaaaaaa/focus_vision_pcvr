@@ -13,6 +13,13 @@ typedef struct TrackingData {
     float position[3];
     float orientation[4];
     uint64_t timestamp_ns;
+    /**
+     * Eye gaze normalized coords (0-1). x=0.5,y=0.5 means center.
+     * gaze_valid=0 means no eye tracking data (use center fallback).
+     */
+    float gaze_x;
+    float gaze_y;
+    uint8_t gaze_valid;
 } TrackingData;
 
 /**
@@ -62,6 +69,13 @@ void fvp_shutdown(void);
  * so the C++ NVENC encoder can produce an IDR frame.
  */
 void fvp_set_idr_callback(void (*callback)(void));
+
+/**
+ * Register a gaze update callback. Called from C++ on init.
+ * When the HMD sends tracking data with gaze info, this callback
+ * forwards gaze coordinates to the C++ NVENC encoder for foveated encoding.
+ */
+void fvp_set_gaze_callback(void (*callback)(float, float, int32_t));
 
 /**
  * Submit pre-encoded H.265 NAL units for RTP packetization and transmission.

@@ -289,6 +289,13 @@ public:
     bool isInitialized() const { return m_initialized; }
     bool isRealEncoder() const { return m_encoder != nullptr; }
 
+    /// Update gaze position for foveated encoding.
+    /// Coordinates are normalized (0-1). Called from tracking data receiver.
+    void setGaze(float gazeX, float gazeY, bool valid);
+
+    /// Enable/disable foveated encoding.
+    void setFoveatedEnabled(bool enabled) { m_foveatedEnabled = enabled; }
+
 private:
     // NVENC session
     void* m_encoder = nullptr;
@@ -309,6 +316,12 @@ private:
     bool m_initialized = false;
     uint32_t m_frameCount = 0;
     uint32_t m_idrInterval = 180;
+
+    // Foveated encoding state
+    bool m_foveatedEnabled = false;
+    std::atomic<float> m_gazeX{0.5f};
+    std::atomic<float> m_gazeY{0.5f};
+    std::atomic<bool> m_gazeValid{false};
 
     bool loadNvencApi();
     bool createEncoderSession();
