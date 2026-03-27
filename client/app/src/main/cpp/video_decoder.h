@@ -5,6 +5,8 @@
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 #include <android/native_window.h>
+#include <android/surface_texture.h>
+#include <android/surface_texture_jni.h>
 #include <atomic>
 
 /// Hardware video decoder using Android MediaCodec NDK API.
@@ -36,7 +38,10 @@ private:
     int m_width = 0;
     int m_height = 0;
 
-    // Surface output for zero-copy decode to GL texture
+    // Surface output for zero-copy decode to GL texture.
+    // ASurfaceTexture wraps the GL texture so MediaCodec renders directly to it.
     GLuint m_outputTexture = 0;
+    ASurfaceTexture* m_surfaceTexture = nullptr;
     ANativeWindow* m_surface = nullptr;
+    bool m_useSurfaceOutput = false;
 };
