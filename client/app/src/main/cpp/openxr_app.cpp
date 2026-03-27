@@ -177,14 +177,16 @@ void OpenXRApp::receiveAndDecodeVideo() {
         //   frame_index (u32 LE), shard_index (u8), total_shards (u8),
         //   flags (u16 LE)
         const uint8_t* fvp = m_recvBuffer.data() + 12;
-        uint32_t frameIndex = fvp[0] | (fvp[1] << 8) | (fvp[2] << 16) | (fvp[3] << 24); // LE
+        uint32_t frameIndex = (uint32_t)fvp[0] | ((uint32_t)fvp[1] << 8) |
+                              ((uint32_t)fvp[2] << 16) | ((uint32_t)fvp[3] << 24); // LE, cast to avoid sign extension
         uint8_t shardIndex = fvp[4];
         uint8_t totalShards = fvp[5];
-        uint16_t flags = fvp[6] | (fvp[7] << 8); // LE
+        uint16_t flags = (uint16_t)fvp[6] | ((uint16_t)fvp[7] << 8); // LE
         bool isKeyframe = (flags & 0x01) != 0;
-        // Note: dataShards is not in the FVP header — it's derived from
-        // totalShards and the FEC redundancy ratio on the receiver side.
-        uint8_t dataShards = totalShards; // Approximation; FEC decoder handles actual counts
+        // Derive data shard count from total shards and FEC redundancy (20%).
+        // FEC adds ceil(data_count * 0.2) parity shards, so:
+        //   total = data + ceil(data * 0.2) → data = floor(total / 1.2)
+        uint8_t dataShards = (uint8_t)(totalShards / 1.2f);
 
         const uint8_t* payload = m_recvBuffer.data() + 20;
         int payloadSize = received - 20;
@@ -198,18 +200,21 @@ void OpenXRApp::receiveAndDecodeVideo() {
                 const uint8_t* nalData = prevFrame->data.data();
                 int nalSize = (int)prevFrame->data.size();
 
-                // Skip Annex B start code (0x00 0x00 0x00 0x01)
+                // Skip Annex B start code: 4-byte (00 00 00 01) or 3-byte (00 00 01)
                 const uint8_t* nalStart = nalData;
                 int nalLen = nalSize;
                 if (nalSize >= 4 && nalData[0] == 0 && nalData[1] == 0 &&
                     nalData[2] == 0 && nalData[3] == 1) {
                     nalStart = nalData + 4;
                     nalLen = nalSize - 4;
+                } else if (nalSize >= 3 && nalData[0] == 0 && nalData[1] == 0 && nalData[2] == 1) {
+                    nalStart = nalData + 3;
+                    nalLen = nalSize - 3;
                 }
 
                 auto result = NalValidator::validate(nalStart, nalLen);
                 if (result == NalValidator::Result::Valid) {
-                    int64_t timestampUs = prevFrame->frameIndex * 11111; // ~90fps
+                    int64_t timestampUs = (int64_t)prevFrame->frameIndex * 11111; // cast before multiply
                     m_videoDecoder.submitPacket(nalData, nalSize, timestampUs);
                 } else {
                     LOGW("NAL validation failed for frame %u, requesting IDR",
@@ -222,6 +227,39 @@ void OpenXRApp::receiveAndDecodeVideo() {
         }
 
         m_fecDecoder.addShard(shardIndex, payload, payloadSize);
+    }
+
+    // Flush: if we have a complete frame but no new frame triggered decode, decode it now.
+    // This handles the last frame in a sequence and prevents off-by-one at stream end.
+    if (m_fecDecoder.isComplete()) {
+        auto lastFrame = m_fecDecoder.tryDecode();
+        if (lastFrame.has_value()) {
+            const uint8_t* nalData = lastFrame->data.data();
+            int nalSize = (int)lastFrame->data.size();
+
+            const uint8_t* nalStart = nalData;
+            int nalLen = nalSize;
+            // Handle both 4-byte (00 00 00 01) and 3-byte (00 00 01) Annex B start codes
+            if (nalSize >= 4 && nalData[0] == 0 && nalData[1] == 0 &&
+                nalData[2] == 0 && nalData[3] == 1) {
+                nalStart = nalData + 4;
+                nalLen = nalSize - 4;
+            } else if (nalSize >= 3 && nalData[0] == 0 && nalData[1] == 0 && nalData[2] == 1) {
+                nalStart = nalData + 3;
+                nalLen = nalSize - 3;
+            }
+
+            auto result = NalValidator::validate(nalStart, nalLen);
+            if (result == NalValidator::Result::Valid) {
+                int64_t timestampUs = (int64_t)lastFrame->frameIndex * 11111; // cast before multiply to avoid overflow
+                m_videoDecoder.submitPacket(nalData, nalSize, timestampUs);
+            } else {
+                LOGW("NAL validation failed for frame %u, requesting IDR",
+                     lastFrame->frameIndex);
+                m_tcpClient.requestIdr();
+                m_videoDecoder.flush();
+            }
+        }
     }
 }
 
