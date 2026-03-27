@@ -18,6 +18,8 @@
 #include "controller_poller.h"
 #include "tcp_client.h"
 #include "audio_player.h"
+#include "eye_tracker.h"
+#include "hmd_profile.h"
 
 #include <vector>
 #include <array>
@@ -87,9 +89,11 @@ private:
     AudioPlayer m_audioPlayer;
     NetworkReceiver m_audioReceiver;
 
-    // Tracking + controllers
+    // Tracking + controllers + eye tracking
     TrackingSender m_trackingSender;
     ControllerPoller m_controllerPoller;
+    EyeTracker m_eyeTracker;
+    HmdProfile m_hmdProfile;
 
     // Timewarp
     Timewarp m_timewarp;

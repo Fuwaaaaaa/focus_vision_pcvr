@@ -23,6 +23,9 @@ public:
     /// Forward IDR request from TCP control to the NVENC encoder.
     void requestIdr();
 
+    /// Forward gaze data from tracking receiver to the NVENC encoder.
+    void updateGaze(float gazeX, float gazeY, bool valid);
+
 private:
     std::unique_ptr<CHmdDevice> m_hmdDevice;
     std::unique_ptr<CControllerDevice> m_leftController;
