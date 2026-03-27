@@ -29,7 +29,9 @@ NalValidator::Result NalValidator::validate(const uint8_t* data, int size) {
     }
 
     uint8_t nalType = (byte0 >> 1) & 0x3F;
-    if (nalType > HEVC_NAL_UNSPEC63) {
+    // nalType is 6 bits (0-63), so > 63 is impossible after masking.
+    // Reject reserved range 41-47 (ITU-T H.265 Table 7-1).
+    if (nalType >= 41 && nalType <= 47) {
         return Result::InvalidType;
     }
 
