@@ -6,6 +6,17 @@ extern "C" {
 
 static vr::IVRDriverContext* s_pDriverContext = nullptr;
 
+// Global pointer for IDR callback to reach the encoder.
+// Set during Init(), cleared during Cleanup().
+static CServerDriver* s_instance = nullptr;
+
+static void onIdrRequest() {
+    // Called from Rust TCP control thread when HMD sends IDR_REQUEST
+    if (s_instance) {
+        s_instance->requestIdr();
+    }
+}
+
 vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
 {
     s_pDriverContext = pDriverContext;
@@ -50,6 +61,10 @@ vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
 
     vr::VRDriverLog()->Log("Focus Vision PCVR: Controllers added\n");
 
+    // Register IDR callback so TCP IDR_REQUEST reaches the NVENC encoder
+    s_instance = this;
+    fvp_set_idr_callback(onIdrRequest);
+
     return vr::VRInitError_None;
 }
 
@@ -61,8 +76,13 @@ void CServerDriver::Cleanup()
     m_rightController.reset();
     m_hmdDevice.reset();
 
-    // Shut down the Rust streaming engine
+    // SAFETY: fvp_shutdown() must be called BEFORE clearing s_instance.
+    // fvp_shutdown() cancels the Tokio runtime, which stops the TCP control
+    // reader task. That task is the only caller of the IDR callback (onIdrRequest),
+    // which accesses s_instance. By shutting down Tokio first, we guarantee
+    // no callback can fire after s_instance is nulled.
     fvp_shutdown();
+    s_instance = nullptr;
 
     vr::CleanupDriverContext();
 }
@@ -70,6 +90,15 @@ void CServerDriver::Cleanup()
 const char* const* CServerDriver::GetInterfaceVersions()
 {
     return vr::k_InterfaceVersions;
+}
+
+void CServerDriver::requestIdr()
+{
+    if (m_hmdDevice) {
+        // Forward to DirectMode's NVENC encoder via HMD device
+        // HMD's DirectMode component handles the actual encoder
+        m_hmdDevice->requestIdr();
+    }
 }
 
 void CServerDriver::RunFrame()

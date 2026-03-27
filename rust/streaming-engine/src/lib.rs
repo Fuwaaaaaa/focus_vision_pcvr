@@ -8,10 +8,9 @@ pub mod engine;
 pub mod tracking;
 pub mod adaptive;
 
-use std::ffi::c_void;
 use std::sync::{RwLock, Once};
 
-use engine::{StreamingEngine, SubmittedFrame};
+use engine::{StreamingEngine, EncodedFrame};
 use fvp_common::protocol::{ControllerState, TrackingData};
 use metrics::latency::FrameTimestamps;
 
@@ -74,18 +73,35 @@ pub extern "C" fn fvp_shutdown() {
     }
 }
 
-/// Submit a video frame for encoding and transmission.
-/// `texture_ptr`: platform-specific handle (D3D11 texture on Windows).
-/// `width`, `height`: frame dimensions.
+/// Register an IDR request callback. Called from C++ on init.
+/// When the HMD sends an IDR_REQUEST over TCP, this callback fires
+/// so the C++ NVENC encoder can produce an IDR frame.
+#[no_mangle]
+pub extern "C" fn fvp_set_idr_callback(callback: extern "C" fn()) {
+    engine::set_idr_callback(callback);
+    log::info!("IDR callback registered");
+}
+
+/// Submit pre-encoded H.265 NAL units for RTP packetization and transmission.
+/// Called from the C++ driver after NVENC encoding.
+///
+/// `nal_data_ptr`: pointer to encoded NAL byte array.
+/// `nal_data_len`: length of the NAL data in bytes.
 /// `frame_index`: monotonically increasing frame counter.
+/// `is_idr`: 1 if this frame is an IDR keyframe, 0 otherwise.
+///
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
-pub extern "C" fn fvp_submit_frame(
-    _texture_ptr: *mut c_void,
-    width: u32,
-    height: u32,
+pub extern "C" fn fvp_submit_encoded_nal(
+    nal_data_ptr: *const u8,
+    nal_data_len: u32,
     frame_index: u32,
+    is_idr: i32,
 ) -> i32 {
+    if nal_data_ptr.is_null() || nal_data_len == 0 {
+        return -1;
+    }
+
     let guard = match ENGINE.read() {
         Ok(g) => g,
         Err(e) => { log::error!("RwLock poisoned: {}", e); return -1; }
@@ -95,16 +111,13 @@ pub extern "C" fn fvp_submit_frame(
         None => return -1,
     };
 
-    // In production (Step 5 full): read D3D11 texture pixels here.
-    // For now: create a placeholder frame to test the pipeline.
+    let nal_data = unsafe { std::slice::from_raw_parts(nal_data_ptr, nal_data_len as usize) }.to_vec();
     let timestamps = FrameTimestamps::new(frame_index);
-    let placeholder_data = video::test_pattern::generate_nv12_frame(width, height, frame_index as u64);
 
-    let frame = SubmittedFrame {
+    let frame = EncodedFrame {
         frame_index,
-        data: placeholder_data,
-        width,
-        height,
+        nal_data,
+        is_idr: is_idr != 0,
         timestamps,
     };
 
@@ -283,9 +296,25 @@ mod tests {
     }
 
     #[test]
-    fn test_fvp_submit_frame_no_engine() {
+    fn test_fvp_submit_encoded_nal_no_engine() {
         reset_engine();
-        let result = fvp_submit_frame(ptr::null_mut(), 100, 100, 0);
+        let nal_data = vec![0u8; 100];
+        let result = fvp_submit_encoded_nal(nal_data.as_ptr(), nal_data.len() as u32, 0, 1);
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_fvp_submit_encoded_nal_null_ptr() {
+        reset_engine();
+        let result = fvp_submit_encoded_nal(ptr::null(), 100, 0, 0);
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_fvp_submit_encoded_nal_zero_len() {
+        reset_engine();
+        let nal_data = vec![0u8; 100];
+        let result = fvp_submit_encoded_nal(nal_data.as_ptr(), 0, 0, 0);
         assert_eq!(result, -1);
     }
 }

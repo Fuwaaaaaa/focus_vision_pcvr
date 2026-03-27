@@ -75,7 +75,7 @@ async fn test_multi_frame_pipeline() {
 /// FEC test: encode with redundancy, drop some shards, verify recovery
 #[test]
 fn test_fec_pipeline_with_packet_loss() {
-    let encoder = FecEncoder::new(0.2);
+    let mut encoder = FecEncoder::new(0.2);
 
     // Create a "frame" of 5000 bytes
     let frame_data: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
@@ -109,6 +109,81 @@ fn test_fec_pipeline_with_packet_loss() {
     let mut recovered_frame: Vec<u8> = recovered.into_iter().flatten().collect();
     recovered_frame.truncate(frame_data.len());
     assert_eq!(recovered_frame, frame_data);
+}
+
+/// IDR flag propagation: verify is_keyframe flag reaches FVP header in RTP packets
+#[test]
+fn test_idr_flag_in_rtp_packets() {
+    use streaming_engine::pipeline::encode_frame_to_packets;
+
+    let nal_data = vec![0xAB; 500]; // Mock NAL
+    let mut packetizer = RtpPacketizer::new(0x1234);
+
+    // IDR frame
+    let idr_packets = encode_frame_to_packets(&nal_data, 0, 9000, true, 0.2, &mut packetizer);
+    assert!(!idr_packets.is_empty());
+    // FVP header flags at offset 18 (12 RTP + 4 frame_index + 1 shard_idx + 1 shard_count)
+    let flags = u16::from_le_bytes([idr_packets[0].data[18], idr_packets[0].data[19]]);
+    assert_eq!(flags & 0x01, 1, "IDR flag should be set");
+
+    // Non-IDR frame
+    let non_idr_packets = encode_frame_to_packets(&nal_data, 1, 18000, false, 0.2, &mut packetizer);
+    let flags = u16::from_le_bytes([non_idr_packets[0].data[18], non_idr_packets[0].data[19]]);
+    assert_eq!(flags & 0x01, 0, "IDR flag should NOT be set");
+}
+
+/// NAL data → RTP+FEC → reconstruct → verify NAL data preserved
+#[test]
+fn test_nal_to_rtp_fec_roundtrip() {
+    use streaming_engine::pipeline::{encode_frame_to_packets, decode_packets_to_frame};
+
+    // Simulate H.265 NAL: start code + IDR header + payload
+    let mut nal_data = vec![0x00, 0x00, 0x00, 0x01, 0x26, 0x01]; // IDR_W_RADL
+    nal_data.extend(vec![0xCD; 3000]); // Payload
+
+    let mut packetizer = RtpPacketizer::new(0x5678);
+    let packets = encode_frame_to_packets(&nal_data, 42, 90000, true, 0.2, &mut packetizer);
+    assert!(packets.len() > 1, "NAL should span multiple RTP packets");
+
+    // Extract shard counts from first packet's FVP header
+    let total_shards = packets[0].data[17] as usize;
+    let shard_size = fvp_common::FEC_SHARD_SIZE;
+    let data_shard_count = (nal_data.len() + shard_size - 1) / shard_size;
+
+    // Reconstruct: collect all packet refs
+    let pkt_refs: Vec<&[u8]> = packets.iter().map(|p| p.data.as_slice()).collect();
+    let recovered = decode_packets_to_frame(&pkt_refs, data_shard_count, total_shards, nal_data.len());
+    assert!(recovered.is_ok(), "Decode should succeed with all packets");
+    assert_eq!(recovered.unwrap(), nal_data, "NAL data should be preserved");
+}
+
+/// NAL data + FEC recovery: drop packets within parity budget, still recover
+#[test]
+fn test_nal_fec_recovery_with_loss() {
+    use streaming_engine::pipeline::{encode_frame_to_packets, decode_packets_to_frame};
+
+    let mut nal_data = vec![0x00, 0x00, 0x00, 0x01, 0x02, 0x01]; // TRAIL_R
+    nal_data.extend(vec![0xEF; 5000]);
+
+    let mut packetizer = RtpPacketizer::new(0x9ABC);
+    let packets = encode_frame_to_packets(&nal_data, 7, 63000, false, 0.2, &mut packetizer);
+
+    let total_shards = packets[0].data[17] as usize;
+    let shard_size = fvp_common::FEC_SHARD_SIZE;
+    let data_shard_count = (nal_data.len() + shard_size - 1) / shard_size;
+    let parity_count = total_shards - data_shard_count;
+
+    // Drop up to parity_count packets (should still recover)
+    let mut surviving: Vec<&[u8]> = Vec::new();
+    for (i, pkt) in packets.iter().enumerate() {
+        if i >= parity_count { // skip first parity_count packets
+            surviving.push(pkt.data.as_slice());
+        }
+    }
+
+    let recovered = decode_packets_to_frame(&surviving, data_shard_count, total_shards, nal_data.len());
+    assert!(recovered.is_ok(), "Should recover with FEC");
+    assert_eq!(recovered.unwrap(), nal_data);
 }
 
 /// Large frame test: ensure packetization handles frames bigger than MTU
