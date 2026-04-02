@@ -1,6 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
-use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Audio samples captured from WASAPI loopback.
@@ -11,17 +10,16 @@ pub struct AudioCapture {
     channels: u16,
 }
 
-/// Raw audio frame: interleaved f32 samples for one Opus frame (10ms = 480 samples/ch).
-pub type AudioFrame = Vec<f32>;
-
-const OPUS_FRAME_SAMPLES: usize = 480; // 10ms at 48kHz
+/// Raw audio chunk: variable-length f32 samples from a single callback invocation.
+pub type AudioChunk = Vec<f32>;
 
 impl AudioCapture {
     /// Start WASAPI loopback capture on the default output device.
-    /// Sends audio frames (10ms, 48kHz, stereo) to the provided channel.
+    /// Sends raw audio chunks (variable-length) to the provided channel.
+    /// The consumer is responsible for accumulating into fixed-size Opus frames.
     ///
     /// Returns None if no audio output device is available (non-fatal).
-    pub fn start(frame_tx: mpsc::Sender<AudioFrame>) -> Option<Self> {
+    pub fn start(chunk_tx: mpsc::Sender<AudioChunk>) -> Option<Self> {
         let host = cpal::default_host();
 
         let device = match host.default_output_device() {
@@ -52,43 +50,57 @@ impl AudioCapture {
             sample_rate, channels, sample_format
         );
 
-        // Accumulation buffer for collecting samples into 10ms frames
-        let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(
-            OPUS_FRAME_SAMPLES * channels as usize * 2,
-        )));
-
-        let buf_clone = buffer.clone();
-        let tx = frame_tx.clone();
-        let ch = channels;
-
         // Build the input stream using loopback capture.
         // cpal uses WASAPI loopback when capturing from an output device.
         let err_fn = |err: cpal::StreamError| {
             log::error!("Audio capture stream error: {}", err);
         };
 
+        // Lock-free: callback sends raw chunks directly via try_send (never blocks).
+        // No Mutex, no accumulation in the real-time callback.
+        let ch = channels;
+        let tx_f32 = chunk_tx.clone();
+        let tx_i16 = chunk_tx;
+
         let stream_result = match sample_format {
             SampleFormat::F32 => device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    accumulate_and_send(data, &buf_clone, &tx, ch);
+                    let chunk = if ch == 1 {
+                        // Mono → stereo: duplicate each sample
+                        let mut stereo = Vec::with_capacity(data.len() * 2);
+                        for &s in data {
+                            stereo.push(s);
+                            stereo.push(s);
+                        }
+                        stereo
+                    } else {
+                        data.to_vec()
+                    };
+                    let _ = tx_f32.try_send(chunk);
                 },
                 err_fn,
                 None,
             ),
-            SampleFormat::I16 => {
-                let buf_c = buffer.clone();
-                device.build_input_stream(
-                    &config.into(),
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        // Convert i16 to f32
-                        let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
-                        accumulate_and_send(&f32_data, &buf_c, &tx, ch);
-                    },
-                    err_fn,
-                    None,
-                )
-            }
+            SampleFormat::I16 => device.build_input_stream(
+                &config.into(),
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let chunk: Vec<f32> = if ch == 1 {
+                        let mut stereo = Vec::with_capacity(data.len() * 2);
+                        for &s in data {
+                            let f = s as f32 / 32768.0;
+                            stereo.push(f);
+                            stereo.push(f);
+                        }
+                        stereo
+                    } else {
+                        data.iter().map(|&s| s as f32 / 32768.0).collect()
+                    };
+                    let _ = tx_i16.try_send(chunk);
+                },
+                err_fn,
+                None,
+            ),
             _ => {
                 log::warn!("Unsupported sample format {:?} — audio disabled", sample_format);
                 return None;
@@ -108,7 +120,7 @@ impl AudioCapture {
             return None;
         }
 
-        log::info!("Audio loopback capture started");
+        log::info!("Audio loopback capture started (lock-free)");
 
         Some(Self {
             stream: Some(stream),
@@ -132,35 +144,5 @@ impl Drop for AudioCapture {
             drop(stream);
             log::info!("Audio capture stopped");
         }
-    }
-}
-
-/// Accumulate incoming samples into fixed-size Opus frames and send them.
-fn accumulate_and_send(
-    data: &[f32],
-    buffer: &Arc<Mutex<Vec<f32>>>,
-    tx: &mpsc::Sender<AudioFrame>,
-    channels: u16,
-) {
-    let mut buf = match buffer.lock() {
-        Ok(b) => b,
-        Err(_) => return,
-    };
-
-    // If device is mono, duplicate to stereo
-    if channels == 1 {
-        for &sample in data {
-            buf.push(sample);
-            buf.push(sample); // duplicate to right channel
-        }
-    } else {
-        buf.extend_from_slice(data);
-    }
-
-    // Extract complete frames
-    let stereo_frame_size = OPUS_FRAME_SAMPLES * 2; // stereo
-    while buf.len() >= stereo_frame_size {
-        let frame: Vec<f32> = buf.drain(..stereo_frame_size).collect();
-        let _ = tx.try_send(frame); // Drop if channel full (audio is lossy)
     }
 }
