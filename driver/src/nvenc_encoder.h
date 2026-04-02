@@ -322,6 +322,11 @@ private:
     std::atomic<float> m_gazeX{0.5f};
     std::atomic<float> m_gazeY{0.5f};
     std::atomic<bool> m_gazeValid{false};
+    std::vector<int8_t> m_qpDeltaMap; // Per-CTU QP delta map for foveated encoding
+    uint32_t m_ctuCols = 0;
+    uint32_t m_ctuRows = 0;
+
+    void computeQpDeltaMap(float gazeX, float gazeY);
 
     bool loadNvencApi();
     bool createEncoderSession();
