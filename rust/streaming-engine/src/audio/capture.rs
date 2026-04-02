@@ -41,30 +41,44 @@ impl AudioCapture {
             }
         };
 
-        let sample_rate = config.sample_rate().0;
+        let device_sample_rate = config.sample_rate().0;
         let channels = config.channels();
         let sample_format = config.sample_format();
+
+        // Force 48kHz to match Opus encoder. WASAPI handles resampling internally
+        // when the requested rate differs from the device's native rate.
+        // This prevents sample rate mismatch (e.g., 44.1kHz device → 48kHz Opus).
+        let sample_rate = 48000u32;
+        let stream_config = cpal::StreamConfig {
+            channels,
+            sample_rate: cpal::SampleRate(sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        if device_sample_rate != sample_rate {
+            log::info!(
+                "Audio capture: device native {}Hz, requesting {}Hz (WASAPI resample)",
+                device_sample_rate, sample_rate
+            );
+        }
 
         log::info!(
             "Audio capture config: {}Hz, {} ch, {:?}",
             sample_rate, channels, sample_format
         );
 
-        // Build the input stream using loopback capture.
-        // cpal uses WASAPI loopback when capturing from an output device.
         let err_fn = |err: cpal::StreamError| {
             log::error!("Audio capture stream error: {}", err);
         };
 
         // Lock-free: callback sends raw chunks directly via try_send (never blocks).
-        // No Mutex, no accumulation in the real-time callback.
         let ch = channels;
         let tx_f32 = chunk_tx.clone();
         let tx_i16 = chunk_tx;
 
         let stream_result = match sample_format {
             SampleFormat::F32 => device.build_input_stream(
-                &config.into(),
+                &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let chunk = if ch == 1 {
                         // Mono → stereo: duplicate each sample
@@ -83,7 +97,7 @@ impl AudioCapture {
                 None,
             ),
             SampleFormat::I16 => device.build_input_stream(
-                &config.into(),
+                &stream_config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let chunk: Vec<f32> = if ch == 1 {
                         let mut stereo = Vec::with_capacity(data.len() * 2);
