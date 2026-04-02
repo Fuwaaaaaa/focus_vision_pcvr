@@ -12,6 +12,12 @@
 - **Context:** config/default.tomlのcodecフィールドで切替可能にし、実測値でどちらを採用するか決定。NVENC側はH.264/H.265両対応が容易
 - **Depends on:** Phase 2 (Android側デコード) 実装後に計測可能
 
+### HeartbeatMonitor + ReconnectHandlerの統合
+- **What:** HeartbeatMonitorをrun_streamingループに接続し、ハートビート失敗時に自動再接続をトリガーする
+- **Why:** TCP切断検出はあるが、ハートビートタイムアウトでの切断検出が未接続。Wi-Fiが半死状態のときに検出できない
+- **Context:** HeartbeatMonitor（heartbeat.rs）とReconnectHandler（reconnect.rs）は定義・テスト済み。adaptive bitrate統合（ARCH-2）と同時に対応が効率的
+- **Depends on:** ARCH-2（adaptive bitrate統合）と同時実装推奨
+
 ## v1.1 準備調査
 
 ### ~~オーディオパイプラインの仮想オーディオデバイス調査~~ (解決済み)
