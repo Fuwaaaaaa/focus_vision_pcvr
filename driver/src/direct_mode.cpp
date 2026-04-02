@@ -101,6 +101,13 @@ void CDirectModeComponent::CreateSwapTextureSet(
 
 void CDirectModeComponent::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHandle)
 {
+    // Clear m_pendingTexture if it points to a texture being destroyed,
+    // to prevent use-after-free if NVENC hasn't consumed it yet.
+    for (const auto& entry : m_swapTextures) {
+        if (entry.handle == sharedTextureHandle && entry.texture.Get() == m_pendingTexture) {
+            m_pendingTexture = nullptr;
+        }
+    }
     m_swapTextures.erase(
         std::remove_if(m_swapTextures.begin(), m_swapTextures.end(),
             [sharedTextureHandle](const SwapTextureEntry& e) { return e.handle == sharedTextureHandle; }),
@@ -109,6 +116,12 @@ void CDirectModeComponent::DestroySwapTextureSet(vr::SharedTextureHandle_t share
 
 void CDirectModeComponent::DestroyAllSwapTextureSets(uint32_t unPid)
 {
+    // Clear m_pendingTexture if it belongs to the destroyed PID
+    for (const auto& entry : m_swapTextures) {
+        if (entry.pid == unPid && entry.texture.Get() == m_pendingTexture) {
+            m_pendingTexture = nullptr;
+        }
+    }
     m_swapTextures.erase(
         std::remove_if(m_swapTextures.begin(), m_swapTextures.end(),
             [unPid](const SwapTextureEntry& e) { return e.pid == unPid; }),
