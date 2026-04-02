@@ -21,6 +21,10 @@ static IDR_CALLBACK: std::sync::RwLock<Option<extern "C" fn()>> = std::sync::RwL
 /// Set via fvp_set_gaze_callback() from C++.
 static GAZE_CALLBACK: std::sync::RwLock<Option<extern "C" fn(f32, f32, i32)>> = std::sync::RwLock::new(None);
 
+/// Callback for bitrate changes — tells C++ NvencEncoder to adjust bitrate.
+/// Set via fvp_set_bitrate_callback() from C++.
+static BITRATE_CALLBACK: std::sync::RwLock<Option<extern "C" fn(u32)>> = std::sync::RwLock::new(None);
+
 pub fn set_idr_callback(cb: extern "C" fn()) {
     if let Ok(mut guard) = IDR_CALLBACK.write() {
         *guard = Some(cb);
@@ -38,6 +42,20 @@ fn notify_idr_request() {
 pub fn set_gaze_callback(cb: extern "C" fn(f32, f32, i32)) {
     if let Ok(mut guard) = GAZE_CALLBACK.write() {
         *guard = Some(cb);
+    }
+}
+
+pub fn set_bitrate_callback(cb: extern "C" fn(u32)) {
+    if let Ok(mut guard) = BITRATE_CALLBACK.write() {
+        *guard = Some(cb);
+    }
+}
+
+fn notify_bitrate_change(bitrate_bps: u32) {
+    if let Ok(guard) = BITRATE_CALLBACK.read() {
+        if let Some(cb) = *guard {
+            cb(bitrate_bps);
+        }
     }
 }
 
@@ -370,10 +388,18 @@ async fn run_streaming(
     let audio_target: SocketAddr = SocketAddr::new(peer_addr.ip(), audio_port);
     spawn_audio_pipeline(audio_target, cancel.clone());
 
-    // Step 3: Process frames
+    // Step 3: Process frames with adaptive bitrate
     let mut packetizer = RtpPacketizer::new(0x46565000); // "FVP\0"
     let mut fec_encoder = crate::transport::fec::FecEncoder::new(config.network.fec_redundancy);
     let mut frame_count: u64 = 0;
+    let mut send_failures: u32 = 0;
+    let mut send_successes: u32 = 0;
+
+    // Adaptive bitrate: adjust encoding bitrate based on network quality
+    let mut bw_estimator = crate::adaptive::bandwidth_estimator::BandwidthEstimator::new();
+    let mut bitrate_ctrl = crate::adaptive::bitrate_controller::BitrateController::new(
+        config.video.bitrate_mbps,
+    );
 
     while let Some(mut frame) = frame_rx.recv().await {
         // NAL data arrives pre-encoded from C++ NVENC encoder.
@@ -393,9 +419,12 @@ async fn run_streaming(
             &mut packetizer,
         );
 
-        // Send via UDP
+        // Send via UDP — track success/failure for adaptive bitrate
         if let Err(e) = udp_sender.send_all(&packets).await {
             log::warn!("UDP send error: {}", e);
+            send_failures += 1;
+        } else {
+            send_successes += 1;
         }
 
         frame.timestamps.mark_send();
@@ -406,6 +435,20 @@ async fn run_streaming(
         }
 
         frame_count += 1;
+
+        // Adaptive bitrate: evaluate every ~1 second (90 frames at 90fps)
+        if frame_count % 90 == 0 {
+            let total = send_successes + send_failures;
+            if total > 0 {
+                bw_estimator.update(send_successes, send_failures, 0.0);
+                if bitrate_ctrl.adjust(&bw_estimator) {
+                    let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
+                    notify_bitrate_change(new_bps);
+                }
+            }
+            send_successes = 0;
+            send_failures = 0;
+        }
 
         // Log stats every 5 seconds
         if frame_count % 450 == 0 {
