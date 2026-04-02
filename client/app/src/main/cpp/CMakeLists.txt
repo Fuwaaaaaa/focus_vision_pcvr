@@ -9,6 +9,20 @@ find_library(ANDROID_LIB android)
 find_library(GLES_LIB GLESv3)
 find_library(EGL_LIB EGL)
 find_library(MEDIANDK_LIB mediandk)
+find_library(AAUDIO_LIB aaudio)
+
+# libopus for audio decoding
+# Built from source via FetchContent (no prebuilt dependency)
+include(FetchContent)
+FetchContent_Declare(
+    opus
+    GIT_REPOSITORY https://gitlab.xiph.org/xiph/opus.git
+    GIT_TAG        v1.5.2
+    GIT_SHALLOW    TRUE
+)
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(opus)
 
 # OpenXR headers (from third_party or system)
 set(OPENXR_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../../../../../../third_party/openxr/include")
@@ -26,6 +40,7 @@ set(CLIENT_SOURCES
     controller_poller.cpp
     timewarp.cpp
     fec_decoder.cpp
+    audio_player.cpp
     ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c
 )
 
@@ -43,5 +58,7 @@ target_link_libraries(focusvision_native
     ${GLES_LIB}
     ${EGL_LIB}
     ${MEDIANDK_LIB}
+    ${AAUDIO_LIB}
+    opus
     android
 )
