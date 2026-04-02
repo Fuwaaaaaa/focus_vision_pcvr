@@ -379,6 +379,17 @@ async fn run_streaming(
         }
     });
 
+    // Step 1.5: Log foveated encoding config
+    if config.foveated.enabled {
+        log::info!(
+            "Foveated encoding enabled: fovea={:.0}%, mid={:.0}%, QP+{}/+{}",
+            config.foveated.fovea_radius * 100.0,
+            config.foveated.mid_radius * 100.0,
+            config.foveated.mid_qp_offset,
+            config.foveated.peripheral_qp_offset,
+        );
+    }
+
     // Step 2: Create UDP senders — video and audio on separate ports
     let udp_target: SocketAddr = SocketAddr::new(peer_addr.ip(), config.network.udp_port + fvp_common::VIDEO_PORT_OFFSET);
     let udp_sender = UdpSender::new(udp_target).await?;
