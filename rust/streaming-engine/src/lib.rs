@@ -27,6 +27,12 @@ pub struct FvpConfig {
     pub refresh_rate: f32,
     pub ipd: f32,
     pub seconds_from_vsync_to_photons: f32,
+    // Foveated encoding settings from TOML config
+    pub foveated_enabled: i32,
+    pub fovea_radius: f32,
+    pub mid_radius: f32,
+    pub mid_qp_offset: i32,
+    pub peripheral_qp_offset: i32,
 }
 
 /// Initialize the streaming engine. Returns 0 on success.
@@ -218,6 +224,11 @@ pub extern "C" fn fvp_get_config(out: *mut FvpConfig) -> i32 {
         (*out).refresh_rate = cfg.video.framerate as f32;
         (*out).ipd = cfg.display.ipd;
         (*out).seconds_from_vsync_to_photons = cfg.display.seconds_from_vsync_to_photons;
+        (*out).foveated_enabled = if cfg.foveated.enabled { 1 } else { 0 };
+        (*out).fovea_radius = cfg.foveated.fovea_radius;
+        (*out).mid_radius = cfg.foveated.mid_radius;
+        (*out).mid_qp_offset = cfg.foveated.mid_qp_offset;
+        (*out).peripheral_qp_offset = cfg.foveated.peripheral_qp_offset;
     }
     0
 }
@@ -304,6 +315,11 @@ mod tests {
             refresh_rate: 0.0,
             ipd: 0.0,
             seconds_from_vsync_to_photons: 0.0,
+            foveated_enabled: 0,
+            fovea_radius: 0.0,
+            mid_radius: 0.0,
+            mid_qp_offset: 0,
+            peripheral_qp_offset: 0,
         };
         let result = fvp_get_config(&mut cfg);
         assert_eq!(result, -1);
