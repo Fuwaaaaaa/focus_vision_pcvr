@@ -13,6 +13,8 @@ pub struct AppConfig {
     pub pairing: PairingConfig,
     #[serde(default)]
     pub display: DisplayConfig,
+    #[serde(default)]
+    pub foveated: FoveatedConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +69,38 @@ pub struct PairingConfig {
     pub lockout_seconds: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FoveatedConfig {
+    #[serde(default = "default_foveated_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_fovea_radius")]
+    pub fovea_radius: f32,
+    #[serde(default = "default_mid_radius")]
+    pub mid_radius: f32,
+    #[serde(default = "default_mid_qp_offset")]
+    pub mid_qp_offset: i32,
+    #[serde(default = "default_peripheral_qp_offset")]
+    pub peripheral_qp_offset: i32,
+}
+
+fn default_foveated_enabled() -> bool { false }
+fn default_fovea_radius() -> f32 { 0.15 }
+fn default_mid_radius() -> f32 { 0.35 }
+fn default_mid_qp_offset() -> i32 { 5 }
+fn default_peripheral_qp_offset() -> i32 { 15 }
+
+impl Default for FoveatedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_foveated_enabled(),
+            fovea_radius: default_fovea_radius(),
+            mid_radius: default_mid_radius(),
+            mid_qp_offset: default_mid_qp_offset(),
+            peripheral_qp_offset: default_peripheral_qp_offset(),
+        }
+    }
+}
+
 fn default_tcp_port() -> u16 { fvp_common::DEFAULT_TCP_PORT }
 fn default_udp_port() -> u16 { fvp_common::DEFAULT_UDP_PORT }
 fn default_fec_redundancy() -> f32 { fvp_common::DEFAULT_FEC_REDUNDANCY }
@@ -116,7 +150,7 @@ impl Default for AudioConfig {
 }
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { network: NetworkConfig::default(), video: VideoConfig::default(), audio: AudioConfig::default(), pairing: PairingConfig::default(), display: DisplayConfig::default() }
+        Self { network: NetworkConfig::default(), video: VideoConfig::default(), audio: AudioConfig::default(), pairing: PairingConfig::default(), display: DisplayConfig::default(), foveated: FoveatedConfig::default() }
     }
 }
 
