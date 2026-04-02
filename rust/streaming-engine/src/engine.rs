@@ -61,12 +61,14 @@ pub struct EncodedFrame {
 
 /// The main streaming engine running on a tokio runtime.
 pub struct StreamingEngine {
+    #[allow(dead_code)] // Kept alive to prevent tokio runtime drop
     runtime: Runtime,
     frame_tx: mpsc::Sender<EncodedFrame>,
     latest_tracking: Arc<StdMutex<Option<TrackingData>>>,
     latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
     cancel_token: CancellationToken,
+    #[allow(dead_code)] // Available for future config queries
     config: AppConfig,
 }
 
@@ -87,7 +89,6 @@ impl StreamingEngine {
 
         let cancel_token = CancellationToken::new();
         let tracking_clone = latest_tracking.clone();
-        let controllers_clone = latest_controllers.clone();
         let tracker_clone = latency_tracker.clone();
         let config_clone = config.clone();
 
@@ -249,14 +250,29 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
 
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(32);
 
-    // Start WASAPI loopback capture (runs on a system thread via cpal)
-    let _capture = match AudioCapture::start(audio_tx) {
-        Some(c) => c,
-        None => {
-            log::info!("Audio capture unavailable — streaming video only");
-            return;
-        }
-    };
+    // Create and hold AudioCapture on a dedicated thread.
+    // cpal Stream is !Send, so it must live on the thread where it was created.
+    // The thread blocks until the cancel token fires, then drops the capture.
+    let hold_cancel = cancel.clone();
+    std::thread::Builder::new()
+        .name("fvp-audio-capture".into())
+        .spawn(move || {
+            let _capture = match AudioCapture::start(audio_tx) {
+                Some(c) => c,
+                None => {
+                    log::info!("Audio capture unavailable — streaming video only");
+                    return;
+                }
+            };
+            // Block until streaming session ends — keeps capture alive
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("audio hold runtime");
+            rt.block_on(hold_cancel.cancelled());
+            log::info!("Audio capture released");
+        })
+        .expect("spawn audio capture thread");
 
     // Spawn async task for encoding + sending
     tokio::spawn(async move {
@@ -322,20 +338,12 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
         }
     });
 
-    // Keep _capture alive — it's moved into this function scope.
-    // The Stream will be dropped when spawn_audio_pipeline returns,
-    // but we need it to stay alive. Box::leak is intentional here:
-    // the capture runs for the lifetime of the streaming session,
-    // which ends when the process exits.
-    // Note: In production, we'd use a proper lifetime management
-    // (Arc, or move into the spawned task). For now this is safe
-    // because the capture stream is tied to the process lifetime.
 }
 
 async fn run_streaming(
     config: AppConfig,
     mut frame_rx: mpsc::Receiver<EncodedFrame>,
-    tracking: Arc<StdMutex<Option<TrackingData>>>,
+    _tracking: Arc<StdMutex<Option<TrackingData>>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

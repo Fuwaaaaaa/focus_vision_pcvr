@@ -1,7 +1,7 @@
 use fvp_common::{MTU_SIZE, RTP_PT_H265};
 
-/// Maximum payload per RTP packet (MTU minus RTP header 12B minus FVP header 8B)
-const MAX_PAYLOAD: usize = MTU_SIZE - 12 - 8;
+/// Maximum payload per RTP packet (MTU minus RTP header 12B minus FVP header 10B)
+const MAX_PAYLOAD: usize = MTU_SIZE - 12 - 10;
 
 /// A single RTP packet ready for transmission.
 #[derive(Debug, Clone)]
@@ -36,13 +36,17 @@ impl RtpPacketizer {
         // Split frame into chunks that fit in one RTP packet
         let chunks: Vec<&[u8]> = frame_data.chunks(MAX_PAYLOAD).collect();
         let total_chunks = chunks.len();
+        if total_chunks > u16::MAX as usize {
+            log::error!("Frame too large: {} shards exceeds u16 max. Dropping frame.", total_chunks);
+            return vec![];
+        }
         let mut packets = Vec::with_capacity(total_chunks);
 
         for (i, chunk) in chunks.iter().enumerate() {
             let is_last = i == total_chunks - 1;
             let seq = self.next_sequence();
 
-            let mut buf = Vec::with_capacity(12 + 8 + chunk.len());
+            let mut buf = Vec::with_capacity(12 + 10 + chunk.len());
 
             // RTP header (12 bytes)
             buf.push(0x80); // V=2, P=0, X=0, CC=0
@@ -52,10 +56,10 @@ impl RtpPacketizer {
             buf.extend_from_slice(&timestamp_90khz.to_be_bytes());
             buf.extend_from_slice(&self.ssrc.to_be_bytes());
 
-            // FVP header (8 bytes)
+            // FVP header (10 bytes) — shard fields are u16 to support large keyframes
             buf.extend_from_slice(&frame_index.to_le_bytes());
-            buf.push(i as u8);          // shard_index
-            buf.push(total_chunks as u8); // shard_count
+            buf.extend_from_slice(&(i as u16).to_le_bytes());            // shard_index
+            buf.extend_from_slice(&(total_chunks as u16).to_le_bytes()); // shard_count
             let flags: u16 = if is_keyframe { 1 } else { 0 };
             buf.extend_from_slice(&flags.to_le_bytes());
 
@@ -94,23 +98,29 @@ impl RtpDepacketizer {
 
     /// Feed an RTP packet. Returns Some(frame_data) when a complete frame is assembled.
     pub fn feed(&mut self, packet: &[u8]) -> Option<ReassembledFrame> {
-        if packet.len() < 20 {
-            return None; // Too small (12 RTP + 8 FVP minimum)
+        if packet.len() < 22 {
+            return None; // Too small (12 RTP + 10 FVP minimum)
         }
 
         // Parse RTP header
         let _mpt = packet[1];
         let marker = (_mpt & 0x80) != 0;
 
-        // Parse FVP header (bytes 12..20)
+        // Parse FVP header (bytes 12..22) — shard fields are u16
         let frame_index = u32::from_le_bytes([packet[12], packet[13], packet[14], packet[15]]);
-        let shard_index = packet[16] as usize;
-        let shard_count = packet[17] as usize;
-        let flags = u16::from_le_bytes([packet[18], packet[19]]);
+        let shard_index = u16::from_le_bytes([packet[16], packet[17]]) as usize;
+        let shard_count = u16::from_le_bytes([packet[18], packet[19]]) as usize;
+        let flags = u16::from_le_bytes([packet[20], packet[21]]);
         let is_keyframe = (flags & 1) != 0;
 
-        // Payload starts at byte 20
-        let payload = &packet[20..];
+        // Payload starts at byte 22
+        let payload = &packet[22..];
+
+        // Sanity check: reject absurd shard counts to prevent memory exhaustion
+        const MAX_SHARDS: usize = 4096; // ~5MB at 1200B/shard — far beyond any real frame
+        if shard_count == 0 || shard_count > MAX_SHARDS || shard_index >= shard_count {
+            return None;
+        }
 
         // New frame?
         if self.current_frame_index != Some(frame_index) {
@@ -166,7 +176,7 @@ mod tests {
         let frame = vec![0xAA; 100]; // Small frame, fits in 1 packet
         let packets = pkt.packetize(&frame, 0, 0, true);
         assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].data.len(), 12 + 8 + 100);
+        assert_eq!(packets[0].data.len(), 12 + 10 + 100);
         // Marker bit should be set on the only packet
         assert_ne!(packets[0].data[1] & 0x80, 0);
     }
