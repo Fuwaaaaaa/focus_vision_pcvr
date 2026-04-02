@@ -63,14 +63,12 @@ pub extern "C" fn fvp_init() -> i32 {
 #[no_mangle]
 pub extern "C" fn fvp_shutdown() {
     log::info!("Focus Vision PCVR Streaming Engine shutting down");
-    // Cancel all async tasks before dropping the engine
-    if let Ok(guard) = ENGINE.read() {
-        if let Some(engine) = guard.as_ref() {
-            engine.shutdown();
-        }
-    }
+    // Single write lock: shutdown + drop atomically to avoid race conditions
     if let Ok(mut guard) = ENGINE.write() {
-        *guard = None; // Drop the engine, which drops the runtime
+        if let Some(engine) = guard.take() {
+            engine.shutdown();
+            // engine is dropped here when it goes out of scope
+        }
     }
 }
 

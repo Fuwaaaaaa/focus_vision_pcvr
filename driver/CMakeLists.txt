@@ -13,6 +13,9 @@ if(DRIVER_SOURCES)
     add_library(driver_focus_vision_pcvr SHARED ${DRIVER_SOURCES})
     target_include_directories(driver_focus_vision_pcvr PRIVATE
         ${OPENVR_INCLUDE_DIR} ${RUST_INCLUDE_DIR} src)
+    if(MSVC)
+        target_compile_options(driver_focus_vision_pcvr PRIVATE /utf-8)
+    endif()
     target_link_libraries(driver_focus_vision_pcvr PRIVATE
         "${RUST_TARGET_DIR}/streaming_engine.lib"
         ws2_32 userenv ntdll bcrypt d3d11 dxgi)

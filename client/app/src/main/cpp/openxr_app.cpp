@@ -169,27 +169,27 @@ void OpenXRApp::receiveAndDecodeVideo() {
         if (received <= 0) break;
 
         // Parse RTP header to extract FVP fields
-        // RTP header: 12 bytes fixed + FVP header: 8 bytes
-        if (received < 20) continue; // Too short for RTP + FVP header
+        // RTP header: 12 bytes fixed + FVP header: 10 bytes
+        if (received < 22) continue; // Too short for RTP + FVP header
 
         // FVP header at offset 12 (all multi-byte fields are little-endian,
         // matching Rust's to_le_bytes() in pipeline.rs):
-        //   frame_index (u32 LE), shard_index (u8), total_shards (u8),
+        //   frame_index (u32 LE), shard_index (u16 LE), total_shards (u16 LE),
         //   flags (u16 LE)
         const uint8_t* fvp = m_recvBuffer.data() + 12;
         uint32_t frameIndex = (uint32_t)fvp[0] | ((uint32_t)fvp[1] << 8) |
-                              ((uint32_t)fvp[2] << 16) | ((uint32_t)fvp[3] << 24); // LE, cast to avoid sign extension
-        uint8_t shardIndex = fvp[4];
-        uint8_t totalShards = fvp[5];
-        uint16_t flags = (uint16_t)fvp[6] | ((uint16_t)fvp[7] << 8); // LE
+                              ((uint32_t)fvp[2] << 16) | ((uint32_t)fvp[3] << 24);
+        uint16_t shardIndex = (uint16_t)fvp[4] | ((uint16_t)fvp[5] << 8);
+        uint16_t totalShards = (uint16_t)fvp[6] | ((uint16_t)fvp[7] << 8);
+        uint16_t flags = (uint16_t)fvp[8] | ((uint16_t)fvp[9] << 8);
         bool isKeyframe = (flags & 0x01) != 0;
+        // Sanity check: reject absurd shard counts
+        if (totalShards == 0 || totalShards > 4096 || shardIndex >= totalShards) continue;
         // Derive data shard count from total shards and FEC redundancy (20%).
-        // FEC adds ceil(data_count * 0.2) parity shards, so:
-        //   total = data + ceil(data * 0.2) → data = floor(total / 1.2)
-        uint8_t dataShards = (uint8_t)(totalShards / 1.2f);
+        uint16_t dataShards = (uint16_t)(totalShards / 1.2f);
 
-        const uint8_t* payload = m_recvBuffer.data() + 20;
-        int payloadSize = received - 20;
+        const uint8_t* payload = m_recvBuffer.data() + 22;
+        int payloadSize = received - 22;
 
         // New frame? Start collecting shards.
         if (frameIndex != m_fecDecoder.currentFrameIndex()) {
