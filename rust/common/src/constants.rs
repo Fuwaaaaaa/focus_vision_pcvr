@@ -16,6 +16,11 @@ pub const HEARTBEAT_MAX_MISSES: u32 = 3;
 pub const MAX_PIN_ATTEMPTS: u8 = 3;
 /// PIN lockout duration in seconds
 pub const PIN_LOCKOUT_SECONDS: u64 = 60;
+/// UDP port offsets from DEFAULT_UDP_PORT (9945)
+/// Video: 9946, Tracking: 9947, Audio: 9948
+pub const VIDEO_PORT_OFFSET: u16 = 1;
+pub const TRACKING_PORT_OFFSET: u16 = 2;
+pub const AUDIO_PORT_OFFSET: u16 = 3;
 /// RTP clock rate for video (standard)
 pub const RTP_CLOCK_RATE: u32 = 90_000;
 /// RTP payload type for H.265
