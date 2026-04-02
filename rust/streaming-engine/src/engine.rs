@@ -292,7 +292,11 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
         })
         .expect("spawn audio capture thread");
 
-    // Spawn async task for encoding + sending
+    // Spawn async task: accumulate raw chunks into 10ms frames, encode, send.
+    // Accumulation happens here (not in the real-time callback) to avoid Mutex.
+    const OPUS_FRAME_SAMPLES: usize = 480; // 10ms at 48kHz
+    const STEREO_FRAME_SIZE: usize = OPUS_FRAME_SAMPLES * 2;
+
     tokio::spawn(async move {
         let mut encoder = match AudioEncoder::new(128_000) {
             Ok(e) => e,
@@ -313,40 +317,45 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
         let mut sequence: u16 = 0;
         let mut timestamp: u32 = 0;
         let ssrc: u32 = 0x41554449; // "AUDI"
+        let mut accum: Vec<f32> = Vec::with_capacity(STEREO_FRAME_SIZE * 2);
 
         log::info!("Audio streaming started to {}", target);
 
         loop {
             tokio::select! {
-                Some(pcm_frame) = audio_rx.recv() => {
-                    // Encode PCM to Opus
-                    let opus_data = match encoder.encode(&pcm_frame) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            log::warn!("Opus encode error: {}", e);
-                            continue;
+                Some(chunk) = audio_rx.recv() => {
+                    // Accumulate raw samples from capture callback
+                    accum.extend_from_slice(&chunk);
+
+                    // Extract and encode complete 10ms frames
+                    while accum.len() >= STEREO_FRAME_SIZE {
+                        let pcm_frame: Vec<f32> = accum.drain(..STEREO_FRAME_SIZE).collect();
+
+                        let opus_data = match encoder.encode(&pcm_frame) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                log::warn!("Opus encode error: {}", e);
+                                continue;
+                            }
+                        };
+
+                        // Build RTP packet: header (12 bytes) + Opus payload
+                        let mut buf = Vec::with_capacity(12 + opus_data.len());
+                        buf.push(0x80); // V=2, P=0, X=0, CC=0
+                        buf.push(0x80 | 111); // M=1 (always for audio), PT=111 (Opus)
+                        buf.extend_from_slice(&sequence.to_be_bytes());
+                        buf.extend_from_slice(&timestamp.to_be_bytes());
+                        buf.extend_from_slice(&ssrc.to_be_bytes());
+                        buf.extend_from_slice(&opus_data);
+
+                        let packet = RtpPacket { data: buf };
+                        if let Err(e) = udp_sender.send_all(&[packet]).await {
+                            log::debug!("Audio UDP send error: {}", e);
                         }
-                    };
 
-                    // Build RTP packet: header (12 bytes) + Opus payload
-                    let mut buf = Vec::with_capacity(12 + opus_data.len());
-
-                    // RTP header (RFC 3550)
-                    buf.push(0x80); // V=2, P=0, X=0, CC=0
-                    buf.push(0x80 | 111); // M=1 (always for audio), PT=111 (Opus)
-                    buf.extend_from_slice(&sequence.to_be_bytes());
-                    buf.extend_from_slice(&timestamp.to_be_bytes());
-                    buf.extend_from_slice(&ssrc.to_be_bytes());
-
-                    buf.extend_from_slice(&opus_data);
-
-                    let packet = RtpPacket { data: buf };
-                    if let Err(e) = udp_sender.send_all(&[packet]).await {
-                        log::debug!("Audio UDP send error: {}", e);
+                        sequence = sequence.wrapping_add(1);
+                        timestamp = timestamp.wrapping_add(480);
                     }
-
-                    sequence = sequence.wrapping_add(1);
-                    timestamp = timestamp.wrapping_add(480); // 10ms at 48kHz
                 }
                 _ = cancel.cancelled() => {
                     log::info!("Audio streaming cancelled");
