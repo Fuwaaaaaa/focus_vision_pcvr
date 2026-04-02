@@ -90,6 +90,16 @@ pub extern "C" fn fvp_set_gaze_callback(callback: extern "C" fn(f32, f32, i32)) 
     log::info!("Gaze callback registered");
 }
 
+/// Register a bitrate change callback. Called from C++ on init.
+/// When adaptive bitrate adjusts the target, this callback fires
+/// so the C++ NVENC encoder can reconfigure its bitrate.
+/// `bitrate_bps`: new target bitrate in bits per second.
+#[no_mangle]
+pub extern "C" fn fvp_set_bitrate_callback(callback: extern "C" fn(u32)) {
+    engine::set_bitrate_callback(callback);
+    log::info!("Bitrate callback registered");
+}
+
 /// Submit pre-encoded H.265 NAL units for RTP packetization and transmission.
 /// Called from the C++ driver after NVENC encoding.
 ///
