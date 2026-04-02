@@ -103,18 +103,14 @@ void CDirectModeComponent::GetNextSwapTextureSetIndex(
 
 void CDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 {
-    // Store the left-eye texture handle for encoding in Present().
-    // In production, we'd combine both eyes or encode them separately.
-    // For v1.0, we encode the left eye texture as a single stream.
-    //
-    // The SharedTextureHandle_t from SteamVR maps to an ID3D11Texture2D
-    // via the swap texture set. The actual D3D11 resource resolution
-    // happens when initEncoder() provides the D3D11 device.
-    //
-    // Note: we don't resolve the handle to a D3D11 texture here because
-    // SteamVR may still be writing to it. We wait until Present() which
-    // signals the frame is complete.
-    (void)perEye; // Used in production for texture handle extraction
+    // Resolve left-eye SharedTextureHandle_t to ID3D11Texture2D.
+    // SteamVR's handle is actually a castable pointer to the D3D11 resource.
+    // We store it for encoding in Present() when the frame is complete.
+    // For v1.0, left eye only (single stream). Right eye ignored.
+    vr::SharedTextureHandle_t leftHandle = perEye[0].hTexture;
+    if (leftHandle != 0) {
+        m_pendingTexture = reinterpret_cast<ID3D11Texture2D*>(leftHandle);
+    }
 }
 
 void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
@@ -132,18 +128,25 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
         return;
     }
 
-    // Encode the frame.
-    // In the full implementation, we would:
-    //   1. Resolve syncTexture to an ID3D11Texture2D
-    //   2. Call m_frameCopy.copyFrame() for safe handoff
-    //   3. Pass copied texture to m_encoder.encode()
-    //
-    // For now, we pass nullptr which triggers the test pattern path
-    // in NvencEncoder, generating synthetic NAL data for pipeline validation.
+    // Encode the frame: copy pending texture, then encode.
+    // m_pendingTexture is set by SubmitLayer() with the left-eye D3D11 resource.
+    // FrameCopy does a sync GPU→GPU copy (double-buffered) so SteamVR can
+    // safely reuse the source texture after Present() returns.
+    // If no texture was submitted (e.g. first frame), fall through to
+    // NvencEncoder's test pattern path.
+    ID3D11Texture2D* encodeInput = nullptr;
+
+    if (m_pendingTexture) {
+        ComPtr<ID3D11DeviceContext> ctx;
+        m_encoder.getDevice()->GetImmediateContext(&ctx);
+        encodeInput = m_frameCopy.copyFrame(ctx.Get(), m_pendingTexture);
+        m_pendingTexture = nullptr; // Consumed
+    }
+
     std::vector<uint8_t> nalData;
     bool isIdr = false;
 
-    if (!m_encoder.encode(nullptr, false, nalData, isIdr)) {
+    if (!m_encoder.encode(encodeInput, false, nalData, isIdr)) {
         return;
     }
 
