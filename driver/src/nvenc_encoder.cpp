@@ -1,6 +1,7 @@
 #include "nvenc_encoder.h"
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <atomic>
 
 static std::atomic<bool> s_idrRequested{false};
@@ -80,6 +81,13 @@ bool NvencEncoder::encode(ID3D11Texture2D* srcTexture,
     outIsIdr = isIdr;
     m_frameCount++;
 
+    // Read gaze data for foveated encoding
+    if (m_foveatedEnabled && m_gazeValid.load()) {
+        float gx = m_gazeX.load();
+        float gy = m_gazeY.load();
+        computeQpDeltaMap(gx, gy);
+    }
+
     // --- Real NVENC path ---
     if (m_encoder) {
         // Copy source texture to our registered input texture
@@ -115,6 +123,17 @@ bool NvencEncoder::encode(ID3D11Texture2D* srcTexture,
             picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
             picParams.pictureType = NV_ENC_PIC_TYPE_IDR;
         }
+
+        // Apply foveated QP delta map if computed.
+        // NV_ENC_PIC_PARAMS::qpDeltaMap and qpDeltaMapSize are in the reserved
+        // area of our inline struct. Their exact offsets depend on the NVENC SDK
+        // version. When the SDK headers are available, replace these reserved-area
+        // writes with proper struct field access.
+        // For now, the QP delta map is computed and ready in m_qpDeltaMap.
+        // TODO: Wire m_qpDeltaMap into picParams once NVENC SDK headers are integrated.
+        //   picParams.qpDeltaMap = m_qpDeltaMap.data();
+        //   picParams.qpDeltaMapSize = static_cast<uint32_t>(m_qpDeltaMap.size());
+        //   Also set NV_ENC_RC_PARAMS::qpMapMode = NV_ENC_QP_MAP_DELTA during init.
 
         st = m_nvencFns.nvEncEncodePicture(m_encoder, &picParams);
         if (st != NV_ENC_SUCCESS && st != NV_ENC_ERR_NEED_MORE_INPUT) {
@@ -168,6 +187,46 @@ void NvencEncoder::setGaze(float gazeX, float gazeY, bool valid) {
     m_gazeX.store(gazeX);
     m_gazeY.store(gazeY);
     m_gazeValid.store(valid);
+}
+
+void NvencEncoder::computeQpDeltaMap(float gazeX, float gazeY) {
+    // CTU size for HEVC is 64x64 (NVENC default)
+    const uint32_t ctuSize = m_config.use_hevc ? 64 : 16;
+    m_ctuCols = (m_config.width + ctuSize - 1) / ctuSize;
+    m_ctuRows = (m_config.height + ctuSize - 1) / ctuSize;
+    const uint32_t mapSize = m_ctuCols * m_ctuRows;
+
+    m_qpDeltaMap.resize(mapSize);
+
+    // Foveation radii as fraction of frame width (matching Rust FoveationConfig defaults)
+    const float foveaRadius = 0.15f;
+    const float midRadius = 0.35f;
+    const int8_t midQpDelta = 5;
+    const int8_t peripheralQpDelta = 15;
+
+    // Gaze position in CTU coordinates
+    const float gazeCtuX = gazeX * static_cast<float>(m_ctuCols);
+    const float gazeCtuY = gazeY * static_cast<float>(m_ctuRows);
+    const float foveaCtu = foveaRadius * static_cast<float>(m_ctuCols);
+    const float midCtu = midRadius * static_cast<float>(m_ctuCols);
+
+    for (uint32_t row = 0; row < m_ctuRows; ++row) {
+        for (uint32_t col = 0; col < m_ctuCols; ++col) {
+            float dx = static_cast<float>(col) + 0.5f - gazeCtuX;
+            float dy = static_cast<float>(row) + 0.5f - gazeCtuY;
+            float dist = sqrtf(dx * dx + dy * dy);
+
+            int8_t delta;
+            if (dist <= foveaCtu) {
+                delta = 0;  // Full quality in fovea
+            } else if (dist <= midCtu) {
+                delta = midQpDelta;
+            } else {
+                delta = peripheralQpDelta;
+            }
+            m_qpDeltaMap[row * m_ctuCols + col] = delta;
+        }
+    }
 }
 
 bool NvencEncoder::loadNvencApi() {
