@@ -24,3 +24,10 @@ Thumbs.db
 /out/
 rust/streaming-engine/include/
 config/local.toml
+
+# Temp files and logs
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
