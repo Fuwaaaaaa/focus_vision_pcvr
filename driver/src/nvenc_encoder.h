@@ -288,6 +288,7 @@ public:
     void requestIdr();
     bool isInitialized() const { return m_initialized; }
     bool isRealEncoder() const { return m_encoder != nullptr; }
+    ID3D11Device* getDevice() const { return m_device.Get(); }
 
     /// Update gaze position for foveated encoding.
     /// Coordinates are normalized (0-1). Called from tracking data receiver.
