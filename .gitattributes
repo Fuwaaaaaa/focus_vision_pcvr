@@ -1,0 +1,14 @@
+# Normalize line endings: LF in repo, native on checkout
+* text=auto eol=lf
+
+# Ensure shell scripts stay LF even on Windows
+*.sh text eol=lf
+*.bat text eol=crlf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.apk binary
+*.lib binary
+*.dll binary
+*.so binary
