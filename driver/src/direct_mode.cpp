@@ -3,6 +3,7 @@ extern "C" {
 #include "streaming_engine.h"
 }
 #include <cstring>
+#include <algorithm>
 
 CDirectModeComponent::CDirectModeComponent()
 {
@@ -48,46 +49,70 @@ void CDirectModeComponent::CreateSwapTextureSet(
     const SwapTextureSetDesc_t* pSwapTextureSetDesc,
     SwapTextureSet_t* pOutSwapTextureSet)
 {
-    if (!pOutSwapTextureSet)
+    if (!pOutSwapTextureSet || !pSwapTextureSetDesc)
         return;
 
-    SwapTexture tex;
-    tex.handle = m_nextHandle++;
-    tex.pid = unPid;
-    m_swapTextures.push_back(tex);
+    // Create real D3D11 textures that SteamVR's compositor will render into.
+    // Triple-buffered: 3 textures per swap set, rotated by GetNextSwapTextureSetIndex.
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = pSwapTextureSetDesc->nWidth;
+    desc.Height = pSwapTextureSetDesc->nHeight;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = static_cast<DXGI_FORMAT>(pSwapTextureSetDesc->nFormat);
+    desc.SampleDesc.Count = pSwapTextureSetDesc->nSampleCount > 0 ? pSwapTextureSetDesc->nSampleCount : 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 
-    // Return 3 textures in the set (triple buffering)
+    ID3D11Device* device = m_encoder.getDevice();
+    if (!device) {
+        vr::VRDriverLog()->Log("Focus Vision PCVR: CreateSwapTextureSet — no D3D11 device\n");
+        return;
+    }
+
     for (uint32_t i = 0; i < 3; i++)
     {
-        pOutSwapTextureSet->rSharedTextureHandles[i] = tex.handle + i;
-    }
-    m_nextHandle += 3;
+        vr::SharedTextureHandle_t handle = m_nextHandle++;
 
-    vr::VRDriverLog()->Log("Focus Vision PCVR: CreateSwapTextureSet\n");
+        SwapTextureEntry entry;
+        entry.handle = handle;
+        entry.pid = unPid;
+
+        HRESULT hr = device->CreateTexture2D(&desc, nullptr, &entry.texture);
+        if (FAILED(hr)) {
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                "Focus Vision PCVR: CreateTexture2D failed for swap set (hr=0x%08lx)\n", hr);
+            vr::VRDriverLog()->Log(buf);
+            return;
+        }
+
+        pOutSwapTextureSet->rSharedTextureHandles[i] = handle;
+        m_swapTextures.push_back(std::move(entry));
+    }
+
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+        "Focus Vision PCVR: CreateSwapTextureSet %ux%u (3 textures)\n",
+        pSwapTextureSetDesc->nWidth, pSwapTextureSetDesc->nHeight);
+    vr::VRDriverLog()->Log(buf);
 }
 
 void CDirectModeComponent::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHandle)
 {
-    for (auto it = m_swapTextures.begin(); it != m_swapTextures.end(); ++it)
-    {
-        if (it->handle == sharedTextureHandle)
-        {
-            m_swapTextures.erase(it);
-            break;
-        }
-    }
+    m_swapTextures.erase(
+        std::remove_if(m_swapTextures.begin(), m_swapTextures.end(),
+            [sharedTextureHandle](const SwapTextureEntry& e) { return e.handle == sharedTextureHandle; }),
+        m_swapTextures.end());
 }
 
 void CDirectModeComponent::DestroyAllSwapTextureSets(uint32_t unPid)
 {
-    auto it = m_swapTextures.begin();
-    while (it != m_swapTextures.end())
-    {
-        if (it->pid == unPid)
-            it = m_swapTextures.erase(it);
-        else
-            ++it;
-    }
+    m_swapTextures.erase(
+        std::remove_if(m_swapTextures.begin(), m_swapTextures.end(),
+            [unPid](const SwapTextureEntry& e) { return e.pid == unPid; }),
+        m_swapTextures.end());
 }
 
 void CDirectModeComponent::GetNextSwapTextureSetIndex(
@@ -103,13 +128,18 @@ void CDirectModeComponent::GetNextSwapTextureSetIndex(
 
 void CDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 {
-    // Resolve left-eye SharedTextureHandle_t to ID3D11Texture2D.
-    // SteamVR's handle is actually a castable pointer to the D3D11 resource.
-    // We store it for encoding in Present() when the frame is complete.
+    // Resolve left-eye SharedTextureHandle_t to ID3D11Texture2D via our map.
+    // The handle was created by CreateSwapTextureSet and maps to a real D3D11 texture.
     // For v1.0, left eye only (single stream). Right eye ignored.
     vr::SharedTextureHandle_t leftHandle = perEye[0].hTexture;
-    if (leftHandle != 0) {
-        m_pendingTexture = reinterpret_cast<ID3D11Texture2D*>(leftHandle);
+    if (leftHandle == INVALID_SHARED_TEXTURE_HANDLE)
+        return;
+
+    for (const auto& entry : m_swapTextures) {
+        if (entry.handle == leftHandle) {
+            m_pendingTexture = entry.texture.Get();
+            return;
+        }
     }
 }
 
