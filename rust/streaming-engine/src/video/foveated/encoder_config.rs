@@ -1,4 +1,4 @@
-use super::region::{FoveationConfig, FoveationLevel};
+use super::region::FoveationConfig;
 
 /// NVENC encoder parameters adjusted per-region for foveated encoding.
 ///

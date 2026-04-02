@@ -1,7 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
 use fvp_common::{HEARTBEAT_INTERVAL_MS, HEARTBEAT_MAX_MISSES};
 
 /// Heartbeat monitor — detects connection loss from missed heartbeats.

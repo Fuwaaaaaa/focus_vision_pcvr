@@ -53,13 +53,17 @@ pub fn encode_frame_to_packets_with_fec(
 
     // Step 3: Each shard becomes an RTP packet payload
     let total_shards = all_shards.len();
+    if total_shards > u16::MAX as usize {
+        log::error!("Frame too large: {} shards exceeds u16 max. Dropping frame.", total_shards);
+        return vec![];
+    }
     let mut packets = Vec::with_capacity(total_shards);
 
     for (i, shard) in all_shards.iter().enumerate() {
         let is_last = i == total_shards - 1;
         let seq = packetizer.next_sequence();
 
-        let mut buf = Vec::with_capacity(12 + 8 + shard.len());
+        let mut buf = Vec::with_capacity(12 + 10 + shard.len());
 
         // RTP header
         buf.push(0x80);
@@ -73,10 +77,10 @@ pub fn encode_frame_to_packets_with_fec(
         buf.extend_from_slice(&timestamp_90khz.to_be_bytes());
         buf.extend_from_slice(&0x42u32.to_be_bytes()); // SSRC
 
-        // FVP header
+        // FVP header (10 bytes) — shard fields are u16 to support large keyframes
         buf.extend_from_slice(&frame_index.to_le_bytes());
-        buf.push(i as u8);
-        buf.push(total_shards as u8);
+        buf.extend_from_slice(&(i as u16).to_le_bytes());            // shard_index
+        buf.extend_from_slice(&(total_shards as u16).to_le_bytes()); // shard_count
         let flags: u16 = if is_keyframe { 1 } else { 0 };
         buf.extend_from_slice(&flags.to_le_bytes());
 
@@ -98,15 +102,21 @@ pub fn decode_packets_to_frame(
     total_shard_count: usize,
     original_frame_len: usize,
 ) -> Result<Vec<u8>, String> {
+    // Sanity check: reject absurd shard counts
+    const MAX_SHARDS: usize = 4096;
+    if total_shard_count == 0 || total_shard_count > MAX_SHARDS || data_shard_count > total_shard_count {
+        return Err("Invalid shard counts".into());
+    }
+
     // Parse each packet to extract shard_index and payload
     let mut shards: Vec<Option<Vec<u8>>> = vec![None; total_shard_count];
 
     for pkt in packets {
-        if pkt.len() < 20 {
+        if pkt.len() < 22 {
             continue;
         }
-        let shard_index = pkt[16] as usize;
-        let payload = &pkt[20..];
+        let shard_index = u16::from_le_bytes([pkt[16], pkt[17]]) as usize;
+        let payload = &pkt[22..];
         if shard_index < total_shard_count {
             shards[shard_index] = Some(payload.to_vec());
         }

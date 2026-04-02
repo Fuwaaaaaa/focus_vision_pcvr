@@ -7,6 +7,11 @@ echo ============================================
 
 where cargo >nul 2>&1 || (echo ERROR: Rust/Cargo not found. & exit /b 1)
 
+REM Initialize git submodules (OpenVR SDK etc.)
+where git >nul 2>&1 && (
+    git submodule update --init --quiet 2>nul
+)
+
 echo.
 echo [1/2] Building Rust streaming engine...
 cargo build --release -p streaming-engine
@@ -21,6 +26,7 @@ if %ERRORLEVEL% neq 0 (
 ) else (
     if exist driver\src\driver_main.cpp (
         cmake -B driver\build -S driver -DCMAKE_BUILD_TYPE=Release
+        if %ERRORLEVEL% neq 0 (echo ERROR: CMake configure failed. & exit /b 1)
         cmake --build driver\build --config Release
         if %ERRORLEVEL% neq 0 (echo ERROR: CMake build failed. & exit /b 1)
         echo Driver build OK.

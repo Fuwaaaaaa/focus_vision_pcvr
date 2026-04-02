@@ -56,7 +56,6 @@ impl AudioCapture {
         let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(
             OPUS_FRAME_SAMPLES * channels as usize * 2,
         )));
-        let frame_size = OPUS_FRAME_SAMPLES * channels as usize;
 
         let buf_clone = buffer.clone();
         let tx = frame_tx.clone();
@@ -72,7 +71,7 @@ impl AudioCapture {
             SampleFormat::F32 => device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    accumulate_and_send(data, &buf_clone, frame_size, &tx, ch);
+                    accumulate_and_send(data, &buf_clone, &tx, ch);
                 },
                 err_fn,
                 None,
@@ -84,7 +83,7 @@ impl AudioCapture {
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         // Convert i16 to f32
                         let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
-                        accumulate_and_send(&f32_data, &buf_c, frame_size, &tx, ch);
+                        accumulate_and_send(&f32_data, &buf_c, &tx, ch);
                     },
                     err_fn,
                     None,
@@ -140,7 +139,6 @@ impl Drop for AudioCapture {
 fn accumulate_and_send(
     data: &[f32],
     buffer: &Arc<Mutex<Vec<f32>>>,
-    frame_size: usize,
     tx: &mpsc::Sender<AudioFrame>,
     channels: u16,
 ) {

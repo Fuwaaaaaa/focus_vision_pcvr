@@ -11,13 +11,14 @@ pub struct RtpHeader {
     pub ssrc: u32,
 }
 
-/// Focus Vision PCVR custom header (8 bytes)
+/// Focus Vision PCVR custom header (10 bytes)
+/// shard_index/count are u16 to support large IDR keyframes (>256 shards at 80Mbps).
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct FvpHeader {
     pub frame_index: u32,
-    pub shard_index: u8,
-    pub shard_count: u8,
+    pub shard_index: u16,
+    pub shard_count: u16,
     pub flags: u16,
 }
 

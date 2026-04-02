@@ -122,13 +122,13 @@ fn test_idr_flag_in_rtp_packets() {
     // IDR frame
     let idr_packets = encode_frame_to_packets(&nal_data, 0, 9000, true, 0.2, &mut packetizer);
     assert!(!idr_packets.is_empty());
-    // FVP header flags at offset 18 (12 RTP + 4 frame_index + 1 shard_idx + 1 shard_count)
-    let flags = u16::from_le_bytes([idr_packets[0].data[18], idr_packets[0].data[19]]);
+    // FVP header flags at offset 20 (12 RTP + 4 frame_index + 2 shard_idx + 2 shard_count)
+    let flags = u16::from_le_bytes([idr_packets[0].data[20], idr_packets[0].data[21]]);
     assert_eq!(flags & 0x01, 1, "IDR flag should be set");
 
     // Non-IDR frame
     let non_idr_packets = encode_frame_to_packets(&nal_data, 1, 18000, false, 0.2, &mut packetizer);
-    let flags = u16::from_le_bytes([non_idr_packets[0].data[18], non_idr_packets[0].data[19]]);
+    let flags = u16::from_le_bytes([non_idr_packets[0].data[20], non_idr_packets[0].data[21]]);
     assert_eq!(flags & 0x01, 0, "IDR flag should NOT be set");
 }
 
@@ -145,8 +145,8 @@ fn test_nal_to_rtp_fec_roundtrip() {
     let packets = encode_frame_to_packets(&nal_data, 42, 90000, true, 0.2, &mut packetizer);
     assert!(packets.len() > 1, "NAL should span multiple RTP packets");
 
-    // Extract shard counts from first packet's FVP header
-    let total_shards = packets[0].data[17] as usize;
+    // Extract shard counts from first packet's FVP header (u16 LE at offset 18)
+    let total_shards = u16::from_le_bytes([packets[0].data[18], packets[0].data[19]]) as usize;
     let shard_size = fvp_common::FEC_SHARD_SIZE;
     let data_shard_count = (nal_data.len() + shard_size - 1) / shard_size;
 
@@ -168,7 +168,7 @@ fn test_nal_fec_recovery_with_loss() {
     let mut packetizer = RtpPacketizer::new(0x9ABC);
     let packets = encode_frame_to_packets(&nal_data, 7, 63000, false, 0.2, &mut packetizer);
 
-    let total_shards = packets[0].data[17] as usize;
+    let total_shards = u16::from_le_bytes([packets[0].data[18], packets[0].data[19]]) as usize;
     let shard_size = fvp_common::FEC_SHARD_SIZE;
     let data_shard_count = (nal_data.len() + shard_size - 1) / shard_size;
     let parity_count = total_shards - data_shard_count;
@@ -194,8 +194,6 @@ fn test_large_frame_packetization() {
     let frame = vec![0xAA; 100_000];
     let packets = pkt.packetize(&frame, 0, 0, true);
 
-    // Each packet payload ≤ MTU - 20 bytes header
-    let max_payload = fvp_common::MTU_SIZE - 12 - 8;
     assert!(packets.len() > 1);
 
     // Verify round-trip
