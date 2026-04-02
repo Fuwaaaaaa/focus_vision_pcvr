@@ -111,7 +111,7 @@ impl StreamingEngine {
         // Spawn tracking receiver (UDP, separate port)
         let tracking_head = latest_tracking.clone();
         let tracking_ctrl = latest_controllers.clone();
-        let tracking_port = config.network.udp_port + 2; // 9947
+        let tracking_port = config.network.udp_port + fvp_common::TRACKING_PORT_OFFSET;
         let cancel = cancel_token.clone();
         runtime.spawn(async move {
             let receiver = TrackingReceiver::new(tracking_head, tracking_ctrl);
@@ -362,11 +362,11 @@ async fn run_streaming(
     });
 
     // Step 2: Create UDP senders — video and audio on separate ports
-    let udp_target: SocketAddr = SocketAddr::new(peer_addr.ip(), config.network.udp_port + 1);
+    let udp_target: SocketAddr = SocketAddr::new(peer_addr.ip(), config.network.udp_port + fvp_common::VIDEO_PORT_OFFSET);
     let udp_sender = UdpSender::new(udp_target).await?;
 
     // Step 2.5: Start audio capture and streaming (optional — non-fatal if unavailable)
-    let audio_port = config.network.udp_port + 3; // 9948
+    let audio_port = config.network.udp_port + fvp_common::AUDIO_PORT_OFFSET;
     let audio_target: SocketAddr = SocketAddr::new(peer_addr.ip(), audio_port);
     spawn_audio_pipeline(audio_target, cancel.clone());
 
