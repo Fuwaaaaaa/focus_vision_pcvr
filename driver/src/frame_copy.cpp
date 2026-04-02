@@ -38,7 +38,11 @@ ID3D11Texture2D* FrameCopy::copyFrame(ID3D11DeviceContext* context, ID3D11Textur
 
     ID3D11Texture2D* dest = m_staging[m_currentBuffer].Get();
     context->CopyResource(dest, source);
-    context->Flush(); // Ensure copy completes before returning
+    // Flush submits GPU commands but does NOT wait for completion.
+    // This is safe because NVENC's nvEncMapInputResource uses the same
+    // D3D11 device context, so GPU command ordering is guaranteed.
+    // The copy will complete before NVENC reads the texture.
+    context->Flush();
 
     m_currentBuffer = (m_currentBuffer + 1) % 2; // Flip double buffer
     return dest;
