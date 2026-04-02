@@ -47,6 +47,11 @@ typedef struct FvpConfig {
     float refresh_rate;
     float ipd;
     float seconds_from_vsync_to_photons;
+    int32_t foveated_enabled;
+    float fovea_radius;
+    float mid_radius;
+    int32_t mid_qp_offset;
+    int32_t peripheral_qp_offset;
 } FvpConfig;
 
 #ifdef __cplusplus
@@ -76,6 +81,14 @@ void fvp_set_idr_callback(void (*callback)(void));
  * forwards gaze coordinates to the C++ NVENC encoder for foveated encoding.
  */
 void fvp_set_gaze_callback(void (*callback)(float, float, int32_t));
+
+/**
+ * Register a bitrate change callback. Called from C++ on init.
+ * When adaptive bitrate adjusts the target, this callback fires
+ * so the C++ NVENC encoder can reconfigure its bitrate.
+ * `bitrate_bps`: new target bitrate in bits per second.
+ */
+void fvp_set_bitrate_callback(void (*callback)(uint32_t));
 
 /**
  * Submit pre-encoded H.265 NAL units for RTP packetization and transmission.
