@@ -61,11 +61,14 @@ private:
     // Latest submitted texture (from SubmitLayer, consumed by Present)
     ID3D11Texture2D* m_pendingTexture = nullptr;
 
-    // Swap texture set tracking
-    struct SwapTexture {
+    // Swap texture set: maps SharedTextureHandle_t → D3D11 texture.
+    // CreateSwapTextureSet allocates real D3D11 textures and returns handles.
+    // SubmitLayer resolves handles back to textures via this map.
+    struct SwapTextureEntry {
         vr::SharedTextureHandle_t handle;
         uint32_t pid;
+        ComPtr<ID3D11Texture2D> texture;
     };
-    std::vector<SwapTexture> m_swapTextures;
+    std::vector<SwapTextureEntry> m_swapTextures;
     vr::SharedTextureHandle_t m_nextHandle = 1;
 };
