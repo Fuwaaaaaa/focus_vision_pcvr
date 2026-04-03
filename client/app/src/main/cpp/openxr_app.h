@@ -25,6 +25,19 @@
 
 #include <vector>
 #include <array>
+#include <string>
+
+/// Pairing flow states for HMD UI overlay
+enum class PairingState {
+    Idle,           // Not started
+    Searching,      // Looking for PC server (TCP connect)
+    PinEntry,       // Waiting for user to enter PIN
+    Verifying,      // PIN submitted, waiting for result
+    Failed,         // Wrong PIN (shows remaining attempts)
+    LockedOut,      // Too many failures (shows countdown)
+    Connected,      // Successfully paired, streaming active
+    Disconnected,   // Was connected, lost connection
+};
 
 class OpenXRApp {
 public:
@@ -109,4 +122,12 @@ private:
     GLuint m_lastDecodedTexture = 0;
     uint32_t m_lastFrameIndex = 0;
     bool m_hasDecodedFrame = false;
+
+    // Connection and pairing state
+    PairingState m_pairingState = PairingState::Idle;
+    uint8_t m_pinAttemptsRemaining = 3;
+    std::string m_pairingMessage;
+    bool m_streamingActive = false;
+    std::chrono::steady_clock::time_point m_lastPacketTime;
+    static constexpr int DISCONNECT_TIMEOUT_MS = 2000; // 2s without packets = disconnected
 };

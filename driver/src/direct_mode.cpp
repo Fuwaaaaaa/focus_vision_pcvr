@@ -82,6 +82,7 @@ void CDirectModeComponent::CreateSwapTextureSet(
         return;
     }
 
+    uint32_t setId = m_nextSetId++;
     for (uint32_t i = 0; i < 3; i++)
     {
         vr::SharedTextureHandle_t handle = m_nextHandle++;
@@ -89,6 +90,8 @@ void CDirectModeComponent::CreateSwapTextureSet(
         SwapTextureEntry entry;
         entry.handle = handle;
         entry.pid = unPid;
+        entry.setId = setId;
+        entry.indexInSet = i;
 
         HRESULT hr = device->CreateTexture2D(&desc, nullptr, &entry.texture);
         if (FAILED(hr)) {
@@ -102,6 +105,7 @@ void CDirectModeComponent::CreateSwapTextureSet(
         pOutSwapTextureSet->rSharedTextureHandles[i] = handle;
         m_swapTextures.push_back(std::move(entry));
     }
+    m_swapSetIndices.push_back({setId, 0});
 
     char buf[128];
     snprintf(buf, sizeof(buf),
@@ -143,11 +147,24 @@ void CDirectModeComponent::GetNextSwapTextureSetIndex(
     vr::SharedTextureHandle_t sharedTextureHandles[2],
     uint32_t (*pIndices)[2])
 {
-    // Simple round-robin through 3 textures
-    static uint32_t s_index = 0;
-    (*pIndices)[0] = s_index;
-    (*pIndices)[1] = s_index;
-    s_index = (s_index + 1) % 3;
+    // Per-set round-robin: find the set each handle belongs to and advance its index
+    for (int eye = 0; eye < 2; eye++) {
+        uint32_t idx = 0;
+        for (const auto& entry : m_swapTextures) {
+            if (entry.handle == sharedTextureHandles[eye]) {
+                // Find this set's current index
+                for (auto& [setId, curIdx] : m_swapSetIndices) {
+                    if (setId == entry.setId) {
+                        idx = curIdx;
+                        curIdx = (curIdx + 1) % 3;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        (*pIndices)[eye] = idx;
+    }
 }
 
 void CDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])

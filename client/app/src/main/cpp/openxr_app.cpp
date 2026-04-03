@@ -192,6 +192,8 @@ void OpenXRApp::receiveAndDecodeVideo() {
 
         // Record packet for stats reporting to PC
         m_stats.onPacketReceived();
+        m_lastPacketTime = std::chrono::steady_clock::now();
+        m_streamingActive = true;
         // Derive data shard count from total shards and FEC redundancy (20%).
         uint16_t dataShards = (uint16_t)(totalShards / 1.2f);
 
@@ -353,6 +355,30 @@ void OpenXRApp::renderFrame() {
             GLuint framebuffer = m_swapchains[eye].getFramebuffer(imgIndex);
             uint32_t width = m_swapchains[eye].getWidth();
             uint32_t height = m_swapchains[eye].getHeight();
+
+            // Check for connection loss (no packets for 2s)
+            bool connectionLost = m_streamingActive &&
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - m_lastPacketTime).count() > DISCONNECT_TIMEOUT_MS;
+
+            if (connectionLost) {
+                // Show dark overlay with reconnect indication.
+                // Timewarp continues on last frame to prevent VR sickness.
+                // Tint the rendered output darker to signal connection issue.
+                m_renderer.renderSolidColor(framebuffer, width, height,
+                    0.02f, 0.02f, 0.04f); // Near-black: "connection lost"
+                m_swapchains[eye].releaseImage();
+
+                projViews[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+                projViews[eye].pose = views[eye].pose;
+                projViews[eye].fov = views[eye].fov;
+                projViews[eye].subImage.swapchain = m_swapchains[eye].getHandle();
+                projViews[eye].subImage.imageRect.offset = {0, 0};
+                projViews[eye].subImage.imageRect.extent = {
+                    (int32_t)width, (int32_t)height};
+                projViews[eye].subImage.imageArrayIndex = 0;
+                continue;
+            }
 
             // Rendering decision: new frame or timewarp
             bool hasNewFrame = m_videoDecoder.getDecodedFrame();

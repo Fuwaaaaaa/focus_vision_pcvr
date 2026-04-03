@@ -76,7 +76,45 @@ enum ConnectionStatus {
 }
 
 impl CompanionApp {
-    fn new(_cc: &eframe::CreationContext) -> Self {
+    fn new(cc: &eframe::CreationContext) -> Self {
+        // Load custom fonts from DESIGN.md: Instrument Serif (brand) + Geist (UI)
+        let mut fonts = egui::FontDefinitions::default();
+
+        // Instrument Serif for brand/display text
+        if let Ok(data) = std::fs::read("fonts/InstrumentSerif-Regular.ttf") {
+            fonts.font_data.insert(
+                "InstrumentSerif".to_string(),
+                egui::FontData::from_owned(data).into(),
+            );
+            fonts.families.entry(egui::FontFamily::Name("Brand".into()))
+                .or_default()
+                .insert(0, "InstrumentSerif".to_string());
+        }
+
+        // Geist for UI body text
+        if let Ok(data) = std::fs::read("fonts/Geist-Regular.ttf") {
+            fonts.font_data.insert(
+                "Geist".to_string(),
+                egui::FontData::from_owned(data).into(),
+            );
+            // Set as default proportional font
+            fonts.families.entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "Geist".to_string());
+        }
+
+        // Geist Mono for stats/data
+        if let Ok(data) = std::fs::read("fonts/GeistMono-Regular.ttf") {
+            fonts.font_data.insert(
+                "GeistMono".to_string(),
+                egui::FontData::from_owned(data).into(),
+            );
+            fonts.families.entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "GeistMono".to_string());
+        }
+
+        cc.egui_ctx.set_fonts(fonts);
         let steamvr_dir = driver::find_steamvr_drivers_dir();
         let driver_installed = steamvr_dir.as_ref()
             .map(|d| driver::is_driver_installed(d))
@@ -275,6 +313,23 @@ impl CompanionApp {
         });
 
         ui.add_space(16.0);
+
+        // Contextual setup hint — shows the next step based on current state
+        let hint = if !self.driver_installed {
+            Some("Next: Install the SteamVR driver above")
+        } else if self.connection_status == ConnectionStatus::Disconnected {
+            if self.devices.is_empty() {
+                Some("Next: Connect Focus Vision via USB and deploy the APK (Deploy tab)")
+            } else {
+                Some("Next: Start SteamVR, then enter the PIN on your headset")
+            }
+        } else {
+            None
+        };
+        if let Some(hint_text) = hint {
+            ui.label(egui::RichText::new(hint_text).size(12.0).color(accent).italics());
+            ui.add_space(8.0);
+        }
 
         // PIN display
         ui.group(|ui| {
