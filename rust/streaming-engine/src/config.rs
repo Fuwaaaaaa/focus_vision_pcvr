@@ -160,3 +160,64 @@ impl AppConfig {
         Ok(toml::from_str(&content)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_values() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.network.tcp_port, 9944);
+        assert_eq!(cfg.network.udp_port, 9945);
+        assert_eq!(cfg.video.bitrate_mbps, 80);
+        assert_eq!(cfg.video.resolution_per_eye, [1832, 1920]);
+        assert_eq!(cfg.video.framerate, 90);
+        assert_eq!(cfg.audio.sample_rate, 48000);
+        assert_eq!(cfg.pairing.max_attempts, 3);
+    }
+
+    #[test]
+    fn test_load_default_toml() {
+        // Try from workspace root or streaming-engine dir
+        let path = if std::path::Path::new("config/default.toml").exists() {
+            "config/default.toml"
+        } else if std::path::Path::new("../../config/default.toml").exists() {
+            "../../config/default.toml"
+        } else {
+            // Skip if config not found (CI may not have it)
+            return;
+        };
+        let cfg = AppConfig::load(path);
+        assert!(cfg.is_ok(), "default.toml should parse: {:?}", cfg.err());
+        let cfg = cfg.unwrap();
+        assert_eq!(cfg.video.bitrate_mbps, 80);
+        assert_eq!(cfg.network.fec_redundancy, 0.2);
+    }
+
+    #[test]
+    fn test_load_nonexistent_file() {
+        let result = AppConfig::load("nonexistent.toml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_toml() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        // All fields should fall back to defaults
+        assert_eq!(cfg.video.framerate, 90);
+        assert_eq!(cfg.network.tcp_port, 9944);
+    }
+
+    #[test]
+    fn test_parse_partial_toml() {
+        let cfg: AppConfig = toml::from_str(r#"
+            [video]
+            bitrate_mbps = 120
+        "#).unwrap();
+        assert_eq!(cfg.video.bitrate_mbps, 120);
+        // Other fields should be defaults
+        assert_eq!(cfg.video.framerate, 90);
+        assert_eq!(cfg.network.tcp_port, 9944);
+    }
+}
