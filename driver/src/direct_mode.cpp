@@ -17,12 +17,23 @@ CDirectModeComponent::~CDirectModeComponent()
 
 bool CDirectModeComponent::initEncoder(ID3D11Device* device, uint32_t width, uint32_t height)
 {
+    // Read config from Rust streaming engine (single source of truth)
+    FvpConfig fvpCfg = {};
     NvencEncoder::Config encConfig;
-    encConfig.width = width;
-    encConfig.height = height;
-    encConfig.fps = 90;
-    encConfig.bitrate_bps = 80'000'000;
-    encConfig.use_hevc = true;
+    if (fvp_get_config(&fvpCfg) == 0) {
+        encConfig.width = fvpCfg.render_width;
+        encConfig.height = fvpCfg.render_height;
+        encConfig.fps = (uint32_t)fvpCfg.refresh_rate;
+        encConfig.bitrate_bps = fvpCfg.render_width * fvpCfg.render_height * 2; // ~80Mbps at native res
+        encConfig.use_hevc = true;
+    } else {
+        // Fallback if engine not initialized yet
+        encConfig.width = width;
+        encConfig.height = height;
+        encConfig.fps = 90;
+        encConfig.bitrate_bps = 80'000'000;
+        encConfig.use_hevc = true;
+    }
 
     if (!m_frameCopy.init(device, width, height)) {
         vr::VRDriverLog()->Log("Focus Vision PCVR: FrameCopy init failed\n");
