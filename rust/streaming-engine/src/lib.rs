@@ -156,7 +156,20 @@ pub extern "C" fn fvp_submit_encoded_nal(
         None => return -1,
     };
 
-    let nal_data = unsafe { std::slice::from_raw_parts(nal_data_ptr, nal_data_len as usize) }.to_vec();
+    // Reuse a thread-local buffer to avoid per-frame allocation.
+    // The Vec retains its capacity across calls, so after the first large frame,
+    // subsequent frames reuse the same heap memory.
+    thread_local! {
+        static NAL_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(256 * 1024));
+    }
+
+    let nal_data = NAL_BUF.with(|buf| {
+        let mut b = buf.borrow_mut();
+        b.clear();
+        b.extend_from_slice(unsafe { std::slice::from_raw_parts(nal_data_ptr, nal_data_len as usize) });
+        b.clone()
+    });
+
     let timestamps = FrameTimestamps::new(frame_index);
 
     let frame = EncodedFrame {

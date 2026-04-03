@@ -299,6 +299,7 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
     // Create and hold AudioCapture on a dedicated thread.
     // cpal Stream is !Send, so it must live on the thread where it was created.
     // The thread blocks until the cancel token fires, then drops the capture.
+    // Poll is_cancelled() every 100ms — avoids creating a tokio runtime just to wait.
     let hold_cancel = cancel.clone();
     std::thread::Builder::new()
         .name("fvp-audio-capture".into())
@@ -310,12 +311,9 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
                     return;
                 }
             };
-            // Block until streaming session ends — keeps capture alive
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("audio hold runtime");
-            rt.block_on(hold_cancel.cancelled());
+            while !hold_cancel.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             log::info!("Audio capture released");
         })
         .expect("spawn audio capture thread");
