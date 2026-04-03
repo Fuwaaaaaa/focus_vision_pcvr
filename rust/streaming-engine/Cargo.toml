@@ -19,6 +19,7 @@ reed-solomon-erasure = "6"
 tokio-util = { version = "0.7", features = ["rt"] }
 cpal = "0.15"
 audiopus = "0.2"
+dirs-next = "2"
 
 [build-dependencies]
 cbindgen = "0.27"

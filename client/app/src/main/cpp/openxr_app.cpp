@@ -20,6 +20,7 @@ void OpenXRApp::initialize(android_app* app) {
     createSwapchains();
     m_renderer.init();
     m_timewarp.init();
+    m_heartbeat.init(&m_tcpClient, &m_stats);
     LOGI("OpenXR app initialized successfully");
 }
 
@@ -157,6 +158,9 @@ void OpenXRApp::mainLoop() {
         // Receive and decode video packets before rendering
         receiveAndDecodeVideo();
         renderFrame();
+
+        // Send heartbeat with stats to PC (every 500ms)
+        m_heartbeat.tick();
     }
 }
 
@@ -185,6 +189,9 @@ void OpenXRApp::receiveAndDecodeVideo() {
         bool isKeyframe = (flags & 0x01) != 0;
         // Sanity check: reject absurd shard counts
         if (totalShards == 0 || totalShards > 4096 || shardIndex >= totalShards) continue;
+
+        // Record packet for stats reporting to PC
+        m_stats.onPacketReceived();
         // Derive data shard count from total shards and FEC redundancy (20%).
         uint16_t dataShards = (uint16_t)(totalShards / 1.2f);
 
