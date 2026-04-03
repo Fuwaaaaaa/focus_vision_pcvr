@@ -67,8 +67,14 @@ private:
     struct SwapTextureEntry {
         vr::SharedTextureHandle_t handle;
         uint32_t pid;
+        uint32_t setId;      // Which swap set this belongs to
+        uint32_t indexInSet;  // 0, 1, or 2 within the set
         ComPtr<ID3D11Texture2D> texture;
     };
     std::vector<SwapTextureEntry> m_swapTextures;
     vr::SharedTextureHandle_t m_nextHandle = 1;
+
+    // Per swap-set round-robin index (setId → current index)
+    std::vector<std::pair<uint32_t, uint32_t>> m_swapSetIndices; // (setId, currentIdx)
+    uint32_t m_nextSetId = 0;
 };
