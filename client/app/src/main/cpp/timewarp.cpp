@@ -1,5 +1,6 @@
 #include "timewarp.h"
 #include "xr_utils.h"
+#include <GLES2/gl2ext.h> // GL_TEXTURE_EXTERNAL_OES
 #include <cmath>
 #include <cstring>
 
@@ -16,11 +17,12 @@ void main() {
 }
 )";
 
-// Fragment shader: sample the video texture
+// Fragment shader: sample the video texture (GL_TEXTURE_EXTERNAL_OES from MediaCodec)
 static const char* kFragmentShader = R"(#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
 precision mediump float;
 in vec2 v_texCoord;
-uniform sampler2D u_texture;
+uniform samplerExternalOES u_texture;
 out vec4 fragColor;
 void main() {
     // Clamp UVs to avoid sampling outside the texture
@@ -85,9 +87,9 @@ void Timewarp::apply(GLuint targetFBO, uint32_t width, uint32_t height,
 
     glUseProgram(m_program);
 
-    // Bind source texture
+    // Bind source texture (GL_TEXTURE_EXTERNAL_OES from MediaCodec via VideoDecoder)
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, sourceTexture);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, sourceTexture);
     glUniform1i(m_uTexture, 0);
 
     // Set UV transform
