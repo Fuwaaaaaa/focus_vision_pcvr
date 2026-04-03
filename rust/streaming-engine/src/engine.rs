@@ -205,11 +205,21 @@ impl StreamingEngine {
     }
 }
 
+/// Heartbeat stats received from HMD.
+/// Parsed from HEARTBEAT TCP message payload.
+pub struct HmdStats {
+    pub packets_received: u32,
+    pub packets_lost: u32,
+    pub avg_decode_us: u32,
+    pub fps: u16,
+}
+
 /// Read TCP control messages after handshake (IDR_REQUEST, HEARTBEAT, DISCONNECT).
 /// When the connection closes or errors, cancels the provided token to stop streaming.
 async fn handle_tcp_control(
     mut stream: tokio::net::TcpStream,
     cancel: tokio_util::sync::CancellationToken,
+    hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::AsyncReadExt;
 
@@ -245,7 +255,25 @@ async fn handle_tcp_control(
                 notify_idr_request();
             }
             fvp_common::protocol::msg_type::HEARTBEAT => {
-                // Heartbeat handled by existing heartbeat module
+                // Parse heartbeat payload: [seq:4][timestamp:8][stats:14]
+                let payload = &msg_buf[1..];
+                if payload.len() >= 26 {
+                    let stats_offset = 12; // skip seq(4) + timestamp(8)
+                    let s = &payload[stats_offset..];
+                    let packets_received = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                    let packets_lost = u32::from_le_bytes([s[4], s[5], s[6], s[7]]);
+                    let avg_decode_us = u32::from_le_bytes([s[8], s[9], s[10], s[11]]);
+                    let fps = u16::from_le_bytes([s[12], s[13]]);
+
+                    if let Ok(mut guard) = hmd_stats.lock() {
+                        *guard = Some(HmdStats {
+                            packets_received,
+                            packets_lost,
+                            avg_decode_us,
+                            fps,
+                        });
+                    }
+                }
             }
             fvp_common::protocol::msg_type::DISCONNECT => {
                 log::info!("Client sent DISCONNECT — stopping stream");
@@ -374,110 +402,176 @@ async fn run_streaming(
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Step 1: Wait for HMD to connect via TCP
-    let tcp_server = TcpControlServer::new(config.clone());
-    let (tcp_stream, peer_addr) = tcp_server.listen_and_accept().await?;
-    log::info!("HMD connected from {}, starting video stream", peer_addr);
+    // Reconnect loop: when a session ends (TCP disconnect, Wi-Fi drop),
+    // clean up and re-listen for a new HMD connection.
+    let mut attempt: u32 = 0;
+    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+    let backoff_base = std::time::Duration::from_secs(1);
 
-    // Spawn TCP control reader for IDR_REQUEST and other in-stream messages.
-    // When the TCP connection drops, cancel stops the streaming loop too.
-    let tcp_cancel = cancel.clone();
-    tokio::spawn(async move {
-        if let Err(e) = handle_tcp_control(tcp_stream, tcp_cancel).await {
-            log::warn!("TCP control reader ended: {}", e);
+    loop {
+        if cancel.is_cancelled() { break; }
+
+        if attempt > 0 {
+            let delay = backoff_base * 2u32.pow((attempt - 1).min(4));
+            log::info!("Reconnecting in {:?} (attempt {}/{})", delay, attempt, MAX_RECONNECT_ATTEMPTS);
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = cancel.cancelled() => { break; }
+            }
         }
-    });
 
-    // Step 1.5: Log foveated encoding config
-    if config.foveated.enabled {
-        log::info!(
-            "Foveated encoding enabled: fovea={:.0}%, mid={:.0}%, QP+{}/+{}",
-            config.foveated.fovea_radius * 100.0,
-            config.foveated.mid_radius * 100.0,
-            config.foveated.mid_qp_offset,
-            config.foveated.peripheral_qp_offset,
+        // Step 1: Wait for HMD to connect via TCP
+        let tcp_server = TcpControlServer::new(config.clone());
+        let accept_result = tokio::select! {
+            r = tcp_server.listen_and_accept() => r,
+            _ = cancel.cancelled() => { break; }
+        };
+
+        let (tcp_stream, peer_addr) = match accept_result {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("TCP accept failed: {}", e);
+                attempt += 1;
+                if attempt > MAX_RECONNECT_ATTEMPTS {
+                    log::error!("Max reconnect attempts reached, stopping");
+                    break;
+                }
+                continue;
+            }
+        };
+
+        log::info!("HMD connected from {}, starting video stream", peer_addr);
+        attempt = 0; // Reset on successful connection
+
+        // Per-session cancel: fires when TCP drops or HMD disconnects
+        let session_cancel = CancellationToken::new();
+
+        // Shared HMD stats for adaptive bitrate (fed by heartbeat messages)
+        let hmd_stats: Arc<StdMutex<Option<HmdStats>>> = Arc::new(StdMutex::new(None));
+
+        // Spawn TCP control reader
+        let tcp_session = session_cancel.clone();
+        let stats_clone = hmd_stats.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_tcp_control(tcp_stream, tcp_session, stats_clone).await {
+                log::warn!("TCP control reader ended: {}", e);
+            }
+        });
+
+        if config.foveated.enabled {
+            log::info!(
+                "Foveated encoding enabled: fovea={:.0}%, mid={:.0}%, QP+{}/+{}",
+                config.foveated.fovea_radius * 100.0,
+                config.foveated.mid_radius * 100.0,
+                config.foveated.mid_qp_offset,
+                config.foveated.peripheral_qp_offset,
+            );
+        }
+
+        // Step 2: Create UDP senders
+        let udp_target: SocketAddr = SocketAddr::new(peer_addr.ip(), config.network.udp_port + fvp_common::VIDEO_PORT_OFFSET);
+        let udp_sender = match UdpSender::new(udp_target).await {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("UDP sender failed: {}", e);
+                session_cancel.cancel();
+                attempt += 1;
+                continue;
+            }
+        };
+
+        // Audio pipeline (per-session)
+        let audio_port = config.network.udp_port + fvp_common::AUDIO_PORT_OFFSET;
+        let audio_target: SocketAddr = SocketAddr::new(peer_addr.ip(), audio_port);
+        spawn_audio_pipeline(audio_target, session_cancel.clone());
+
+        // Step 3: Process frames with adaptive bitrate (HMD-reported loss)
+        let mut packetizer = RtpPacketizer::new(0x46565000);
+        let mut fec_encoder = crate::transport::fec::FecEncoder::new(config.network.fec_redundancy);
+        let mut frame_count: u64 = 0;
+
+        let mut bw_estimator = crate::adaptive::bandwidth_estimator::BandwidthEstimator::new();
+        let mut bitrate_ctrl = crate::adaptive::bitrate_controller::BitrateController::new(
+            config.video.bitrate_mbps,
         );
-    }
 
-    // Step 2: Create UDP senders — video and audio on separate ports
-    let udp_target: SocketAddr = SocketAddr::new(peer_addr.ip(), config.network.udp_port + fvp_common::VIDEO_PORT_OFFSET);
-    let udp_sender = UdpSender::new(udp_target).await?;
+        loop {
+            tokio::select! {
+                frame_opt = frame_rx.recv() => {
+                    let mut frame = match frame_opt {
+                        Some(f) => f,
+                        None => break, // Channel closed (engine shutdown)
+                    };
 
-    // Step 2.5: Start audio capture and streaming (optional — non-fatal if unavailable)
-    let audio_port = config.network.udp_port + fvp_common::AUDIO_PORT_OFFSET;
-    let audio_target: SocketAddr = SocketAddr::new(peer_addr.ip(), audio_port);
-    spawn_audio_pipeline(audio_target, cancel.clone());
+                    frame.timestamps.mark_encode_start();
+                    frame.timestamps.mark_encode_end();
 
-    // Step 3: Process frames with adaptive bitrate
-    let mut packetizer = RtpPacketizer::new(0x46565000); // "FVP\0"
-    let mut fec_encoder = crate::transport::fec::FecEncoder::new(config.network.fec_redundancy);
-    let mut frame_count: u64 = 0;
-    let mut send_failures: u32 = 0;
-    let mut send_successes: u32 = 0;
+                    let timestamp_90khz = (frame_count * (fvp_common::RTP_CLOCK_RATE as u64 / 90)) as u32;
 
-    // Adaptive bitrate: adjust encoding bitrate based on network quality
-    let mut bw_estimator = crate::adaptive::bandwidth_estimator::BandwidthEstimator::new();
-    let mut bitrate_ctrl = crate::adaptive::bitrate_controller::BitrateController::new(
-        config.video.bitrate_mbps,
-    );
+                    let packets = pipeline::encode_frame_to_packets_with_fec(
+                        &frame.nal_data,
+                        frame.frame_index,
+                        timestamp_90khz,
+                        frame.is_idr,
+                        &mut fec_encoder,
+                        &mut packetizer,
+                    );
 
-    while let Some(mut frame) = frame_rx.recv().await {
-        // NAL data arrives pre-encoded from C++ NVENC encoder.
-        // Mark encode timestamps for latency tracking (encode happened in C++,
-        // but we record receipt time here).
-        frame.timestamps.mark_encode_start();
-        frame.timestamps.mark_encode_end();
+                    if let Err(e) = udp_sender.send_all(&packets).await {
+                        log::warn!("UDP send error: {}", e);
+                    }
 
-        let timestamp_90khz = (frame_count * (fvp_common::RTP_CLOCK_RATE as u64 / 90)) as u32;
+                    frame.timestamps.mark_send();
 
-        let packets = pipeline::encode_frame_to_packets_with_fec(
-            &frame.nal_data,
-            frame.frame_index,
-            timestamp_90khz,
-            frame.is_idr,
-            &mut fec_encoder,
-            &mut packetizer,
-        );
+                    if let Ok(mut tracker) = latency_tracker.lock() {
+                        tracker.record(frame.timestamps);
+                    }
 
-        // Send via UDP — track success/failure for adaptive bitrate
-        if let Err(e) = udp_sender.send_all(&packets).await {
-            log::warn!("UDP send error: {}", e);
-            send_failures += 1;
-        } else {
-            send_successes += 1;
-        }
+                    frame_count += 1;
 
-        frame.timestamps.mark_send();
+                    // Adaptive bitrate: use HMD-reported stats (real packet loss)
+                    if frame_count % 90 == 0 {
+                        if let Ok(mut guard) = hmd_stats.lock() {
+                            if let Some(stats) = guard.take() {
+                                bw_estimator.update(
+                                    stats.packets_received,
+                                    stats.packets_lost,
+                                    0.0, // RTT not yet measured
+                                );
+                                if bitrate_ctrl.adjust(&bw_estimator) {
+                                    let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
+                                    notify_bitrate_change(new_bps);
+                                }
+                            }
+                        }
+                    }
 
-        // Record latency
-        if let Ok(mut tracker) = latency_tracker.lock() {
-            tracker.record(frame.timestamps);
-        }
-
-        frame_count += 1;
-
-        // Adaptive bitrate: evaluate every ~1 second (90 frames at 90fps)
-        if frame_count % 90 == 0 {
-            let total = send_successes + send_failures;
-            if total > 0 {
-                bw_estimator.update(send_successes, send_failures, 0.0);
-                if bitrate_ctrl.adjust(&bw_estimator) {
-                    let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
-                    notify_bitrate_change(new_bps);
+                    // Log stats every 5 seconds
+                    if frame_count % 450 == 0 {
+                        if let Ok(tracker) = latency_tracker.lock() {
+                            if let Some(avg) = tracker.avg_pc_latency_us() {
+                                log::info!("PC latency: avg={}us encode={}us",
+                                    avg, tracker.avg_encode_latency_us().unwrap_or(0));
+                            }
+                        }
+                    }
+                }
+                _ = session_cancel.cancelled() => {
+                    log::info!("Session ended — waiting for new connection");
+                    break;
+                }
+                _ = cancel.cancelled() => {
+                    log::info!("Engine shutdown — stopping streaming");
+                    return Ok(());
                 }
             }
-            send_successes = 0;
-            send_failures = 0;
         }
 
-        // Log stats every 5 seconds
-        if frame_count % 450 == 0 {
-            if let Ok(tracker) = latency_tracker.lock() {
-                if let Some(avg) = tracker.avg_pc_latency_us() {
-                    log::info!("PC latency: avg={}us encode={}us",
-                        avg, tracker.avg_encode_latency_us().unwrap_or(0));
-                }
-            }
+        // Session ended — loop back to accept new connection
+        attempt += 1;
+        if attempt > MAX_RECONNECT_ATTEMPTS {
+            log::error!("Max reconnect attempts reached");
+            break;
         }
     }
 
