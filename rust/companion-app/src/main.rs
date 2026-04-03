@@ -5,6 +5,7 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::thread;
 
 fn main() -> eframe::Result {
     env_logger::init();
@@ -47,6 +48,13 @@ struct CompanionApp {
     // Audio settings
     audio_enabled: bool,
     audio_bitrate_kbps: u32,
+
+    // Deploy async state
+    deploy_in_progress: bool,
+    deploy_result: Arc<Mutex<Option<String>>>,
+
+    // Engine status (read from status.json)
+    last_status_read: Instant,
 
     // UI state
     active_tab: Tab,
@@ -99,6 +107,9 @@ impl CompanionApp {
             bitrate_mbps: 0.0,
             audio_enabled: true,
             audio_bitrate_kbps: 128,
+            deploy_in_progress: false,
+            deploy_result: Arc::new(Mutex::new(None)),
+            last_status_read: Instant::now() - Duration::from_secs(10),
             active_tab: Tab::Home,
             status_log: Arc::new(Mutex::new(Vec::new())),
         }
@@ -121,12 +132,66 @@ impl CompanionApp {
             self.devices = adb::list_devices(adb);
         }
     }
+
+    fn read_engine_status(&mut self) {
+        if self.last_status_read.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_status_read = Instant::now();
+
+        let path = match dirs_next::data_dir() {
+            Some(d) => d.join("FocusVisionPCVR").join("status.json"),
+            None => return,
+        };
+
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
+                let status = val["status"].as_str().unwrap_or("unknown");
+                match status {
+                    "waiting" => {
+                        if let Some(pin) = val["pin"].as_str() {
+                            if pin != "----" {
+                                self.pin_code = pin.to_string();
+                                self.connection_status = ConnectionStatus::WaitingForPin;
+                            } else {
+                                self.connection_status = ConnectionStatus::Disconnected;
+                            }
+                        }
+                    }
+                    "streaming" => {
+                        self.connection_status = ConnectionStatus::Connected;
+                        if let Some(pin) = val["pin"].as_str() {
+                            self.pin_code = pin.to_string();
+                        }
+                        self.latency_ms = val["latency_us"].as_u64().unwrap_or(0) as f32 / 1000.0;
+                        self.fps = val["fps"].as_u64().unwrap_or(0) as u32;
+                        self.bitrate_mbps = val["bitrate_mbps"].as_u64().unwrap_or(0) as f32;
+                    }
+                    _ => {
+                        self.connection_status = ConnectionStatus::Disconnected;
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_deploy_result(&mut self) {
+        if let Ok(mut result) = self.deploy_result.lock() {
+            if let Some(msg) = result.take() {
+                self.deploy_status = msg.clone();
+                self.deploy_in_progress = false;
+                self.log(&msg);
+            }
+        }
+    }
 }
 
 impl eframe::App for CompanionApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Auto-refresh device list
+        // Auto-refresh device list and engine status
         self.scan_devices();
+        self.read_engine_status();
+        self.check_deploy_result();
 
         // Request repaint every second for live stats
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -346,33 +411,45 @@ impl CompanionApp {
             && !self.apk_path.is_empty()
             && std::path::Path::new(&self.apk_path).exists();
 
-        ui.add_enabled_ui(can_deploy, |ui| {
+        let deploy_enabled = can_deploy && !self.deploy_in_progress;
+        ui.add_enabled_ui(deploy_enabled, |ui| {
+            let label = if self.deploy_in_progress {
+                "Installing..."
+            } else {
+                "Install APK on All Devices"
+            };
             if ui.button(
-                egui::RichText::new("Install APK on All Devices").size(16.0)
+                egui::RichText::new(label).size(16.0)
             ).clicked() {
+                self.deploy_in_progress = true;
+                self.deploy_status = "Installing...".to_string();
+
                 let adb = self.adb_path.clone().unwrap();
                 let apk = self.apk_path.clone();
+                let devices: Vec<_> = self.devices.iter().map(|d| d.serial.clone()).collect();
+                let result = self.deploy_result.clone();
 
-                for device in &self.devices {
-                    self.deploy_status = format!("Installing on {}...", device.serial);
-                    self.log(&format!("Installing APK on {}", device.serial));
-
-                    match adb::install_apk(&adb, &device.serial, &apk) {
-                        Ok(_) => {
-                            self.deploy_status = format!("Success: {}", device.serial);
-                            self.log(&format!("APK installed on {}", device.serial));
-
-                            // Auto-launch
-                            let _ = adb::launch_app(&adb, &device.serial,
-                                "com.focusvision.pcvr");
-                            self.log(&format!("App launched on {}", device.serial));
+                thread::Builder::new()
+                    .name("fvp-deploy".into())
+                    .spawn(move || {
+                        let mut outcomes = Vec::new();
+                        for serial in &devices {
+                            match adb::install_apk(&adb, serial, &apk) {
+                                Ok(_) => {
+                                    let _ = adb::launch_app(&adb, serial, "com.focusvision.pcvr");
+                                    outcomes.push(format!("OK: {}", serial));
+                                }
+                                Err(e) => {
+                                    outcomes.push(format!("FAIL {}: {}", serial, e));
+                                }
+                            }
                         }
-                        Err(e) => {
-                            self.deploy_status = format!("Failed: {e}");
-                            self.log(&format!("Install failed on {}: {e}", device.serial));
+                        let msg = outcomes.join(", ");
+                        if let Ok(mut guard) = result.lock() {
+                            *guard = Some(msg);
                         }
-                    }
-                }
+                    })
+                    .expect("spawn deploy thread");
             }
         });
 
