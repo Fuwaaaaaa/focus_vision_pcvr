@@ -20,6 +20,8 @@
 #include "audio_player.h"
 #include "eye_tracker.h"
 #include "hmd_profile.h"
+#include "heartbeat_client.h"
+#include "stats_reporter.h"
 
 #include <vector>
 #include <array>
@@ -98,6 +100,10 @@ private:
     // Timewarp
     Timewarp m_timewarp;
     PoseHistory m_poseHistory;
+
+    // Heartbeat + stats
+    HeartbeatClient m_heartbeat;
+    StatsReporter m_stats;
 
     // State: last decoded frame
     GLuint m_lastDecodedTexture = 0;
