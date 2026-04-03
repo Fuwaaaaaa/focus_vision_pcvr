@@ -21,10 +21,10 @@ public:
     };
 
     /// Start collecting shards for a new frame.
-    void beginFrame(uint32_t frameIndex, uint8_t totalShards, uint8_t dataShards, bool isKeyframe);
+    void beginFrame(uint32_t frameIndex, uint16_t totalShards, uint16_t dataShards, bool isKeyframe);
 
     /// Add a received shard.
-    void addShard(uint8_t shardIndex, const uint8_t* data, int dataLen);
+    void addShard(uint16_t shardIndex, const uint8_t* data, int dataLen);
 
     /// Attempt to reconstruct the frame.
     /// Returns the decoded frame data if enough shards are available.
@@ -37,11 +37,11 @@ public:
 
 private:
     uint32_t m_frameIndex = 0;
-    uint8_t m_totalShards = 0;
-    uint8_t m_dataShards = 0;
+    uint16_t m_totalShards = 0;
+    uint16_t m_dataShards = 0;
     bool m_isKeyframe = false;
     int m_shardSize = 0;
-    uint8_t m_receivedCount = 0;
+    uint16_t m_receivedCount = 0;
 
     // Shard storage: index → data (empty = not received)
     std::vector<std::vector<uint8_t>> m_shards;
