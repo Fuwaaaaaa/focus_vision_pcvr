@@ -1,9 +1,8 @@
 #pragma once
 
+#include "platform_defines.h"
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <EGL/egl.h>
-#include <GLES3/gl3.h>
 #include <android_native_app_glue.h>
 
 #include "xr_swapchain.h"
@@ -63,6 +62,9 @@ private:
     void receiveAndDecodeVideo();
 
     void handleSessionStateChange(XrSessionState newState);
+
+    // Android app reference (for JNI access)
+    android_app* m_androidApp = nullptr;
 
     // OpenXR handles
     XrInstance m_instance = XR_NULL_HANDLE;

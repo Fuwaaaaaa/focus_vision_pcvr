@@ -3,8 +3,10 @@
 
 #include <GLES2/gl2ext.h> // GL_TEXTURE_EXTERNAL_OES
 #include <cstring>
+#include <chrono>
+#include <unordered_map>
 
-bool VideoDecoder::init(int width, int height, const char* mimeType) {
+bool VideoDecoder::init(JNIEnv* env, int width, int height, const char* mimeType) {
     m_width = width;
     m_height = height;
 
@@ -22,21 +24,51 @@ bool VideoDecoder::init(int width, int height, const char* mimeType) {
         return false;
     }
 
-    // Create ASurfaceTexture from the GL texture (API level 28+).
-    // This bridges MediaCodec's decoded output directly to our GL texture.
-    m_surfaceTexture = ASurfaceTexture_create(m_outputTexture);
-    if (m_surfaceTexture) {
-        m_surface = ASurfaceTexture_acquireANativeWindow(m_surfaceTexture);
-        if (m_surface) {
-            m_useSurfaceOutput = true;
-            LOGI("VideoDecoder: Surface output enabled (zero-copy)");
-        } else {
-            LOGW("VideoDecoder: Failed to acquire ANativeWindow, falling back to buffer mode");
-            ASurfaceTexture_release(m_surfaceTexture);
-            m_surfaceTexture = nullptr;
+    // Zero-copy SurfaceTexture path via JNI
+    if (env) {
+        env->GetJavaVM(&m_javaVM);
+
+        jclass stClass = env->FindClass("android/graphics/SurfaceTexture");
+        if (stClass) {
+            jmethodID ctor = env->GetMethodID(stClass, "<init>", "(I)V");
+            if (ctor) {
+                jobject localST = env->NewObject(stClass, ctor, (jint)m_outputTexture);
+                if (localST && !env->ExceptionCheck()) {
+                    m_javaSurfaceTexture = env->NewGlobalRef(localST);
+                    env->DeleteLocalRef(localST);
+
+                    m_surfaceTexture = ASurfaceTexture_fromSurfaceTexture(
+                        env, m_javaSurfaceTexture);
+                    if (m_surfaceTexture) {
+                        m_surface = ASurfaceTexture_acquireANativeWindow(m_surfaceTexture);
+                        if (m_surface) {
+                            m_useSurfaceOutput = true;
+                            LOGI("VideoDecoder: Zero-copy SurfaceTexture enabled (texture=%u)",
+                                 m_outputTexture);
+                        } else {
+                            LOGW("VideoDecoder: acquireANativeWindow failed, buffer fallback");
+                            ASurfaceTexture_release(m_surfaceTexture);
+                            m_surfaceTexture = nullptr;
+                        }
+                    } else {
+                        LOGW("VideoDecoder: fromSurfaceTexture failed, buffer fallback");
+                    }
+
+                    if (!m_useSurfaceOutput && m_javaSurfaceTexture) {
+                        env->DeleteGlobalRef(m_javaSurfaceTexture);
+                        m_javaSurfaceTexture = nullptr;
+                    }
+                } else {
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                    LOGW("VideoDecoder: Java SurfaceTexture creation failed, buffer fallback");
+                }
+            }
+            env->DeleteLocalRef(stClass);
         }
-    } else {
-        LOGW("VideoDecoder: ASurfaceTexture_create failed, falling back to buffer mode");
+    }
+
+    if (!m_useSurfaceOutput) {
+        LOGI("VideoDecoder: Using buffer output mode");
     }
 
     // Create MediaCodec decoder
@@ -98,6 +130,19 @@ void VideoDecoder::shutdown() {
         ASurfaceTexture_release(m_surfaceTexture);
         m_surfaceTexture = nullptr;
     }
+    if (m_javaSurfaceTexture && m_javaVM) {
+        JNIEnv* env = nullptr;
+        bool didAttach = false;
+        if (m_javaVM->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+            m_javaVM->AttachCurrentThread(&env, nullptr);
+            didAttach = true;
+        }
+        if (env) {
+            env->DeleteGlobalRef(m_javaSurfaceTexture);
+            m_javaSurfaceTexture = nullptr;
+        }
+        if (didAttach) m_javaVM->DetachCurrentThread();
+    }
     if (m_outputTexture) {
         glDeleteTextures(1, &m_outputTexture);
         m_outputTexture = 0;
@@ -119,6 +164,7 @@ bool VideoDecoder::submitPacket(const uint8_t* data, int size, int64_t timestamp
 
     memcpy(buf, data, size);
     AMediaCodec_queueInputBuffer(m_codec, bufIdx, 0, size, timestampUs, 0);
+    m_submitTimes.push_back(std::chrono::steady_clock::now());
     return true;
 }
 
@@ -129,15 +175,27 @@ bool VideoDecoder::getDecodedFrame() {
     ssize_t bufIdx = AMediaCodec_dequeueOutputBuffer(m_codec, &info, 0); // non-blocking
 
     if (bufIdx >= 0) {
+        // Measure submit-to-output decode latency
+        if (!m_submitTimes.empty()) {
+            auto latency = std::chrono::steady_clock::now() - m_submitTimes.front();
+            m_submitTimes.pop_front();
+            uint32_t latencyUs = (uint32_t)std::chrono::duration_cast<
+                std::chrono::microseconds>(latency).count();
+            m_totalDecodeUs += latencyUs;
+            m_decodeCount++;
+            m_avgDecodeUs = (uint32_t)(m_totalDecodeUs / m_decodeCount);
+
+            // Log every 90 frames (~1s at 90fps)
+            if (m_decodeCount % 90 == 0) {
+                LOGI("VideoDecoder: decode latency avg=%uus (%u frames)",
+                     m_avgDecodeUs, m_decodeCount);
+            }
+        }
+
         if (m_useSurfaceOutput) {
-            // Surface output: release with render=true to update the SurfaceTexture.
-            // Then call updateTexImage() to make the new frame available in the GL texture.
             AMediaCodec_releaseOutputBuffer(m_codec, bufIdx, true);
             ASurfaceTexture_updateTexImage(m_surfaceTexture);
         } else {
-            // Buffer output: release without rendering.
-            // In this fallback path, the GL texture stays empty.
-            // A full buffer-to-texture upload would be needed here for production.
             AMediaCodec_releaseOutputBuffer(m_codec, bufIdx, false);
         }
         return true;
@@ -160,5 +218,6 @@ bool VideoDecoder::getDecodedFrame() {
 void VideoDecoder::flush() {
     if (!m_initialized || !m_codec) return;
     AMediaCodec_flush(m_codec);
+    m_submitTimes.clear();
     LOGI("VideoDecoder flushed");
 }
