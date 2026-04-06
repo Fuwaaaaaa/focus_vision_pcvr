@@ -19,6 +19,71 @@ static constexpr uint8_t MSG_STREAM_CONFIG = 0x06;
 static constexpr uint8_t MSG_STREAM_START = 0x07;
 static constexpr uint8_t MSG_IDR_REQUEST = 0x30;
 
+bool TcpControlClient::initTls() {
+    mbedtls_ssl_init(&m_ssl);
+    mbedtls_ssl_config_init(&m_sslConf);
+    mbedtls_entropy_init(&m_entropy);
+    mbedtls_ctr_drbg_init(&m_ctrDrbg);
+    mbedtls_net_init(&m_netCtx);
+
+    if (mbedtls_ctr_drbg_seed(&m_ctrDrbg, mbedtls_entropy_func, &m_entropy, nullptr, 0) != 0) {
+        LOGE("MbedTLS: ctr_drbg_seed failed");
+        return false;
+    }
+
+    if (mbedtls_ssl_config_defaults(&m_sslConf, MBEDTLS_SSL_IS_CLIENT,
+            MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+        LOGE("MbedTLS: ssl_config_defaults failed");
+        return false;
+    }
+
+    // Skip server certificate verification (self-signed cert, TOFU model)
+    mbedtls_ssl_conf_authmode(&m_sslConf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&m_sslConf, mbedtls_ctr_drbg_random, &m_ctrDrbg);
+
+    if (mbedtls_ssl_setup(&m_ssl, &m_sslConf) != 0) {
+        LOGE("MbedTLS: ssl_setup failed");
+        return false;
+    }
+
+    // Set the file descriptor for MbedTLS I/O
+    m_netCtx.fd = m_socket;
+    mbedtls_ssl_set_bio(&m_ssl, &m_netCtx, mbedtls_net_send, mbedtls_net_recv, nullptr);
+
+    // Perform TLS handshake
+    int ret;
+    while ((ret = mbedtls_ssl_handshake(&m_ssl)) != 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            LOGE("MbedTLS: handshake failed: -0x%04x", -ret);
+            return false;
+        }
+    }
+
+    m_tlsEnabled = true;
+    LOGI("TLS handshake complete (cipher: %s)", mbedtls_ssl_get_ciphersuite(&m_ssl));
+    return true;
+}
+
+void TcpControlClient::shutdownTls() {
+    if (m_tlsEnabled) {
+        mbedtls_ssl_close_notify(&m_ssl);
+        m_tlsEnabled = false;
+    }
+    mbedtls_ssl_free(&m_ssl);
+    mbedtls_ssl_config_free(&m_sslConf);
+    mbedtls_ctr_drbg_free(&m_ctrDrbg);
+    mbedtls_entropy_free(&m_entropy);
+    mbedtls_net_free(&m_netCtx);
+}
+
+int TcpControlClient::tlsSend(const uint8_t* data, int len) {
+    return mbedtls_ssl_write(&m_ssl, data, len);
+}
+
+int TcpControlClient::tlsRecv(uint8_t* data, int len) {
+    return mbedtls_ssl_read(&m_ssl, data, len);
+}
+
 bool TcpControlClient::connect(const char* serverAddress, int port) {
     m_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (m_socket < 0) {
@@ -42,12 +107,19 @@ bool TcpControlClient::connect(const char* serverAddress, int port) {
         return false;
     }
 
+    // Attempt TLS handshake
+    if (!initTls()) {
+        LOGW("TLS handshake failed, falling back to plaintext");
+    }
+
     m_connected = true;
-    LOGI("TCP connected to %s:%d", serverAddress, port);
+    LOGI("TCP connected to %s:%d (TLS: %s)", serverAddress, port,
+         m_tlsEnabled ? "yes" : "no");
     return true;
 }
 
 void TcpControlClient::disconnect() {
+    shutdownTls();
     if (m_socket >= 0) {
         close(m_socket);
         m_socket = -1;
@@ -122,14 +194,20 @@ bool TcpControlClient::requestIdr() {
 bool TcpControlClient::sendMessage(uint8_t type, const uint8_t* payload, int payloadLen) {
     if (m_socket < 0) return false;
 
-    uint32_t len = 1 + payloadLen; // type byte + payload
-    // Send length (LE)
-    if (send(m_socket, &len, 4, 0) != 4) return false;
-    // Send type
-    if (send(m_socket, &type, 1, 0) != 1) return false;
-    // Send payload
+    uint32_t len = 1 + payloadLen;
+
+    auto writeAll = [&](const void* data, int size) -> bool {
+        if (m_tlsEnabled) {
+            return tlsSend((const uint8_t*)data, size) == size;
+        } else {
+            return send(m_socket, data, size, 0) == size;
+        }
+    };
+
+    if (!writeAll(&len, 4)) return false;
+    if (!writeAll(&type, 1)) return false;
     if (payloadLen > 0 && payload) {
-        if (send(m_socket, payload, payloadLen, 0) != payloadLen) return false;
+        if (!writeAll(payload, payloadLen)) return false;
     }
     return true;
 }
@@ -137,15 +215,27 @@ bool TcpControlClient::sendMessage(uint8_t type, const uint8_t* payload, int pay
 bool TcpControlClient::recvMessage(uint8_t& outType, std::vector<uint8_t>& outPayload) {
     if (m_socket < 0) return false;
 
-    // Read length
+    auto readAll = [&](void* data, int size) -> bool {
+        int total = 0;
+        while (total < size) {
+            int n;
+            if (m_tlsEnabled) {
+                n = tlsRecv((uint8_t*)data + total, size - total);
+            } else {
+                n = recv(m_socket, (uint8_t*)data + total, size - total, 0);
+            }
+            if (n <= 0) return false;
+            total += n;
+        }
+        return true;
+    };
+
     uint32_t len = 0;
-    if (recv(m_socket, &len, 4, MSG_WAITALL) != 4) return false;
+    if (!readAll(&len, 4)) return false;
     if (len == 0 || len > 65536) return false;
 
-    // Read message
     std::vector<uint8_t> buf(len);
-    ssize_t received = recv(m_socket, buf.data(), len, MSG_WAITALL);
-    if (received != (ssize_t)len) return false;
+    if (!readAll(buf.data(), len)) return false;
 
     outType = buf[0];
     outPayload.assign(buf.begin() + 1, buf.end());
