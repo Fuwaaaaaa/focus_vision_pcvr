@@ -5,6 +5,7 @@ plugins {
 android {
     namespace = "com.focusvision.pcvr"
     compileSdk = 34
+    ndkVersion = "26.1.10909125"
     defaultConfig {
         applicationId = "com.focusvision.pcvr"
         minSdk = 29
@@ -17,7 +18,7 @@ android {
         }
     }
     externalNativeBuild {
-        cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.25.0+" }
+        cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
