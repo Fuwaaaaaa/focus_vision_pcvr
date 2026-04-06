@@ -2,8 +2,9 @@ use std::time::{Duration, Instant};
 use fvp_common::{MAX_PIN_ATTEMPTS, PIN_LOCKOUT_SECONDS};
 
 /// PIN pairing state with brute-force protection.
+/// Uses 6-digit PIN (0-999999) with cryptographic RNG.
 pub struct PairingState {
-    pin: u16,
+    pin: u32,
     attempts: u8,
     lockout_until: Option<Instant>,
     paired: bool,
@@ -12,7 +13,7 @@ pub struct PairingState {
 impl PairingState {
     pub fn new() -> Self {
         let pin = generate_pin();
-        log::info!("Pairing PIN: {:04}", pin);
+        log::info!("Pairing PIN: {:06}", pin);
         Self {
             pin,
             attempts: 0,
@@ -31,7 +32,7 @@ impl PairingState {
     }
 
     /// Attempt to verify a PIN. Returns Ok(()) on success, Err(reason) on failure.
-    pub fn verify(&mut self, submitted_pin: u16) -> Result<(), PairingError> {
+    pub fn verify(&mut self, submitted_pin: u32) -> Result<(), PairingError> {
         if self.paired {
             return Ok(());
         }
@@ -54,9 +55,8 @@ impl PairingState {
                     Instant::now() + Duration::from_secs(PIN_LOCKOUT_SECONDS),
                 );
                 self.attempts = 0;
-                // Generate new PIN after lockout
                 self.pin = generate_pin();
-                log::warn!("Locked out for {}s. New PIN: {:04}", PIN_LOCKOUT_SECONDS, self.pin);
+                log::warn!("Locked out for {}s. New PIN: {:06}", PIN_LOCKOUT_SECONDS, self.pin);
                 Err(PairingError::LockedOut)
             } else {
                 Err(PairingError::WrongPin {
@@ -70,7 +70,7 @@ impl PairingState {
         self.paired
     }
 
-    pub fn get_pin(&self) -> u16 {
+    pub fn get_pin(&self) -> u32 {
         self.pin
     }
 }
@@ -81,13 +81,8 @@ pub enum PairingError {
     LockedOut,
 }
 
-fn generate_pin() -> u16 {
-    use std::time::SystemTime;
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    (seed % 10000) as u16
+fn generate_pin() -> u32 {
+    rand::random::<u32>() % 1_000_000
 }
 
 #[cfg(test)]
@@ -115,13 +110,28 @@ mod tests {
     #[test]
     fn test_lockout_after_max_attempts() {
         let mut state = PairingState::new();
-        let wrong = 9999u16.wrapping_add(1); // always 0 or different
+        let wrong = 999_999u32.wrapping_add(1);
         for _ in 0..MAX_PIN_ATTEMPTS {
             let _ = state.verify(wrong);
         }
         assert!(state.is_locked());
-        // Even correct PIN fails during lockout
         let pin = state.get_pin();
         assert!(matches!(state.verify(pin), Err(PairingError::LockedOut)));
+    }
+
+    #[test]
+    fn test_pin_range_is_6_digits() {
+        for _ in 0..100 {
+            let pin = generate_pin();
+            assert!(pin < 1_000_000, "PIN {} exceeds 6-digit range", pin);
+        }
+    }
+
+    #[test]
+    fn test_pin_not_always_same() {
+        // Generate 10 PINs; at least 2 should differ (cryptographic RNG)
+        let pins: Vec<u32> = (0..10).map(|_| generate_pin()).collect();
+        let unique: std::collections::HashSet<u32> = pins.into_iter().collect();
+        assert!(unique.len() >= 2, "All PINs identical — RNG may be broken");
     }
 }
