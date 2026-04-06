@@ -1,7 +1,8 @@
 #pragma once
 
+#include "platform_defines.h"
 #include <openxr/openxr.h>
-#include <GLES3/gl3.h>
+#include <openxr/openxr_platform.h>
 #include <vector>
 
 /// Wraps an OpenXR swapchain with GL framebuffers for rendering.

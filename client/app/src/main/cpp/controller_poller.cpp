@@ -169,8 +169,8 @@ void ControllerPoller::pollAndSend(XrSession session, XrSpace stageSpace,
 
         sender.sendControllerState(
             (uint8_t)hand, loc.pose, predictedTime,
-            triggerState.currentValue, gripState.currentValue,
-            thumbState.currentValue.x, thumbState.currentValue.y,
+            triggerState.currentState, gripState.currentState,
+            thumbState.currentState.x, thumbState.currentState.y,
             flags, 100 // battery placeholder
         );
     }

@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.25)
-project(focus_vision_client LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.18)
+project(focus_vision_client LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -24,8 +24,19 @@ set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(opus)
 
-# OpenXR headers (from third_party or system)
-set(OPENXR_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../../../../../../third_party/openxr/include")
+# OpenXR SDK (headers + loader library)
+FetchContent_Declare(
+    openxr
+    GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git
+    GIT_TAG        release-1.1.43
+    GIT_SHALLOW    TRUE
+)
+set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
+set(DYNAMIC_LOADER ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(openxr)
+set(OPENXR_INCLUDE_DIR "${openxr_SOURCE_DIR}/include")
 
 # Source files
 set(CLIENT_SOURCES
@@ -40,6 +51,9 @@ set(CLIENT_SOURCES
     controller_poller.cpp
     timewarp.cpp
     fec_decoder.cpp
+    nal_validator.cpp
+    eye_tracker.cpp
+    hmd_profile.cpp
     audio_player.cpp
     ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c
 )
@@ -59,6 +73,7 @@ target_link_libraries(focusvision_native
     ${EGL_LIB}
     ${MEDIANDK_LIB}
     ${AAUDIO_LIB}
+    openxr_loader
     opus
     android
 )

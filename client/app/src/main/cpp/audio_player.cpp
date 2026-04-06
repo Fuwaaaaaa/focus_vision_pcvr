@@ -1,7 +1,7 @@
 #include "audio_player.h"
 #include "xr_utils.h"
 
-#include <opus/opus.h>
+#include <opus.h>
 #include <aaudio/AAudio.h>
 #include <cstring>
 
