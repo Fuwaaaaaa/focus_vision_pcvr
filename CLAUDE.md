@@ -1,6 +1,6 @@
 # Focus Vision PCVR
 
-VIVE Focus Vision向けPCVRストリーミングツール。
+VIVE Focus Vision向けPCVRストリーミングツール（v1.1）。
 
 ## Architecture
 - `rust/streaming-engine/` — Rust static library (C ABI via cbindgen)
@@ -9,22 +9,38 @@ VIVE Focus Vision向けPCVRストリーミングツール。
 - `driver/` — C++ OpenVR driver DLL (loaded by SteamVR)
 - `client/` — Android OpenXR client (Kotlin + C++ NDK)
 
+See `ARCHITECTURE.md` for detailed system diagrams and data flow.
+
 ## Build
 ```bash
-./build.bat   # Windows
+./build.bat   # Windows full build
 cargo build --release -p streaming-engine    # Rust streaming engine
 cargo build --release -p focus-vision-companion  # PC companion app
-cargo test --workspace  # Run tests
+cargo test --workspace  # Run 104+ tests
+```
+
+## Testing
+```bash
+cargo test --workspace              # All tests (104+)
+cargo test -p streaming-engine      # Engine: 66 tests (FEC, RTP, pairing, TLS, etc.)
+cargo test -p focus-vision-companion # Companion: 25 tests (config, ADB, export)
+cargo test -p fvp-common            # Common: 6 tests (protocol structs, flags)
 ```
 
 ## Companion App
 ```bash
 cargo run -p focus-vision-companion  # Run the PC companion app
 ```
-Features: SteamVR driver install, PIN display, ADB deploy to HMD, streaming stats.
+Features: SteamVR driver install, 6-digit PIN display, ADB deploy, codec toggle (H.264/H.265), latency graphs, log export.
 
 ## Config
 `config/default.toml` — override with `config/local.toml` (gitignored).
+
+## Security
+- TCP control channel encrypted with TLS 1.3 (rustls server, MbedTLS client)
+- 6-digit PIN with cryptographic RNG (1M combinations, 5 attempts then 300s lockout)
+- TOFU certificate pinning (SHA-256 fingerprint)
+- See `SECURITY.md` for threat model.
 
 ## Design System
 Always read DESIGN.md before making any visual or UI decisions.
