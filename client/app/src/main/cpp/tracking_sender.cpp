@@ -47,11 +47,12 @@ void TrackingSender::shutdown() {
     m_initialized = false;
 }
 
-void TrackingSender::sendHeadPose(const XrPosef& pose, int64_t timestampNs) {
+void TrackingSender::sendHeadPose(const XrPosef& pose, int64_t timestampNs,
+                                  float gazeX, float gazeY, bool gazeValid) {
     if (!m_initialized) return;
 
-    // Packet: [type:1B][timestamp:8B][px,py,pz:12B][qx,qy,qz,qw:16B] = 37 bytes
-    uint8_t buf[37];
+    // Packet: [type:1B][timestamp:8B][pos:12B][orient:16B][gaze_x:4B][gaze_y:4B][gaze_valid:1B] = 46B
+    uint8_t buf[46];
     int off = 0;
 
     buf[off++] = PACKET_HEAD_POSE;
@@ -63,6 +64,9 @@ void TrackingSender::sendHeadPose(const XrPosef& pose, int64_t timestampNs) {
     appendF32(buf, off, pose.orientation.y);
     appendF32(buf, off, pose.orientation.z);
     appendF32(buf, off, pose.orientation.w);
+    appendF32(buf, off, gazeX);
+    appendF32(buf, off, gazeY);
+    buf[off++] = gazeValid ? 1 : 0;
 
     sendto(m_socket, buf, off, 0,
         (struct sockaddr*)&m_serverAddr, sizeof(m_serverAddr));

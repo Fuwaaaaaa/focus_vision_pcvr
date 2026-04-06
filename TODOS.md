@@ -45,6 +45,11 @@
   4. 各codecで5分以上計測し、安定後の平均値を比較
   5. `video_decoder.cpp`の`avgDecodeLatencyUs()`で統計取得可能
 
+### ~~Foveated Encoding~~ (完了)
+- Eye tracker (OpenXR XR_EXT_eye_gaze_interaction) → TrackingSender経由でgaze座標をPC送信
+- NVENCのQP delta map (fovea/mid/periphery 3ゾーン) をピクチャパラメータに接続
+- config/default.toml `foveated.enabled = true` で有効化可能
+
 ## v1.1 準備調査
 
 ### ~~オーディオパイプラインの仮想オーディオデバイス調査~~ (解決済み)

@@ -43,6 +43,11 @@ typedef int32_t NVENCSTATUS;
 #define NV_ENC_PARAMS_RC_CBR_LOWDELAY_HQ 8
 #define NV_ENC_TUNING_INFO_LOW_LATENCY   2
 
+// QP map modes for foveated encoding
+#define NV_ENC_QP_MAP_DISABLED  0
+#define NV_ENC_QP_MAP_EMPHASIS  1
+#define NV_ENC_QP_MAP_DELTA     2
+
 #define NVENCAPI_MAJOR_VERSION 12
 #define NVENCAPI_MINOR_VERSION 2
 #define NVENCAPI_VERSION (NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24))
@@ -87,7 +92,11 @@ struct NV_ENC_RC_PARAMS {
     uint32_t reserved1[2];
     uint32_t averageBitRate;
     uint32_t maxBitRate;
-    uint32_t reserved2[250];
+    uint32_t vbvBufferSize;
+    uint32_t vbvInitialDelay;
+    uint32_t reserved2a[2];
+    uint32_t qpMapMode;      // NV_ENC_QP_MAP_DELTA for foveated encoding
+    uint32_t reserved2[245];
 };
 
 struct NV_ENC_CODEC_CONFIG {
@@ -200,8 +209,10 @@ struct NV_ENC_PIC_PARAMS {
     uint32_t pictureStruct;
     uint32_t pictureType;
     NV_ENC_CODEC_CONFIG codecPicParams;
-    uint32_t reserved[284];
-    void*    reserved2[64];
+    int8_t*  qpDeltaMap;      // Per-CTU QP delta values for foveated encoding
+    uint32_t qpDeltaMapSize;  // Number of entries in qpDeltaMap
+    uint32_t reserved[282];
+    void*    reserved2[63];
 };
 
 struct NV_ENC_LOCK_BITSTREAM {
