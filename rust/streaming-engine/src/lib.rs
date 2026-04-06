@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod engine;
 pub mod tracking;
 pub mod adaptive;
+pub mod codec_benchmark;
 
 use std::sync::{RwLock, Once};
 
