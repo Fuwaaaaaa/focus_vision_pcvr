@@ -91,3 +91,63 @@ pub enum VideoCodec {
 impl Default for VideoCodec {
     fn default() -> Self { Self::H265 }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtp_header_size_is_12_bytes() {
+        assert_eq!(std::mem::size_of::<RtpHeader>(), 12);
+    }
+
+    #[test]
+    fn fvp_header_size_is_10_bytes() {
+        assert_eq!(std::mem::size_of::<FvpHeader>(), 10);
+    }
+
+    #[test]
+    fn button_flags_no_bit_collisions() {
+        let all_flags = [
+            buttons::A_X_PRESSED, buttons::B_Y_PRESSED, buttons::MENU_PRESSED,
+            buttons::SYSTEM_PRESSED, buttons::THUMBSTICK_CLICK, buttons::TRIGGER_TOUCH,
+            buttons::THUMBSTICK_TOUCH, buttons::GRIP_TOUCH,
+        ];
+        for i in 0..all_flags.len() {
+            for j in (i + 1)..all_flags.len() {
+                assert_eq!(all_flags[i] & all_flags[j], 0,
+                    "Bit collision between flag {} and {}", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn tracking_data_default_has_center_gaze() {
+        let td = TrackingData::default();
+        assert_eq!(td.gaze_x, 0.0);
+        assert_eq!(td.gaze_y, 0.0);
+        assert_eq!(td.gaze_valid, 0);
+    }
+
+    #[test]
+    fn video_codec_default_is_h265() {
+        assert_eq!(VideoCodec::default(), VideoCodec::H265);
+    }
+
+    #[test]
+    fn msg_types_are_unique() {
+        let types = [
+            msg_type::HELLO, msg_type::HELLO_ACK, msg_type::PIN_REQUEST,
+            msg_type::PIN_RESPONSE, msg_type::PIN_RESULT, msg_type::STREAM_CONFIG,
+            msg_type::STREAM_START, msg_type::HEARTBEAT, msg_type::HEARTBEAT_ACK,
+            msg_type::TRACKING_DATA, msg_type::CONTROLLER_DATA, msg_type::IDR_REQUEST,
+            msg_type::AUDIO_CONFIG, msg_type::AUDIO_START, msg_type::DISCONNECT,
+        ];
+        for i in 0..types.len() {
+            for j in (i + 1)..types.len() {
+                assert_ne!(types[i], types[j],
+                    "Duplicate msg_type at index {} and {}", i, j);
+            }
+        }
+    }
+}

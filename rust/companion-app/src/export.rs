@@ -4,13 +4,13 @@ use std::path::PathBuf;
 use crate::adb;
 
 /// Sanitize PII from log text (IP addresses, Wi-Fi SSIDs).
-fn sanitize_pii(text: &str) -> String {
+pub(crate) fn sanitize_pii(text: &str) -> String {
     // Mask IPv4 addresses
     let re_ip = regex_lite_ipv4(text);
     re_ip
 }
 
-fn regex_lite_ipv4(text: &str) -> String {
+pub(crate) fn regex_lite_ipv4(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -39,7 +39,7 @@ fn regex_lite_ipv4(text: &str) -> String {
 }
 
 /// Collect system info string.
-fn system_info() -> String {
+pub(crate) fn system_info() -> String {
     let mut info = String::new();
     info.push_str(&format!("OS: {}\n", std::env::consts::OS));
     info.push_str(&format!("Arch: {}\n", std::env::consts::ARCH));
@@ -113,10 +113,62 @@ pub fn export_logs(adb_path: Option<&str>, device_serial: Option<&str>) -> Resul
     Ok(zip_path)
 }
 
-fn chrono_lite_timestamp() -> String {
+pub(crate) fn chrono_lite_timestamp() -> String {
     // Simple timestamp without chrono dependency
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}", now.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_address_is_redacted() {
+        let result = sanitize_pii("192.168.1.1");
+        assert_eq!(result, "[REDACTED_IP]");
+    }
+
+    #[test]
+    fn non_ip_numbers_preserved() {
+        let result = sanitize_pii("12345");
+        assert_eq!(result, "12345");
+    }
+
+    #[test]
+    fn system_info_returns_non_empty_string() {
+        let info = system_info();
+        assert!(!info.is_empty());
+        assert!(info.contains("OS:"));
+        assert!(info.contains("Arch:"));
+    }
+
+    #[test]
+    fn chrono_lite_timestamp_returns_non_zero() {
+        let ts = chrono_lite_timestamp();
+        let secs: u64 = ts.parse().expect("timestamp should be a number");
+        assert!(secs > 0);
+    }
+
+    #[test]
+    fn multiple_ips_in_one_string_all_masked() {
+        let result = sanitize_pii("src 10.0.0.1 dst 172.16.0.1 done");
+        assert_eq!(result, "src [REDACTED_IP] dst [REDACTED_IP] done");
+    }
+
+    #[test]
+    fn ip_with_port_ip_part_is_masked() {
+        let result = sanitize_pii("192.168.1.1:9944");
+        assert!(result.contains("[REDACTED_IP]"));
+        // The port part should remain after the redacted IP
+        assert!(result.contains(":9944"));
+    }
+
+    #[test]
+    fn empty_string_sanitization_returns_empty() {
+        let result = sanitize_pii("");
+        assert_eq!(result, "");
+    }
 }
