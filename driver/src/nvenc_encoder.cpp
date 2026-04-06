@@ -124,16 +124,11 @@ bool NvencEncoder::encode(ID3D11Texture2D* srcTexture,
             picParams.pictureType = NV_ENC_PIC_TYPE_IDR;
         }
 
-        // Apply foveated QP delta map if computed.
-        // NV_ENC_PIC_PARAMS::qpDeltaMap and qpDeltaMapSize are in the reserved
-        // area of our inline struct. Their exact offsets depend on the NVENC SDK
-        // version. When the SDK headers are available, replace these reserved-area
-        // writes with proper struct field access.
-        // For now, the QP delta map is computed and ready in m_qpDeltaMap.
-        // TODO: Wire m_qpDeltaMap into picParams once NVENC SDK headers are integrated.
-        //   picParams.qpDeltaMap = m_qpDeltaMap.data();
-        //   picParams.qpDeltaMapSize = static_cast<uint32_t>(m_qpDeltaMap.size());
-        //   Also set NV_ENC_RC_PARAMS::qpMapMode = NV_ENC_QP_MAP_DELTA during init.
+        // Apply foveated QP delta map if computed
+        if (m_foveatedEnabled && !m_qpDeltaMap.empty()) {
+            picParams.qpDeltaMap = m_qpDeltaMap.data();
+            picParams.qpDeltaMapSize = static_cast<uint32_t>(m_qpDeltaMap.size());
+        }
 
         st = m_nvencFns.nvEncEncodePicture(m_encoder, &picParams);
         if (st != NV_ENC_SUCCESS && st != NV_ENC_ERR_NEED_MORE_INPUT) {
@@ -281,6 +276,9 @@ bool NvencEncoder::createEncoderSession() {
     encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR_LOWDELAY_HQ;
     encConfig.rcParams.averageBitRate = m_config.bitrate_bps;
     encConfig.rcParams.maxBitRate = m_config.bitrate_bps;
+    if (m_foveatedEnabled) {
+        encConfig.rcParams.qpMapMode = NV_ENC_QP_MAP_DELTA;
+    }
 
     NV_ENC_INITIALIZE_PARAMS initParams = {};
     initParams.version = NVENCAPI_STRUCT_VERSION(NV_ENC_INITIALIZE_PARAMS, 5);
