@@ -21,7 +21,7 @@ public:
 
     /// Run the handshake: HELLO → PIN → CONFIG → START.
     /// Returns true if streaming is ready.
-    bool handshake(uint16_t pin);
+    bool handshake(uint32_t pin);
 
     const StreamConfig& getStreamConfig() const { return m_config; }
     bool isConnected() const { return m_connected; }

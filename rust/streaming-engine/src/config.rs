@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(cfg.video.resolution_per_eye, [1832, 1920]);
         assert_eq!(cfg.video.framerate, 90);
         assert_eq!(cfg.audio.sample_rate, 48000);
-        assert_eq!(cfg.pairing.max_attempts, 3);
+        assert_eq!(cfg.pairing.max_attempts, 5);
     }
 
     #[test]

@@ -55,7 +55,7 @@ void TcpControlClient::disconnect() {
     m_connected = false;
 }
 
-bool TcpControlClient::handshake(uint16_t pin) {
+bool TcpControlClient::handshake(uint32_t pin) {
     uint8_t type;
     std::vector<uint8_t> payload;
 
@@ -75,9 +75,10 @@ bool TcpControlClient::handshake(uint16_t pin) {
         return false;
     }
 
-    // Step 4: Send PIN_RESPONSE
-    uint8_t pinBytes[2] = { (uint8_t)(pin & 0xFF), (uint8_t)(pin >> 8) };
-    if (!sendMessage(MSG_PIN_RESPONSE, pinBytes, 2)) return false;
+    // Step 4: Send PIN_RESPONSE (6-digit PIN as u32 LE)
+    uint8_t pinBytes[4];
+    memcpy(pinBytes, &pin, 4);
+    if (!sendMessage(MSG_PIN_RESPONSE, pinBytes, 4)) return false;
 
     // Step 5: Receive PIN_RESULT
     if (!recvMessage(type, payload) || type != MSG_PIN_RESULT) {
