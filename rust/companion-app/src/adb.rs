@@ -86,6 +86,20 @@ pub fn install_apk(adb_path: &str, serial: &str, apk_path: &str) -> Result<Strin
     }
 }
 
+/// Dump logcat from the device (non-blocking — returns buffered log).
+pub fn dump_logcat(adb_path: &str, serial: &str) -> Result<String, String> {
+    let output = Command::new(adb_path)
+        .args(["-s", serial, "logcat", "-d", "-s", "FocusVision:*"])
+        .output()
+        .map_err(|e| format!("Failed to run adb: {e}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
 /// Launch the app on the device.
 pub fn launch_app(adb_path: &str, serial: &str, package: &str) -> Result<String, String> {
     let activity = format!("{package}/.MainActivity");
