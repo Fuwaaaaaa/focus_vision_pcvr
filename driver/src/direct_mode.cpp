@@ -40,6 +40,11 @@ bool CDirectModeComponent::initEncoder(ID3D11Device* device, uint32_t width, uin
         return false;
     }
 
+    // Enable foveated encoding if configured
+    if (fvpCfg.foveated_enabled) {
+        m_encoder.setFoveatedEnabled(true);
+    }
+
     if (!m_encoder.init(device, encConfig)) {
         vr::VRDriverLog()->Log("Focus Vision PCVR: NvencEncoder init failed\n");
         return false;
