@@ -24,7 +24,7 @@ pub fn write_status_file(status: &str, pin: Option<u16>, latency_us: Option<u64>
         None => return,
     };
     let _ = std::fs::create_dir_all(&dir);
-    let pin_str = pin.map(|p| format!("{:04}", p)).unwrap_or_else(|| "----".to_string());
+    let pin_str = pin.map(|p| format!("{:06}", p)).unwrap_or_else(|| "------".to_string());
     let json = format!(
         r#"{{"status":"{}","pin":"{}","latency_us":{},"fps":{},"bitrate_mbps":{}}}"#,
         status, pin_str,

@@ -20,6 +20,12 @@ tokio-util = { version = "0.7", features = ["rt"] }
 cpal = "0.15"
 audiopus = "0.2"
 dirs-next = "2"
+rand = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tokio-rustls = "0.26"
+rcgen = "0.13"
+serde_json = "1"
+sha2 = "0.10"
 
 [build-dependencies]
 cbindgen = "0.27"
