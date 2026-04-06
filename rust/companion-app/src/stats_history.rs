@@ -40,3 +40,63 @@ impl StatsHistory {
         buf.push_back(value);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_respects_max_points_ring_buffer_limit() {
+        let mut h = StatsHistory::new();
+        for i in 0..50 {
+            h.push(i as f32, i as f32, i as f32);
+        }
+        assert_eq!(h.latency_ms.len(), 30);
+        assert_eq!(h.fps.len(), 30);
+        assert_eq!(h.packet_loss.len(), 30);
+    }
+
+    #[test]
+    fn empty_buffer_produces_empty_plot_points() {
+        let h = StatsHistory::new();
+        let points = StatsHistory::as_plot_points(&h.latency_ms);
+        assert!(points.is_empty());
+    }
+
+    #[test]
+    fn full_buffer_overflow_drops_oldest() {
+        let mut h = StatsHistory::new();
+        for i in 0..35 {
+            h.push(i as f32, 0.0, 0.0);
+        }
+        // Oldest should be 5.0 (items 0..4 were dropped)
+        assert_eq!(h.latency_ms.len(), 30);
+        assert_eq!(*h.latency_ms.front().unwrap(), 5.0);
+        assert_eq!(*h.latency_ms.back().unwrap(), 34.0);
+    }
+
+    #[test]
+    fn as_plot_points_conversion_accuracy() {
+        let mut h = StatsHistory::new();
+        h.push(10.0, 60.0, 0.5);
+        h.push(20.0, 90.0, 1.0);
+        h.push(15.0, 75.0, 0.0);
+
+        let points = StatsHistory::as_plot_points(&h.latency_ms);
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[0], [0.0, 10.0]);
+        assert_eq!(points[1], [1.0, 20.0]);
+        assert_eq!(points[2], [2.0, 15.0]);
+    }
+
+    #[test]
+    fn push_exactly_max_points_items() {
+        let mut h = StatsHistory::new();
+        for i in 0..30 {
+            h.push(i as f32, i as f32, i as f32);
+        }
+        assert_eq!(h.latency_ms.len(), 30);
+        assert_eq!(*h.latency_ms.front().unwrap(), 0.0);
+        assert_eq!(*h.latency_ms.back().unwrap(), 29.0);
+    }
+}
