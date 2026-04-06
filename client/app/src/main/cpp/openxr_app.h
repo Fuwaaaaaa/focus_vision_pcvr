@@ -13,6 +13,7 @@
 #include "nal_validator.h"
 #include "timewarp.h"
 #include "overlay_renderer.h"
+#include "facial_tracker.h"
 #include "pose_history.h"
 #include "tracking_sender.h"
 #include "controller_poller.h"
@@ -116,6 +117,7 @@ private:
     // Timewarp
     Timewarp m_timewarp;
     OverlayRenderer m_overlay;
+    FacialTracker m_facialTracker;
     PoseHistory m_poseHistory;
 
     // Heartbeat + stats
