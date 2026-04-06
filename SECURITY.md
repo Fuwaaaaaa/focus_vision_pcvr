@@ -1,0 +1,51 @@
+# Security
+
+## Threat Model
+
+Focus Vision PCVR communicates over Wi-Fi between a Windows PC and an Android HMD. The primary threat is an attacker on the same local network.
+
+### Mitigated Threats
+
+| Threat | Mitigation |
+|--------|-----------|
+| PIN brute-force | 6-digit PIN (1M combinations), 5 attempts then 300s lockout, cryptographic RNG |
+| Man-in-the-middle | TLS 1.3 on TCP control channel (rustls server, MbedTLS client) |
+| PIN eavesdropping | PIN sent only over TLS-encrypted channel |
+| Server impersonation | TOFU certificate pinning (SHA-256 fingerprint saved on first connect) |
+| PIN prediction | `rand::random()` (cryptographic CSPRNG) replaces `subsec_nanos()` |
+
+### Known Limitations
+
+| Threat | Status | Notes |
+|--------|--------|-------|
+| UDP stream encryption | Not implemented | Video/audio/tracking sent as plaintext UDP. SRTP planned for future. |
+| Replay attacks | Partially mitigated | TLS prevents replay on control channel. UDP streams have no replay protection. |
+| Session hijacking | Low risk | Once paired, no re-authentication. Session bound to TCP connection lifetime. |
+| Certificate rotation | Manual | New cert generated each server restart. No automated rotation. |
+
+### Architecture
+
+```
+Control Channel (port 9944):
+  TCP → TLS 1.3 → Message framing → PIN pairing → Streaming
+
+Data Channels (UDP):
+  Video (9946): RTP + FEC, plaintext
+  Tracking (9947): Head pose + eye gaze, plaintext
+  Audio (9948): Opus encoded, plaintext
+```
+
+### Responsible Disclosure
+
+Report security issues via GitHub Issues (private if sensitive) or email.
+
+### Dependencies
+
+| Library | Purpose | Version |
+|---------|---------|---------|
+| rustls | TLS server | 0.23 |
+| tokio-rustls | Async TLS | 0.26 |
+| rcgen | Self-signed cert generation | 0.13 |
+| sha2 | Certificate fingerprint | 0.10 |
+| rand | Cryptographic PIN generation | 0.8 |
+| MbedTLS | TLS client (Android NDK) | 3.6.2 |
