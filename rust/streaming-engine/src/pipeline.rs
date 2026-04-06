@@ -132,3 +132,192 @@ pub fn decode_packets_to_frame(
 
     Ok(frame_data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::rtp::RtpPacketizer;
+
+    /// Helper: create a packetizer with default SSRC.
+    fn make_packetizer() -> RtpPacketizer {
+        RtpPacketizer::new(0x42)
+    }
+
+    #[test]
+    fn test_encode_empty_frame_returns_no_packets() {
+        let mut pkt = make_packetizer();
+        let packets = encode_frame_to_packets(&[], 0, 0, false, 0.2, &mut pkt);
+        assert!(packets.is_empty(), "Empty frame should produce zero packets");
+    }
+
+    #[test]
+    fn test_encode_small_frame_single_shard() {
+        // A frame smaller than FEC_SHARD_SIZE should produce a small number of
+        // packets (data shards + parity shards). With 0.2 redundancy and 1 data
+        // shard we get ceil(1*0.2)=max(1,1)=1 parity, so 2 total packets.
+        let frame = vec![0xAB; 100];
+        let mut pkt = make_packetizer();
+        let packets = encode_frame_to_packets(&frame, 1, 9000, false, 0.2, &mut pkt);
+
+        // 1 data shard + 1 parity shard = 2 packets
+        assert_eq!(packets.len(), 2);
+
+        // Each packet should be: 12 (RTP) + 10 (FVP) + FEC_SHARD_SIZE bytes
+        for p in &packets {
+            assert_eq!(p.data.len(), 12 + 10 + FEC_SHARD_SIZE);
+        }
+    }
+
+    #[test]
+    fn test_rtp_header_fields() {
+        let frame = vec![0xFF; 50];
+        let mut pkt = make_packetizer();
+        let packets = encode_frame_to_packets(&frame, 42, 12345, false, 0.2, &mut pkt);
+        assert!(!packets.is_empty());
+
+        let data = &packets[0].data;
+        // Byte 0: V=2, P=0, X=0, CC=0 => 0x80
+        assert_eq!(data[0], 0x80);
+
+        // Bytes 4..8: timestamp in big-endian
+        let ts = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        assert_eq!(ts, 12345);
+
+        // Bytes 8..12: SSRC = 0x42 in big-endian
+        let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+        assert_eq!(ssrc, 0x42);
+    }
+
+    #[test]
+    fn test_fvp_header_frame_index_and_shard_fields() {
+        let frame = vec![0x11; FEC_SHARD_SIZE * 3 + 10]; // 4 data shards
+        let mut pkt = make_packetizer();
+        let packets = encode_frame_to_packets(&frame, 99, 0, false, 0.2, &mut pkt);
+
+        // 4 data shards, parity = ceil(4*0.2) = max(1,1) = 1 => 5 total
+        assert_eq!(packets.len(), 5);
+
+        for (i, p) in packets.iter().enumerate() {
+            let d = &p.data;
+            // FVP header starts at byte 12
+            let frame_idx = u32::from_le_bytes([d[12], d[13], d[14], d[15]]);
+            assert_eq!(frame_idx, 99, "frame_index mismatch at shard {i}");
+
+            let shard_index = u16::from_le_bytes([d[16], d[17]]) as usize;
+            assert_eq!(shard_index, i, "shard_index mismatch at shard {i}");
+
+            let shard_count = u16::from_le_bytes([d[18], d[19]]) as usize;
+            assert_eq!(shard_count, 5, "shard_count mismatch at shard {i}");
+        }
+    }
+
+    #[test]
+    fn test_keyframe_flag_set_in_fvp_header() {
+        let frame = vec![0xCC; 100];
+        let mut pkt = make_packetizer();
+
+        // Keyframe
+        let kf_packets = encode_frame_to_packets(&frame, 0, 0, true, 0.2, &mut pkt);
+        for p in &kf_packets {
+            let flags = u16::from_le_bytes([p.data[20], p.data[21]]);
+            assert_eq!(flags & 1, 1, "Keyframe flag should be set");
+        }
+
+        // Non-keyframe
+        let nkf_packets = encode_frame_to_packets(&frame, 1, 0, false, 0.2, &mut pkt);
+        for p in &nkf_packets {
+            let flags = u16::from_le_bytes([p.data[20], p.data[21]]);
+            assert_eq!(flags & 1, 0, "Keyframe flag should be clear");
+        }
+    }
+
+    #[test]
+    fn test_marker_bit_only_on_last_packet() {
+        let frame = vec![0xDD; FEC_SHARD_SIZE * 2 + 1]; // 3 data shards
+        let mut pkt = make_packetizer();
+        let packets = encode_frame_to_packets(&frame, 0, 0, false, 0.2, &mut pkt);
+        assert!(packets.len() >= 3);
+
+        for (i, p) in packets.iter().enumerate() {
+            let marker = p.data[1] & 0x80;
+            if i == packets.len() - 1 {
+                assert_ne!(marker, 0, "Last packet must have marker bit set");
+            } else {
+                assert_eq!(marker, 0, "Non-last packet must not have marker bit");
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let original = vec![0xEE; 5000];
+        let mut pkt = make_packetizer();
+        let packets = encode_frame_to_packets(&original, 7, 45000, true, 0.2, &mut pkt);
+
+        // Determine data/total shard counts from the first packet's FVP header
+        let total_shard_count =
+            u16::from_le_bytes([packets[0].data[18], packets[0].data[19]]) as usize;
+        let data_shard_count =
+            (original.len() + FEC_SHARD_SIZE - 1) / FEC_SHARD_SIZE;
+
+        let pkt_refs: Vec<&[u8]> = packets.iter().map(|p| p.data.as_slice()).collect();
+        let decoded =
+            decode_packets_to_frame(&pkt_refs, data_shard_count, total_shard_count, original.len())
+                .expect("decode should succeed");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_decode_recovers_with_lost_packets() {
+        // Encode with enough redundancy to lose some shards
+        let original = vec![0xAA; FEC_SHARD_SIZE * 4]; // exactly 4 data shards
+        let mut pkt = make_packetizer();
+        let packets = encode_frame_to_packets(&original, 0, 0, false, 0.5, &mut pkt);
+
+        let total_shard_count =
+            u16::from_le_bytes([packets[0].data[18], packets[0].data[19]]) as usize;
+        let data_shard_count = 4;
+        // 0.5 redundancy on 4 data => ceil(2) = 2 parity, total = 6
+        assert_eq!(total_shard_count, 6);
+
+        // Drop 2 packets (within parity budget)
+        let surviving: Vec<&[u8]> = packets
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1 && *i != 3)
+            .map(|(_, p)| p.data.as_slice())
+            .collect();
+
+        let decoded = decode_packets_to_frame(
+            &surviving,
+            data_shard_count,
+            total_shard_count,
+            original.len(),
+        )
+        .expect("FEC should recover 2 lost shards with 50% redundancy");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_decode_rejects_invalid_shard_counts() {
+        // total = 0
+        assert!(decode_packets_to_frame(&[], 0, 0, 100).is_err());
+        // data > total
+        assert!(decode_packets_to_frame(&[], 5, 3, 100).is_err());
+        // total exceeds MAX_SHARDS (4096)
+        assert!(decode_packets_to_frame(&[], 1, 5000, 100).is_err());
+    }
+
+    #[test]
+    fn test_decode_skips_undersized_packets() {
+        // Packets smaller than 22 bytes should be silently ignored
+        let tiny: Vec<u8> = vec![0; 10];
+        let pkt_refs: Vec<&[u8]> = vec![tiny.as_slice()];
+        // This won't reconstruct anything, but it should not panic.
+        // With 2 data, 1 parity = total 3 but no valid shards => FEC fails.
+        let result = decode_packets_to_frame(&pkt_refs, 2, 3, 100);
+        assert!(result.is_err());
+    }
+}
