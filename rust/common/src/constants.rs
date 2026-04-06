@@ -13,9 +13,9 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 500;
 /// Max heartbeat misses before disconnect
 pub const HEARTBEAT_MAX_MISSES: u32 = 3;
 /// Max PIN pairing attempts before lockout
-pub const MAX_PIN_ATTEMPTS: u8 = 3;
+pub const MAX_PIN_ATTEMPTS: u8 = 5;
 /// PIN lockout duration in seconds
-pub const PIN_LOCKOUT_SECONDS: u64 = 60;
+pub const PIN_LOCKOUT_SECONDS: u64 = 300;
 /// UDP port offsets from DEFAULT_UDP_PORT (9945)
 /// Video: 9946, Tracking: 9947, Audio: 9948
 pub const VIDEO_PORT_OFFSET: u16 = 1;
