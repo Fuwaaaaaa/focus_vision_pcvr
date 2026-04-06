@@ -12,6 +12,7 @@ OpenXRApp::~OpenXRApp() { shutdown(); }
 
 void OpenXRApp::initialize(android_app* app) {
     LOGI("Initializing OpenXR app...");
+    m_androidApp = app;
     createInstance(app);
     getSystem();
     initEGL();
@@ -21,6 +22,12 @@ void OpenXRApp::initialize(android_app* app) {
     m_renderer.init();
     m_timewarp.init();
     m_heartbeat.init(&m_tcpClient, &m_stats);
+
+    // Initialize video decoder with JNI for zero-copy SurfaceTexture output.
+    // EGL context is current at this point (initEGL called above).
+    JNIEnv* env = nullptr;
+    app->activity->vm->AttachCurrentThread(&env, nullptr);
+    m_videoDecoder.init(env, 1832, 1920); // Per-eye resolution from config
     LOGI("OpenXR app initialized successfully");
 }
 
