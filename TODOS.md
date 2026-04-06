@@ -38,6 +38,12 @@
 - **Why:** Outside Voiceの指摘: H.264はMediaCodecデコードが2-5ms速い可能性。80Mbpsでは画質差が小さく、レイテンシー目標50msに対して2-5msの差は大きい
 - **Context:** config/default.tomlのcodecフィールドで切替可能にし、実測値でどちらを採用するか決定。NVENC側はH.264/H.265両対応が容易
 - **Depends on:** Phase 2 (Android側デコード) 実装後に計測可能
+- **計測手順（準備済み）:**
+  1. `config/default.toml`の`codec = "hevc"`を`"h264"`に変更してPC側を再起動
+  2. Focus Visionでストリーミング開始
+  3. `adb logcat | grep "decode latency"`で90フレーム毎の平均レイテンシーを取得
+  4. 各codecで5分以上計測し、安定後の平均値を比較
+  5. `video_decoder.cpp`の`avgDecodeLatencyUs()`で統計取得可能
 
 ## v1.1 準備調査
 
