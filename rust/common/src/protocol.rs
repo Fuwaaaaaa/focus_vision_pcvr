@@ -76,6 +76,7 @@ pub mod msg_type {
     pub const TRACKING_DATA: u8 = 0x20;
     pub const CONTROLLER_DATA: u8 = 0x21;
     pub const IDR_REQUEST: u8 = 0x30;
+    pub const FACE_DATA: u8 = 0x35;
     pub const AUDIO_CONFIG: u8 = 0x40;
     pub const AUDIO_START: u8 = 0x41;
     pub const DISCONNECT: u8 = 0xFF;
@@ -141,7 +142,8 @@ mod tests {
             msg_type::PIN_RESPONSE, msg_type::PIN_RESULT, msg_type::STREAM_CONFIG,
             msg_type::STREAM_START, msg_type::HEARTBEAT, msg_type::HEARTBEAT_ACK,
             msg_type::TRACKING_DATA, msg_type::CONTROLLER_DATA, msg_type::IDR_REQUEST,
-            msg_type::AUDIO_CONFIG, msg_type::AUDIO_START, msg_type::DISCONNECT,
+            msg_type::FACE_DATA, msg_type::AUDIO_CONFIG, msg_type::AUDIO_START,
+            msg_type::DISCONNECT,
         ];
         for i in 0..types.len() {
             for j in (i + 1)..types.len() {

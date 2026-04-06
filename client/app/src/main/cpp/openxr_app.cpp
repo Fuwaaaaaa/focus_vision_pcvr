@@ -23,6 +23,7 @@ void OpenXRApp::initialize(android_app* app) {
     m_timewarp.init();
     m_overlay.init();
     m_heartbeat.init(&m_tcpClient, &m_stats);
+    m_facialTracker.init(m_instance, m_session);
 
     // Initialize video decoder with JNI for zero-copy SurfaceTexture output.
     // EGL context is current at this point (initEGL called above).
@@ -358,6 +359,21 @@ void OpenXRApp::renderFrame() {
         auto gaze = m_eyeTracker.poll(frameState.predictedDisplayTime);
         m_trackingSender.sendHeadPose(views[0].pose, frameState.predictedDisplayTime,
                                        gaze.x, gaze.y, gaze.valid);
+
+        // Poll face tracking and send blendshapes to PC via TCP (msg 0x35)
+        if (m_facialTracker.isAvailable() && m_tcpClient.isConnected()) {
+            auto face = m_facialTracker.poll();
+            if (face.lipValid || face.eyeValid) {
+                // Pack: [lip_valid:1B][eye_valid:1B][lip:37*4B][eye:14*4B] = 206 bytes
+                uint8_t buf[206];
+                int off = 0;
+                buf[off++] = face.lipValid ? 1 : 0;
+                buf[off++] = face.eyeValid ? 1 : 0;
+                memcpy(buf + off, face.lip.data(), 37 * 4); off += 37 * 4;
+                memcpy(buf + off, face.eye.data(), 14 * 4); off += 14 * 4;
+                m_tcpClient.sendMessage(0x35, buf, off); // MSG_FACE_DATA
+            }
+        }
 
         // Render each eye
         for (uint32_t eye = 0; eye < 2; eye++) {
