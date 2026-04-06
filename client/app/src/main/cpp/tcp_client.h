@@ -5,6 +5,12 @@
 #include <vector>
 #include <atomic>
 
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/sha256.h>
+
 /// TCP control channel client. Handles handshake, PIN pairing, stream config.
 class TcpControlClient {
 public:
@@ -39,4 +45,18 @@ private:
     int m_socket = -1;
     std::atomic<bool> m_connected{false};
     StreamConfig m_config;
+
+    // TLS state
+    bool m_tlsEnabled = false;
+    mbedtls_ssl_context m_ssl;
+    mbedtls_ssl_config m_sslConf;
+    mbedtls_entropy_context m_entropy;
+    mbedtls_ctr_drbg_context m_ctrDrbg;
+    mbedtls_net_context m_netCtx;
+    std::string m_certFingerprint; // TOFU: saved on first connect
+
+    bool initTls();
+    void shutdownTls();
+    int tlsSend(const uint8_t* data, int len);
+    int tlsRecv(uint8_t* data, int len);
 };
