@@ -52,28 +52,28 @@
 
 ## v1.1 スコープ
 
-### Codec切替UI
+### ~~Codec切替UI~~ (完了)
 - **What:** コンパニオンアプリにH.264/H.265トグルボタンを追加
 - **Why:** config/default.tomlの手動編集なしでcodec切替可能に。レイテンシー比較テストが容易になる
 - **Context:** config.rsのcodecフィールド + NVENCのuse_hevcフラグは既に対応済み。UIとconfig書き換えのみ
 
-### リアルタイムレイテンシーグラフ
+### ~~リアルタイムレイテンシーグラフ~~ (完了)
 - **What:** コンパニオンアプリにsparkline形式のレイテンシー/FPS/パケットロスグラフを追加
 - **Why:** 数値だけでは傾向が見えない。スパイクや劣化パターンの視覚化
 - **Context:** status.jsonに全データが既にある。egui::plot::Lineで30秒分のリングバッファ描画
 
-### HMD内接続品質オーバーレイ
+### ~~HMD内接続品質オーバーレイ~~ (完了)
 - **What:** VR体験中にWi-Fi信号強度/パケットロス率を視野隅に小さく表示
 - **Why:** 「なぜカクつくのか」を即座に診断可能に
 - **Context:** OpenXR composition layerでクワッドオーバーレイ。StatsReporterのデータをGL描画
 
-### 自動Codec選択
+### ~~自動Codec選択~~ (完了)
 - **What:** 初回接続時にH.264/H.265の両方で短時間ベンチマークし、高速な方を自動選択
 - **Why:** ユーザーが手動テスト不要。HMDのMediaCodec実装差を自動吸収
 - **Context:** デコードレイテンシー計測（avgDecodeLatencyUs）が既に実装済み。各codec 5秒 × 2回でN=900サンプル
 - **Depends on:** Codec切替UIの実装後（codec切替のFFIパスが必要）
 
-### ワンクリックログエクスポート
+### ~~ワンクリックログエクスポート~~ (完了)
 - **What:** PC側ログ + HMD logcat + システム情報をzip化して保存するボタン
 - **Why:** トラブルシューティング時の「ログを送って」が1クリックに
 - **Context:** companion appのADB接続を再利用。IPアドレス等のPIIはサニタイズが必要
