@@ -18,7 +18,7 @@ use metrics::latency::FrameTimestamps;
 
 /// Write engine status to a shared JSON file for the companion app.
 /// Path: %APPDATA%/FocusVisionPCVR/status.json (Windows)
-pub fn write_status_file(status: &str, pin: Option<u16>, latency_us: Option<u64>, fps: Option<u16>, bitrate_mbps: Option<u32>) {
+pub fn write_status_file(status: &str, pin: Option<u32>, latency_us: Option<u64>, fps: Option<u16>, bitrate_mbps: Option<u32>) {
     let dir = match dirs_next::data_dir() {
         Some(d) => d.join("FocusVisionPCVR"),
         None => return,
