@@ -2,6 +2,15 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [1.1.0] - 2026-04-06
+
+### Added
+- **Codec切替UI:** コンパニオンアプリでH.264/H.265をワンクリック切替。config/local.tomlに保存
+- **レイテンシーグラフ:** Homeタブにsparkline形式の30秒レイテンシー/FPSグラフ（egui_plot）
+- **ログエクスポート:** PC/HMDログ+システム情報をzip化するワンクリックボタン。PII自動サニタイズ
+- **HMD接続品質オーバーレイ:** VR視野にWi-Fi信号強度風の3バーアイコン。パケットロスに応じて緑/黄/赤
+- **自動Codec選択:** 初回接続時にH.265/H.264の両方で5秒ベンチマーク→低レイテンシーなcodecを自動選択
+
 ## [1.0.0] - 2026-04-06
 
 ### Added
