@@ -9,6 +9,7 @@ pub mod engine;
 pub mod tracking;
 pub mod adaptive;
 pub mod codec_benchmark;
+pub mod face_tracking;
 
 use std::sync::{RwLock, Once};
 

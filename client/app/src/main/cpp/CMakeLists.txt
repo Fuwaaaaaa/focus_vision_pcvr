@@ -67,6 +67,7 @@ set(CLIENT_SOURCES
     eye_tracker.cpp
     hmd_profile.cpp
     overlay_renderer.cpp
+    facial_tracker.cpp
     audio_player.cpp
     ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c
 )
