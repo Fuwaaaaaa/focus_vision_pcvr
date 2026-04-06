@@ -1,7 +1,11 @@
 mod adb;
+mod config;
 mod driver;
+mod export;
+mod stats_history;
 
 use eframe::egui;
+use egui_plot::{Line, PlotPoints, Plot};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -59,6 +63,17 @@ struct CompanionApp {
     // UI state
     active_tab: Tab,
     status_log: Arc<Mutex<Vec<String>>>,
+
+    // v1.1: Codec selection
+    selected_codec: String,
+    local_config: config::LocalConfig,
+
+    // v1.1: Stats history for sparkline graphs
+    stats_history: stats_history::StatsHistory,
+
+    // v1.1: Log export
+    export_in_progress: bool,
+    export_result: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -150,6 +165,14 @@ impl CompanionApp {
             last_status_read: Instant::now() - Duration::from_secs(10),
             active_tab: Tab::Home,
             status_log: Arc::new(Mutex::new(Vec::new())),
+            selected_codec: {
+                let cfg = config::LocalConfig::load();
+                cfg.video.codec.clone()
+            },
+            local_config: config::LocalConfig::load(),
+            stats_history: stats_history::StatsHistory::new(),
+            export_in_progress: false,
+            export_result: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -204,6 +227,8 @@ impl CompanionApp {
                         self.latency_ms = val["latency_us"].as_u64().unwrap_or(0) as f32 / 1000.0;
                         self.fps = val["fps"].as_u64().unwrap_or(0) as u32;
                         self.bitrate_mbps = val["bitrate_mbps"].as_u64().unwrap_or(0) as f32;
+                        let packet_loss = val["packet_loss_percent"].as_f64().unwrap_or(0.0) as f32;
+                        self.stats_history.push(self.latency_ms, self.fps as f32, packet_loss);
                     }
                     _ => {
                         self.connection_status = ConnectionStatus::Disconnected;
@@ -222,6 +247,15 @@ impl CompanionApp {
             }
         }
     }
+
+    fn check_export_result(&mut self) {
+        if let Ok(mut result) = self.export_result.lock() {
+            if let Some(msg) = result.take() {
+                self.export_in_progress = false;
+                self.log(&msg);
+            }
+        }
+    }
 }
 
 impl eframe::App for CompanionApp {
@@ -230,6 +264,7 @@ impl eframe::App for CompanionApp {
         self.scan_devices();
         self.read_engine_status();
         self.check_deploy_result();
+        self.check_export_result();
 
         // Request repaint every second for live stats
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -385,6 +420,36 @@ impl CompanionApp {
                         ui.label(egui::RichText::new("Mbps").size(11.0).color(text_muted));
                     });
                 });
+            });
+
+            // Sparkline graphs (30s history)
+            ui.add_space(8.0);
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Latency (30s)").size(11.0).color(text_muted));
+                let points = stats_history::StatsHistory::as_plot_points(&self.stats_history.latency_ms);
+                Plot::new("latency_spark")
+                    .height(50.0)
+                    .show_axes(false)
+                    .show_grid(false)
+                    .allow_drag(false)
+                    .allow_zoom(false)
+                    .allow_scroll(false)
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(Line::new(PlotPoints::new(points)).color(accent));
+                    });
+
+                ui.label(egui::RichText::new("FPS (30s)").size(11.0).color(text_muted));
+                let fps_points = stats_history::StatsHistory::as_plot_points(&self.stats_history.fps);
+                Plot::new("fps_spark")
+                    .height(50.0)
+                    .show_axes(false)
+                    .show_grid(false)
+                    .allow_drag(false)
+                    .allow_zoom(false)
+                    .allow_scroll(false)
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(Line::new(PlotPoints::new(fps_points)).color(accent));
+                    });
             });
         }
     }
@@ -577,7 +642,57 @@ impl CompanionApp {
 
         ui.add_space(16.0);
 
-        ui.label(egui::RichText::new("Focus Vision PCVR v0.1.0").size(11.0).color(text_muted));
+        // Codec selection (v1.1)
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Video Codec").size(13.0).color(text_muted));
+            let prev = self.selected_codec.clone();
+            ui.radio_value(&mut self.selected_codec, "h265".to_string(), "H.265 (HEVC) — higher quality");
+            ui.radio_value(&mut self.selected_codec, "h264".to_string(), "H.264 — lower latency (2-5ms)");
+            if self.selected_codec != prev {
+                self.local_config.video.codec = self.selected_codec.clone();
+                match self.local_config.save() {
+                    Ok(()) => self.log(&format!("Codec set to {}. Restart engine to apply.", self.selected_codec)),
+                    Err(e) => self.log(&format!("Failed to save config: {e}")),
+                }
+            }
+        });
+
+        ui.add_space(16.0);
+
+        // Log export (v1.1)
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Diagnostics").size(13.0).color(text_muted));
+            let export_enabled = !self.export_in_progress;
+            ui.add_enabled_ui(export_enabled, |ui| {
+                let label = if self.export_in_progress { "Exporting..." } else { "Export Logs (zip)" };
+                if ui.button(label).clicked() {
+                    self.export_in_progress = true;
+                    let adb = self.adb_path.clone();
+                    let serial = self.devices.first().map(|d| d.serial.clone());
+                    let result = self.export_result.clone();
+                    thread::Builder::new()
+                        .name("fvp-export".into())
+                        .spawn(move || {
+                            let msg = match export::export_logs(
+                                adb.as_deref(),
+                                serial.as_deref(),
+                            ) {
+                                Ok(path) => format!("Logs exported: {}", path.display()),
+                                Err(e) => format!("Export failed: {e}"),
+                            };
+                            if let Ok(mut guard) = result.lock() {
+                                *guard = Some(msg);
+                            }
+                        })
+                        .expect("spawn export thread");
+                }
+            });
+            ui.label(egui::RichText::new("PC logs + HMD logcat + system info → zip").size(11.0).color(text_muted));
+        });
+
+        ui.add_space(16.0);
+
+        ui.label(egui::RichText::new("Focus Vision PCVR v1.0.0").size(11.0).color(text_muted));
     }
 }
 
