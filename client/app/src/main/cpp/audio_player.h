@@ -5,9 +5,10 @@
 #include <atomic>
 #include <mutex>
 
-// Forward declarations (Android NDK headers)
+// Forward declarations
 struct OpusDecoder;
-struct AAudioStream;
+
+#include <aaudio/AAudio.h>
 
 /**
  * Audio receiver and player for the HMD side.

@@ -3,6 +3,7 @@
 #include <openxr/openxr.h>
 #include <cstdint>
 #include <atomic>
+#include <netinet/in.h>
 
 /// Sends 6DoF head tracking data from HMD to PC via UDP.
 /// Packet format: [type:1B][timestamp_ns:8B][position:12B][orientation:16B] = 37 bytes

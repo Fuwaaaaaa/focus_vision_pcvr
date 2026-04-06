@@ -18,7 +18,7 @@ if(DRIVER_SOURCES)
     endif()
     target_link_libraries(driver_focus_vision_pcvr PRIVATE
         "${RUST_TARGET_DIR}/streaming_engine.lib"
-        ws2_32 userenv ntdll bcrypt d3d11 dxgi)
+        ws2_32 userenv ntdll bcrypt d3d11 dxgi propsys ole32 oleaut32)
     set_target_properties(driver_focus_vision_pcvr PROPERTIES
         OUTPUT_NAME "driver_focus_vision_pcvr"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/focus_vision_pcvr/bin/win64")
