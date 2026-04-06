@@ -21,6 +21,7 @@ void OpenXRApp::initialize(android_app* app) {
     createSwapchains();
     m_renderer.init();
     m_timewarp.init();
+    m_overlay.init();
     m_heartbeat.init(&m_tcpClient, &m_stats);
 
     // Initialize video decoder with JNI for zero-copy SurfaceTexture output.
@@ -424,6 +425,15 @@ void OpenXRApp::renderFrame() {
                 // No frame yet: solid color
                 m_renderer.renderSolidColor(framebuffer, width, height,
                     0.05f, 0.05f, 0.2f);
+            }
+
+            // Connection quality overlay (signal bars)
+            if (m_streamingActive) {
+                float loss = (float)m_stats.packetsLost() /
+                    std::max(1u, m_stats.packetsReceived() + m_stats.packetsLost());
+                float quality = 1.0f - std::min(1.0f, loss * 10.0f); // 10% loss = 0 quality
+                m_overlay.render(framebuffer, width, height,
+                                  quality, loss * 100.0f, m_videoDecoder.avgDecodeLatencyUs() / 1000.0f);
             }
 
             m_swapchains[eye].releaseImage();

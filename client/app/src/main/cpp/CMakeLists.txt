@@ -54,6 +54,7 @@ set(CLIENT_SOURCES
     nal_validator.cpp
     eye_tracker.cpp
     hmd_profile.cpp
+    overlay_renderer.cpp
     audio_player.cpp
     ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c
 )
