@@ -28,5 +28,5 @@ mid_qp_offset = 5
 peripheral_qp_offset = 15
 
 [pairing]
-max_attempts = 3
-lockout_seconds = 60
+max_attempts = 5
+lockout_seconds = 300

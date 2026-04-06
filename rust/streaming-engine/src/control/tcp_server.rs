@@ -67,10 +67,10 @@ impl TcpControlServer {
 
         // Step 4: Receive PIN_RESPONSE
         let msg = read_message(&mut stream).await?;
-        if msg.0 != msg_type::PIN_RESPONSE || msg.1.len() < 2 {
-            return Err("Expected PIN_RESPONSE".into());
+        if msg.0 != msg_type::PIN_RESPONSE || msg.1.len() < 4 {
+            return Err("Expected PIN_RESPONSE (4 bytes)".into());
         }
-        let submitted_pin = u16::from_le_bytes([msg.1[0], msg.1[1]]);
+        let submitted_pin = u32::from_le_bytes([msg.1[0], msg.1[1], msg.1[2], msg.1[3]]);
 
         // Step 5: Verify PIN
         let mut pairing = self.pairing.lock().await;
@@ -256,7 +256,7 @@ mod tests {
         let _ = read_message(&mut client).await.unwrap(); // HELLO_ACK
         let _ = read_message(&mut client).await.unwrap(); // PIN_REQUEST
         // Send wrong PIN
-        send_message(&mut client, msg_type::PIN_RESPONSE, &9999u16.to_le_bytes()).await.unwrap();
+        send_message(&mut client, msg_type::PIN_RESPONSE, &999999u32.to_le_bytes()).await.unwrap();
         // Receive PIN_RESULT
         let (t, payload) = read_message(&mut client).await.unwrap();
         assert_eq!(t, msg_type::PIN_RESULT);
