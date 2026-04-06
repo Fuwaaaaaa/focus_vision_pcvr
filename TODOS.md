@@ -50,7 +50,40 @@
 - NVENCのQP delta map (fovea/mid/periphery 3ゾーン) をピクチャパラメータに接続
 - config/default.toml `foveated.enabled = true` で有効化可能
 
-## v1.1 準備調査
+## v1.1 スコープ
+
+### Codec切替UI
+- **What:** コンパニオンアプリにH.264/H.265トグルボタンを追加
+- **Why:** config/default.tomlの手動編集なしでcodec切替可能に。レイテンシー比較テストが容易になる
+- **Context:** config.rsのcodecフィールド + NVENCのuse_hevcフラグは既に対応済み。UIとconfig書き換えのみ
+
+### リアルタイムレイテンシーグラフ
+- **What:** コンパニオンアプリにsparkline形式のレイテンシー/FPS/パケットロスグラフを追加
+- **Why:** 数値だけでは傾向が見えない。スパイクや劣化パターンの視覚化
+- **Context:** status.jsonに全データが既にある。egui::plot::Lineで30秒分のリングバッファ描画
+
+### HMD内接続品質オーバーレイ
+- **What:** VR体験中にWi-Fi信号強度/パケットロス率を視野隅に小さく表示
+- **Why:** 「なぜカクつくのか」を即座に診断可能に
+- **Context:** OpenXR composition layerでクワッドオーバーレイ。StatsReporterのデータをGL描画
+
+### 自動Codec選択
+- **What:** 初回接続時にH.264/H.265の両方で短時間ベンチマークし、高速な方を自動選択
+- **Why:** ユーザーが手動テスト不要。HMDのMediaCodec実装差を自動吸収
+- **Context:** デコードレイテンシー計測（avgDecodeLatencyUs）が既に実装済み。各codec 5秒 × 2回でN=900サンプル
+- **Depends on:** Codec切替UIの実装後（codec切替のFFIパスが必要）
+
+### ワンクリックログエクスポート
+- **What:** PC側ログ + HMD logcat + システム情報をzip化して保存するボタン
+- **Why:** トラブルシューティング時の「ログを送って」が1クリックに
+- **Context:** companion appのADB接続を再利用。IPアドレス等のPIIはサニタイズが必要
+
+## v1.1 準備調査��完了）
+
+### ~~NVENC SDK構造体オフセット検証~~
+- **What:** NV_ENC_RC_PARAMSのqpMapModeフィールドオフセットが実際のNVENC SDK v12.2と一致するか検証
+- **Why:** インライン構造体のフィールド配置が不正確だとfoveated encoding有効化時にクラッシュまたは無視される
+- **Context:** foveatedはデフォル���無効なので現状影響なし。有効化���に実機検証必須
 
 ### ~~オーディオパイプラインの仮想オーディオデバイス調査~~ (解決済み)
 - EUREKA: WASAPI loopback captureで仮想デバイス不要。カーネルモードドライバーなしでシステム音声をキャプチャ可能。
