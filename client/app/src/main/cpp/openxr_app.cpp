@@ -353,6 +353,11 @@ void OpenXRApp::renderFrame() {
 
         xrLocateViews(m_session, &locateInfo, &viewState, 2, &viewCount, views.data());
 
+        // Poll eye gaze and send head tracking + gaze data to PC
+        auto gaze = m_eyeTracker.poll(frameState.predictedDisplayTime);
+        m_trackingSender.sendHeadPose(views[0].pose, frameState.predictedDisplayTime,
+                                       gaze.x, gaze.y, gaze.valid);
+
         // Render each eye
         for (uint32_t eye = 0; eye < 2; eye++) {
             uint32_t imgIndex;
