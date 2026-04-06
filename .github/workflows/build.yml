@@ -39,11 +39,15 @@ jobs:
           shell: bash
           run: |
             mkdir -p dist/fonts
-            curl -sL -o /tmp/instrument-serif.zip "https://fonts.google.com/download?family=Instrument+Serif"
-            unzip -qo /tmp/instrument-serif.zip -d /tmp/instrument-serif
-            cp /tmp/instrument-serif/InstrumentSerif-Regular.ttf dist/fonts/ || true
-            curl -sL -o dist/fonts/Geist-Regular.ttf "https://github.com/vercel/geist-font/raw/main/packages/geist-font/fonts/geist-sans/Geist-Regular.ttf" || true
-            curl -sL -o dist/fonts/GeistMono-Regular.ttf "https://github.com/vercel/geist-font/raw/main/packages/geist-mono/fonts/geist-mono/GeistMono-Regular.ttf" || true
+            # Instrument Serif from Google Fonts API
+            curl -sL -o dist/fonts/InstrumentSerif-Regular.ttf \
+              "https://github.com/google/fonts/raw/main/ofl/instrumentserif/InstrumentSerif-Regular.ttf" || true
+            # Geist from Vercel
+            curl -sL -o dist/fonts/Geist-Regular.ttf \
+              "https://github.com/vercel/geist-font/raw/main/packages/geist-font/fonts/geist-sans/Geist-Regular.ttf" || true
+            curl -sL -o dist/fonts/GeistMono-Regular.ttf \
+              "https://github.com/vercel/geist-font/raw/main/packages/geist-mono/fonts/geist-mono/GeistMono-Regular.ttf" || true
+            ls -la dist/fonts/
         - name: Package companion app
           shell: bash
           run: |
