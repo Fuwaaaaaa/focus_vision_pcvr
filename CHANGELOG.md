@@ -2,6 +2,25 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [1.0.0] - 2026-04-06
+
+### Added
+- **オーディオストリーミング:** WASAPI loopback → Opus → AAudio。PC音声をHMDで低遅延再生
+- **FECクライアント復元:** GF(2^8) Vandermonde行列ベースReed-Solomon。パケットロス耐性
+- **Timewarp:** Quaternionベース回転補正。デコード遅延時の頭部追従を維持
+- **HeartbeatClient:** 500ms毎にHMD統計（パケットロス、デコードレイテンシー）をTCPで送信
+- **適応ビットレート:** HMD実パケットロスをBandwidthEstimatorに接続
+- **自動再接続:** 指数バックオフ（1s→16s、max 5回）。TCP切断時にセッション停止→再リッスン
+- **エンジン状態IPC:** status.json経由でコンパニオンアプリとPIN/接続状態/統計を共有
+- **JNI SurfaceTexture:** zero-copy MediaCodec→GLテクスチャ。ASurfaceTexture_fromSurfaceTexture
+- **デコードレイテンシー計測:** submit-to-output wall time。logcatに90フレーム毎の平均出力
+- **Android CI:** NDK r26b + Gradle 8.5 + OpenXR SDK FetchContent。APK自動ビルド
+
+### Fixed
+- **FecFrameDecoder uint16_t化:** >255シャードのIDRフレームのサイレント破損を防止
+- **Timewarpシェーダー型修正:** sampler2D → samplerExternalOES + GL_OES_EGL_image_external_essl3
+- **ADB deploy非同期化:** UIフリーズ防止
+
 ## [0.1.0.0] - 2026-03-27
 
 ### Added
