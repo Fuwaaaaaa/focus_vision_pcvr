@@ -2,6 +2,28 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [1.1.1] - 2026-04-07
+
+### Fixed
+- **TLS制御チャネル修正:** ハンドシェイク後にダミー平文ストリームを返していたバグを修正。制御メッセージが実際のTLS接続上で送受信されるように
+- **direct_mode use-after-free修正:** `m_pendingTexture`を生ポインタからComPtrに変更し参照カウント安全性を確保
+- **JNI参照リーク修正:** VideoDecoder::init()のエラーパスで`m_javaSurfaceTexture`のグローバル参照を解放
+- **FFI unsafe修正:** `fvp_submit_encoded_nal`等のFFI関数に`unsafe`マーキング追加
+- **unwrapパニック修正:** trackingポートパース、exportのfile_name()でパニックの可能性を除去
+- **Clippy全警告解消:** 33件のclippy警告を修正（map_or→is_some_and、Default derive等）
+
+### Performance
+- **NALバッファ clone除去:** `std::mem::take()`で所有権移転。フレーム毎のmemcpy削減（1-5ms/frame）
+- **FEC encoder clone除去:** `encode()`が所有権を受け取るように変更。データシャードのコピー削減（2-5ms/frame）
+- **レイテンシートラッカー最適化:** `collect()`→`fold()`でVec allocationを除去
+
+### Tests
+- **テスト134件に増加**（119→134、+15件）
+- TLS handshakeの実際のtokio_rustls接続テスト追加
+- tracking パケットパース（gaze拡張、controller）テスト追加
+- face tracking OSC全blendshape検証テスト追加
+- audio encoder エッジケーステスト追加
+
 ## [1.1.0] - 2026-04-06
 
 ### Added
