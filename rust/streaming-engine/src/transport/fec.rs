@@ -23,9 +23,9 @@ impl FecEncoder {
     }
 
     /// Encode data shards and produce parity shards.
-    /// Input: list of equal-length data shards.
+    /// Takes ownership of data shards to avoid cloning.
     /// Returns: data shards + parity shards concatenated.
-    pub fn encode(&mut self, data_shards: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, FecError> {
+    pub fn encode(&mut self, mut data_shards: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, FecError> {
         if data_shards.is_empty() {
             return Err(FecError::EmptyInput);
         }
@@ -54,16 +54,15 @@ impl FecEncoder {
 
         let rs = self.cached_rs.as_ref().unwrap();
 
-        // Build shard matrix: data + empty parity
-        let mut shards: Vec<Vec<u8>> = data_shards.to_vec();
+        // Append empty parity shards (data shards are moved in, not cloned)
         for _ in 0..parity_count {
-            shards.push(vec![0u8; shard_len]);
+            data_shards.push(vec![0u8; shard_len]);
         }
 
-        rs.encode(&mut shards)
+        rs.encode(&mut data_shards)
             .map_err(|e| FecError::ReedSolomon(format!("{e}")))?;
 
-        Ok(shards)
+        Ok(data_shards)
     }
 }
 
@@ -121,19 +120,21 @@ mod tests {
     fn test_fec_encode_decode_no_loss() {
         let mut encoder = FecEncoder::new(0.5); // 50% redundancy
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 100]).collect();
-        let encoded = encoder.encode(&data).unwrap();
+        let expected = data.clone();
+        let encoded = encoder.encode(data).unwrap();
         assert_eq!(encoded.len(), 6); // 4 data + 2 parity
 
         let mut shards: Vec<Option<Vec<u8>>> = encoded.into_iter().map(Some).collect();
         let decoded = FecDecoder::decode(&mut shards, 4).unwrap();
-        assert_eq!(decoded, data);
+        assert_eq!(decoded, expected);
     }
 
     #[test]
     fn test_fec_recover_from_loss() {
         let mut encoder = FecEncoder::new(0.5);
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 100]).collect();
-        let encoded = encoder.encode(&data).unwrap();
+        let expected = data.clone();
+        let encoded = encoder.encode(data).unwrap();
 
         // Lose 2 shards (within parity capacity)
         let mut shards: Vec<Option<Vec<u8>>> = encoded.into_iter().map(Some).collect();
@@ -141,14 +142,14 @@ mod tests {
         shards[3] = None; // lose data shard 3
 
         let decoded = FecDecoder::decode(&mut shards, 4).unwrap();
-        assert_eq!(decoded, data);
+        assert_eq!(decoded, expected);
     }
 
     #[test]
     fn test_fec_too_much_loss() {
         let mut encoder = FecEncoder::new(0.25); // 1 parity shard for 4 data
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 100]).collect();
-        let encoded = encoder.encode(&data).unwrap();
+        let encoded = encoder.encode(data).unwrap();
         assert_eq!(encoded.len(), 5); // 4 data + 1 parity
 
         // Lose 2 shards — exceeds parity capacity
@@ -164,7 +165,8 @@ mod tests {
     fn test_fec_20_percent_default() {
         let mut encoder = FecEncoder::new(0.2);
         let data: Vec<Vec<u8>> = (0..10).map(|i| vec![i; 200]).collect();
-        let encoded = encoder.encode(&data).unwrap();
+        let expected = data.clone();
+        let encoded = encoder.encode(data).unwrap();
         assert_eq!(encoded.len(), 12); // 10 data + 2 parity
 
         // Lose 2 shards (exactly at capacity)
@@ -173,6 +175,6 @@ mod tests {
         shards[7] = None;
 
         let decoded = FecDecoder::decode(&mut shards, 10).unwrap();
-        assert_eq!(decoded, data);
+        assert_eq!(decoded, expected);
     }
 }
