@@ -2,6 +2,34 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [2.0.0] - 2026-04-07
+
+### Strategy
+- **差別化先行戦略:** VIVE Hubが既に提供するDP/ハンドトラッキング/パススルーより、独自価値（レイテンシー最適化、FT強化、オープンソース）を優先
+- **フェーズ再編成:** Phase 1=レイテンシー基盤、Phase 2=Foveated+FT Suite、Phase 3=ハードウェアパリティ
+
+### Added
+- **96fpsサポート:** RTPタイムスタンプをconfigフレームレートから動的計算。30-120fps対応
+- **プロトコルバージョニング:** HELLO/HELLO_ACKにu16 protocol_version追加。未知メッセージは警告+スキップ（後方互換性維持）
+- **UDPトランスポート最適化:** SO_RCVBUF/SO_SNDBUF 2MB + DSCP EF marking（非致命的フォールバック）
+- **フルRGBカラーレンジ:** `video.full_range` config + FvpConfig FFI。NVENC VUIパラメータは実機検証待ち
+- **レイテンシーウォーターフォール:** HMD内でencode/network/decode/renderの内訳を色分けバーで表示
+- **HEARTBEAT_ACK:** PC側エンコード/トータルレイテンシーをHMDに送信
+
+### Fixed
+- **RTPタイムスタンプバグ:** `engine.rs:682`の`/90`ハードコードを修正。96fps/120fpsで正しいタイムスタンプを生成
+- **フレームレート依存定数:** ビットレート調整間隔、ログ間隔、LatencyTrackerウィンドウをconfigから動的計算
+
+### Changed
+- **Config validate():** `Vec<String>` → `Vec<ConfigError>` に変更。構造化されたフィールド名付きエラー（graceful migration維持）
+
+### Tests
+- **テスト168件に増加**（156→168、+12件）
+- RTPタイムスタンプ回帰テスト3件（90/96/120fps）
+- ビットレート調整間隔スケーリングテスト1件
+- プロトコルバージョニングテスト3件（encode/decode、空ペイロード、部分ペイロード）
+- Config validation構造化エラーテスト更新
+
 ## [1.3.0] - 2026-04-07
 
 ### Added

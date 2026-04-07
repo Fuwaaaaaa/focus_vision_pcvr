@@ -1,6 +1,6 @@
 # Focus Vision PCVR
 
-VIVE Focus Vision向けPCVRストリーミングツール（v1.3）。
+VIVE Focus Vision向けPCVRストリーミングツール（v2.0）。
 
 ## Architecture
 - `rust/streaming-engine/` — Rust static library (C ABI via cbindgen)
@@ -25,15 +25,15 @@ See `ARCHITECTURE.md` for detailed system diagrams and data flow.
 ./build.bat   # Windows full build
 cargo build --release -p streaming-engine    # Rust streaming engine
 cargo build --release -p focus-vision-companion  # PC companion app
-cargo test --workspace  # Run 156+ tests
+cargo test --workspace  # Run 168+ tests
 ```
 
 ## Testing
 ```bash
-cargo test --workspace              # All tests (156+)
-cargo test -p streaming-engine      # Engine: 118 tests (FEC, RTP, pairing, TLS, haptics, sleep, FT, config validation)
+cargo test --workspace              # All tests (168+)
+cargo test -p streaming-engine      # Engine: 127 tests (FEC, RTP, pairing, TLS, haptics, sleep, FT, config, 96fps regression)
 cargo test -p focus-vision-companion # Companion: 25 tests (config, ADB, export)
-cargo test -p fvp-common            # Common: 6 tests (protocol structs, flags)
+cargo test -p fvp-common            # Common: 9 tests (protocol structs, flags, versioning)
 ```
 
 ## Companion App
