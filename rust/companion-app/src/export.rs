@@ -6,8 +6,8 @@ use crate::adb;
 /// Sanitize PII from log text (IP addresses, Wi-Fi SSIDs).
 pub(crate) fn sanitize_pii(text: &str) -> String {
     // Mask IPv4 addresses
-    let re_ip = regex_lite_ipv4(text);
-    re_ip
+    
+    regex_lite_ipv4(text)
 }
 
 pub(crate) fn regex_lite_ipv4(text: &str) -> String {
@@ -83,9 +83,13 @@ pub fn export_logs(adb_path: Option<&str>, device_serial: Option<&str>) -> Resul
             if let Ok(entries) = std::fs::read_dir(&log_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "json" || e == "log") {
+                    if path.extension().is_some_and(|e| e == "json" || e == "log") {
                         if let Ok(content) = std::fs::read_to_string(&path) {
-                            let name = format!("pc/{}", path.file_name().unwrap().to_string_lossy());
+                            let fname = match path.file_name() {
+                                Some(f) => f.to_string_lossy(),
+                                None => continue,
+                            };
+                            let name = format!("pc/{}", fname);
                             let _ = zip.start_file(&name, options);
                             let _ = zip.write_all(sanitize_pii(&content).as_bytes());
                         }

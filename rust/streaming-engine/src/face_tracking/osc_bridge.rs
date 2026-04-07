@@ -36,6 +36,12 @@ const EYE_NAMES: [&str; 14] = [
     "EyeLeftSqueeze", "EyeRightSqueeze",
 ];
 
+impl Default for OscBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OscBridge {
     pub fn new() -> Self {
         let socket = UdpSocket::bind("0.0.0.0:0").ok();

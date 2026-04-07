@@ -49,7 +49,7 @@ void android_main(struct android_app* app) {
         LOGE("Fatal error: %s", e.what());
     }
 
+    g_app = nullptr; // Clear before shutdown to prevent dangling pointer in handleAppCmd
     xrApp.shutdown();
-    g_app = nullptr;
     LOGI("=== Focus Vision PCVR Client Exiting ===");
 }

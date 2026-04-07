@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use fvp_common::protocol::VideoCodec;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub network: NetworkConfig,
@@ -146,11 +147,6 @@ impl Default for AudioConfig {
             sample_rate: default_audio_sample_rate(),
             channels: default_audio_channels(),
         }
-    }
-}
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self { network: NetworkConfig::default(), video: VideoConfig::default(), audio: AudioConfig::default(), pairing: PairingConfig::default(), display: DisplayConfig::default(), foveated: FoveatedConfig::default() }
     }
 }
 

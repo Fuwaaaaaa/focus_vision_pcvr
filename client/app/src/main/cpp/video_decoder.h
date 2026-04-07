@@ -40,6 +40,8 @@ public:
     uint32_t avgDecodeLatencyUs() const { return m_avgDecodeUs; }
 
 private:
+    void cleanupSurfaceResources(JNIEnv* env);
+
     AMediaCodec* m_codec = nullptr;
     AMediaFormat* m_format = nullptr;
     std::atomic<bool> m_initialized{false};

@@ -76,7 +76,7 @@ impl FecDecoder {
     /// `data_count`: number of data shards (first N in the array).
     /// Returns reconstructed data shards on success.
     pub fn decode(
-        shards: &mut Vec<Option<Vec<u8>>>,
+        shards: &mut [Option<Vec<u8>>],
         data_count: usize,
     ) -> Result<Vec<Vec<u8>>, FecError> {
         let total = shards.len();
