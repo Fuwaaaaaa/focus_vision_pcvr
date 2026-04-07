@@ -110,6 +110,52 @@ void OverlayRenderer::render(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHe
     glUseProgram(0);
 }
 
+void OverlayRenderer::renderDashboard(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight,
+                                       uint32_t bitrateMbps, bool codecIsH265, int highlightItem) {
+    if (!m_initialized || !m_dashboardVisible) return;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glViewport(0, 0, fbWidth, fbHeight);
+    glUseProgram(m_program);
+    glBindVertexArray(m_vao);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // Panel background (bottom-right, semi-transparent dark)
+    // NDC coordinates: x=0.3..0.95, y=-0.95..-0.5
+    float panelX = 0.3f;
+    float panelY = -0.95f;
+    float panelW = 0.65f;
+    float panelH = 0.45f;
+    renderBar(panelX, panelY, panelW, panelH, 0.04f, 0.04f, 0.05f); // bg-primary
+
+    // Bitrate label area
+    float itemY = panelY + panelH - 0.12f;
+    float itemX = panelX + 0.05f;
+
+    // "[-]" button
+    float btnColor = (highlightItem == 0) ? 0.83f : 0.4f;
+    renderBar(itemX, itemY, 0.08f, 0.08f, 0.1f, btnColor * 0.5f, btnColor * 0.3f);
+
+    // Bitrate value area
+    renderBar(itemX + 0.12f, itemY, 0.25f, 0.08f, 0.07f, 0.07f, 0.08f);
+
+    // "[+]" button
+    btnColor = (highlightItem == 2) ? 0.83f : 0.4f;
+    renderBar(itemX + 0.42f, itemY, 0.08f, 0.08f, 0.1f, btnColor * 0.5f, btnColor * 0.3f);
+
+    // Codec indicator row
+    float codecY = itemY - 0.14f;
+    float codecColor = codecIsH265 ? 0.2f : 0.6f;
+    renderBar(itemX, codecY, 0.25f, 0.08f, 0.07f, codecColor * 0.3f, 0.07f);
+    float h264Color = !codecIsH265 ? 0.2f : 0.6f;
+    renderBar(itemX + 0.28f, codecY, 0.25f, 0.08f, 0.07f, h264Color * 0.3f, 0.07f);
+
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
 void OverlayRenderer::renderSleepDimming(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight, float alpha) {
     if (!m_initialized || alpha <= 0.01f) return;
 
