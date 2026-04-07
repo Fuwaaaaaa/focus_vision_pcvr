@@ -64,10 +64,16 @@ pub extern "C" fn fvp_init() -> i32 {
     INIT.call_once(|| { env_logger::init(); });
     log::info!("Focus Vision PCVR Streaming Engine initializing...");
 
-    let config = config::AppConfig::load("config/default.toml").unwrap_or_else(|e| {
+    let mut config = config::AppConfig::load("config/default.toml").unwrap_or_else(|e| {
         log::warn!("Failed to load config, using defaults: {}", e);
         config::AppConfig::default()
     });
+
+    // Validate and fix invalid config values
+    let warnings = config.validate();
+    for w in &warnings {
+        log::warn!("Config validation: {}", w);
+    }
 
     // Store config for fvp_get_config()
     if let Ok(mut guard) = CONFIG.write() {
