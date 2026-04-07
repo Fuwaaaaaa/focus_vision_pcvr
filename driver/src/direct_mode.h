@@ -58,8 +58,10 @@ private:
     FrameCopy m_frameCopy;
     bool m_encoderReady = false;
 
-    // Latest submitted texture (from SubmitLayer, consumed by Present)
-    ID3D11Texture2D* m_pendingTexture = nullptr;
+    // Latest submitted texture (from SubmitLayer, consumed by Present).
+    // ComPtr ensures the texture stays alive even if its swap set is destroyed
+    // between SubmitLayer and Present.
+    ComPtr<ID3D11Texture2D> m_pendingTexture;
 
     // Swap texture set: maps SharedTextureHandle_t → D3D11 texture.
     // CreateSwapTextureSet allocates real D3D11 textures and returns handles.

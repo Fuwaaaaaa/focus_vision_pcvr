@@ -10,6 +10,12 @@ pub struct PairingState {
     paired: bool,
 }
 
+impl Default for PairingState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PairingState {
     pub fn new() -> Self {
         let pin = generate_pin();

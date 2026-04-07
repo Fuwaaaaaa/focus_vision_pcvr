@@ -87,6 +87,12 @@ pub struct RtpDepacketizer {
     expected_count: usize,
 }
 
+impl Default for RtpDepacketizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RtpDepacketizer {
     pub fn new() -> Self {
         Self {
@@ -141,10 +147,8 @@ impl RtpDepacketizer {
             let received = self.shards.iter().filter(|s| s.is_some()).count();
             if received == self.expected_count {
                 let mut frame_data = Vec::new();
-                for shard in &self.shards {
-                    if let Some(data) = shard {
-                        frame_data.extend_from_slice(data);
-                    }
+                for data in self.shards.iter().flatten() {
+                    frame_data.extend_from_slice(data);
                 }
                 self.current_frame_index = None;
                 return Some(ReassembledFrame {

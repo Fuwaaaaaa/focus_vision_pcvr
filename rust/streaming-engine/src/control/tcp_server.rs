@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 
@@ -9,6 +9,11 @@ use fvp_common::protocol::msg_type;
 use crate::config::AppConfig;
 use crate::control::pairing::PairingState;
 use crate::control::tls;
+
+/// Combined async read+write trait for boxed TLS or plain TCP streams.
+/// Combined async read+write trait for boxed TLS or plain TCP streams.
+pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 
 /// TCP control channel server with TLS.
 /// Handles: TLS handshake, connection handshake, PIN pairing, stream config, heartbeat.
@@ -61,7 +66,8 @@ impl TcpControlServer {
     }
 
     /// Start listening. Accepts TLS connection, then runs protocol handshake.
-    pub async fn listen_and_accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
+    /// Returns the authenticated stream (TLS-wrapped or plaintext) for post-handshake control.
+    pub async fn listen_and_accept(&self) -> std::io::Result<(Box<dyn AsyncStream>, SocketAddr)> {
         let addr: SocketAddr = format!("0.0.0.0:{}", self.config.network.tcp_port)
             .parse()
             .unwrap();
@@ -79,16 +85,10 @@ impl TcpControlServer {
                 match acceptor.accept(tcp_stream).await {
                     Ok(tls_stream) => {
                         match self.handle_handshake_generic(tls_stream).await {
-                            Ok(_) => {
+                            Ok(stream) => {
                                 *self.connected.lock().await = true;
-                                // Note: we return a dummy TcpStream here since the real
-                                // stream is now TLS-wrapped. In production, the caller
-                                // would need to hold the TLS stream instead.
-                                // For now, reconnect for post-handshake communication.
                                 log::info!("TLS handshake + pairing complete from {}", peer);
-                                // Return the underlying TCP info for the caller
-                                let dummy = TcpStream::connect(addr).await?;
-                                return Ok((dummy, peer));
+                                return Ok((Box::new(stream), peer));
                             }
                             Err(e) => {
                                 log::warn!("Handshake failed from {}: {}", peer, e);
@@ -104,11 +104,10 @@ impl TcpControlServer {
             } else {
                 // Plaintext fallback (dev/test mode)
                 match self.handle_handshake_generic(tcp_stream).await {
-                    Ok(_stream) => {
+                    Ok(stream) => {
                         *self.connected.lock().await = true;
-                        // Re-establish for caller (simplified)
-                        let stream = TcpStream::connect(addr).await?;
-                        return Ok((stream, peer));
+                        log::info!("Handshake + pairing complete from {}", peer);
+                        return Ok((Box::new(stream), peer));
                     }
                     Err(e) => {
                         log::warn!("Handshake failed from {}: {}", peer, e);
@@ -232,6 +231,9 @@ where
 }
 
 // Convenience aliases for tests that use TcpStream directly
+#[cfg(test)]
+use tokio::net::TcpStream;
+
 #[cfg(test)]
 async fn read_message(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     read_message_generic(stream).await
