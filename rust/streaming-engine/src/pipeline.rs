@@ -60,7 +60,8 @@ pub fn encode_frame_to_packets_with_fec(
         }
     };
 
-    // Step 3: Each shard becomes an RTP packet payload
+    // Step 3: Each shard becomes an RTP packet payload.
+    // Buffer pool in packetizer avoids per-frame allocation after the first frame.
     let total_shards = all_shards.len();
     if total_shards > u16::MAX as usize {
         log::error!("Frame too large: {} shards exceeds u16 max. Dropping frame.", total_shards);
@@ -72,7 +73,7 @@ pub fn encode_frame_to_packets_with_fec(
         let is_last = i == total_shards - 1;
         let seq = packetizer.next_sequence();
 
-        let mut buf = Vec::with_capacity(12 + 10 + shard.len());
+        let mut buf = packetizer.take_buf(12 + 10 + shard.len());
 
         // RTP header
         buf.push(0x80);

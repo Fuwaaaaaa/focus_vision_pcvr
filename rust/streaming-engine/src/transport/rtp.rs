@@ -10,14 +10,37 @@ pub struct RtpPacket {
 }
 
 /// Packetizes encoded NAL units into RTP packets with FVP headers.
+/// Maintains a pool of reusable byte buffers to avoid per-frame allocation.
 pub struct RtpPacketizer {
     ssrc: u32,
     sequence: u16,
+    /// Recycled packet buffers from previous frames.
+    /// After the first frame, subsequent frames reuse these without allocating.
+    buf_pool: Vec<Vec<u8>>,
 }
 
 impl RtpPacketizer {
     pub fn new(ssrc: u32) -> Self {
-        Self { ssrc, sequence: 0 }
+        Self { ssrc, sequence: 0, buf_pool: Vec::new() }
+    }
+
+    /// Take a buffer from the pool (reusing capacity) or create a new one.
+    pub(crate) fn take_buf(&mut self, needed: usize) -> Vec<u8> {
+        match self.buf_pool.pop() {
+            Some(mut buf) => {
+                buf.clear();
+                buf.reserve(needed.saturating_sub(buf.capacity()));
+                buf
+            }
+            None => Vec::with_capacity(needed),
+        }
+    }
+
+    /// Return used packet buffers to the pool for reuse on the next frame.
+    pub fn recycle(&mut self, packets: Vec<RtpPacket>) {
+        for pkt in packets {
+            self.buf_pool.push(pkt.data);
+        }
     }
 
     /// Packetize a single encoded frame into multiple RTP packets.
@@ -46,7 +69,7 @@ impl RtpPacketizer {
             let is_last = i == total_chunks - 1;
             let seq = self.next_sequence();
 
-            let mut buf = Vec::with_capacity(12 + 10 + chunk.len());
+            let mut buf = self.take_buf(12 + 10 + chunk.len());
 
             // RTP header (12 bytes)
             buf.push(0x80); // V=2, P=0, X=0, CC=0
