@@ -25,6 +25,33 @@ static GAZE_CALLBACK: std::sync::RwLock<Option<extern "C" fn(f32, f32, i32)>> = 
 /// Set via fvp_set_bitrate_callback() from C++.
 static BITRATE_CALLBACK: std::sync::RwLock<Option<extern "C" fn(u32)>> = std::sync::RwLock::new(None);
 
+/// Channel for sending haptic events to the TCP control writer.
+/// Set per session when TCP connection is established.
+static HAPTIC_TX: std::sync::RwLock<Option<mpsc::Sender<HapticEvent>>> = std::sync::RwLock::new(None);
+
+/// Haptic vibration event from SteamVR to HMD.
+#[derive(Debug, Clone)]
+pub struct HapticEvent {
+    pub controller_id: u8,     // 0=left, 1=right
+    pub duration_ms: u16,      // vibration duration
+    pub frequency: f32,        // Hz
+    pub amplitude: f32,        // 0.0 - 1.0
+}
+
+/// Queue a haptic event for delivery to HMD. Called from C++ driver thread.
+pub fn queue_haptic(controller_id: u8, duration_ms: u16, frequency: f32, amplitude: f32) {
+    if let Ok(guard) = HAPTIC_TX.read() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.try_send(HapticEvent {
+                controller_id,
+                duration_ms,
+                frequency,
+                amplitude,
+            });
+        }
+    }
+}
+
 pub fn set_idr_callback(cb: extern "C" fn()) {
     if let Ok(mut guard) = IDR_CALLBACK.write() {
         *guard = Some(cb);
@@ -220,86 +247,115 @@ pub struct HmdStats {
     pub fps: u16,
 }
 
-/// Read TCP control messages after handshake (IDR_REQUEST, HEARTBEAT, FACE_DATA, DISCONNECT).
+/// Read TCP control messages and write haptic events.
+/// Handles: IDR_REQUEST, HEARTBEAT, FACE_DATA, DISCONNECT (inbound).
+/// Sends: HAPTIC_EVENT (outbound to HMD).
 /// When the connection closes or errors, cancels the provided token to stop streaming.
-/// Accepts any async stream (TLS-wrapped or plaintext) from the handshake.
 async fn handle_tcp_control(
-    mut stream: Box<dyn crate::control::tcp_server::AsyncStream>,
+    stream: Box<dyn crate::control::tcp_server::AsyncStream>,
     cancel: tokio_util::sync::CancellationToken,
     hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
     osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
+    mut haptic_rx: mpsc::Receiver<HapticEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const MAX_MSG_LEN: usize = 65536; // 64KB — control messages are small
 
+    // Split stream for concurrent read (inbound messages) and write (haptic events)
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    /// Send a framed message to the HMD.
+    async fn send_msg<W: AsyncWriteExt + Unpin>(writer: &mut W, msg_type: u8, payload: &[u8]) -> std::io::Result<()> {
+        let len = (1 + payload.len()) as u32;
+        writer.write_all(&len.to_le_bytes()).await?;
+        writer.write_all(&[msg_type]).await?;
+        writer.write_all(payload).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
     loop {
-        // Read framed message: [length:u32 LE][type:u8][payload]
+        // Concurrently: read inbound messages OR send haptic events
         let mut len_buf = [0u8; 4];
-        if stream.read_exact(&mut len_buf).await.is_err() {
-            log::info!("TCP control connection closed — stopping stream");
-            cancel.cancel();
-            break;
-        }
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 { continue; }
-        if len > MAX_MSG_LEN {
-            log::error!("TCP message too large ({} bytes), closing connection", len);
-            cancel.cancel();
-            break;
-        }
+        tokio::select! {
+            read_result = reader.read_exact(&mut len_buf) => {
+                if read_result.is_err() {
+                    log::info!("TCP control connection closed — stopping stream");
+                    cancel.cancel();
+                    break;
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                if len == 0 { continue; }
+                if len > MAX_MSG_LEN {
+                    log::error!("TCP message too large ({} bytes), closing connection", len);
+                    cancel.cancel();
+                    break;
+                }
 
-        let mut msg_buf = vec![0u8; len];
-        if stream.read_exact(&mut msg_buf).await.is_err() {
-            log::info!("TCP control read failed mid-message — stopping stream");
-            cancel.cancel();
-            break;
-        }
-        let msg_type = msg_buf[0];
+                let mut msg_buf = vec![0u8; len];
+                if reader.read_exact(&mut msg_buf).await.is_err() {
+                    log::info!("TCP control read failed mid-message — stopping stream");
+                    cancel.cancel();
+                    break;
+                }
+                let msg_type = msg_buf[0];
 
-        match msg_type {
-            fvp_common::protocol::msg_type::IDR_REQUEST => {
-                log::info!("Received IDR_REQUEST from client");
-                notify_idr_request();
-            }
-            fvp_common::protocol::msg_type::HEARTBEAT => {
-                // Parse heartbeat payload: [seq:4][timestamp:8][stats:14]
-                let payload = &msg_buf[1..];
-                if payload.len() >= 26 {
-                    let stats_offset = 12; // skip seq(4) + timestamp(8)
-                    let s = &payload[stats_offset..];
-                    let packets_received = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                    let packets_lost = u32::from_le_bytes([s[4], s[5], s[6], s[7]]);
-                    let avg_decode_us = u32::from_le_bytes([s[8], s[9], s[10], s[11]]);
-                    let fps = u16::from_le_bytes([s[12], s[13]]);
+                match msg_type {
+                    fvp_common::protocol::msg_type::IDR_REQUEST => {
+                        log::info!("Received IDR_REQUEST from client");
+                        notify_idr_request();
+                    }
+                    fvp_common::protocol::msg_type::HEARTBEAT => {
+                        let payload = &msg_buf[1..];
+                        if payload.len() >= 26 {
+                            let stats_offset = 12;
+                            let s = &payload[stats_offset..];
+                            let packets_received = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                            let packets_lost = u32::from_le_bytes([s[4], s[5], s[6], s[7]]);
+                            let avg_decode_us = u32::from_le_bytes([s[8], s[9], s[10], s[11]]);
+                            let fps = u16::from_le_bytes([s[12], s[13]]);
 
-                    if let Ok(mut guard) = hmd_stats.lock() {
-                        *guard = Some(HmdStats {
-                            packets_received,
-                            packets_lost,
-                            avg_decode_us,
-                            fps,
-                        });
+                            if let Ok(mut guard) = hmd_stats.lock() {
+                                *guard = Some(HmdStats {
+                                    packets_received,
+                                    packets_lost,
+                                    avg_decode_us,
+                                    fps,
+                                });
+                            }
+                        }
+                    }
+                    fvp_common::protocol::msg_type::FACE_DATA => {
+                        let payload = &msg_buf[1..];
+                        if let Some((lip_valid, eye_valid, lip, eye)) =
+                            crate::face_tracking::osc_bridge::parse_face_data(payload)
+                        {
+                            if let Ok(mut bridge) = osc_bridge.lock() {
+                                bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
+                            }
+                        }
+                    }
+                    fvp_common::protocol::msg_type::DISCONNECT => {
+                        log::info!("Client sent DISCONNECT — stopping stream");
+                        cancel.cancel();
+                        break;
+                    }
+                    _ => {
+                        log::debug!("Unknown TCP control message type: 0x{:02x}", msg_type);
                     }
                 }
             }
-            fvp_common::protocol::msg_type::FACE_DATA => {
-                let payload = &msg_buf[1..];
-                if let Some((lip_valid, eye_valid, lip, eye)) =
-                    crate::face_tracking::osc_bridge::parse_face_data(payload)
-                {
-                    if let Ok(mut bridge) = osc_bridge.lock() {
-                        bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
-                    }
+            Some(haptic) = haptic_rx.recv() => {
+                // Send haptic event to HMD: [controller_id:1B][duration_ms:2B][frequency:4B][amplitude:4B]
+                let mut payload = Vec::with_capacity(11);
+                payload.push(haptic.controller_id);
+                payload.extend_from_slice(&haptic.duration_ms.to_le_bytes());
+                payload.extend_from_slice(&haptic.frequency.to_le_bytes());
+                payload.extend_from_slice(&haptic.amplitude.to_le_bytes());
+                if let Err(e) = send_msg(&mut writer, fvp_common::protocol::msg_type::HAPTIC_EVENT, &payload).await {
+                    log::warn!("Failed to send haptic event: {}", e);
                 }
-            }
-            fvp_common::protocol::msg_type::DISCONNECT => {
-                log::info!("Client sent DISCONNECT — stopping stream");
-                cancel.cancel();
-                break;
-            }
-            _ => {
-                log::debug!("Unknown TCP control message type: 0x{:02x}", msg_type);
             }
         }
     }
@@ -470,12 +526,18 @@ async fn run_streaming(
             crate::face_tracking::osc_bridge::OscBridge::with_smoothing(config.face_tracking.smoothing)
         ));
 
-        // Spawn TCP control reader (uses the same TLS/plain stream from handshake)
+        // Haptic event channel (PC driver → TCP → HMD)
+        let (haptic_tx, haptic_rx) = mpsc::channel::<HapticEvent>(16);
+        if let Ok(mut guard) = HAPTIC_TX.write() {
+            *guard = Some(haptic_tx);
+        }
+
+        // Spawn TCP control reader/writer (uses the same TLS/plain stream from handshake)
         let tcp_session = session_cancel.clone();
         let stats_clone = hmd_stats.clone();
         let osc_clone = osc_bridge.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone).await {
+            if let Err(e) = handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, haptic_rx).await {
                 log::warn!("TCP control reader ended: {}", e);
             }
         });
