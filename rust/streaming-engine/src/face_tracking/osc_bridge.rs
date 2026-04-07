@@ -101,6 +101,35 @@ impl OscBridge {
     }
 }
 
+/// Parse face data payload from FACE_DATA TCP message.
+/// Format: [lip_valid:1B][eye_valid:1B][lip:37×4B][eye:14×4B] = 206 bytes.
+/// Returns (lip_valid, eye_valid, lip[37], eye[14]).
+pub fn parse_face_data(payload: &[u8]) -> Option<(bool, bool, [f32; 37], [f32; 14])> {
+    if payload.len() < 206 {
+        return None;
+    }
+    let lip_valid = payload[0] != 0;
+    let eye_valid = payload[1] != 0;
+
+    let mut lip = [0.0f32; 37];
+    for (i, val) in lip.iter_mut().enumerate() {
+        let off = 2 + i * 4;
+        *val = f32::from_le_bytes([
+            payload[off], payload[off + 1], payload[off + 2], payload[off + 3],
+        ]);
+    }
+
+    let mut eye = [0.0f32; 14];
+    for (i, val) in eye.iter_mut().enumerate() {
+        let off = 2 + 37 * 4 + i * 4;
+        *val = f32::from_le_bytes([
+            payload[off], payload[off + 1], payload[off + 2], payload[off + 3],
+        ]);
+    }
+
+    Some((lip_valid, eye_valid, lip, eye))
+}
+
 /// Encode a minimal OSC message: address + ",f" type tag + float value.
 /// OSC spec: all strings null-terminated and padded to 4-byte boundary.
 fn encode_osc_float(address: &str, value: f32) -> Option<Vec<u8>> {
@@ -219,5 +248,40 @@ mod tests {
             let tag_pos = msg.windows(4).position(|w| w == b",f\0\0");
             assert!(tag_pos.is_some(), "Missing type tag for {}", name);
         }
+    }
+
+    #[test]
+    fn test_parse_face_data_valid() {
+        let mut payload = vec![0u8; 206];
+        payload[0] = 1; // lip_valid
+        payload[1] = 1; // eye_valid
+        // Set JawOpen (index 3) = 0.8
+        let jaw_off = 2 + 3 * 4;
+        payload[jaw_off..jaw_off + 4].copy_from_slice(&0.8f32.to_le_bytes());
+        // Set EyeLeftBlink (index 0) = 0.5
+        let eye_off = 2 + 37 * 4;
+        payload[eye_off..eye_off + 4].copy_from_slice(&0.5f32.to_le_bytes());
+
+        let (lv, ev, lip, eye) = parse_face_data(&payload).unwrap();
+        assert!(lv);
+        assert!(ev);
+        assert!((lip[3] - 0.8).abs() < 1e-6);
+        assert!((eye[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_parse_face_data_too_short() {
+        assert!(parse_face_data(&[0u8; 100]).is_none());
+        assert!(parse_face_data(&[0u8; 205]).is_none());
+    }
+
+    #[test]
+    fn test_parse_face_data_validity_flags() {
+        let mut payload = vec![0u8; 206];
+        payload[0] = 0; // lip not valid
+        payload[1] = 1; // eye valid
+        let (lv, ev, _, _) = parse_face_data(&payload).unwrap();
+        assert!(!lv);
+        assert!(ev);
     }
 }

@@ -220,13 +220,14 @@ pub struct HmdStats {
     pub fps: u16,
 }
 
-/// Read TCP control messages after handshake (IDR_REQUEST, HEARTBEAT, DISCONNECT).
+/// Read TCP control messages after handshake (IDR_REQUEST, HEARTBEAT, FACE_DATA, DISCONNECT).
 /// When the connection closes or errors, cancels the provided token to stop streaming.
 /// Accepts any async stream (TLS-wrapped or plaintext) from the handshake.
 async fn handle_tcp_control(
     mut stream: Box<dyn crate::control::tcp_server::AsyncStream>,
     cancel: tokio_util::sync::CancellationToken,
     hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
+    osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::AsyncReadExt;
 
@@ -279,6 +280,16 @@ async fn handle_tcp_control(
                             avg_decode_us,
                             fps,
                         });
+                    }
+                }
+            }
+            fvp_common::protocol::msg_type::FACE_DATA => {
+                let payload = &msg_buf[1..];
+                if let Some((lip_valid, eye_valid, lip, eye)) =
+                    crate::face_tracking::osc_bridge::parse_face_data(payload)
+                {
+                    if let Ok(bridge) = osc_bridge.lock() {
+                        bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
                     }
                 }
             }
@@ -454,11 +465,15 @@ async fn run_streaming(
         // Shared HMD stats for adaptive bitrate (fed by heartbeat messages)
         let hmd_stats: Arc<StdMutex<Option<HmdStats>>> = Arc::new(StdMutex::new(None));
 
+        // OSC bridge for face tracking data (HMD → VRChat)
+        let osc_bridge = Arc::new(StdMutex::new(crate::face_tracking::osc_bridge::OscBridge::new()));
+
         // Spawn TCP control reader (uses the same TLS/plain stream from handshake)
         let tcp_session = session_cancel.clone();
         let stats_clone = hmd_stats.clone();
+        let osc_clone = osc_bridge.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp_control(tcp_control_stream, tcp_session, stats_clone).await {
+            if let Err(e) = handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone).await {
                 log::warn!("TCP control reader ended: {}", e);
             }
         });
