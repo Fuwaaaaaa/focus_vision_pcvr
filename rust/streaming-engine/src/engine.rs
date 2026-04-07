@@ -52,6 +52,29 @@ pub fn queue_haptic(controller_id: u8, duration_ms: u16, frequency: f32, amplitu
     }
 }
 
+impl HapticEvent {
+    /// Serialize haptic event to wire format: [controller_id:1B][duration_ms:2B][frequency:4B][amplitude:4B]
+    pub fn to_payload(&self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(11);
+        payload.push(self.controller_id);
+        payload.extend_from_slice(&self.duration_ms.to_le_bytes());
+        payload.extend_from_slice(&self.frequency.to_le_bytes());
+        payload.extend_from_slice(&self.amplitude.to_le_bytes());
+        payload
+    }
+
+    /// Deserialize haptic event from wire format.
+    pub fn from_payload(data: &[u8]) -> Option<Self> {
+        if data.len() < 11 { return None; }
+        Some(Self {
+            controller_id: data[0],
+            duration_ms: u16::from_le_bytes([data[1], data[2]]),
+            frequency: f32::from_le_bytes([data[3], data[4], data[5], data[6]]),
+            amplitude: f32::from_le_bytes([data[7], data[8], data[9], data[10]]),
+        })
+    }
+}
+
 pub fn set_idr_callback(cb: extern "C" fn()) {
     if let Ok(mut guard) = IDR_CALLBACK.write() {
         *guard = Some(cb);
@@ -347,12 +370,7 @@ async fn handle_tcp_control(
                 }
             }
             Some(haptic) = haptic_rx.recv() => {
-                // Send haptic event to HMD: [controller_id:1B][duration_ms:2B][frequency:4B][amplitude:4B]
-                let mut payload = Vec::with_capacity(11);
-                payload.push(haptic.controller_id);
-                payload.extend_from_slice(&haptic.duration_ms.to_le_bytes());
-                payload.extend_from_slice(&haptic.frequency.to_le_bytes());
-                payload.extend_from_slice(&haptic.amplitude.to_le_bytes());
+                let payload = haptic.to_payload();
                 if let Err(e) = send_msg(&mut writer, fvp_common::protocol::msg_type::HAPTIC_EVENT, &payload).await {
                     log::warn!("Failed to send haptic event: {}", e);
                 }
@@ -770,5 +788,68 @@ mod tests {
         };
         assert!(!engine.submit_frame(frame), "frame 4 should fail (channel full)");
         engine.shutdown();
+    }
+
+    #[test]
+    fn test_haptic_event_serialization_roundtrip() {
+        let event = HapticEvent {
+            controller_id: 1,
+            duration_ms: 250,
+            frequency: 160.0,
+            amplitude: 0.75,
+        };
+        let payload = event.to_payload();
+        assert_eq!(payload.len(), 11);
+
+        let decoded = HapticEvent::from_payload(&payload).unwrap();
+        assert_eq!(decoded.controller_id, 1);
+        assert_eq!(decoded.duration_ms, 250);
+        assert!((decoded.frequency - 160.0).abs() < 1e-6);
+        assert!((decoded.amplitude - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_haptic_event_payload_too_short() {
+        assert!(HapticEvent::from_payload(&[0u8; 10]).is_none());
+        assert!(HapticEvent::from_payload(&[]).is_none());
+    }
+
+    #[test]
+    fn test_haptic_event_left_right_controllers() {
+        let left = HapticEvent { controller_id: 0, duration_ms: 100, frequency: 320.0, amplitude: 1.0 };
+        let right = HapticEvent { controller_id: 1, duration_ms: 50, frequency: 160.0, amplitude: 0.5 };
+
+        let lp = left.to_payload();
+        let rp = right.to_payload();
+        assert_eq!(lp[0], 0); // left
+        assert_eq!(rp[0], 1); // right
+    }
+
+    #[test]
+    fn test_queue_haptic_no_tx_doesnt_panic() {
+        // With no active session, HAPTIC_TX is None — should not panic
+        if let Ok(mut guard) = HAPTIC_TX.write() {
+            *guard = None;
+        }
+        queue_haptic(0, 100, 160.0, 0.5); // should be a no-op
+    }
+
+    #[tokio::test]
+    async fn test_queue_haptic_channel_full() {
+        let (tx, _rx) = mpsc::channel::<HapticEvent>(2); // small channel
+        if let Ok(mut guard) = HAPTIC_TX.write() {
+            *guard = Some(tx);
+        }
+
+        // Fill the channel
+        queue_haptic(0, 100, 160.0, 1.0);
+        queue_haptic(0, 100, 160.0, 1.0);
+        // Third should be dropped silently (channel full)
+        queue_haptic(0, 100, 160.0, 1.0);
+
+        // Clean up
+        if let Ok(mut guard) = HAPTIC_TX.write() {
+            *guard = None;
+        }
     }
 }
