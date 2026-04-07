@@ -94,4 +94,19 @@ mod tests {
         assert!(est.loss_rate() > 0.0);
         assert!(est.loss_rate() < 0.5);
     }
+
+    #[test]
+    fn test_zero_packets_both_zero() {
+        let mut est = BandwidthEstimator::new();
+        est.update(0, 0, 5.0);
+        assert_eq!(est.loss_rate(), 0.0);
+        assert!(est.has_data());
+    }
+
+    #[test]
+    fn test_all_packets_lost() {
+        let mut est = BandwidthEstimator::new();
+        est.update(0, 100, 10.0); // 100% loss
+        assert!((est.loss_rate() - 1.0).abs() < 0.01);
+    }
 }
