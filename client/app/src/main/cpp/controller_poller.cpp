@@ -1,6 +1,10 @@
 #include "controller_poller.h"
 #include "xr_utils.h"
 #include <cstring>
+#include <cmath>
+
+// Thumbstick deadzone — values below this magnitude are zeroed to prevent drift
+static constexpr float THUMBSTICK_DEADZONE = 0.1f;
 
 bool ControllerPoller::init(XrInstance instance, XrSession session) {
     if (!createActionSet(instance)) return false;
@@ -74,39 +78,97 @@ bool ControllerPoller::createActions() {
         XR_ACTION_TYPE_BOOLEAN_INPUT, m_handPaths, 2);
     m_menuAction = createAction(m_actionSet, "menu", "Menu",
         XR_ACTION_TYPE_BOOLEAN_INPUT, m_handPaths, 2);
+    m_thumbstickClickAction = createAction(m_actionSet, "thumbstick_click", "Thumbstick Click",
+        XR_ACTION_TYPE_BOOLEAN_INPUT, m_handPaths, 2);
+    m_triggerTouchAction = createAction(m_actionSet, "trigger_touch", "Trigger Touch",
+        XR_ACTION_TYPE_BOOLEAN_INPUT, m_handPaths, 2);
+    m_gripTouchAction = createAction(m_actionSet, "grip_touch", "Grip Touch",
+        XR_ACTION_TYPE_BOOLEAN_INPUT, m_handPaths, 2);
+    m_thumbstickTouchAction = createAction(m_actionSet, "thumbstick_touch", "Thumbstick Touch",
+        XR_ACTION_TYPE_BOOLEAN_INPUT, m_handPaths, 2);
     m_hapticAction = createAction(m_actionSet, "haptic", "Haptic",
         XR_ACTION_TYPE_VIBRATION_OUTPUT, m_handPaths, 2);
     return true;
 }
 
 bool ControllerPoller::suggestBindings(XrInstance instance) {
-    // Use Khronos simple controller profile as default
-    XrPath profilePath;
-    xrStringToPath(instance, "/interaction_profiles/khr/simple_controller", &profilePath);
-
     auto pathOf = [&](const char* p) -> XrPath {
         XrPath path; xrStringToPath(instance, p, &path); return path;
     };
 
-    XrActionSuggestedBinding bindings[] = {
-        {m_poseAction, pathOf("/user/hand/left/input/grip/pose")},
-        {m_poseAction, pathOf("/user/hand/right/input/grip/pose")},
-        {m_triggerAction, pathOf("/user/hand/left/input/select/click")},
-        {m_triggerAction, pathOf("/user/hand/right/input/select/click")},
-        {m_menuAction, pathOf("/user/hand/left/input/menu/click")},
-        {m_menuAction, pathOf("/user/hand/right/input/menu/click")},
-    };
+    // VIVE Focus 3 / Focus Vision controller profile (full input support)
+    {
+        XrPath profilePath;
+        xrStringToPath(instance,
+            "/interaction_profiles/htc/vive_focus3_controller", &profilePath);
 
-    XrInteractionProfileSuggestedBinding suggestion = {
-        XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
-    suggestion.interactionProfile = profilePath;
-    suggestion.suggestedBindings = bindings;
-    suggestion.countSuggestedBindings = sizeof(bindings) / sizeof(bindings[0]);
+        XrActionSuggestedBinding bindings[] = {
+            {m_poseAction,             pathOf("/user/hand/left/input/grip/pose")},
+            {m_poseAction,             pathOf("/user/hand/right/input/grip/pose")},
+            {m_triggerAction,          pathOf("/user/hand/left/input/trigger/value")},
+            {m_triggerAction,          pathOf("/user/hand/right/input/trigger/value")},
+            {m_gripAction,             pathOf("/user/hand/left/input/squeeze/value")},
+            {m_gripAction,             pathOf("/user/hand/right/input/squeeze/value")},
+            {m_thumbstickAction,       pathOf("/user/hand/left/input/thumbstick")},
+            {m_thumbstickAction,       pathOf("/user/hand/right/input/thumbstick")},
+            {m_aAction,                pathOf("/user/hand/left/input/x/click")},
+            {m_aAction,                pathOf("/user/hand/right/input/a/click")},
+            {m_bAction,                pathOf("/user/hand/left/input/y/click")},
+            {m_bAction,                pathOf("/user/hand/right/input/b/click")},
+            {m_menuAction,             pathOf("/user/hand/left/input/menu/click")},
+            {m_thumbstickClickAction,  pathOf("/user/hand/left/input/thumbstick/click")},
+            {m_thumbstickClickAction,  pathOf("/user/hand/right/input/thumbstick/click")},
+            {m_triggerTouchAction,     pathOf("/user/hand/left/input/trigger/touch")},
+            {m_triggerTouchAction,     pathOf("/user/hand/right/input/trigger/touch")},
+            {m_thumbstickTouchAction,  pathOf("/user/hand/left/input/thumbstick/touch")},
+            {m_thumbstickTouchAction,  pathOf("/user/hand/right/input/thumbstick/touch")},
+            {m_hapticAction,           pathOf("/user/hand/left/output/haptic")},
+            {m_hapticAction,           pathOf("/user/hand/right/output/haptic")},
+        };
 
-    XrResult result = xrSuggestInteractionProfileBindings(instance, &suggestion);
-    if (XR_FAILED(result)) {
-        LOGW("Suggest bindings failed (result=%d), controllers may not work", (int)result);
+        XrInteractionProfileSuggestedBinding suggestion = {
+            XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        suggestion.interactionProfile = profilePath;
+        suggestion.suggestedBindings = bindings;
+        suggestion.countSuggestedBindings = sizeof(bindings) / sizeof(bindings[0]);
+
+        XrResult result = xrSuggestInteractionProfileBindings(instance, &suggestion);
+        if (XR_SUCCEEDED(result)) {
+            LOGI("ControllerPoller: VIVE Focus 3 profile bound successfully");
+        } else {
+            LOGW("ControllerPoller: VIVE Focus 3 profile failed (result=%d), trying simple", (int)result);
+        }
     }
+
+    // Fallback: Khronos simple controller profile (minimal bindings)
+    {
+        XrPath profilePath;
+        xrStringToPath(instance,
+            "/interaction_profiles/khr/simple_controller", &profilePath);
+
+        XrActionSuggestedBinding bindings[] = {
+            {m_poseAction,    pathOf("/user/hand/left/input/grip/pose")},
+            {m_poseAction,    pathOf("/user/hand/right/input/grip/pose")},
+            {m_triggerAction, pathOf("/user/hand/left/input/select/click")},
+            {m_triggerAction, pathOf("/user/hand/right/input/select/click")},
+            {m_menuAction,    pathOf("/user/hand/left/input/menu/click")},
+            {m_menuAction,    pathOf("/user/hand/right/input/menu/click")},
+            {m_hapticAction,  pathOf("/user/hand/left/output/haptic")},
+            {m_hapticAction,  pathOf("/user/hand/right/output/haptic")},
+        };
+
+        XrInteractionProfileSuggestedBinding suggestion = {
+            XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        suggestion.interactionProfile = profilePath;
+        suggestion.suggestedBindings = bindings;
+        suggestion.countSuggestedBindings = sizeof(bindings) / sizeof(bindings[0]);
+
+        XrResult result = xrSuggestInteractionProfileBindings(instance, &suggestion);
+        if (XR_FAILED(result)) {
+            LOGW("ControllerPoller: Simple profile also failed (result=%d)", (int)result);
+        }
+    }
+
     return true;
 }
 
@@ -157,7 +219,16 @@ void ControllerPoller::pollAndSend(XrSession session, XrSpace stageSpace,
         getInfo.action = m_thumbstickAction;
         xrGetActionStateVector2f(session, &getInfo, &thumbState);
 
-        // Get buttons
+        // Apply thumbstick deadzone
+        float thumbX = thumbState.currentState.x;
+        float thumbY = thumbState.currentState.y;
+        float thumbMag = std::sqrt(thumbX * thumbX + thumbY * thumbY);
+        if (thumbMag < THUMBSTICK_DEADZONE) {
+            thumbX = 0.0f;
+            thumbY = 0.0f;
+        }
+
+        // Get buttons and touch sensors
         uint32_t flags = 0;
         auto getButton = [&](XrAction action, uint32_t bit) {
             XrActionStateBoolean state = {XR_TYPE_ACTION_STATE_BOOLEAN};
@@ -165,14 +236,18 @@ void ControllerPoller::pollAndSend(XrSession session, XrSpace stageSpace,
             xrGetActionStateBoolean(session, &getInfo, &state);
             if (state.currentState) flags |= bit;
         };
-        getButton(m_aAction, 0x01);
-        getButton(m_bAction, 0x02);
-        getButton(m_menuAction, 0x04);
+        getButton(m_aAction, 0x01);               // A_X_PRESSED
+        getButton(m_bAction, 0x02);               // B_Y_PRESSED
+        getButton(m_menuAction, 0x04);            // MENU_PRESSED
+        getButton(m_thumbstickClickAction, 0x10); // THUMBSTICK_CLICK
+        getButton(m_triggerTouchAction, 0x20);    // TRIGGER_TOUCH
+        getButton(m_thumbstickTouchAction, 0x40); // THUMBSTICK_TOUCH
+        getButton(m_gripTouchAction, 0x80);       // GRIP_TOUCH
 
         sender.sendControllerState(
             (uint8_t)hand, loc.pose, predictedTime,
             triggerState.currentState, gripState.currentState,
-            thumbState.currentState.x, thumbState.currentState.y,
+            thumbX, thumbY,
             flags, 100 // battery placeholder
         );
     }
