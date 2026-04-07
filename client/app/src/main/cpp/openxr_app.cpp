@@ -6,6 +6,17 @@
 
 #include <cstring>
 #include <thread>
+#include <cstdio>
+
+/// Read HMD battery level from Android sysfs (0-100, or -1 on failure).
+static int readBatteryLevel() {
+    FILE* f = fopen("/sys/class/power_supply/battery/capacity", "r");
+    if (!f) return -1;
+    int level = -1;
+    if (fscanf(f, "%d", &level) != 1) level = -1;
+    fclose(f);
+    return level;
+}
 
 OpenXRApp::OpenXRApp() {}
 OpenXRApp::~OpenXRApp() { shutdown(); }
@@ -155,6 +166,7 @@ void OpenXRApp::createSwapchains() {
 
 void OpenXRApp::mainLoop() {
     m_recvBuffer.resize(2048); // Max RTP packet size
+    uint32_t frameCount = 0;
 
     while (m_running) {
         pollEvents();
@@ -164,12 +176,21 @@ void OpenXRApp::mainLoop() {
             continue;
         }
 
+        // Update HMD battery level every ~30 seconds (2700 frames at 90fps)
+        if (frameCount % 2700 == 0) {
+            int level = readBatteryLevel();
+            if (level >= 0 && level <= 100) {
+                m_controllerPoller.setHmdBattery(static_cast<uint8_t>(level));
+            }
+        }
+
         // Receive and decode video packets before rendering
         receiveAndDecodeVideo();
         renderFrame();
 
         // Send heartbeat with stats to PC (every 500ms)
         m_heartbeat.tick();
+        frameCount++;
     }
 }
 
