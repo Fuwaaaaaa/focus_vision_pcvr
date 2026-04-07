@@ -71,20 +71,20 @@ impl LatencyTracker {
 
     /// Average PC-side latency over recent frames (microseconds).
     pub fn avg_pc_latency_us(&self) -> Option<u64> {
-        let values: Vec<u64> = self.history.iter()
+        let (sum, count) = self.history.iter()
             .filter_map(|ts| ts.pc_latency_us())
-            .collect();
-        if values.is_empty() { return None; }
-        Some(values.iter().sum::<u64>() / values.len() as u64)
+            .fold((0u64, 0u64), |(s, c), v| (s + v, c + 1));
+        if count == 0 { return None; }
+        Some(sum / count)
     }
 
     /// Average encode latency over recent frames (microseconds).
     pub fn avg_encode_latency_us(&self) -> Option<u64> {
-        let values: Vec<u64> = self.history.iter()
+        let (sum, count) = self.history.iter()
             .filter_map(|ts| ts.encode_latency_us())
-            .collect();
-        if values.is_empty() { return None; }
-        Some(values.iter().sum::<u64>() / values.len() as u64)
+            .fold((0u64, 0u64), |(s, c), v| (s + v, c + 1));
+        if count == 0 { return None; }
+        Some(sum / count)
     }
 
     pub fn frame_count(&self) -> usize {
