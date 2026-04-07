@@ -98,6 +98,16 @@ void CControllerDevice::CreateInputComponents()
         &m_hJoystickX, vr::VRScalarType_Absolute, vr::VRScalarUnits_NormalizedTwoSided);
     input->CreateScalarComponent(m_propertyContainer, "/input/joystick/y",
         &m_hJoystickY, vr::VRScalarType_Absolute, vr::VRScalarUnits_NormalizedTwoSided);
+
+    // Haptic output
+    input->CreateHapticComponent(m_propertyContainer, "/output/haptic", &m_hHaptic);
+}
+
+void CControllerDevice::TriggerHaptic(float duration_s, float frequency, float amplitude)
+{
+    uint16_t duration_ms = static_cast<uint16_t>(duration_s * 1000.0f);
+    if (duration_ms == 0) duration_ms = 1;
+    fvp_haptic_event(m_isLeft ? 0 : 1, duration_ms, frequency, amplitude);
 }
 
 void CControllerDevice::RunFrame()

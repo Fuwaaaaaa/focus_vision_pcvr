@@ -129,6 +129,22 @@ pub extern "C" fn fvp_set_bitrate_callback(callback: extern "C" fn(u32)) {
     log::info!("Bitrate callback registered");
 }
 
+/// Queue a haptic vibration event for delivery to HMD controller.
+/// Called from C++ OpenVR driver when SteamVR requests haptic feedback.
+/// `controller_id`: 0=left, 1=right.
+/// `duration_ms`: vibration duration in milliseconds.
+/// `frequency`: vibration frequency in Hz.
+/// `amplitude`: vibration intensity 0.0-1.0.
+#[no_mangle]
+pub extern "C" fn fvp_haptic_event(
+    controller_id: u8,
+    duration_ms: u16,
+    frequency: f32,
+    amplitude: f32,
+) {
+    engine::queue_haptic(controller_id, duration_ms, frequency, amplitude);
+}
+
 /// Submit pre-encoded H.265 NAL units for RTP packetization and transmission.
 /// Called from the C++ driver after NVENC encoding.
 ///

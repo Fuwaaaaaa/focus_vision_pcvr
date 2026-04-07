@@ -121,4 +121,18 @@ void CServerDriver::RunFrame()
     if (m_hmdDevice) m_hmdDevice->RunFrame();
     if (m_leftController) m_leftController->RunFrame();
     if (m_rightController) m_rightController->RunFrame();
+
+    // Poll for haptic vibration events from SteamVR
+    vr::VREvent_t event;
+    while (vr::VRServerDriverHost()->PollNextEvent(&event, sizeof(event))) {
+        if (event.eventType == vr::VREvent_Input_HapticVibration) {
+            const auto& haptic = event.data.hapticVibration;
+            // Route to the correct controller
+            if (m_leftController && haptic.componentHandle == m_leftController->GetHapticHandle()) {
+                m_leftController->TriggerHaptic(haptic.fDurationSeconds, haptic.fFrequency, haptic.fAmplitude);
+            } else if (m_rightController && haptic.componentHandle == m_rightController->GetHapticHandle()) {
+                m_rightController->TriggerHaptic(haptic.fDurationSeconds, haptic.fFrequency, haptic.fAmplitude);
+            }
+        }
+    }
 }
