@@ -20,7 +20,18 @@ public:
     /// alpha: 0.0 = fully transparent, 1.0 = fully black.
     void renderSleepDimming(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight, float alpha);
 
+    /// Render the HMD dashboard panel.
+    /// bitrateItem: 0=decrease highlight, 1=value, 2=increase highlight.
+    /// codecIsH265: current codec.
+    void renderDashboard(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight,
+                         uint32_t bitrateMbps, bool codecIsH265, int highlightItem);
+
+    bool isDashboardVisible() const { return m_dashboardVisible; }
+    void toggleDashboard() { m_dashboardVisible = !m_dashboardVisible; }
+    void setDashboardVisible(bool v) { m_dashboardVisible = v; }
+
 private:
+    bool m_dashboardVisible = false;
     GLuint m_program = 0;
     GLuint m_vao = 0;
     GLuint m_vbo = 0;
