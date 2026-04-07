@@ -288,7 +288,7 @@ async fn handle_tcp_control(
                 if let Some((lip_valid, eye_valid, lip, eye)) =
                     crate::face_tracking::osc_bridge::parse_face_data(payload)
                 {
-                    if let Ok(bridge) = osc_bridge.lock() {
+                    if let Ok(mut bridge) = osc_bridge.lock() {
                         bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
                     }
                 }
@@ -466,7 +466,9 @@ async fn run_streaming(
         let hmd_stats: Arc<StdMutex<Option<HmdStats>>> = Arc::new(StdMutex::new(None));
 
         // OSC bridge for face tracking data (HMD → VRChat)
-        let osc_bridge = Arc::new(StdMutex::new(crate::face_tracking::osc_bridge::OscBridge::new()));
+        let osc_bridge = Arc::new(StdMutex::new(
+            crate::face_tracking::osc_bridge::OscBridge::with_smoothing(config.face_tracking.smoothing)
+        ));
 
         // Spawn TCP control reader (uses the same TLS/plain stream from handshake)
         let tcp_session = session_cancel.clone();
