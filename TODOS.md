@@ -119,3 +119,65 @@
 - SleepDetector: ヘッドポーズdeltaで非活動検出、タイムアウト後にビットレート低下
 - SLEEP_ENTER/SLEEP_EXIT プロトコル、renderSleepDimming() HMDオーバーレイ
 - [sleep_mode]設定セクション
+
+## v2.0 スコープ（Phase 1完了）
+
+### ~~96fpsサポート~~ (完了)
+- RTPタイムスタンプ`/90`ハードコード修正、フレームレート依存定数を動的化
+- ドライバー側は既にconfigからrefresh_rateを広告済み
+
+### ~~プロトコルバージョニング~~ (完了)
+- HELLO/HELLO_ACKにu16 protocol_version追加、後方互換性維持
+- 未知メッセージタイプはログ警告+スキップ
+
+### ~~UDPトランスポート最適化~~ (完了)
+- SO_RCVBUF/SO_SNDBUF 2MB + DSCP EF marking
+- 非致命的フォールバック（setsockopt失敗時は警告のみ）
+
+### ~~フルRGBカラーレンジ~~ (完了)
+- `video.full_range` config + FvpConfig FFI追加
+- NVENC VUIパラメータ（videoFullRangeFlag）は実機検証待ち
+
+### ~~レイテンシーウォーターフォール~~ (完了)
+- HMD overlay: encode/network/decode/render色分けバー表示
+- HEARTBEAT_ACKでPC側レイテンシーデータをHMDに送信
+
+### ~~Config validation構造化~~ (完了)
+- validate() → Vec<ConfigError>、フィールド名付き構造化エラー
+- graceful migration維持（クランプ+警告）
+
+## v2.1 スコープ（Phase 2 — 未着手）
+
+### Foveated Transport (NVENC ROI)
+- **What:** NVENC ROI encodeで視線領域ごとの解像度制御。帯域40%削減目標
+- **Why:** 既存QPデルタマップ（20%削減）を超える帯域最適化
+- **Context:** NVENC SDK 12.x以降が必要。非対応時は既存QPデルタマップにフォールバック（=現行動作）
+- **Depends on:** 実機でNVENC ROI対応確認
+
+### VRChat FT Suite
+- **What:** 表情プロファイル（アバターごとブレンドシェイプ感度）、自動キャリブレーション、ミラーモード
+- **Why:** VRChat FTがFocus Vision PCVRの「殺し文句」。VRCFaceTracking互換で最高品質のFT体験を提供
+- **Context:** 既存osc_bridge.rsを拡張。プロファイルはJSONファイルで永続化
+- **Depends on:** Phase 1完了（完了済み）
+
+### GoogleTest導入 (C++ドライバー)
+- **What:** driver/CMakeLists.txtにGoogleTestを追加。QPマップ計算、ボーントランスフォーム変換のテスト
+- **Why:** C++ 27ファイルにテスト0。v2.1でNVENC ROI追加時にリスク増大
+- **Priority:** P2
+- **Depends on:** Phase 2実装と同時
+
+## v3.0 スコープ（Phase 3+ — 未着手）
+
+### コミュニティプラグインAPI
+- **What:** TCPコントロールチャンネルにカスタムデータチャンネル追加。コミュニティが独自モジュール作成可能に
+- **Why:** オープンソースの真の強みはエコシステム。ボディトラッキングリレー、カスタムオーバーレイ等が可能に
+- **Context:** メッセージタイプ空間(0x00-0xFF)に十分な余裕。カスタムメッセージ登録+コールバックフック+ドキュメントが必要
+- **Priority:** P3
+- **Depends on:** v2.x完了 + コミュニティ形成
+
+### NVENC VUIパラメータ実機検証
+- **What:** NV_ENC_CONFIG_HEVCのVUIパラメータ（videoFullRangeFlag, colorMatrix）のオフセットを実機で検証
+- **Why:** インライン構造体のreservedフィールド内オフセットが不正確だとクラッシュの可能性
+- **Context:** `video.full_range = true` は設定済みだがNVENC側の設定が未接続
+- **Priority:** P2
+- **Depends on:** 実機入手
