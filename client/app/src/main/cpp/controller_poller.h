@@ -9,6 +9,9 @@ public:
     bool init(XrInstance instance, XrSession session);
     void shutdown();
 
+    /// Set HMD battery level (0-100). Call from main app with JNI-obtained value.
+    void setHmdBattery(uint8_t level) { m_hmdBattery = level; }
+
     /// Poll controller state and send via TrackingSender. Call every frame.
     void pollAndSend(XrSession session, XrSpace stageSpace,
                      XrTime predictedTime, TrackingSender& sender);
@@ -45,4 +48,5 @@ private:
     XrPath m_handPaths[2] = {0, 0};
 
     bool m_initialized = false;
+    uint8_t m_hmdBattery = 100; // Updated from Android BatteryManager
 };
