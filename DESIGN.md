@@ -109,6 +109,29 @@
 - 入力は大きなタッチターゲット (最小56x72px per digit)
 - 情報は最小限。ステータスバーは1行: レイテンシー、FPS、ビットレートのみ
 
+## Sleep Mode UI
+- **暗転オーバーレイ:** フルスクリーン黒クワッド、alpha 0.0→0.85 を 400ms でフェードイン
+- **復帰:** 動き検知で alpha 0.85→0.0 を 250ms でフェードアウト（即座の復帰感）
+- **テキスト:** 暗転中は何も表示しない。ツールが消える哲学と一貫
+- **コンパニオンアプリ:** ステータス行に "💤 Sleep" を text-muted で表示
+
+## Face Tracking Status
+- **コンパニオンアプリ:** OSC接続状態を小さなインジケーターで表示
+  - 送信中: accent (#34D399) ドット + "FT Active"
+  - 未接続: text-muted ドット + "FT Idle"
+- **HMDオーバーレイ:** FTステータスは表示しない（最小限方針）
+
+## Battery Indicator
+- **HMDオーバーレイ:** 既存の信号バーの隣に数字で表示（例: "87%"）
+  - 100-20%: text-secondary
+  - 20-10%: warning (#fbbf24)
+  - <10%: error (#f87171)
+- **コンパニオンアプリ:** ステータスセクションにバッテリーアイコン + パーセント
+
+## Controller Touch Feedback
+- **コンパニオンアプリ:** 入力デバッグビューで touch 状態を accent-dim の丸で表示
+- **デッドゾーン:** スティック表示時、デッドゾーン領域を bg-tertiary の円で視覚化
+
 ## Decisions Log
 | Date | Decision | Rationale |
 |------|----------|-----------|
@@ -116,3 +139,6 @@
 | 2026-03-27 | Emerald green accent (#34D399) | 競合は全員ブルー。グリーンは「接続済み/正常」を自然に伝え、差別化になる |
 | 2026-03-27 | Instrument Serif for brand | VRツールでセリフは異例。「テック製品」ではなく「体験」を売るメッセージ |
 | 2026-03-27 | Brutally Minimal aesthetic | 「設定ゼロ」の製品哲学と一貫。ツールが消えてVR体験だけが残る |
+| 2026-04-07 | Sleep mode: no text overlay | 暗転中はテキストなし。「ツールが消える」哲学と一貫 |
+| 2026-04-07 | Battery: number-only display | アイコンではなく数字。VR内の可読性とミニマル方針 |
+| 2026-04-07 | FT status: companion only | HMDオーバーレイには表示しない。情報最小限の原則 |
