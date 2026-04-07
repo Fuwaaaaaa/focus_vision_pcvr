@@ -124,15 +124,17 @@ impl TcpControlServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        // Step 1: Receive HELLO
+        // Step 1: Receive HELLO (with optional protocol version)
         let msg = read_message_generic(&mut stream).await?;
         if msg.0 != msg_type::HELLO {
             return Err("Expected HELLO".into());
         }
-        log::info!("Received HELLO from client");
+        let client_version = fvp_common::protocol::parse_hello_version(&msg.1);
+        log::info!("Received HELLO from client (protocol v{})", client_version);
 
-        // Step 2: Send HELLO_ACK
-        send_message_generic(&mut stream, msg_type::HELLO_ACK, &[1, 0]).await?;
+        // Step 2: Send HELLO_ACK with our protocol version
+        let version_payload = fvp_common::protocol::encode_version(fvp_common::protocol::PROTOCOL_VERSION);
+        send_message_generic(&mut stream, msg_type::HELLO_ACK, &version_payload).await?;
 
         // Step 3: Send PIN_REQUEST
         send_message_generic(&mut stream, msg_type::PIN_REQUEST, &[]).await?;
