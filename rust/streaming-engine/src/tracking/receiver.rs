@@ -178,6 +178,81 @@ mod tests {
     #[test]
     fn test_parse_head_pose_too_short() {
         assert!(parse_head_pose(&[0u8; 10]).is_none());
+        assert!(parse_head_pose(&[0u8; 35]).is_none()); // 1 byte short
+    }
+
+    #[test]
+    fn test_parse_head_pose_with_gaze() {
+        let mut pkt = make_head_pose_packet(100, 0.0, 0.0, 0.0);
+        // Append gaze extension: gaze_x(4) + gaze_y(4) + gaze_valid(1) = 9 bytes
+        pkt.extend_from_slice(&0.3f32.to_le_bytes()); // gaze_x
+        pkt.extend_from_slice(&0.7f32.to_le_bytes()); // gaze_y
+        pkt.push(1); // gaze_valid
+
+        let data = parse_head_pose(&pkt[1..]).unwrap();
+        assert!((data.gaze_x - 0.3).abs() < 1e-6);
+        assert!((data.gaze_y - 0.7).abs() < 1e-6);
+        assert_eq!(data.gaze_valid, 1);
+    }
+
+    #[test]
+    fn test_parse_head_pose_without_gaze_defaults_center() {
+        let pkt = make_head_pose_packet(100, 0.0, 0.0, 0.0);
+        let data = parse_head_pose(&pkt[1..]).unwrap();
+        assert_eq!(data.gaze_x, 0.5);
+        assert_eq!(data.gaze_y, 0.5);
+        assert_eq!(data.gaze_valid, 0);
+    }
+
+    fn make_controller_packet(id: u8, trigger: f32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(PACKET_CONTROLLER);
+        buf.push(id);                                        // controller_id
+        buf.extend_from_slice(&1000u64.to_le_bytes());       // timestamp_ns
+        buf.extend_from_slice(&0.1f32.to_le_bytes());        // px
+        buf.extend_from_slice(&0.2f32.to_le_bytes());        // py
+        buf.extend_from_slice(&0.3f32.to_le_bytes());        // pz
+        buf.extend_from_slice(&0.0f32.to_le_bytes());        // qx
+        buf.extend_from_slice(&0.0f32.to_le_bytes());        // qy
+        buf.extend_from_slice(&0.0f32.to_le_bytes());        // qz
+        buf.extend_from_slice(&1.0f32.to_le_bytes());        // qw
+        buf.extend_from_slice(&trigger.to_le_bytes());       // trigger
+        buf.extend_from_slice(&0.5f32.to_le_bytes());        // grip
+        buf.extend_from_slice(&0.0f32.to_le_bytes());        // thumbstick_x
+        buf.extend_from_slice(&0.0f32.to_le_bytes());        // thumbstick_y
+        buf.extend_from_slice(&0x03u32.to_le_bytes());       // button_flags
+        buf.push(80);                                         // battery_level
+        buf
+    }
+
+    #[test]
+    fn test_parse_controller() {
+        let pkt = make_controller_packet(1, 0.75);
+        let state = parse_controller(&pkt[1..]).unwrap();
+        assert_eq!(state.controller_id, 1);
+        assert_eq!(state.timestamp_ns, 1000);
+        assert_eq!(state.position, [0.1, 0.2, 0.3]);
+        assert!((state.trigger - 0.75).abs() < 1e-6);
+        assert!((state.grip - 0.5).abs() < 1e-6);
+        assert_eq!(state.button_flags, 0x03);
+        assert_eq!(state.battery_level, 80);
+    }
+
+    #[test]
+    fn test_parse_controller_too_short() {
+        assert!(parse_controller(&[0u8; 20]).is_none());
+        assert!(parse_controller(&[0u8; 52]).is_none()); // 1 byte short
+    }
+
+    #[test]
+    fn test_parse_controller_minimal_53_bytes() {
+        // Exactly 53 bytes = no button_flags or battery
+        let pkt = make_controller_packet(0, 1.0);
+        let minimal = &pkt[1..54]; // 53 bytes (id + 52 body)
+        let state = parse_controller(minimal).unwrap();
+        assert_eq!(state.controller_id, 0);
+        assert_eq!(state.button_flags, 0); // default
+        assert_eq!(state.battery_level, 100); // default
     }
 
     #[tokio::test]
