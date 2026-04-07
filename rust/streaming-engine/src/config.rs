@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub display: DisplayConfig,
     #[serde(default)]
     pub foveated: FoveatedConfig,
+    #[serde(default)]
+    pub face_tracking: FaceTrackingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +103,30 @@ impl Default for FoveatedConfig {
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FaceTrackingConfig {
+    #[serde(default = "default_ft_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_ft_smoothing")]
+    pub smoothing: f32,
+    #[serde(default = "default_ft_osc_port")]
+    pub osc_port: u16,
+}
+
+impl Default for FaceTrackingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ft_enabled(),
+            smoothing: default_ft_smoothing(),
+            osc_port: default_ft_osc_port(),
+        }
+    }
+}
+
+fn default_ft_enabled() -> bool { true }
+fn default_ft_smoothing() -> f32 { 0.6 }
+fn default_ft_osc_port() -> u16 { 9000 }
 
 fn default_tcp_port() -> u16 { fvp_common::DEFAULT_TCP_PORT }
 fn default_udp_port() -> u16 { fvp_common::DEFAULT_UDP_PORT }
