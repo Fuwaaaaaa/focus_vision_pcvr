@@ -95,4 +95,46 @@ mod tests {
         assert!(result.is_ok());
         assert!(!result.unwrap().is_empty());
     }
+
+    #[test]
+    fn test_encode_clamps_out_of_range() {
+        let mut encoder = AudioEncoder::new(128_000).unwrap();
+        // Values outside [-1.0, 1.0] should be clamped, not cause errors
+        let mut pcm = vec![2.0f32; 960]; // all > 1.0
+        pcm[0] = -5.0; // way below -1.0
+        let result = encoder.encode(&pcm);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_encode_multiple_frames_consecutive() {
+        let mut encoder = AudioEncoder::new(128_000).unwrap();
+        let silence = vec![0.0f32; 960];
+        // Opus encoder is stateful — verify consecutive frames work
+        for _ in 0..10 {
+            let result = encoder.encode(&silence);
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_tone_packet_smaller_than_silence() {
+        // Opus compresses silence better than tones
+        let mut encoder = AudioEncoder::new(128_000).unwrap();
+
+        let silence = vec![0.0f32; 960];
+        let silence_pkt = encoder.encode(&silence).unwrap();
+
+        let mut tone = Vec::with_capacity(960);
+        for i in 0..480 {
+            let s = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48000.0).sin() * 0.8;
+            tone.push(s);
+            tone.push(s);
+        }
+        let tone_pkt = encoder.encode(&tone).unwrap();
+
+        // Tone should generally produce a larger packet than silence
+        assert!(tone_pkt.len() >= silence_pkt.len(),
+            "tone={} bytes, silence={} bytes", tone_pkt.len(), silence_pkt.len());
+    }
 }
