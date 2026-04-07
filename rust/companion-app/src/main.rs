@@ -75,6 +75,12 @@ struct CompanionApp {
     export_in_progress: bool,
     export_result: Arc<Mutex<Option<String>>>,
 
+    // v1.2: Subsystem status (read from status.json)
+    sub_ft_active: bool,
+    sub_sleep_active: bool,
+    sub_audio_enabled: bool,
+    sub_packet_loss: f32,
+
     // v1.2: Sleep mode + face tracking settings
     sleep_enabled: bool,
     sleep_timeout: u32,
@@ -179,6 +185,10 @@ impl CompanionApp {
             stats_history: stats_history::StatsHistory::new(),
             export_in_progress: false,
             export_result: Arc::new(Mutex::new(None)),
+            sub_ft_active: false,
+            sub_sleep_active: false,
+            sub_audio_enabled: true,
+            sub_packet_loss: 0.0,
             sleep_enabled: {
                 let cfg = config::LocalConfig::load();
                 cfg.sleep_mode.enabled
@@ -249,8 +259,11 @@ impl CompanionApp {
                         self.latency_ms = val["latency_us"].as_u64().unwrap_or(0) as f32 / 1000.0;
                         self.fps = val["fps"].as_u64().unwrap_or(0) as u32;
                         self.bitrate_mbps = val["bitrate_mbps"].as_u64().unwrap_or(0) as f32;
-                        let packet_loss = val["packet_loss_percent"].as_f64().unwrap_or(0.0) as f32;
-                        self.stats_history.push(self.latency_ms, self.fps as f32, packet_loss);
+                        self.sub_ft_active = val["ft_active"].as_bool().unwrap_or(false);
+                        self.sub_sleep_active = val["sleep_active"].as_bool().unwrap_or(false);
+                        self.sub_audio_enabled = val["audio_enabled"].as_bool().unwrap_or(true);
+                        self.sub_packet_loss = val["packet_loss_pct"].as_f64().unwrap_or(0.0) as f32;
+                        self.stats_history.push(self.latency_ms, self.fps as f32, self.sub_packet_loss);
                     }
                     _ => {
                         self.connection_status = ConnectionStatus::Disconnected;
@@ -472,6 +485,58 @@ impl CompanionApp {
                     .show(ui, |plot_ui| {
                         plot_ui.line(Line::new(PlotPoints::new(fps_points)).color(accent));
                     });
+            });
+
+            // Subsystem status indicators
+            ui.add_space(8.0);
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Subsystems").size(13.0).color(text_muted));
+                ui.add_space(4.0);
+
+                let active_color = accent;
+                let idle_color = text_muted;
+
+                ui.horizontal(|ui| {
+                    let (ft_color, ft_label) = if self.sub_ft_active {
+                        (active_color, "FT Active")
+                    } else {
+                        (idle_color, "FT Idle")
+                    };
+                    ui.label(egui::RichText::new("●").size(11.0).color(ft_color));
+                    ui.label(egui::RichText::new(ft_label).size(11.0).color(ft_color));
+
+                    ui.add_space(16.0);
+
+                    let (sleep_color, sleep_label) = if self.sub_sleep_active {
+                        (idle_color, "Sleep")
+                    } else {
+                        (active_color, "Awake")
+                    };
+                    ui.label(egui::RichText::new("●").size(11.0).color(sleep_color));
+                    ui.label(egui::RichText::new(sleep_label).size(11.0).color(sleep_color));
+
+                    ui.add_space(16.0);
+
+                    let (audio_color, audio_label) = if self.sub_audio_enabled {
+                        (active_color, "Audio OK")
+                    } else {
+                        (idle_color, "Audio Off")
+                    };
+                    ui.label(egui::RichText::new("●").size(11.0).color(audio_color));
+                    ui.label(egui::RichText::new(audio_label).size(11.0).color(audio_color));
+
+                    ui.add_space(16.0);
+
+                    let loss_color = if self.sub_packet_loss > 5.0 {
+                        egui::Color32::from_rgb(248, 113, 113) // error red
+                    } else if self.sub_packet_loss > 2.0 {
+                        egui::Color32::from_rgb(251, 191, 36) // warning yellow
+                    } else {
+                        text_muted
+                    };
+                    ui.label(egui::RichText::new(format!("Loss {:.1}%", self.sub_packet_loss))
+                        .size(11.0).color(loss_color));
+                });
             });
         }
     }
