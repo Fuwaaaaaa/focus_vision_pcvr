@@ -50,5 +50,8 @@ private:
     vr::VRInputComponentHandle_t m_hMenu = vr::k_ulInvalidInputComponentHandle;
     vr::VRInputComponentHandle_t m_hSystem = vr::k_ulInvalidInputComponentHandle;
     vr::VRInputComponentHandle_t m_hThumbstickClick = vr::k_ulInvalidInputComponentHandle;
+    vr::VRInputComponentHandle_t m_hTriggerTouch = vr::k_ulInvalidInputComponentHandle;
+    vr::VRInputComponentHandle_t m_hThumbstickTouch = vr::k_ulInvalidInputComponentHandle;
+    vr::VRInputComponentHandle_t m_hGripTouch = vr::k_ulInvalidInputComponentHandle;
     vr::VRInputComponentHandle_t m_hHaptic = vr::k_ulInvalidInputComponentHandle;
 };

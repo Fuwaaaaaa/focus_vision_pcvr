@@ -32,6 +32,10 @@ private:
     XrAction m_aAction = XR_NULL_HANDLE;         // A/X button
     XrAction m_bAction = XR_NULL_HANDLE;         // B/Y button
     XrAction m_menuAction = XR_NULL_HANDLE;      // Menu button
+    XrAction m_thumbstickClickAction = XR_NULL_HANDLE; // Thumbstick click
+    XrAction m_triggerTouchAction = XR_NULL_HANDLE;    // Trigger touch
+    XrAction m_gripTouchAction = XR_NULL_HANDLE;       // Grip touch
+    XrAction m_thumbstickTouchAction = XR_NULL_HANDLE; // Thumbstick touch
     XrAction m_hapticAction = XR_NULL_HANDLE;    // Haptic output
 
     // Spaces for controller poses

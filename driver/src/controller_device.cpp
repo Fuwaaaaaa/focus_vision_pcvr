@@ -99,6 +99,11 @@ void CControllerDevice::CreateInputComponents()
     input->CreateScalarComponent(m_propertyContainer, "/input/joystick/y",
         &m_hJoystickY, vr::VRScalarType_Absolute, vr::VRScalarUnits_NormalizedTwoSided);
 
+    // Touch sensors (boolean)
+    input->CreateBooleanComponent(m_propertyContainer, "/input/trigger/touch", &m_hTriggerTouch);
+    input->CreateBooleanComponent(m_propertyContainer, "/input/joystick/touch", &m_hThumbstickTouch);
+    input->CreateBooleanComponent(m_propertyContainer, "/input/grip/touch", &m_hGripTouch);
+
     // Haptic output
     input->CreateHapticComponent(m_propertyContainer, "/output/haptic", &m_hHaptic);
 }
@@ -150,6 +155,12 @@ void CControllerDevice::RunFrame()
             (state.button_flags & 0x08) != 0, 0.0);  // SYSTEM_PRESSED
         input->UpdateBooleanComponent(m_hThumbstickClick,
             (state.button_flags & 0x10) != 0, 0.0);  // THUMBSTICK_CLICK
+        input->UpdateBooleanComponent(m_hTriggerTouch,
+            (state.button_flags & 0x20) != 0, 0.0);  // TRIGGER_TOUCH
+        input->UpdateBooleanComponent(m_hThumbstickTouch,
+            (state.button_flags & 0x40) != 0, 0.0);  // THUMBSTICK_TOUCH
+        input->UpdateBooleanComponent(m_hGripTouch,
+            (state.button_flags & 0x80) != 0, 0.0);  // GRIP_TOUCH
     }
     else
     {
