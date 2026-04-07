@@ -146,25 +146,38 @@
 - validate() → Vec<ConfigError>、フィールド名付き構造化エラー
 - graceful migration維持（クランプ+警告）
 
-## v2.1 スコープ（Phase 2 — 未着手）
+## v2.1 スコープ（Phase 2完了）
 
-### Foveated Transport (NVENC ROI)
+### ~~FT表情プロファイル~~ (完了)
+- profiles.rs: FtProfile構造体、JSON save/load/list/delete、51 weightベクトル
+- OscBridgeにweight適用統合、set_profile()メソッド
+- config: face_tracking.active_profile フィールド追加
+
+### ~~FT自動キャリブレーション~~ (完了)
+- calibration.rs: CalibrationState、2ステップ（Relax→ExaggerateAll）、min/max収集
+- weight計算: 1.0 / (max - min)、range < 0.01は1.0フォールバック
+- プロトコル: CALIBRATE_START (0x60), CALIBRATE_STATUS (0x61)
+
+### ~~フォベアテッドプリセット~~ (完了)
+- FoveatedPreset enum: subtle/balanced/aggressive/custom
+- effective_qp_offsets()でプリセット→QP値解決
+- qp_map.h: computeQpDeltaMap()純粋関数化
+
+### ~~GoogleTest導入~~ (完了)
+- driver/CMakeLists.txt: GoogleTest v1.15.2 via FetchContent
+- driver/tests/test_qp_map.cpp: 7テスト（CTUグリッド、gaze、プリセット）
+
+### Foveated Transport (NVENC ROI) — 実機待ち
 - **What:** NVENC ROI encodeで視線領域ごとの解像度制御。帯域40%削減目標
-- **Why:** 既存QPデルタマップ（20%削減）を超える帯域最適化
-- **Context:** NVENC SDK 12.x以降が必要。非対応時は既存QPデルタマップにフォールバック（=現行動作）
+- **Why:** プリセット（aggressive +8/+25）で~30%まで改善済み。ROIでさらに40%目標
+- **Context:** NVENC SDK 12.x以降が必要。非対応時は現行プリセットにフォールバック
 - **Depends on:** 実機でNVENC ROI対応確認
 
-### VRChat FT Suite
-- **What:** 表情プロファイル（アバターごとブレンドシェイプ感度）、自動キャリブレーション、ミラーモード
-- **Why:** VRChat FTがFocus Vision PCVRの「殺し文句」。VRCFaceTracking互換で最高品質のFT体験を提供
-- **Context:** 既存osc_bridge.rsを拡張。プロファイルはJSONファイルで永続化
-- **Depends on:** Phase 1完了（完了済み）
-
-### GoogleTest導入 (C++ドライバー)
-- **What:** driver/CMakeLists.txtにGoogleTestを追加。QPマップ計算、ボーントランスフォーム変換のテスト
-- **Why:** C++ 27ファイルにテスト0。v2.1でNVENC ROI追加時にリスク増大
-- **Priority:** P2
-- **Depends on:** Phase 2実装と同時
+### FTミラーモード — 実機待ち
+- **What:** HMD内で自分の表情をリアルタイムプレビュー
+- **Why:** キャリブレーション結果の視覚的確認
+- **Context:** HMD側カメラフィードが必要。OpenXR passthrough拡張依存
+- **Depends on:** 実機入手
 
 ## v3.0 スコープ（Phase 3+ — 未着手）
 
