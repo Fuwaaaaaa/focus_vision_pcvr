@@ -18,24 +18,50 @@ use engine::{StreamingEngine, EncodedFrame};
 use fvp_common::protocol::{ControllerState, TrackingData};
 use metrics::latency::FrameTimestamps;
 
+/// Subsystem status for the companion app.
+#[derive(Debug, Default)]
+pub struct SubsystemStatus {
+    pub ft_active: bool,
+    pub sleep_active: bool,
+    pub audio_enabled: bool,
+    pub packet_loss_pct: f32,
+}
+
 /// Write engine status to a shared JSON file for the companion app.
 /// Path: %APPDATA%/FocusVisionPCVR/status.json (Windows)
-pub fn write_status_file(status: &str, pin: Option<u32>, latency_us: Option<u64>, fps: Option<u16>, bitrate_mbps: Option<u32>) {
+/// Uses atomic write (temp file + rename) to prevent partial reads.
+pub fn write_status_file(
+    status: &str,
+    pin: Option<u32>,
+    latency_us: Option<u64>,
+    fps: Option<u16>,
+    bitrate_mbps: Option<u32>,
+    subsystems: Option<&SubsystemStatus>,
+) {
     let dir = match dirs_next::data_dir() {
         Some(d) => d.join("FocusVisionPCVR"),
         None => return,
     };
     let _ = std::fs::create_dir_all(&dir);
     let pin_str = pin.map(|p| format!("{:06}", p)).unwrap_or_else(|| "------".to_string());
+    let sub = subsystems.map(|s| format!(
+        r#","ft_active":{},"sleep_active":{},"audio_enabled":{},"packet_loss_pct":{:.1}"#,
+        s.ft_active, s.sleep_active, s.audio_enabled, s.packet_loss_pct,
+    )).unwrap_or_default();
     let json = format!(
-        r#"{{"status":"{}","pin":"{}","latency_us":{},"fps":{},"bitrate_mbps":{}}}"#,
+        r#"{{"status":"{}","pin":"{}","latency_us":{},"fps":{},"bitrate_mbps":{}{}}}"#,
         status, pin_str,
         latency_us.unwrap_or(0),
         fps.unwrap_or(0),
         bitrate_mbps.unwrap_or(0),
+        sub,
     );
+    // Atomic write: write to temp file then rename to prevent partial reads
     let path = dir.join("status.json");
-    let _ = std::fs::write(&path, json);
+    let tmp_path = dir.join("status.json.tmp");
+    if std::fs::write(&tmp_path, &json).is_ok() {
+        let _ = std::fs::rename(&tmp_path, &path);
+    }
 }
 
 static INIT: Once = Once::new();
@@ -84,7 +110,7 @@ pub extern "C" fn fvp_init() -> i32 {
             if let Ok(mut guard) = ENGINE.write() {
                 *guard = Some(eng);
             }
-            write_status_file("waiting", None, None, None, None);
+            write_status_file("waiting", None, None, None, None, None);
             log::info!("Streaming engine started");
             0
         }
