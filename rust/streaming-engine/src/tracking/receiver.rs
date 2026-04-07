@@ -290,4 +290,41 @@ mod tests {
 
         recv_handle.abort();
     }
+
+    #[test]
+    fn test_parse_head_pose_gaze_nan() {
+        let mut pkt = make_head_pose_packet(100, 0.0, 0.0, 0.0);
+        // Append gaze with NaN values
+        pkt.extend_from_slice(&f32::NAN.to_le_bytes());
+        pkt.extend_from_slice(&f32::NAN.to_le_bytes());
+        pkt.push(1);
+
+        let data = parse_head_pose(&pkt[1..]).unwrap();
+        // NaN passes through (validation is caller's responsibility)
+        assert!(data.gaze_x.is_nan());
+        assert_eq!(data.gaze_valid, 1);
+    }
+
+    #[test]
+    fn test_parse_head_pose_gaze_out_of_bounds() {
+        let mut pkt = make_head_pose_packet(100, 0.0, 0.0, 0.0);
+        pkt.extend_from_slice(&(-0.5f32).to_le_bytes()); // below 0
+        pkt.extend_from_slice(&1.5f32.to_le_bytes());    // above 1
+        pkt.push(1);
+
+        let data = parse_head_pose(&pkt[1..]).unwrap();
+        // Out-of-bounds passes through (no clamping in parser)
+        assert!(data.gaze_x < 0.0);
+        assert!(data.gaze_y > 1.0);
+    }
+
+    #[test]
+    fn test_parse_controller_left_and_right() {
+        let left = make_controller_packet(0, 0.5);
+        let right = make_controller_packet(1, 0.9);
+        let ls = parse_controller(&left[1..]).unwrap();
+        let rs = parse_controller(&right[1..]).unwrap();
+        assert_eq!(ls.controller_id, 0);
+        assert_eq!(rs.controller_id, 1);
+    }
 }
