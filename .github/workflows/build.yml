@@ -20,6 +20,8 @@ jobs:
           run: cargo build --release -p streaming-engine
         - name: Test
           run: cargo test --release --workspace
+        - name: Clippy
+          run: cargo clippy --workspace -- -D warnings
         - uses: actions/upload-artifact@v4
           with:
             name: streaming-engine-lib
