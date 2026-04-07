@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub foveated: FoveatedConfig,
     #[serde(default)]
     pub face_tracking: FaceTrackingConfig,
+    #[serde(default)]
+    pub sleep_mode: SleepModeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +125,34 @@ impl Default for FaceTrackingConfig {
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SleepModeConfig {
+    #[serde(default = "default_sleep_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_sleep_timeout")]
+    pub timeout_seconds: u32,
+    #[serde(default = "default_sleep_motion_threshold")]
+    pub motion_threshold: f32,
+    #[serde(default = "default_sleep_bitrate")]
+    pub sleep_bitrate_mbps: u32,
+}
+
+impl Default for SleepModeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_sleep_enabled(),
+            timeout_seconds: default_sleep_timeout(),
+            motion_threshold: default_sleep_motion_threshold(),
+            sleep_bitrate_mbps: default_sleep_bitrate(),
+        }
+    }
+}
+
+fn default_sleep_enabled() -> bool { true }
+fn default_sleep_timeout() -> u32 { 300 }
+fn default_sleep_motion_threshold() -> f32 { 0.002 }
+fn default_sleep_bitrate() -> u32 { 8 }
 
 fn default_ft_enabled() -> bool { true }
 fn default_ft_smoothing() -> f32 { 0.6 }

@@ -578,6 +578,13 @@ async fn run_streaming(
         let mut bitrate_ctrl = crate::adaptive::bitrate_controller::BitrateController::new(
             config.video.bitrate_mbps,
         );
+        let mut sleep_detector = crate::sleep_mode::SleepDetector::new(
+            config.sleep_mode.enabled,
+            config.sleep_mode.motion_threshold,
+            config.sleep_mode.timeout_seconds,
+            config.sleep_mode.sleep_bitrate_mbps,
+        );
+        let normal_bitrate_mbps = config.video.bitrate_mbps;
 
         loop {
             tokio::select! {
@@ -628,6 +635,26 @@ async fn run_streaming(
                                 if bitrate_ctrl.adjust(&bw_estimator) {
                                     let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
                                     notify_bitrate_change(new_bps);
+                                }
+                            }
+                        }
+                    }
+
+                    // Sleep mode detection: check head tracking for motion
+                    if let Ok(guard) = _tracking.lock() {
+                        if let Some(ref data) = *guard {
+                            if let Some(transition) = sleep_detector.update(data) {
+                                match transition {
+                                    crate::sleep_mode::SleepTransition::Sleep => {
+                                        log::info!("Sleep mode: entering (no motion for {}s)", config.sleep_mode.timeout_seconds);
+                                        let bps = sleep_detector.sleep_bitrate_mbps() * 1_000_000;
+                                        notify_bitrate_change(bps);
+                                    }
+                                    crate::sleep_mode::SleepTransition::Wake => {
+                                        log::info!("Sleep mode: waking up (motion detected)");
+                                        let bps = normal_bitrate_mbps * 1_000_000;
+                                        notify_bitrate_change(bps);
+                                    }
                                 }
                             }
                         }

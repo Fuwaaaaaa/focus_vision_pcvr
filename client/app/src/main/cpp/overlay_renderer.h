@@ -16,6 +16,10 @@ public:
     void render(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight,
                 float quality, float packetLossPercent, float latencyMs);
 
+    /// Render a full-screen dimming overlay for sleep mode.
+    /// alpha: 0.0 = fully transparent, 1.0 = fully black.
+    void renderSleepDimming(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight, float alpha);
+
 private:
     GLuint m_program = 0;
     GLuint m_vao = 0;
