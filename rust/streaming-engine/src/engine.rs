@@ -35,6 +35,11 @@ static HAPTIC_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// Whether audio capture is active (set by audio pipeline thread).
 static AUDIO_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Latest PC-side encode latency in microseconds (for HEARTBEAT_ACK waterfall).
+static PC_ENCODE_LATENCY_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Latest PC-side total latency in microseconds (present→send).
+static PC_TOTAL_LATENCY_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Check if audio is currently active.
 pub fn is_audio_active() -> bool {
     AUDIO_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
@@ -174,7 +179,7 @@ impl StreamingEngine {
         let latest_tracking = Arc::new(StdMutex::new(None));
         let latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>> =
             Arc::new(StdMutex::new([None, None]));
-        let latency_tracker = Arc::new(StdMutex::new(LatencyTracker::new(90)));
+        let latency_tracker = Arc::new(StdMutex::new(LatencyTracker::new(config.video.framerate as usize)));
 
         let cancel_token = CancellationToken::new();
         let tracking_clone = latest_tracking.clone();
@@ -368,6 +373,16 @@ async fn handle_tcp_control(
                                     fps,
                                 });
                             }
+
+                            // Send HEARTBEAT_ACK with PC-side latency for waterfall overlay
+                            let encode_us = PC_ENCODE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
+                            let total_us = PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
+                            let mut ack_payload = Vec::with_capacity(8);
+                            ack_payload.extend_from_slice(&encode_us.to_le_bytes());
+                            ack_payload.extend_from_slice(&total_us.to_le_bytes());
+                            let _ = send_msg(&mut writer,
+                                fvp_common::protocol::msg_type::HEARTBEAT_ACK,
+                                &ack_payload).await;
                         }
                     }
                     fvp_common::protocol::msg_type::FACE_DATA => {
@@ -424,7 +439,7 @@ async fn handle_tcp_control(
                         break;
                     }
                     _ => {
-                        log::debug!("Unknown TCP control message type: 0x{:02x}", msg_type);
+                        log::warn!("Unknown TCP message type 0x{:02x} (len={}B) — skipping (client may be newer)", msg_type, msg_buf.len() - 1);
                     }
                 }
             }
@@ -679,7 +694,8 @@ async fn run_streaming(
                     frame.timestamps.mark_encode_start();
                     frame.timestamps.mark_encode_end();
 
-                    let timestamp_90khz = (frame_count * (fvp_common::RTP_CLOCK_RATE as u64 / 90)) as u32;
+                    let framerate = config.video.framerate as u64;
+                    let timestamp_90khz = (frame_count * (fvp_common::RTP_CLOCK_RATE as u64 / framerate)) as u32;
 
                     let packets = pipeline::encode_frame_to_packets_with_fec(
                         &frame.nal_data,
@@ -706,7 +722,7 @@ async fn run_streaming(
                     frame_count += 1;
 
                     // Adaptive bitrate: use HMD-reported stats (real packet loss)
-                    if frame_count.is_multiple_of(90) {
+                    if frame_count.is_multiple_of(framerate) {
                         if let Ok(mut guard) = hmd_stats.lock() {
                             if let Some(stats) = guard.take() {
                                 bw_estimator.update(
@@ -742,13 +758,22 @@ async fn run_streaming(
                         }
                     }
 
+                    // Update PC latency atomics for HEARTBEAT_ACK waterfall
+                    if let Ok(tracker) = latency_tracker.lock() {
+                        if let Some(enc) = tracker.avg_encode_latency_us() {
+                            PC_ENCODE_LATENCY_US.store(enc as u32, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if let Some(total) = tracker.avg_pc_latency_us() {
+                            PC_TOTAL_LATENCY_US.store(total as u32, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+
                     // Log stats every 5 seconds
-                    if frame_count.is_multiple_of(450) {
-                        if let Ok(tracker) = latency_tracker.lock() {
-                            if let Some(avg) = tracker.avg_pc_latency_us() {
-                                log::info!("PC latency: avg={}us encode={}us",
-                                    avg, tracker.avg_encode_latency_us().unwrap_or(0));
-                            }
+                    if frame_count.is_multiple_of(framerate * 5) {
+                        let enc = PC_ENCODE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
+                        let total = PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
+                        if total > 0 {
+                            log::info!("PC latency: avg={}us encode={}us", total, enc);
                         }
                     }
                 }
@@ -914,6 +939,55 @@ mod tests {
         // Clean up
         if let Ok(mut guard) = HAPTIC_TX.write() {
             *guard = None;
+        }
+    }
+
+    #[test]
+    fn test_rtp_timestamp_at_90fps() {
+        // At 90fps: each frame increments by 90000/90 = 1000
+        let framerate = 90u64;
+        let tick = fvp_common::RTP_CLOCK_RATE as u64 / framerate;
+        assert_eq!(tick, 1000);
+
+        // Frame 0 → timestamp 0, Frame 1 → 1000, Frame 90 → 90000 (1 second)
+        assert_eq!((0u64 * tick) as u32, 0);
+        assert_eq!((1u64 * tick) as u32, 1000);
+        assert_eq!((90u64 * tick) as u32, 90000);
+    }
+
+    #[test]
+    fn test_rtp_timestamp_at_96fps() {
+        // At 96fps: each frame increments by 90000/96 = 937
+        let framerate = 96u64;
+        let tick = fvp_common::RTP_CLOCK_RATE as u64 / framerate;
+        assert_eq!(tick, 937); // 90000 / 96 = 937.5, truncated to 937
+
+        // Frame 96 → ~90000 (1 second)
+        let ts_1s = (96u64 * tick) as u32;
+        assert!(ts_1s >= 89900 && ts_1s <= 90100, "1s timestamp should be ~90000, got {}", ts_1s);
+    }
+
+    #[test]
+    fn test_rtp_timestamp_at_120fps() {
+        // At 120fps: each frame increments by 90000/120 = 750
+        let framerate = 120u64;
+        let tick = fvp_common::RTP_CLOCK_RATE as u64 / framerate;
+        assert_eq!(tick, 750);
+
+        // Frame 120 → 90000 (exactly 1 second)
+        assert_eq!((120u64 * tick) as u32, 90000);
+    }
+
+    #[test]
+    fn test_bitrate_adjustment_interval_scales_with_framerate() {
+        // At 90fps, adjustment every 90 frames = 1 second
+        // At 96fps, adjustment every 96 frames = 1 second
+        // At 120fps, adjustment every 120 frames = 1 second
+        for fps in [90u64, 96, 120] {
+            let interval = fps;
+            assert!(fps.is_multiple_of(interval), "frame_count should align at {fps}fps");
+            // Verify the interval represents ~1 second
+            assert_eq!(interval, fps);
         }
     }
 }

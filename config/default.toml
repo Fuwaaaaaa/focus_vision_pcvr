@@ -8,6 +8,7 @@ codec = "h265"
 bitrate_mbps = 80
 resolution_per_eye = [1832, 1920]
 framerate = 90
+full_range = true     # Full RGB (0-255) instead of limited (16-235)
 
 [display]
 ipd = 0.063
