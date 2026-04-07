@@ -43,11 +43,21 @@ pub fn encode_frame_to_packets_with_fec(
     }
 
     // Step 2: FEC encode (add parity shards, RS instance cached in FecEncoder)
-    let all_shards = match fec.encode(&data_shards) {
+    // data_shards ownership is moved into encode() to avoid cloning.
+    let data_shard_count = data_shards.len();
+    let all_shards = match fec.encode(data_shards) {
         Ok(shards) => shards,
         Err(e) => {
             log::warn!("FEC encode failed: {e}, sending without FEC");
-            data_shards
+            // Rebuild minimal shards for fallback (rare error path)
+            frame_data
+                .chunks(shard_size)
+                .map(|chunk| {
+                    let mut shard = chunk.to_vec();
+                    shard.resize(shard_size, 0);
+                    shard
+                })
+                .collect()
         }
     };
 
