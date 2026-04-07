@@ -691,7 +691,7 @@ impl CompanionApp {
 
         ui.add_space(16.0);
 
-        ui.label(egui::RichText::new("Focus Vision PCVR v1.0.0").size(11.0).color(text_muted));
+        ui.label(egui::RichText::new(format!("Focus Vision PCVR v{}", env!("CARGO_PKG_VERSION"))).size(11.0).color(text_muted));
     }
 }
 
