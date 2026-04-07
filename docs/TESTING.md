@@ -388,3 +388,251 @@ ____
 | thumbstick touch 検知 | 同上 |
 | スティック微小入力 | デッドゾーン内はゼロ |
 | バッテリーレベル | 実際の値（100%固定でない） |
+
+---
+
+## 12. v2.0 新機能テスト (Phase 1)
+
+### 12A. 96fpsサポート
+
+```bash
+# 1. config/local.toml で framerate を変更
+[video]
+framerate = 96
+
+# 2. エンジン再起動、SteamVRでゲーム起動
+# 3. コンパニオンアプリでFPS確認
+```
+
+| チェック項目 | 確認方法 | 期待値 |
+|-------------|---------|--------|
+| SteamVR表示モード | SteamVR Settings → Video | 96Hz |
+| FPS | コンパニオンアプリ | 96fps |
+| RTPタイムスタンプ | PCログ検索 | ドリフトなし（90000tick/s） |
+| 90fpsに戻す | framerate=90に変更 | 正常動作 |
+| 120fps | framerate=120 | 120fps（GPU性能次第） |
+
+### 12B. プロトコルバージョニング
+
+| チェック項目 | 確認方法 | 期待値 |
+|-------------|---------|--------|
+| 接続時バージョン表示 | PCログ `grep "protocol v"` | "Received HELLO from client (protocol v2)" |
+| HELLO_ACKにバージョン | HMDログ | protocol version 2 |
+| 旧クライアント互換 | v1.3 APKで接続 | "protocol v1"で接続成功 |
+
+### 12C. レイテンシーウォーターフォール
+
+```bash
+# 1. HMDでストリーミング開始
+# 2. 左下のシグナルバーの上にカラーバーが表示されることを確認
+```
+
+| チェック項目 | 確認方法 | 期待値 |
+|-------------|---------|--------|
+| ウォーターフォール表示 | HMD内 左下 | 4色のスタックバー表示 |
+| 色分け | 目視 | 青(encode)→水色(network)→緑(decode)→黄(render) |
+| 動的更新 | 負荷変動時 | バーの比率が変化 |
+| HEARTBEAT_ACKデータ | HMDログ `grep "HEARTBEAT_ACK"` | encode_us, total_us の値 |
+
+### 12D. フルRGBカラーレンジ
+
+```bash
+# 1. config/local.toml
+[video]
+full_range = true
+
+# 2. テストパターンや高彩度コンテンツを表示
+# 3. full_range = false と比較
+```
+
+| チェック項目 | 確認方法 | 期待値 |
+|-------------|---------|--------|
+| full_range=true | 黒レベルの沈み込み | limited rangeより深い黒 |
+| full_range=false | 比較 | 黒が浮く（16が最低値） |
+| 色域 | 高彩度画像表示 | full_rangeの方が鮮やか |
+
+**注意:** NVENC VUIパラメータが未接続のため、初回は差が出ない可能性あり。差がない場合は NVENC SDK offset検証が必要（TODOS.md参照）。
+
+### 12E. UDPトランスポート最適化
+
+| チェック項目 | 確認方法 | 期待値 |
+|-------------|---------|--------|
+| SO_SNDBUF設定 | PCログ `grep "SO_SNDBUF"` | 警告なし（成功） |
+| DSCP設定 | PCログ `grep "DSCP"` | 警告なし or "non-fatal" |
+| パケットロス比較 | コンパニオンアプリ | 最適化前と同等以下 |
+
+### 12F. Config validation (構造化エラー)
+
+```bash
+# 1. config/default.toml に不正値を設定
+[foveated]
+fovea_radius = -1.0
+mid_radius = 0.05
+
+# 2. エンジンを起動
+```
+
+| チェック項目 | 確認方法 | 期待値 |
+|-------------|---------|--------|
+| fovea_radius=-1.0 | ログ | `[foveated.fovea_radius] -1 invalid, clamped to 0.15` |
+| mid_radius < fovea_radius | ログ | `[foveated.mid_radius] invalid (must be > fovea_radius)` |
+| フィールド名付き | ログ形式 | `Config validation [field.name]: message` |
+
+---
+
+## 13. v2.1 新機能テスト (Phase 2)
+
+### 13A. FT 表情プロファイル
+
+```bash
+# 1. VRChatでアバターを表示、FT有効化
+# 2. コンパニオンアプリ Settings → Face Tracking
+# 3. 現在の挙動を確認（プロファイルなし = weight全1.0）
+```
+
+**プロファイル作成テスト:**
+
+```bash
+# %APPDATA%/FocusVisionPCVR/profiles/ に手動作成:
+# avatar_test.json:
+{
+  "name": "avatar_test",
+  "weights": [2.0, 2.0, 2.0, 2.0, 1.0, 1.0, ... ],
+  "smoothing_override": 0.4
+}
+# → 最初の4 blendshape (Jaw系) が2倍感度
+
+# config/local.toml:
+[face_tracking]
+active_profile = "avatar_test"
+```
+
+| チェック項目 | 確認方法 | 期待値 |
+|-------------|---------|--------|
+| プロファイル読込 | PCログ `grep "profile activated"` | "FT profile activated: avatar_test" |
+| weight適用 | VRChat口の動き | Jaw系が通常の2倍に拡大 |
+| smoothing override | 応答性比較 | 0.4=デフォルト0.6より速い応答 |
+| プロファイルなし | active_profile="" | 通常動作（weight 1.0） |
+| 不正プロファイル名 | `active_profile = "../evil"` | 読込拒否（ログ警告） |
+| NaN weight | `"weights": [NaN]` | 1.0にサニタイズ |
+
+### 13B. FT 自動キャリブレーション
+
+```bash
+# 注: コンパニオンアプリUIは未実装のため、TCP経由で手動テスト
+# 将来的にはコンパニオンアプリに「Calibrate」ボタンを追加
+
+# テスト方法:
+# 1. エンジン起動、HMD接続
+# 2. FTデータが正常に受信されていることを確認
+# 3. 以下のRustテストでキャリブロジック検証
+cargo test -p streaming-engine -- calibration
+```
+
+| チェック項目 | 確認方法 | 期待値 |
+|-------------|---------|--------|
+| Relaxステップ | 90フレーム（~1秒）のmin収集 | min値が正しく記録 |
+| ExaggerateAllステップ | 90フレームのmax収集 | max値が正しく記録 |
+| weight計算 | 1.0 / (max - min) | 妥当な値（0.5〜5.0程度） |
+| 定数値（動かない） | range < 0.01 | weight = 1.0（ゼロ除算なし） |
+| プロファイル生成 | compute_profile() | 有効なFtProfileオブジェクト |
+
+### 13C. フォベアテッドプリセット
+
+```bash
+# config/local.toml で各プリセットをテスト:
+[foveated]
+enabled = true
+preset = "subtle"      # → +3/+8
+# preset = "balanced"  # → +5/+15 (default)
+# preset = "aggressive" # → +8/+25
+# preset = "custom"    # → mid_qp_offset/peripheral_qp_offset の値を使用
+```
+
+| チェック項目 | 確認方法 | 期待値 |
+|-------------|---------|--------|
+| subtle | 周辺部を注視 | ほぼ気づかない品質差 |
+| balanced | 周辺部を注視 | 軽いぼやけ |
+| aggressive | 周辺部を注視 | 明確なぼやけ（帯域大幅削減） |
+| custom | mid=10, peripheral=30 | カスタム値で動作 |
+| 帯域削減 | コンパニオンアプリ ビットレート比較 | subtle<balanced<aggressive |
+
+**帯域削減記録テンプレート:**
+
+```
+日付: ____
+ゲーム: ____
+解像度: 1832x1920
+
+Foveated OFF:   ____Mbps (baseline)
+Subtle (+3/+8): ____Mbps (____% 削減)
+Balanced (+5/+15): ____Mbps (____% 削減)
+Aggressive (+8/+25): ____Mbps (____% 削減)
+
+主観品質 (中心部): subtle __/10, balanced __/10, aggressive __/10
+主観品質 (周辺部): subtle __/10, balanced __/10, aggressive __/10
+推奨プリセット: ____
+```
+
+### 13D. NVENC ROI 対応確認（探索的テスト）
+
+```bash
+# 1. PCのNVENC SDKバージョンを確認
+nvidia-smi
+# → Driver version から NVENC SDK version を推定
+
+# 2. nvEncodeAPI64.dll のロードを確認
+# PCログで "NvencEncoder" を検索
+# → "nvEncOpenEncodeSessionEx" が成功しているか
+
+# 3. ROI encode の利用可能性を調査
+# NV_ENC_PIC_PARAMS の qpDeltaMap が動作しているなら、ROI拡張の可能性あり
+# → 現時点ではQPデルタマップ方式のみ。ROIは将来のNVENC SDK更新で対応
+```
+
+| チェック項目 | 確認方法 | 期待値 |
+|-------------|---------|--------|
+| NVENC SDK version | nvidia-smi + ドライバーバージョン | v12.x 以上ならROI可能性あり |
+| QPデルタマップ動作 | foveated=true で画質差確認 | 中心高品質、周辺低品質 |
+
+---
+
+## 14. v2.1 テスト結果サマリーテンプレート
+
+```
+=== Focus Vision PCVR v2.1 実機テスト結果 ===
+日付: ____
+テスター: ____
+PC: ____ (GPU: ____, Driver: ____)
+HMD: VIVE Focus Vision (FW: ____)
+Wi-Fi: ____ (5GHz / 6GHz)
+ビルド: v2.1.0 (commit: ____)
+
+=== Phase 1 (v2.0) ===
+96fps動作:          PASS / FAIL  (実測FPS: ____)
+プロトコルバージョン: PASS / FAIL
+ウォーターフォール:   PASS / FAIL
+フルRGB:            PASS / FAIL / SKIP (VUI未接続)
+UDP最適化:          PASS / FAIL
+Config validation:  PASS / FAIL
+
+=== Phase 2 (v2.1) ===
+FTプロファイル:       PASS / FAIL
+FTキャリブレーション:  PASS / FAIL / SKIP (UIなし)
+Foveated subtle:    PASS / FAIL  (帯域削減: ___%)
+Foveated balanced:  PASS / FAIL  (帯域削減: ___%)
+Foveated aggressive: PASS / FAIL  (帯域削減: ___%)
+NVENC ROI:          N/A / 対応 / 非対応
+
+=== 安定性 ===
+30分連続:           PASS / FAIL
+メモリリーク:        なし / あり (詳細: ____)
+
+=== 既知の制限事項 ===
+- NVENC VUI (Full RGB) は SDK offset 検証後に接続
+- FT キャリブレーション UI はコンパニオンアプリに未実装
+- FT ミラーモードは passthrough 拡張依存（未実装）
+
+備考:
+____
+```
