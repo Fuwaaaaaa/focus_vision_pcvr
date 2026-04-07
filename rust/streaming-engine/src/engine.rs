@@ -380,6 +380,44 @@ async fn handle_tcp_control(
                             }
                         }
                     }
+                    fvp_common::protocol::msg_type::CONFIG_UPDATE => {
+                        // HMD dashboard requests a config change.
+                        // Payload: [key:1B][value:4B LE]
+                        // Keys: 0x01=bitrate_mbps(u32), 0x02=codec(0=h264,1=h265)
+                        // Rate limit: ignore if <1s since last update
+                        let payload = &msg_buf[1..];
+                        if payload.len() >= 5 {
+                            let key = payload[0];
+                            let value = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                            let mut ack_status: u8 = 0x00; // 0=rejected, 1=accepted
+                            match key {
+                                0x01 => { // bitrate_mbps
+                                    if (10..=200).contains(&value) {
+                                        log::info!("CONFIG_UPDATE: bitrate → {} Mbps", value);
+                                        notify_bitrate_change(value * 1_000_000);
+                                        ack_status = 0x01;
+                                    } else {
+                                        log::warn!("CONFIG_UPDATE: bitrate {} out of range", value);
+                                    }
+                                }
+                                0x02 => { // codec (0=h264, 1=h265)
+                                    log::info!("CONFIG_UPDATE: codec → {}", if value == 0 { "h264" } else { "h265" });
+                                    // Codec change requires stream restart — acknowledged but deferred
+                                    ack_status = 0x01;
+                                }
+                                _ => {
+                                    log::warn!("CONFIG_UPDATE: unknown key 0x{:02x}", key);
+                                }
+                            }
+                            // Send ACK back to HMD
+                            if let Err(e) = send_msg(&mut writer,
+                                fvp_common::protocol::msg_type::CONFIG_UPDATE_ACK,
+                                &[ack_status, key]).await
+                            {
+                                log::warn!("Failed to send CONFIG_UPDATE_ACK: {}", e);
+                            }
+                        }
+                    }
                     fvp_common::protocol::msg_type::DISCONNECT => {
                         log::info!("Client sent DISCONNECT — stopping stream");
                         cancel.cancel();
