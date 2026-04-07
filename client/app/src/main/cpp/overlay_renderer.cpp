@@ -64,7 +64,7 @@ void OverlayRenderer::renderBar(float x, float y, float width, float height,
     glUniform2f(glGetUniformLocation(m_program, "uOffset"), x, y);
     glUniform2f(glGetUniformLocation(m_program, "uScale"), width, height);
     glUniform3f(glGetUniformLocation(m_program, "uColor"), r, g, b);
-    glDrawArrays(GL_TRIANGLE_STRIP, 4, 4);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
 void OverlayRenderer::render(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight,
