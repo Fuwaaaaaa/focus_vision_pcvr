@@ -159,4 +159,65 @@ mod tests {
         let bridge = OscBridge::new();
         assert!(bridge.socket.is_some());
     }
+
+    #[test]
+    fn test_osc_float_value_encoding() {
+        let msg = encode_osc_float("/x", 0.75).unwrap();
+        // Float at the last 4 bytes, big-endian per OSC spec
+        let float_bytes = &msg[msg.len() - 4..];
+        let value = f32::from_be_bytes(float_bytes.try_into().unwrap());
+        assert!((value - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_send_face_data_skips_near_zero() {
+        // Verify that near-zero values don't generate OSC traffic.
+        // We can't easily observe UDP, but we test that the code path runs
+        // without error. The bridge sends only values > 0.01.
+        let bridge = OscBridge::new();
+        let mut lip = [0.0f32; 37];
+        let mut eye = [0.0f32; 14];
+
+        // All zeros — should send nothing
+        bridge.send_face_data(true, true, &lip, &eye);
+
+        // Set one lip and one eye above threshold
+        lip[3] = 0.8; // JawOpen
+        eye[0] = 0.5; // EyeLeftBlink
+        bridge.send_face_data(true, true, &lip, &eye);
+    }
+
+    #[test]
+    fn test_send_face_data_disabled() {
+        let mut bridge = OscBridge::new();
+        bridge.set_enabled(false);
+        let lip = [1.0f32; 37];
+        let eye = [1.0f32; 14];
+        // Should return immediately without sending
+        bridge.send_face_data(true, true, &lip, &eye);
+    }
+
+    #[test]
+    fn test_all_lip_names_generate_valid_osc() {
+        for name in &LIP_NAMES {
+            let addr = format!("/avatar/parameters/{}", name);
+            let msg = encode_osc_float(&addr, 1.0).unwrap();
+            // Address must be null-terminated and 4-byte aligned
+            assert_eq!(msg.len() % 4, 0);
+            // Must contain the type tag
+            let tag_pos = msg.windows(4).position(|w| w == b",f\0\0");
+            assert!(tag_pos.is_some(), "Missing type tag for {}", name);
+        }
+    }
+
+    #[test]
+    fn test_all_eye_names_generate_valid_osc() {
+        for name in &EYE_NAMES {
+            let addr = format!("/avatar/parameters/{}", name);
+            let msg = encode_osc_float(&addr, 0.5).unwrap();
+            assert_eq!(msg.len() % 4, 0);
+            let tag_pos = msg.windows(4).position(|w| w == b",f\0\0");
+            assert!(tag_pos.is_some(), "Missing type tag for {}", name);
+        }
+    }
 }
