@@ -35,9 +35,10 @@ private:
     bool m_eyeAvailable = false;
     XrSession m_session = XR_NULL_HANDLE;
 
-    // Opaque handles (XrFacialTrackerHTC)
-    uint64_t m_lipTracker = 0;
-    uint64_t m_eyeTracker = 0;
+    // Opaque handles — stored as void* for SDK version compatibility.
+    // Cast to XrFacialTrackerHTC at call site.
+    void* m_lipTracker = nullptr;
+    void* m_eyeTracker = nullptr;
 
     // Function pointers (resolved via xrGetInstanceProcAddr)
     PFN_xrVoidFunction m_pfnCreateFacialTracker = nullptr;
