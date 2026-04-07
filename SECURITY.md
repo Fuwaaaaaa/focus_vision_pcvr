@@ -13,6 +13,7 @@ Focus Vision PCVR communicates over Wi-Fi between a Windows PC and an Android HM
 | PIN eavesdropping | PIN sent only over TLS-encrypted channel |
 | Server impersonation | TOFU certificate pinning (SHA-256 fingerprint saved on first connect) |
 | PIN prediction | `rand::random()` (cryptographic CSPRNG) replaces `subsec_nanos()` |
+| CONFIG_UPDATE injection | TLS authentication required + input validation (range checks on bitrate 10-200, codec enum) |
 
 ### Known Limitations
 
@@ -28,6 +29,10 @@ Focus Vision PCVR communicates over Wi-Fi between a Windows PC and an Android HM
 ```
 Control Channel (port 9944):
   TCP → TLS 1.3 → Message framing → PIN pairing → Streaming
+  CONFIG_UPDATE (0x55): HMD → PC config change (bitrate, codec)
+    - Only accepted from TLS-authenticated clients
+    - Values validated: bitrate [10-200] Mbps, codec enum [0,1]
+    - ACK (0x56) sent back with accept/reject status
 
 Data Channels (UDP):
   Video (9946): RTP + FEC, plaintext
