@@ -526,6 +526,9 @@ async fn run_streaming(
                         log::warn!("UDP send error: {}", e);
                     }
 
+                    // Return packet buffers to the pool for reuse on the next frame
+                    packetizer.recycle(packets);
+
                     frame.timestamps.mark_send();
 
                     if let Ok(mut tracker) = latency_tracker.lock() {
