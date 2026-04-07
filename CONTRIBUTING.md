@@ -24,10 +24,10 @@ cmake --build driver/build --config Release
 ## Test
 
 ```bash
-cargo test --workspace    # All 104+ tests
+cargo test --workspace    # All 156+ tests
 ```
 
-Tests cover: FEC encode/decode, RTP packetization, TCP control handshake, PIN pairing, TLS certificate generation, adaptive bitrate, audio encoding, config parsing, ADB output parsing, PII sanitization, protocol struct layout.
+Tests cover: FEC encode/decode, RTP packetization, TCP control handshake (plain + TLS), PIN pairing, TLS certificate generation, adaptive bitrate, audio encoding, config parsing + validation (range checks, NaN, port conflicts), ADB output parsing, PII sanitization, protocol struct layout, haptic event serialization + channel overflow, face tracking EMA smoothing + blendshape parsing, sleep mode motion detection + state transitions, tracking packet parsing (head pose, gaze, controller).
 
 ## Project Structure
 
