@@ -101,13 +101,11 @@ impl CalibrationState {
     pub fn compute_profile(&self) -> FtProfile {
         let mut weights = vec![1.0f32; TOTAL_BLENDSHAPES];
 
-        for i in 0..TOTAL_BLENDSHAPES {
+        for (i, weight) in weights.iter_mut().enumerate() {
             let range = self.max_values[i] - self.min_values[i];
             if range > 0.01 {
-                // Scale so that the observed range maps to 0.0-1.0
-                weights[i] = 1.0 / range;
+                *weight = 1.0 / range;
             }
-            // If range is tiny (< 0.01), the blendshape barely moves → keep weight 1.0
         }
 
         FtProfile {

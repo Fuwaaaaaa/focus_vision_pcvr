@@ -42,11 +42,34 @@ impl FtProfile {
     pub fn normalize(&mut self) {
         self.weights.resize(TOTAL_BLENDSHAPES, 1.0);
     }
+
+    /// Replace NaN/Infinity/negative weights with 1.0.
+    pub fn sanitize_weights(&mut self) {
+        for w in &mut self.weights {
+            if w.is_nan() || w.is_infinite() || *w < 0.0 {
+                *w = 1.0;
+            }
+        }
+    }
 }
 
 /// Profile storage directory: %APPDATA%/FocusVisionPCVR/profiles/
 fn profiles_dir() -> Option<std::path::PathBuf> {
     dirs_next::data_dir().map(|d| d.join("FocusVisionPCVR").join("profiles"))
+}
+
+/// Validate profile name: reject path traversal, separators, and null bytes.
+fn sanitize_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Profile name cannot be empty");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
+        return Err("Profile name contains invalid characters");
+    }
+    if name.len() > 64 {
+        return Err("Profile name too long (max 64 chars)");
+    }
+    Ok(())
 }
 
 /// List available profile names (without .json extension).
@@ -68,18 +91,21 @@ pub fn list_profiles() -> Vec<String> {
         .collect()
 }
 
-/// Load a profile by name. Returns None if not found or invalid.
+/// Load a profile by name. Returns None if not found, invalid, or name fails sanitization.
 pub fn load_profile(name: &str) -> Option<FtProfile> {
+    sanitize_name(name).ok()?;
     let dir = profiles_dir()?;
     let path = dir.join(format!("{name}.json"));
     let content = std::fs::read_to_string(&path).ok()?;
     let mut profile: FtProfile = serde_json::from_str(&content).ok()?;
     profile.normalize();
+    profile.sanitize_weights();
     Some(profile)
 }
 
 /// Save a profile. Creates the profiles directory if needed.
 pub fn save_profile(profile: &FtProfile) -> Result<(), Box<dyn std::error::Error>> {
+    sanitize_name(&profile.name)?;
     let dir = profiles_dir().ok_or("Cannot determine app data directory")?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", profile.name));
@@ -90,7 +116,8 @@ pub fn save_profile(profile: &FtProfile) -> Result<(), Box<dyn std::error::Error
 }
 
 /// Delete a profile by name.
-pub fn delete_profile(name: &str) -> Result<(), std::io::Error> {
+pub fn delete_profile(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    sanitize_name(name)?;
     let dir = match profiles_dir() {
         Some(d) => d,
         None => return Ok(()),

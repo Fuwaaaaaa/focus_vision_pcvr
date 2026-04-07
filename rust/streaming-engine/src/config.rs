@@ -326,6 +326,20 @@ impl AppConfig {
             self.sleep_mode.motion_threshold = 0.002;
         }
 
+        // Foveated
+        if self.foveated.fovea_radius <= 0.0 || self.foveated.fovea_radius > 0.5
+            || self.foveated.fovea_radius.is_nan()
+        {
+            errors.push(ConfigError { field: "foveated.fovea_radius", message: format!("{} invalid, clamped to 0.15", self.foveated.fovea_radius) });
+            self.foveated.fovea_radius = 0.15;
+        }
+        if self.foveated.mid_radius <= self.foveated.fovea_radius || self.foveated.mid_radius > 1.0
+            || self.foveated.mid_radius.is_nan()
+        {
+            errors.push(ConfigError { field: "foveated.mid_radius", message: format!("{} invalid (must be > fovea_radius), clamped to 0.35", self.foveated.mid_radius) });
+            self.foveated.mid_radius = 0.35;
+        }
+
         errors
     }
 }
