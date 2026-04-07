@@ -74,6 +74,8 @@ bool ControllerPoller::createActions() {
         XR_ACTION_TYPE_BOOLEAN_INPUT, m_handPaths, 2);
     m_menuAction = createAction(m_actionSet, "menu", "Menu",
         XR_ACTION_TYPE_BOOLEAN_INPUT, m_handPaths, 2);
+    m_hapticAction = createAction(m_actionSet, "haptic", "Haptic",
+        XR_ACTION_TYPE_VIBRATION_OUTPUT, m_handPaths, 2);
     return true;
 }
 
@@ -173,5 +175,24 @@ void ControllerPoller::pollAndSend(XrSession session, XrSpace stageSpace,
             thumbState.currentState.x, thumbState.currentState.y,
             flags, 100 // battery placeholder
         );
+    }
+}
+
+void ControllerPoller::applyHaptic(XrSession session, int hand, float durationSec, float frequency, float amplitude) {
+    if (!m_initialized || hand < 0 || hand > 1) return;
+
+    XrHapticVibration vibration = {XR_TYPE_HAPTIC_VIBRATION};
+    vibration.duration = static_cast<XrDuration>(durationSec * 1e9f); // seconds → nanoseconds
+    vibration.frequency = frequency;
+    vibration.amplitude = amplitude;
+
+    XrHapticActionInfo hapticInfo = {XR_TYPE_HAPTIC_ACTION_INFO};
+    hapticInfo.action = m_hapticAction;
+    hapticInfo.subactionPath = m_handPaths[hand];
+
+    XrResult result = xrApplyHapticFeedback(session, &hapticInfo,
+        reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+    if (XR_FAILED(result)) {
+        LOGW("ControllerPoller: xrApplyHapticFeedback failed (hand=%d, result=%d)", hand, (int)result);
     }
 }

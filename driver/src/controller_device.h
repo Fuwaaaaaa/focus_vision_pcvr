@@ -26,10 +26,14 @@ public:
     const char* GetSerialNumber() const;
     bool IsLeft() const { return m_isLeft; }
 
+    /// Called by server_driver when SteamVR triggers haptic output.
+    void TriggerHaptic(float duration_s, float frequency, float amplitude);
+
+    vr::VRInputComponentHandle_t GetHapticHandle() const { return m_hHaptic; }
+
 private:
     void SetupProperties();
     void CreateInputComponents();
-    void UpdateInputFromControllerState();
 
     bool m_isLeft;
     uint32_t m_objectId = vr::k_unTrackedDeviceIndexInvalid;
@@ -46,4 +50,5 @@ private:
     vr::VRInputComponentHandle_t m_hMenu = vr::k_ulInvalidInputComponentHandle;
     vr::VRInputComponentHandle_t m_hSystem = vr::k_ulInvalidInputComponentHandle;
     vr::VRInputComponentHandle_t m_hThumbstickClick = vr::k_ulInvalidInputComponentHandle;
+    vr::VRInputComponentHandle_t m_hHaptic = vr::k_ulInvalidInputComponentHandle;
 };
