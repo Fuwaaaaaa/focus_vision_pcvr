@@ -84,14 +84,13 @@ pub mod msg_type {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum VideoCodec {
     H264,
+    #[default]
     H265,
 }
 
-impl Default for VideoCodec {
-    fn default() -> Self { Self::H265 }
-}
 
 #[cfg(test)]
 mod tests {

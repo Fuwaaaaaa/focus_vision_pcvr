@@ -121,11 +121,10 @@ void CDirectModeComponent::CreateSwapTextureSet(
 
 void CDirectModeComponent::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHandle)
 {
-    // Clear m_pendingTexture if it points to a texture being destroyed,
-    // to prevent use-after-free if NVENC hasn't consumed it yet.
+    // Release m_pendingTexture if it points to a texture being destroyed
     for (const auto& entry : m_swapTextures) {
-        if (entry.handle == sharedTextureHandle && entry.texture.Get() == m_pendingTexture) {
-            m_pendingTexture = nullptr;
+        if (entry.handle == sharedTextureHandle && entry.texture.Get() == m_pendingTexture.Get()) {
+            m_pendingTexture.Reset();
         }
     }
     m_swapTextures.erase(
@@ -136,10 +135,10 @@ void CDirectModeComponent::DestroySwapTextureSet(vr::SharedTextureHandle_t share
 
 void CDirectModeComponent::DestroyAllSwapTextureSets(uint32_t unPid)
 {
-    // Clear m_pendingTexture if it belongs to the destroyed PID
+    // Release m_pendingTexture if it belongs to the destroyed PID
     for (const auto& entry : m_swapTextures) {
-        if (entry.pid == unPid && entry.texture.Get() == m_pendingTexture) {
-            m_pendingTexture = nullptr;
+        if (entry.pid == unPid && entry.texture.Get() == m_pendingTexture.Get()) {
+            m_pendingTexture.Reset();
         }
     }
     m_swapTextures.erase(
@@ -183,7 +182,7 @@ void CDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 
     for (const auto& entry : m_swapTextures) {
         if (entry.handle == leftHandle) {
-            m_pendingTexture = entry.texture.Get();
+            m_pendingTexture = entry.texture;
             return;
         }
     }
@@ -215,8 +214,8 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
     if (m_pendingTexture) {
         ComPtr<ID3D11DeviceContext> ctx;
         m_encoder.getDevice()->GetImmediateContext(&ctx);
-        encodeInput = m_frameCopy.copyFrame(ctx.Get(), m_pendingTexture);
-        m_pendingTexture = nullptr; // Consumed
+        encodeInput = m_frameCopy.copyFrame(ctx.Get(), m_pendingTexture.Get());
+        m_pendingTexture.Reset(); // Consumed
     }
 
     std::vector<uint8_t> nalData;

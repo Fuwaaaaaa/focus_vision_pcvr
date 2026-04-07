@@ -138,8 +138,11 @@ pub extern "C" fn fvp_set_bitrate_callback(callback: extern "C" fn(u32)) {
 /// `is_idr`: 1 if this frame is an IDR keyframe, 0 otherwise.
 ///
 /// Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `nal_data_ptr` must be valid for `nal_data_len` bytes.
 #[no_mangle]
-pub extern "C" fn fvp_submit_encoded_nal(
+pub unsafe extern "C" fn fvp_submit_encoded_nal(
     nal_data_ptr: *const u8,
     nal_data_len: u32,
     frame_index: u32,
@@ -165,10 +168,13 @@ pub extern "C" fn fvp_submit_encoded_nal(
         static NAL_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(256 * 1024));
     }
 
+    // SAFETY: Caller (C++ driver) guarantees nal_data_ptr is valid for nal_data_len bytes.
+    // Null check is performed above.
+    let nal_slice = unsafe { std::slice::from_raw_parts(nal_data_ptr, nal_data_len as usize) };
     let nal_data = NAL_BUF.with(|buf| {
         let mut b = buf.borrow_mut();
         b.clear();
-        b.extend_from_slice(unsafe { std::slice::from_raw_parts(nal_data_ptr, nal_data_len as usize) });
+        b.extend_from_slice(nal_slice);
         b.clone()
     });
 
@@ -186,8 +192,11 @@ pub extern "C" fn fvp_submit_encoded_nal(
 
 /// Get the latest tracking data from the connected HMD.
 /// Returns 0 on success, -1 if no data available.
+///
+/// # Safety
+/// `out` must be a valid, aligned pointer to TrackingData.
 #[no_mangle]
-pub extern "C" fn fvp_get_tracking_data(out: *mut TrackingData) -> i32 {
+pub unsafe extern "C" fn fvp_get_tracking_data(out: *mut TrackingData) -> i32 {
     if out.is_null() {
         return -1;
     }
@@ -203,7 +212,8 @@ pub extern "C" fn fvp_get_tracking_data(out: *mut TrackingData) -> i32 {
 
     match engine.get_tracking() {
         Some(data) => {
-            unsafe { *out = data; }
+            // SAFETY: Null check above guarantees out is valid.
+            unsafe { out.write(data); }
             0
         }
         None => -1,
@@ -213,8 +223,11 @@ pub extern "C" fn fvp_get_tracking_data(out: *mut TrackingData) -> i32 {
 /// Get the latest controller state.
 /// `controller_id`: 0 = left, 1 = right.
 /// Returns 0 on success, -1 if no data available.
+///
+/// # Safety
+/// `out` must be a valid, aligned pointer to ControllerState.
 #[no_mangle]
-pub extern "C" fn fvp_get_controller_state(controller_id: u8, out: *mut ControllerState) -> i32 {
+pub unsafe extern "C" fn fvp_get_controller_state(controller_id: u8, out: *mut ControllerState) -> i32 {
     if out.is_null() {
         return -1;
     }
@@ -230,7 +243,7 @@ pub extern "C" fn fvp_get_controller_state(controller_id: u8, out: *mut Controll
 
     match engine.get_controller(controller_id) {
         Some(state) => {
-            unsafe { *out = state; }
+            out.write(state);
             0
         }
         None => -1,
@@ -239,8 +252,11 @@ pub extern "C" fn fvp_get_controller_state(controller_id: u8, out: *mut Controll
 
 /// Get the display/video configuration.
 /// Returns 0 on success, -1 if config not loaded.
+///
+/// # Safety
+/// `out` must be a valid, aligned pointer to FvpConfig.
 #[no_mangle]
-pub extern "C" fn fvp_get_config(out: *mut FvpConfig) -> i32 {
+pub unsafe extern "C" fn fvp_get_config(out: *mut FvpConfig) -> i32 {
     if out.is_null() {
         return -1;
     }
@@ -254,18 +270,18 @@ pub extern "C" fn fvp_get_config(out: *mut FvpConfig) -> i32 {
         None => return -1,
     };
 
-    unsafe {
-        (*out).render_width = cfg.video.resolution_per_eye[0];
-        (*out).render_height = cfg.video.resolution_per_eye[1];
-        (*out).refresh_rate = cfg.video.framerate as f32;
-        (*out).ipd = cfg.display.ipd;
-        (*out).seconds_from_vsync_to_photons = cfg.display.seconds_from_vsync_to_photons;
-        (*out).foveated_enabled = if cfg.foveated.enabled { 1 } else { 0 };
-        (*out).fovea_radius = cfg.foveated.fovea_radius;
-        (*out).mid_radius = cfg.foveated.mid_radius;
-        (*out).mid_qp_offset = cfg.foveated.mid_qp_offset;
-        (*out).peripheral_qp_offset = cfg.foveated.peripheral_qp_offset;
-    }
+    out.write(FvpConfig {
+        render_width: cfg.video.resolution_per_eye[0],
+        render_height: cfg.video.resolution_per_eye[1],
+        refresh_rate: cfg.video.framerate as f32,
+        ipd: cfg.display.ipd,
+        seconds_from_vsync_to_photons: cfg.display.seconds_from_vsync_to_photons,
+        foveated_enabled: if cfg.foveated.enabled { 1 } else { 0 },
+        fovea_radius: cfg.foveated.fovea_radius,
+        mid_radius: cfg.foveated.mid_radius,
+        mid_qp_offset: cfg.foveated.mid_qp_offset,
+        peripheral_qp_offset: cfg.foveated.peripheral_qp_offset,
+    });
     0
 }
 
@@ -291,13 +307,13 @@ mod tests {
 
     #[test]
     fn test_fvp_get_tracking_null_ptr() {
-        let result = fvp_get_tracking_data(ptr::null_mut());
+        let result = unsafe { fvp_get_tracking_data(ptr::null_mut()) };
         assert_eq!(result, -1);
     }
 
     #[test]
     fn test_fvp_get_controller_null_ptr() {
-        let result = fvp_get_controller_state(0, ptr::null_mut());
+        let result = unsafe { fvp_get_controller_state(0, ptr::null_mut()) };
         assert_eq!(result, -1);
     }
 
@@ -317,7 +333,7 @@ mod tests {
             button_flags: 0,
             battery_level: 0,
         };
-        let result = fvp_get_controller_state(255, &mut state);
+        let result = unsafe { fvp_get_controller_state(255, &mut state) };
         assert_eq!(result, -1);
     }
 
@@ -332,13 +348,13 @@ mod tests {
             gaze_y: 0.5,
             gaze_valid: 0,
         };
-        let result = fvp_get_tracking_data(&mut data);
+        let result = unsafe { fvp_get_tracking_data(&mut data) };
         assert_eq!(result, -1);
     }
 
     #[test]
     fn test_fvp_get_config_null_ptr() {
-        let result = fvp_get_config(ptr::null_mut());
+        let result = unsafe { fvp_get_config(ptr::null_mut()) };
         assert_eq!(result, -1);
     }
 
@@ -357,7 +373,7 @@ mod tests {
             mid_qp_offset: 0,
             peripheral_qp_offset: 0,
         };
-        let result = fvp_get_config(&mut cfg);
+        let result = unsafe { fvp_get_config(&mut cfg) };
         assert_eq!(result, -1);
     }
 
@@ -372,14 +388,14 @@ mod tests {
     fn test_fvp_submit_encoded_nal_no_engine() {
         reset_engine();
         let nal_data = vec![0u8; 100];
-        let result = fvp_submit_encoded_nal(nal_data.as_ptr(), nal_data.len() as u32, 0, 1);
+        let result = unsafe { fvp_submit_encoded_nal(nal_data.as_ptr(), nal_data.len() as u32, 0, 1) };
         assert_eq!(result, -1);
     }
 
     #[test]
     fn test_fvp_submit_encoded_nal_null_ptr() {
         reset_engine();
-        let result = fvp_submit_encoded_nal(ptr::null(), 100, 0, 0);
+        let result = unsafe { fvp_submit_encoded_nal(ptr::null(), 100, 0, 0) };
         assert_eq!(result, -1);
     }
 
@@ -387,7 +403,7 @@ mod tests {
     fn test_fvp_submit_encoded_nal_zero_len() {
         reset_engine();
         let nal_data = vec![0u8; 100];
-        let result = fvp_submit_encoded_nal(nal_data.as_ptr(), 0, 0, 0);
+        let result = unsafe { fvp_submit_encoded_nal(nal_data.as_ptr(), 0, 0, 0) };
         assert_eq!(result, -1);
     }
 }

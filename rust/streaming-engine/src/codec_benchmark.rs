@@ -1,10 +1,10 @@
-/// Codec benchmark: compares H.265 vs H.264 decode latency from HMD reports.
-///
-/// Flow:
-/// 1. Start with H.265 for 5 seconds, collect decode latency samples
-/// 2. Switch to H.264 for 5 seconds, collect decode latency samples
-/// 3. Compare averages, select the codec with lower latency
-/// 4. Save result to config/local.toml
+//! Codec benchmark: compares H.265 vs H.264 decode latency from HMD reports.
+//!
+//! Flow:
+//! 1. Start with H.265 for 5 seconds, collect decode latency samples
+//! 2. Switch to H.264 for 5 seconds, collect decode latency samples
+//! 3. Compare averages, select the codec with lower latency
+//! 4. Save result to config/local.toml
 
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,12 @@ pub struct CodecBenchmark {
     h264_samples: Vec<u32>,
 
     result: Option<CodecChoice>,
+}
+
+impl Default for CodecBenchmark {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CodecBenchmark {
@@ -70,7 +76,7 @@ impl CodecBenchmark {
         match self.phase {
             BenchPhase::NotStarted => None,
             BenchPhase::TestingHevc => {
-                if self.phase_start.map_or(false, |s| s.elapsed() >= self.phase_duration) {
+                if self.phase_start.is_some_and(|s| s.elapsed() >= self.phase_duration) {
                     self.phase = BenchPhase::TestingH264;
                     self.phase_start = Some(Instant::now());
                     log::info!(
@@ -83,9 +89,9 @@ impl CodecBenchmark {
                 Some(CodecChoice::Hevc)
             }
             BenchPhase::TestingH264 => {
-                if self.phase_start.map_or(false, |s| s.elapsed() >= self.phase_duration) {
+                if self.phase_start.is_some_and(|s| s.elapsed() >= self.phase_duration) {
                     self.finalize();
-                    return self.result.map(|r| r);
+                    return self.result;
                 }
                 Some(CodecChoice::H264)
             }
