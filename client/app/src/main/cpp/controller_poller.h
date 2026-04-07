@@ -13,6 +13,9 @@ public:
     void pollAndSend(XrSession session, XrSpace stageSpace,
                      XrTime predictedTime, TrackingSender& sender);
 
+    /// Apply haptic vibration to a controller. Called when PC sends HAPTIC_EVENT.
+    void applyHaptic(XrSession session, int hand, float durationSec, float frequency, float amplitude);
+
 private:
     bool createActionSet(XrInstance instance);
     bool createActions();
@@ -29,6 +32,7 @@ private:
     XrAction m_aAction = XR_NULL_HANDLE;         // A/X button
     XrAction m_bAction = XR_NULL_HANDLE;         // B/Y button
     XrAction m_menuAction = XR_NULL_HANDLE;      // Menu button
+    XrAction m_hapticAction = XR_NULL_HANDLE;    // Haptic output
 
     // Spaces for controller poses
     XrSpace m_handSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
