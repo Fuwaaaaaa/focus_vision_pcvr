@@ -47,6 +47,7 @@ typedef struct FvpConfig {
     float refresh_rate;
     float ipd;
     float seconds_from_vsync_to_photons;
+    int32_t full_range;
     int32_t foveated_enabled;
     float fovea_radius;
     float mid_radius;

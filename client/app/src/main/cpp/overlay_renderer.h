@@ -26,6 +26,12 @@ public:
     void renderDashboard(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight,
                          uint32_t bitrateMbps, bool codecIsH265, int highlightItem);
 
+    /// Render latency waterfall: stacked horizontal bars showing where time goes.
+    /// Each value in microseconds. Total bar width proportional to sum.
+    void renderLatencyWaterfall(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight,
+                                uint32_t encodeUs, uint32_t networkUs,
+                                uint32_t decodeUs, uint32_t renderUs);
+
     bool isDashboardVisible() const { return m_dashboardVisible; }
     void toggleDashboard() { m_dashboardVisible = !m_dashboardVisible; }
     void setDashboardVisible(bool v) { m_dashboardVisible = v; }
