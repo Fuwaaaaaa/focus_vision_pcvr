@@ -2,6 +2,26 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [1.2.0] - 2026-04-07
+
+### Fixed
+- **Face Tracking接続修正:** FACE_DATA (0x35)のTCPハンドラが未実装でFTが完全に動作していなかった問題を修正。OscBridgeへのデータパスを接続
+- **バッテリーレベル:** コントローラー状態のバッテリー値が100%固定だった問題を修正。Android sysfsから実値を読み取り
+
+### Added
+- **Face Tracking EMAスムージング:** blendshape値に指数移動平均フィルタを適用しジッター低減。係数はconfig設定可能（デフォルト0.6）
+- **ハプティクスフィードバック:** SteamVR→PCドライバ→TCP→HMDの完全な振動パイプライン。`HAPTIC_EVENT (0x38)`プロトコルメッセージ、OpenXR `xrApplyHapticFeedback`
+- **タッチセンサー:** trigger_touch、grip_touch、thumbstick_touch、thumbstick_clickをポーリング・SteamVRに送信
+- **HTC VIVE Focus 3コントローラープロファイル:** フル入力バインディング（トリガー/グリップ/スティック/A/B/X/Y/タッチ）+ simple_controllerフォールバック
+- **サムスティックデッドゾーン:** 0.1マグニチュード以下をゼロにクランプしドリフト防止
+- **VR睡眠モード:** ヘッドポーズの動き検知で非活動検出。タイムアウト後にビットレート低下（80→8Mbps）+ 画面暗転。動き検知で自動復帰
+- **[face_tracking]設定セクション:** enabled、smoothing、osc_port
+- **[sleep_mode]設定セクション:** enabled、timeout_seconds、motion_threshold、sleep_bitrate_mbps
+
+### Tests
+- **テスト144件に増加**（134→144、+10件）
+- Face Dataパーステスト、EMAスムージングテスト、SleepDetectorテスト5件
+
 ## [1.1.1] - 2026-04-07
 
 ### Fixed

@@ -92,3 +92,30 @@
 ### ~~Android側Opusデコード + AAudio再生~~ (完了)
 - AudioPlayer (audio_player.cpp) のOpusデコード + AAudio低遅延再生を実装済み (c07a19f)。
 - libopusをAndroid NDKビルドに統合、AAudioStreamでlow-latency再生。
+
+## v1.2 スコープ
+
+### ~~Face Tracking TCP受信ハンドラ修正~~ (完了)
+- FACE_DATA (0x35) のTCPハンドラが未実装だった致命的バグを修正
+- OscBridgeへのデータパスを接続、parse_face_data()ヘルパー関数追加
+
+### ~~Face Tracking EMAスムージング~~ (完了)
+- blendshapeジッター低減のため指数移動平均フィルタ追加
+- [face_tracking]設定セクション（smoothing, osc_port）
+
+### ~~ハプティクスフィードバック~~ (完了)
+- SteamVR→PCドライバ→Rust engine→TCP→HMD→xrApplyHapticFeedback
+- HAPTIC_EVENT (0x38)プロトコル、fvp_haptic_event() FFI
+
+### ~~タッチセンサー + デッドゾーン~~ (完了)
+- trigger_touch, grip_touch, thumbstick_touch, thumbstick_clickポーリング
+- HTC VIVE Focus 3コントローラープロファイル追加
+- サムスティックデッドゾーン（0.1マグニチュード）
+
+### ~~バッテリーレベル~~ (完了)
+- Android sysfs (/sys/class/power_supply/battery/capacity) から実バッテリー読み取り
+
+### ~~VR睡眠モード~~ (完了)
+- SleepDetector: ヘッドポーズdeltaで非活動検出、タイムアウト後にビットレート低下
+- SLEEP_ENTER/SLEEP_EXIT プロトコル、renderSleepDimming() HMDオーバーレイ
+- [sleep_mode]設定セクション
