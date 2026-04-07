@@ -80,6 +80,8 @@ pub mod msg_type {
     pub const HAPTIC_EVENT: u8 = 0x38;
     pub const SLEEP_ENTER: u8 = 0x50;
     pub const SLEEP_EXIT: u8 = 0x51;
+    pub const CONFIG_UPDATE: u8 = 0x55;
+    pub const CONFIG_UPDATE_ACK: u8 = 0x56;
     pub const AUDIO_CONFIG: u8 = 0x40;
     pub const AUDIO_START: u8 = 0x41;
     pub const DISCONNECT: u8 = 0xFF;
