@@ -7,6 +7,11 @@
 #include <stdlib.h>
 
 /**
+ * Total blendshape count (37 lip + 14 eye).
+ */
+#define TOTAL_BLENDSHAPES 51
+
+/**
  * Tracking data sent from HMD to PC
  */
 typedef struct TrackingData {
