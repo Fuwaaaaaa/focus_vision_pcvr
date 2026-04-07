@@ -77,6 +77,7 @@ pub struct FvpConfig {
     pub ipd: f32,
     pub seconds_from_vsync_to_photons: f32,
     // Foveated encoding settings from TOML config
+    pub full_range: i32,
     pub foveated_enabled: i32,
     pub fovea_radius: f32,
     pub mid_radius: f32,
@@ -95,10 +96,10 @@ pub extern "C" fn fvp_init() -> i32 {
         config::AppConfig::default()
     });
 
-    // Validate and fix invalid config values
-    let warnings = config.validate();
-    for w in &warnings {
-        log::warn!("Config validation: {}", w);
+    // Validate and fix invalid config values (graceful: clamp + warn)
+    let errors = config.validate();
+    for e in &errors {
+        log::warn!("{}", e);
     }
 
     // Store config for fvp_get_config()
@@ -327,6 +328,7 @@ pub unsafe extern "C" fn fvp_get_config(out: *mut FvpConfig) -> i32 {
         refresh_rate: cfg.video.framerate as f32,
         ipd: cfg.display.ipd,
         seconds_from_vsync_to_photons: cfg.display.seconds_from_vsync_to_photons,
+        full_range: if cfg.video.full_range { 1 } else { 0 },
         foveated_enabled: if cfg.foveated.enabled { 1 } else { 0 },
         fovea_radius: cfg.foveated.fovea_radius,
         mid_radius: cfg.foveated.mid_radius,
@@ -418,6 +420,7 @@ mod tests {
             refresh_rate: 0.0,
             ipd: 0.0,
             seconds_from_vsync_to_photons: 0.0,
+            full_range: 0,
             foveated_enabled: 0,
             fovea_radius: 0.0,
             mid_radius: 0.0,

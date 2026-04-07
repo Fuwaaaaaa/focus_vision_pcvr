@@ -110,6 +110,47 @@ void OverlayRenderer::render(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHe
     glUseProgram(0);
 }
 
+void OverlayRenderer::renderLatencyWaterfall(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight,
+                                              uint32_t encodeUs, uint32_t networkUs,
+                                              uint32_t decodeUs, uint32_t renderUs) {
+    if (!m_initialized) return;
+    (void)fbWidth; (void)fbHeight;
+
+    uint32_t totalUs = encodeUs + networkUs + decodeUs + renderUs;
+    if (totalUs == 0) return;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glUseProgram(m_program);
+    glBindVertexArray(m_vao);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // Waterfall position: bottom-left, above signal bars
+    float baseX = -0.95f;
+    float baseY = -0.82f;
+    float totalWidth = 0.40f;
+    float barHeight = 0.025f;
+
+    // Stacked horizontal bars: Encode (blue) | Network (cyan) | Decode (green) | Render (yellow)
+    float x = baseX;
+    float encW = totalWidth * (float)encodeUs / (float)totalUs;
+    float netW = totalWidth * (float)networkUs / (float)totalUs;
+    float decW = totalWidth * (float)decodeUs / (float)totalUs;
+    float renW = totalWidth * (float)renderUs / (float)totalUs;
+
+    renderBar(x, baseY, encW, barHeight, 0.37f, 0.51f, 0.89f);  // Blue — encode
+    x += encW;
+    renderBar(x, baseY, netW, barHeight, 0.26f, 0.83f, 0.96f);  // Cyan — network
+    x += netW;
+    renderBar(x, baseY, decW, barHeight, 0.2f, 0.83f, 0.6f);    // Green — decode
+    x += decW;
+    renderBar(x, baseY, renW, barHeight, 0.98f, 0.75f, 0.14f);  // Yellow — render
+
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
 void OverlayRenderer::renderDashboard(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight,
                                        uint32_t bitrateMbps, bool codecIsH265, int highlightItem) {
     if (!m_initialized || !m_dashboardVisible) return;

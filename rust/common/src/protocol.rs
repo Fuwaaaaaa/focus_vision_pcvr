@@ -87,6 +87,25 @@ pub mod msg_type {
     pub const DISCONNECT: u8 = 0xFF;
 }
 
+/// Protocol version. Bumped when new message types are added.
+/// v1 = initial release (v1.0-v1.3)
+/// v2 = added protocol versioning, latency waterfall, UDP optimization (v2.0)
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// Parse protocol version from HELLO payload. Returns 1 if payload is empty (v1 client).
+pub fn parse_hello_version(payload: &[u8]) -> u16 {
+    if payload.len() >= 2 {
+        u16::from_le_bytes([payload[0], payload[1]])
+    } else {
+        1 // Legacy client with no version field
+    }
+}
+
+/// Encode protocol version for HELLO/HELLO_ACK payload.
+pub fn encode_version(version: u16) -> [u8; 2] {
+    version.to_le_bytes()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
@@ -140,14 +159,34 @@ mod tests {
     }
 
     #[test]
+    fn protocol_version_encode_decode() {
+        let encoded = encode_version(PROTOCOL_VERSION);
+        let decoded = parse_hello_version(&encoded);
+        assert_eq!(decoded, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn protocol_version_empty_payload_is_v1() {
+        // Legacy clients send empty HELLO — should be treated as v1
+        assert_eq!(parse_hello_version(&[]), 1);
+    }
+
+    #[test]
+    fn protocol_version_single_byte_is_v1() {
+        // Partial payload — also treated as legacy v1
+        assert_eq!(parse_hello_version(&[2]), 1);
+    }
+
+    #[test]
     fn msg_types_are_unique() {
         let types = [
             msg_type::HELLO, msg_type::HELLO_ACK, msg_type::PIN_REQUEST,
             msg_type::PIN_RESPONSE, msg_type::PIN_RESULT, msg_type::STREAM_CONFIG,
             msg_type::STREAM_START, msg_type::HEARTBEAT, msg_type::HEARTBEAT_ACK,
             msg_type::TRACKING_DATA, msg_type::CONTROLLER_DATA, msg_type::IDR_REQUEST,
-            msg_type::FACE_DATA, msg_type::AUDIO_CONFIG, msg_type::AUDIO_START,
-            msg_type::DISCONNECT,
+            msg_type::FACE_DATA, msg_type::HAPTIC_EVENT, msg_type::SLEEP_ENTER,
+            msg_type::SLEEP_EXIT, msg_type::CONFIG_UPDATE, msg_type::CONFIG_UPDATE_ACK,
+            msg_type::AUDIO_CONFIG, msg_type::AUDIO_START, msg_type::DISCONNECT,
         ];
         for i in 0..types.len() {
             for j in (i + 1)..types.len() {
