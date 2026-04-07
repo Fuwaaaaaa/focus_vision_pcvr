@@ -105,6 +105,38 @@ pub struct FoveatedConfig {
     pub mid_qp_offset: i32,
     #[serde(default = "default_peripheral_qp_offset")]
     pub peripheral_qp_offset: i32,
+    /// Foveated encoding preset: "subtle", "balanced", "aggressive".
+    /// Overrides mid_qp_offset and peripheral_qp_offset when set.
+    #[serde(default = "default_foveated_preset")]
+    pub preset: FoveatedPreset,
+}
+
+/// Foveated encoding preset with predefined QP offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FoveatedPreset {
+    /// Subtle: mid +3, peripheral +8 (minimal quality difference)
+    Subtle,
+    /// Balanced: mid +5, peripheral +15 (default, ~20% bandwidth reduction)
+    #[default]
+    Balanced,
+    /// Aggressive: mid +8, peripheral +25 (~35% bandwidth reduction)
+    Aggressive,
+    /// Custom: use mid_qp_offset and peripheral_qp_offset values directly
+    Custom,
+}
+
+
+impl FoveatedPreset {
+    /// Get QP offsets for this preset. Returns (mid, peripheral).
+    pub fn qp_offsets(self) -> Option<(i32, i32)> {
+        match self {
+            Self::Subtle => Some((3, 8)),
+            Self::Balanced => Some((5, 15)),
+            Self::Aggressive => Some((8, 25)),
+            Self::Custom => None, // Use config values directly
+        }
+    }
 }
 
 fn default_foveated_enabled() -> bool { false }
@@ -112,6 +144,7 @@ fn default_fovea_radius() -> f32 { 0.15 }
 fn default_mid_radius() -> f32 { 0.35 }
 fn default_mid_qp_offset() -> i32 { 5 }
 fn default_peripheral_qp_offset() -> i32 { 15 }
+fn default_foveated_preset() -> FoveatedPreset { FoveatedPreset::Balanced }
 
 impl Default for FoveatedConfig {
     fn default() -> Self {
@@ -121,7 +154,15 @@ impl Default for FoveatedConfig {
             mid_radius: default_mid_radius(),
             mid_qp_offset: default_mid_qp_offset(),
             peripheral_qp_offset: default_peripheral_qp_offset(),
+            preset: default_foveated_preset(),
         }
+    }
+}
+
+impl FoveatedConfig {
+    /// Get effective QP offsets (preset overrides manual values unless Custom).
+    pub fn effective_qp_offsets(&self) -> (i32, i32) {
+        self.preset.qp_offsets().unwrap_or((self.mid_qp_offset, self.peripheral_qp_offset))
     }
 }
 
@@ -133,6 +174,9 @@ pub struct FaceTrackingConfig {
     pub smoothing: f32,
     #[serde(default = "default_ft_osc_port")]
     pub osc_port: u16,
+    /// Active expression profile name. Empty = no profile (all weights 1.0).
+    #[serde(default)]
+    pub active_profile: String,
 }
 
 impl Default for FaceTrackingConfig {
@@ -141,6 +185,7 @@ impl Default for FaceTrackingConfig {
             enabled: default_ft_enabled(),
             smoothing: default_ft_smoothing(),
             osc_port: default_ft_osc_port(),
+            active_profile: String::new(),
         }
     }
 }

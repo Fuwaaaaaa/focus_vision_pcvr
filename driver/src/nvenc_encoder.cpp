@@ -1,4 +1,5 @@
 #include "nvenc_encoder.h"
+#include "qp_map.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -185,43 +186,15 @@ void NvencEncoder::setGaze(float gazeX, float gazeY, bool valid) {
 }
 
 void NvencEncoder::computeQpDeltaMap(float gazeX, float gazeY) {
-    // CTU size for HEVC is 64x64 (NVENC default)
     const uint32_t ctuSize = m_config.use_hevc ? 64 : 16;
-    m_ctuCols = (m_config.width + ctuSize - 1) / ctuSize;
-    m_ctuRows = (m_config.height + ctuSize - 1) / ctuSize;
-    const uint32_t mapSize = m_ctuCols * m_ctuRows;
+    computeCtuGrid(m_config.width, m_config.height, ctuSize, m_ctuCols, m_ctuRows);
 
-    m_qpDeltaMap.resize(mapSize);
-
-    // Foveation radii as fraction of frame width (matching Rust FoveationConfig defaults)
-    const float foveaRadius = 0.15f;
-    const float midRadius = 0.35f;
-    const int8_t midQpDelta = 5;
-    const int8_t peripheralQpDelta = 15;
-
-    // Gaze position in CTU coordinates
-    const float gazeCtuX = gazeX * static_cast<float>(m_ctuCols);
-    const float gazeCtuY = gazeY * static_cast<float>(m_ctuRows);
-    const float foveaCtu = foveaRadius * static_cast<float>(m_ctuCols);
-    const float midCtu = midRadius * static_cast<float>(m_ctuCols);
-
-    for (uint32_t row = 0; row < m_ctuRows; ++row) {
-        for (uint32_t col = 0; col < m_ctuCols; ++col) {
-            float dx = static_cast<float>(col) + 0.5f - gazeCtuX;
-            float dy = static_cast<float>(row) + 0.5f - gazeCtuY;
-            float dist = sqrtf(dx * dx + dy * dy);
-
-            int8_t delta;
-            if (dist <= foveaCtu) {
-                delta = 0;  // Full quality in fovea
-            } else if (dist <= midCtu) {
-                delta = midQpDelta;
-            } else {
-                delta = peripheralQpDelta;
-            }
-            m_qpDeltaMap[row * m_ctuCols + col] = delta;
-        }
-    }
+    // Use preset offsets from config (default: balanced = +5/+15)
+    ::computeQpDeltaMap(
+        gazeX, gazeY, m_ctuCols, m_ctuRows,
+        m_config.fovea_radius, m_config.mid_radius,
+        m_config.mid_qp_offset, m_config.peripheral_qp_offset,
+        m_qpDeltaMap);
 }
 
 bool NvencEncoder::loadNvencApi() {

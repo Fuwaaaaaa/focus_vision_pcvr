@@ -23,15 +23,17 @@ channels = 2
 
 [foveated]
 enabled = false
+preset = "balanced"      # subtle (+3/+8), balanced (+5/+15), aggressive (+8/+25), custom
 fovea_radius = 0.15
 mid_radius = 0.35
-mid_qp_offset = 5
+mid_qp_offset = 5        # only used when preset = "custom"
 peripheral_qp_offset = 15
 
 [face_tracking]
 enabled = true
 smoothing = 0.6    # EMA factor (0.0 = no smoothing, 0.99 = very smooth)
 osc_port = 9000
+active_profile = ""  # Expression profile name (empty = no profile)
 
 [sleep_mode]
 enabled = true
