@@ -1,6 +1,19 @@
 use serde::{Deserialize, Serialize};
 use fvp_common::protocol::VideoCodec;
 
+/// Structured config validation error. Values are clamped to defaults (graceful migration).
+#[derive(Debug, Clone)]
+pub struct ConfigError {
+    pub field: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Config validation [{}]: {}", self.field, self.message)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(Default)]
 pub struct AppConfig {
@@ -64,7 +77,13 @@ pub struct VideoConfig {
     pub resolution_per_eye: [u32; 2],
     #[serde(default = "default_framerate")]
     pub framerate: u32,
+    /// Full RGB color range (0-255) instead of limited (16-235).
+    /// Requires NVENC VUI parameter support — see TODOS.md for SDK verification.
+    #[serde(default = "default_full_range")]
+    pub full_range: bool,
 }
+
+fn default_full_range() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairingConfig {
@@ -181,7 +200,7 @@ impl Default for NetworkConfig {
 }
 impl Default for VideoConfig {
     fn default() -> Self {
-        Self { codec: VideoCodec::default(), bitrate_mbps: default_bitrate(), resolution_per_eye: default_resolution(), framerate: default_framerate() }
+        Self { codec: VideoCodec::default(), bitrate_mbps: default_bitrate(), resolution_per_eye: default_resolution(), framerate: default_framerate(), full_range: default_full_range() }
     }
 }
 impl Default for PairingConfig {
@@ -212,32 +231,33 @@ impl AppConfig {
         Ok(toml::from_str(&content)?)
     }
 
-    /// Validate config values, returning warnings for any corrected fields.
-    /// Invalid values are clamped to valid defaults. Caller should log warnings.
-    pub fn validate(&mut self) -> Vec<String> {
-        let mut warnings = Vec::new();
+    /// Validate config values, returning structured errors for any corrected fields.
+    /// Invalid values are clamped to valid defaults (graceful migration).
+    /// Callers should log errors and can inspect which fields were corrected.
+    pub fn validate(&mut self) -> Vec<ConfigError> {
+        let mut errors = Vec::new();
 
         // Network
         if self.network.tcp_port < 1024 {
-            warnings.push(format!("tcp_port {} < 1024, using default {}", self.network.tcp_port, default_tcp_port()));
+            errors.push(ConfigError { field: "network.tcp_port", message: format!("{} < 1024, clamped to {}", self.network.tcp_port, default_tcp_port()) });
             self.network.tcp_port = default_tcp_port();
         }
         if self.network.udp_port < 1024 {
-            warnings.push(format!("udp_port {} < 1024, using default {}", self.network.udp_port, default_udp_port()));
+            errors.push(ConfigError { field: "network.udp_port", message: format!("{} < 1024, clamped to {}", self.network.udp_port, default_udp_port()) });
             self.network.udp_port = default_udp_port();
         }
         if self.network.tcp_port == self.network.udp_port {
-            warnings.push(format!("tcp_port == udp_port ({}), offsetting udp_port", self.network.tcp_port));
+            errors.push(ConfigError { field: "network.udp_port", message: format!("== tcp_port ({}), offsetting", self.network.tcp_port) });
             self.network.udp_port = self.network.tcp_port + 1;
         }
 
         // Video
         if self.video.bitrate_mbps < 10 || self.video.bitrate_mbps > 200 {
-            warnings.push(format!("bitrate_mbps {} out of range [10-200], using default 80", self.video.bitrate_mbps));
+            errors.push(ConfigError { field: "video.bitrate_mbps", message: format!("{} out of range [10-200], clamped to 80", self.video.bitrate_mbps) });
             self.video.bitrate_mbps = 80;
         }
         if self.video.framerate < 30 || self.video.framerate > 120 {
-            warnings.push(format!("framerate {} out of range [30-120], using default 90", self.video.framerate));
+            errors.push(ConfigError { field: "video.framerate", message: format!("{} out of range [30-120], clamped to 90", self.video.framerate) });
             self.video.framerate = 90;
         }
 
@@ -245,23 +265,23 @@ impl AppConfig {
         if self.face_tracking.smoothing.is_nan() || self.face_tracking.smoothing.is_infinite()
             || self.face_tracking.smoothing < 0.0 || self.face_tracking.smoothing > 0.99
         {
-            warnings.push(format!("smoothing {} invalid, using default 0.6", self.face_tracking.smoothing));
+            errors.push(ConfigError { field: "face_tracking.smoothing", message: format!("{} invalid, clamped to 0.6", self.face_tracking.smoothing) });
             self.face_tracking.smoothing = 0.6;
         }
 
         // Sleep mode
         if self.sleep_mode.timeout_seconds < 30 || self.sleep_mode.timeout_seconds > 3600 {
-            warnings.push(format!("sleep timeout {} out of range [30-3600], using default 300", self.sleep_mode.timeout_seconds));
+            errors.push(ConfigError { field: "sleep_mode.timeout_seconds", message: format!("{} out of range [30-3600], clamped to 300", self.sleep_mode.timeout_seconds) });
             self.sleep_mode.timeout_seconds = 300;
         }
         if self.sleep_mode.motion_threshold <= 0.0 || self.sleep_mode.motion_threshold > 0.1
             || self.sleep_mode.motion_threshold.is_nan()
         {
-            warnings.push(format!("motion_threshold {} invalid, using default 0.002", self.sleep_mode.motion_threshold));
+            errors.push(ConfigError { field: "sleep_mode.motion_threshold", message: format!("{} invalid, clamped to 0.002", self.sleep_mode.motion_threshold) });
             self.sleep_mode.motion_threshold = 0.002;
         }
 
-        warnings
+        errors
     }
 }
 
@@ -328,25 +348,26 @@ mod tests {
     #[test]
     fn test_validate_default_config_is_clean() {
         let mut cfg = AppConfig::default();
-        let warnings = cfg.validate();
-        assert!(warnings.is_empty(), "Default config should have no warnings: {:?}", warnings);
+        let errors = cfg.validate();
+        assert!(errors.is_empty(), "Default config should have no errors: {:?}", errors);
     }
 
     #[test]
     fn test_validate_bitrate_out_of_range() {
         let mut cfg = AppConfig::default();
         cfg.video.bitrate_mbps = 0;
-        let warnings = cfg.validate();
-        assert!(!warnings.is_empty());
-        assert_eq!(cfg.video.bitrate_mbps, 80); // reset to default
+        let errors = cfg.validate();
+        assert!(!errors.is_empty());
+        assert_eq!(cfg.video.bitrate_mbps, 80); // clamped to default
+        assert_eq!(errors[0].field, "video.bitrate_mbps");
     }
 
     #[test]
     fn test_validate_port_too_low() {
         let mut cfg = AppConfig::default();
         cfg.network.tcp_port = 80;
-        let warnings = cfg.validate();
-        assert!(warnings.iter().any(|w| w.contains("tcp_port")));
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "network.tcp_port"));
         assert_eq!(cfg.network.tcp_port, default_tcp_port());
     }
 
@@ -355,8 +376,8 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.network.tcp_port = 5000;
         cfg.network.udp_port = 5000;
-        let warnings = cfg.validate();
-        assert!(warnings.iter().any(|w| w.contains("tcp_port == udp_port")));
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "network.udp_port"));
         assert_ne!(cfg.network.tcp_port, cfg.network.udp_port);
     }
 
@@ -364,18 +385,20 @@ mod tests {
     fn test_validate_smoothing_nan() {
         let mut cfg = AppConfig::default();
         cfg.face_tracking.smoothing = f32::NAN;
-        let warnings = cfg.validate();
-        assert!(!warnings.is_empty());
+        let errors = cfg.validate();
+        assert!(!errors.is_empty());
         assert_eq!(cfg.face_tracking.smoothing, 0.6);
+        assert_eq!(errors[0].field, "face_tracking.smoothing");
     }
 
     #[test]
     fn test_validate_sleep_timeout_zero() {
         let mut cfg = AppConfig::default();
         cfg.sleep_mode.timeout_seconds = 0;
-        let warnings = cfg.validate();
-        assert!(!warnings.is_empty());
+        let errors = cfg.validate();
+        assert!(!errors.is_empty());
         assert_eq!(cfg.sleep_mode.timeout_seconds, 300);
+        assert_eq!(errors[0].field, "sleep_mode.timeout_seconds");
     }
 
     #[test]
@@ -385,7 +408,7 @@ mod tests {
         cfg.video.framerate = 120; // max
         cfg.sleep_mode.timeout_seconds = 3600; // max
         cfg.face_tracking.smoothing = 0.0; // min
-        let warnings = cfg.validate();
-        assert!(warnings.is_empty(), "Edge values should be valid: {:?}", warnings);
+        let errors = cfg.validate();
+        assert!(errors.is_empty(), "Edge values should be valid: {:?}", errors);
     }
 }
