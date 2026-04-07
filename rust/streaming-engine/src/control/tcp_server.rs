@@ -247,6 +247,7 @@ async fn send_message(stream: &mut TcpStream, msg_type: u8, payload: &[u8]) -> s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::pki_types::ServerName;
 
     #[tokio::test]
     async fn test_message_framing_roundtrip() {
@@ -365,5 +366,134 @@ mod tests {
         send_message(&mut client, fvp_common::protocol::msg_type::DISCONNECT, &[]).await.unwrap();
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tls_handshake_full_flow() {
+        use tokio_rustls::TlsConnector;
+        use rustls::ClientConfig;
+        use rustls::pki_types::ServerName;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let config = crate::config::AppConfig::default();
+        let server = TcpControlServer::new(config); // with TLS
+        let pin = server.pairing.lock().await.get_pin();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let test_addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (tcp_stream, _peer) = listener.accept().await.unwrap();
+            let acceptor = server.tls_acceptor.as_ref().unwrap();
+            let tls_stream = acceptor.accept(tcp_stream).await.unwrap();
+            server.handle_handshake_generic(tls_stream).await
+        });
+
+        // Client: connect with TLS (skip cert verification for self-signed)
+        let client_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp = TcpStream::connect(test_addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+
+        // Run handshake protocol over TLS
+        send_message_generic(&mut tls, msg_type::HELLO, &[]).await.unwrap();
+        let (t, _) = read_message_generic(&mut tls).await.unwrap();
+        assert_eq!(t, msg_type::HELLO_ACK);
+        let (t, _) = read_message_generic(&mut tls).await.unwrap();
+        assert_eq!(t, msg_type::PIN_REQUEST);
+        send_message_generic(&mut tls, msg_type::PIN_RESPONSE, &pin.to_le_bytes()).await.unwrap();
+        let (t, payload) = read_message_generic(&mut tls).await.unwrap();
+        assert_eq!(t, msg_type::PIN_RESULT);
+        assert_eq!(payload[0], 0x01);
+        let (t, _) = read_message_generic(&mut tls).await.unwrap();
+        assert_eq!(t, msg_type::STREAM_CONFIG);
+        send_message_generic(&mut tls, msg_type::STREAM_START, &[]).await.unwrap();
+
+        let result = server_task.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_message_over_tls_roundtrip() {
+        use tokio_rustls::TlsConnector;
+        use rustls::ClientConfig;
+        use rustls::pki_types::ServerName;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (acceptor, _fp) = crate::control::tls::create_tls_acceptor().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let (msg_type, payload) = read_message_generic(&mut tls).await.unwrap();
+            assert_eq!(msg_type, 0x55);
+            assert_eq!(payload, vec![10, 20, 30]);
+            send_message_generic(&mut tls, 0x56, &[40]).await.unwrap();
+        });
+
+        let client_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(name, tcp).await.unwrap();
+
+        send_message_generic(&mut tls, 0x55, &[10, 20, 30]).await.unwrap();
+        let (t, p) = read_message_generic(&mut tls).await.unwrap();
+        assert_eq!(t, 0x56);
+        assert_eq!(p, vec![40]);
+
+        server.await.unwrap();
+    }
+
+    /// Test-only certificate verifier that accepts any server cert.
+    #[derive(Debug)]
+    struct NoVerifier;
+
+    impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
     }
 }
