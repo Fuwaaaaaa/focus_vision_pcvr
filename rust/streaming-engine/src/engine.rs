@@ -29,6 +29,22 @@ static BITRATE_CALLBACK: std::sync::RwLock<Option<extern "C" fn(u32)>> = std::sy
 /// Set per session when TCP connection is established.
 static HAPTIC_TX: std::sync::RwLock<Option<mpsc::Sender<HapticEvent>>> = std::sync::RwLock::new(None);
 
+/// Counter for dropped haptic events (channel full). Exposed in status.json.
+static HAPTIC_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether audio capture is active (set by audio pipeline thread).
+static AUDIO_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Check if audio is currently active.
+pub fn is_audio_active() -> bool {
+    AUDIO_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Get the number of haptic events dropped due to full channel.
+pub fn haptic_drop_count() -> u64 {
+    HAPTIC_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Haptic vibration event from SteamVR to HMD.
 #[derive(Debug, Clone)]
 pub struct HapticEvent {
@@ -42,12 +58,17 @@ pub struct HapticEvent {
 pub fn queue_haptic(controller_id: u8, duration_ms: u16, frequency: f32, amplitude: f32) {
     if let Ok(guard) = HAPTIC_TX.read() {
         if let Some(tx) = guard.as_ref() {
-            let _ = tx.try_send(HapticEvent {
+            if tx.try_send(HapticEvent {
                 controller_id,
                 duration_ms,
                 frequency,
                 amplitude,
-            });
+            }).is_err() {
+                let count = HAPTIC_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if count % 100 == 1 {
+                    log::warn!("Haptic event dropped (total: {})", count);
+                }
+            }
         }
     }
 }
@@ -397,8 +418,12 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
         .name("fvp-audio-capture".into())
         .spawn(move || {
             let _capture = match AudioCapture::start(audio_tx) {
-                Some(c) => c,
+                Some(c) => {
+                    AUDIO_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    c
+                }
                 None => {
+                    AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
                     log::info!("Audio capture unavailable — streaming video only");
                     return;
                 }
@@ -406,6 +431,7 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
             while !hold_cancel.is_cancelled() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
             log::info!("Audio capture released");
         })
         .expect("spawn audio capture thread");
