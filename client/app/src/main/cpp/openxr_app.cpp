@@ -381,6 +381,10 @@ void OpenXRApp::renderFrame() {
         m_trackingSender.sendHeadPose(views[0].pose, frameState.predictedDisplayTime,
                                        gaze.x, gaze.y, gaze.valid);
 
+        // Poll controllers and send state to PC
+        m_controllerPoller.pollAndSend(m_session, m_stageSpace,
+            frameState.predictedDisplayTime, m_trackingSender);
+
         // Poll face tracking and send blendshapes to PC via TCP (msg 0x35)
         if (m_facialTracker.isAvailable() && m_tcpClient.isConnected()) {
             auto face = m_facialTracker.poll();
@@ -471,6 +475,10 @@ void OpenXRApp::renderFrame() {
                 float quality = 1.0f - std::min(1.0f, loss * 10.0f); // 10% loss = 0 quality
                 m_overlay.render(framebuffer, width, height,
                                   quality, loss * 100.0f, m_videoDecoder.avgDecodeLatencyUs() / 1000.0f);
+
+                // HMD dashboard overlay (toggled via menu button)
+                m_overlay.renderDashboard(framebuffer, width, height,
+                    m_dashboardBitrate, m_dashboardCodecH265, -1);
             }
 
             m_swapchains[eye].releaseImage();
