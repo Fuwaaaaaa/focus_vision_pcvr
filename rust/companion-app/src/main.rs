@@ -74,6 +74,12 @@ struct CompanionApp {
     // v1.1: Log export
     export_in_progress: bool,
     export_result: Arc<Mutex<Option<String>>>,
+
+    // v1.2: Sleep mode + face tracking settings
+    sleep_enabled: bool,
+    sleep_timeout: u32,
+    ft_enabled: bool,
+    ft_smoothing: f32,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -173,6 +179,22 @@ impl CompanionApp {
             stats_history: stats_history::StatsHistory::new(),
             export_in_progress: false,
             export_result: Arc::new(Mutex::new(None)),
+            sleep_enabled: {
+                let cfg = config::LocalConfig::load();
+                cfg.sleep_mode.enabled
+            },
+            sleep_timeout: {
+                let cfg = config::LocalConfig::load();
+                cfg.sleep_mode.timeout_seconds
+            },
+            ft_enabled: {
+                let cfg = config::LocalConfig::load();
+                cfg.face_tracking.enabled
+            },
+            ft_smoothing: {
+                let cfg = config::LocalConfig::load();
+                cfg.face_tracking.smoothing
+            },
         }
     }
 
@@ -622,6 +644,65 @@ impl CompanionApp {
                     ui.add(egui::Slider::new(&mut self.audio_bitrate_kbps, 64..=256).suffix(" kbps"));
                 });
                 ui.label(egui::RichText::new("WASAPI loopback — no virtual device needed").size(11.0).color(text_muted));
+            }
+        });
+
+        ui.add_space(16.0);
+
+        // Sleep Mode settings (v1.2)
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Sleep Mode").size(13.0).color(text_muted));
+
+            let prev_enabled = self.sleep_enabled;
+            let prev_timeout = self.sleep_timeout;
+            ui.checkbox(&mut self.sleep_enabled, "Auto-sleep on inactivity");
+
+            if self.sleep_enabled {
+                ui.horizontal(|ui| {
+                    ui.label("Timeout:");
+                    ui.add(egui::Slider::new(&mut self.sleep_timeout, 30..=900).suffix("s"));
+                });
+                ui.label(egui::RichText::new(format!("{}m {}s — bitrate drops to 8 Mbps during sleep",
+                    self.sleep_timeout / 60, self.sleep_timeout % 60)).size(11.0).color(text_muted));
+            }
+
+            if self.sleep_enabled != prev_enabled || self.sleep_timeout != prev_timeout {
+                self.local_config.sleep_mode.enabled = self.sleep_enabled;
+                self.local_config.sleep_mode.timeout_seconds = self.sleep_timeout;
+                match self.local_config.save() {
+                    Ok(()) => self.log(&format!("Sleep mode: {} (timeout {}s)",
+                        if self.sleep_enabled { "enabled" } else { "disabled" }, self.sleep_timeout)),
+                    Err(e) => self.log(&format!("Failed to save config: {e}")),
+                }
+            }
+        });
+
+        ui.add_space(16.0);
+
+        // Face Tracking settings (v1.2)
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Face Tracking").size(13.0).color(text_muted));
+
+            let prev_enabled = self.ft_enabled;
+            let prev_smoothing = self.ft_smoothing;
+            ui.checkbox(&mut self.ft_enabled, "Face tracking → VRChat OSC");
+
+            if self.ft_enabled {
+                ui.horizontal(|ui| {
+                    ui.label("Smoothing:");
+                    ui.add(egui::Slider::new(&mut self.ft_smoothing, 0.0..=0.95).fixed_decimals(2));
+                });
+                ui.label(egui::RichText::new("0.0 = raw, higher = smoother (reduces jitter)").size(11.0).color(text_muted));
+            }
+
+            if self.ft_enabled != prev_enabled || (self.ft_smoothing - prev_smoothing).abs() > 0.001 {
+                self.local_config.face_tracking.enabled = self.ft_enabled;
+                self.local_config.face_tracking.smoothing = self.ft_smoothing;
+                match self.local_config.save() {
+                    Ok(()) => self.log(&format!("Face tracking: {} (smoothing {:.2})",
+                        if self.ft_enabled { "enabled" } else { "disabled" }, self.ft_smoothing)),
+                    Err(e) => self.log(&format!("Failed to save config: {e}")),
+                }
             }
         });
 

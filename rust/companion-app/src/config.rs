@@ -7,6 +7,10 @@ use std::path::PathBuf;
 pub struct LocalConfig {
     #[serde(default)]
     pub video: VideoOverride,
+    #[serde(default)]
+    pub sleep_mode: SleepModeOverride,
+    #[serde(default)]
+    pub face_tracking: FaceTrackingOverride,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -24,9 +28,39 @@ impl Default for VideoOverride {
     }
 }
 
-fn default_codec() -> String {
-    "h265".to_string()
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SleepModeOverride {
+    #[serde(default = "default_sleep_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_sleep_timeout")]
+    pub timeout_seconds: u32,
 }
+
+impl Default for SleepModeOverride {
+    fn default() -> Self {
+        Self { enabled: default_sleep_enabled(), timeout_seconds: default_sleep_timeout() }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FaceTrackingOverride {
+    #[serde(default = "default_ft_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_ft_smoothing")]
+    pub smoothing: f32,
+}
+
+impl Default for FaceTrackingOverride {
+    fn default() -> Self {
+        Self { enabled: default_ft_enabled(), smoothing: default_ft_smoothing() }
+    }
+}
+
+fn default_codec() -> String { "h265".to_string() }
+fn default_sleep_enabled() -> bool { true }
+fn default_sleep_timeout() -> u32 { 300 }
+fn default_ft_enabled() -> bool { true }
+fn default_ft_smoothing() -> f32 { 0.6 }
 
 impl LocalConfig {
     /// Load from config/local.toml relative to the project root.
