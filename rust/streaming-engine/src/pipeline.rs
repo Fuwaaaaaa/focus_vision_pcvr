@@ -44,7 +44,6 @@ pub fn encode_frame_to_packets_with_fec(
 
     // Step 2: FEC encode (add parity shards, RS instance cached in FecEncoder)
     // data_shards ownership is moved into encode() to avoid cloning.
-    let data_shard_count = data_shards.len();
     let all_shards = match fec.encode(data_shards) {
         Ok(shards) => shards,
         Err(e) => {
