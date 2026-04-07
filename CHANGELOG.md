@@ -2,6 +2,25 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [1.3.0] - 2026-04-07
+
+### Added
+- **コンフィグバリデーション:** bitrate/ports/framerate/smoothing/timeout の範囲チェック。不正値はデフォルトにフォールバック+ログ警告
+- **コンパニオンアプリ設定UI:** 睡眠モード（enable/timeout）とFace Tracking（enable/smoothing）をGUIから設定可能に
+- **サブシステムステータス表示:** Home画面にFT Active/Idle、Awake/Sleep、Audio OK/Off、Packet Loss%をリアルタイム表示
+- **エラー通知改善:** ハプティクスドロップカウンター（AtomicU64）、オーディオ状態フラグ（AtomicBool）
+- **HMDダッシュボードオーバーレイ:** VR内からビットレート調整・codec確認が可能な設定パネル
+- **CONFIG_UPDATEプロトコル:** HMD→PC設定変更メッセージ（0x55）+ ACK（0x56）、値バリデーション付き
+- **Atomic status.json:** temp+rename による部分読み取り防止
+
+### Fixed
+- **バージョン文字列:** "v1.0.0" 固定 → `CARGO_PKG_VERSION` から自動取得
+
+### Tests
+- **テスト156件に増加**（144→156、+12件）
+- ハプティクスパイプライン5テスト（シリアライズ、チャネル満杯、roundtrip）
+- コンフィグバリデーション7テスト（範囲外、NaN、ポート競合、エッジ値）
+
 ## [1.2.0] - 2026-04-07
 
 ### Fixed
