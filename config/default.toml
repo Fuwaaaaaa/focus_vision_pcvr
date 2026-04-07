@@ -32,6 +32,12 @@ enabled = true
 smoothing = 0.6    # EMA factor (0.0 = no smoothing, 0.99 = very smooth)
 osc_port = 9000
 
+[sleep_mode]
+enabled = true
+timeout_seconds = 300       # 5 minutes of inactivity → sleep
+motion_threshold = 0.002    # meters per frame (~0.18m/s at 90fps)
+sleep_bitrate_mbps = 8      # reduced bitrate during sleep
+
 [pairing]
 max_attempts = 5
 lockout_seconds = 300
