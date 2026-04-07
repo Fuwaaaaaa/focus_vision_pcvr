@@ -248,7 +248,7 @@ void ControllerPoller::pollAndSend(XrSession session, XrSpace stageSpace,
             (uint8_t)hand, loc.pose, predictedTime,
             triggerState.currentState, gripState.currentState,
             thumbX, thumbY,
-            flags, 100 // battery placeholder
+            flags, m_hmdBattery
         );
     }
 }
