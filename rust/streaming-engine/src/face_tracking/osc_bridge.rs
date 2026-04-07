@@ -14,6 +14,8 @@ pub struct OscBridge {
     smoothing: f32,
     prev_lip: [f32; 37],
     prev_eye: [f32; 14],
+    /// Active expression profile weights. None = all weights 1.0 (no scaling).
+    profile_weights: Option<Vec<f32>>,
 }
 
 // HTC lip expression names (37), in order of XrLipExpressionHTC enum
@@ -66,6 +68,7 @@ impl OscBridge {
             smoothing: smoothing.clamp(0.0, 0.99),
             prev_lip: [0.0; 37],
             prev_eye: [0.0; 14],
+            profile_weights: None,
         }
     }
 
@@ -94,9 +97,14 @@ impl OscBridge {
             for (i, &raw) in lip.iter().enumerate() {
                 let smoothed = alpha * self.prev_lip[i] + (1.0 - alpha) * raw;
                 self.prev_lip[i] = smoothed;
-                if smoothed > 0.01 {
+                // Apply profile weight (lip indices 0-36)
+                let weight = self.profile_weights.as_ref()
+                    .and_then(|w| w.get(i).copied())
+                    .unwrap_or(1.0);
+                let scaled = (smoothed * weight).clamp(0.0, 1.0);
+                if scaled > 0.01 {
                     let addr = format!("/avatar/parameters/{}", LIP_NAMES[i]);
-                    if let Some(msg) = encode_osc_float(&addr, smoothed) {
+                    if let Some(msg) = encode_osc_float(&addr, scaled) {
                         let _ = socket.send_to(&msg, target);
                     }
                 }
@@ -107,9 +115,14 @@ impl OscBridge {
             for (i, &raw) in eye.iter().enumerate() {
                 let smoothed = alpha * self.prev_eye[i] + (1.0 - alpha) * raw;
                 self.prev_eye[i] = smoothed;
-                if smoothed > 0.01 {
+                // Apply profile weight (eye indices 37-50)
+                let weight = self.profile_weights.as_ref()
+                    .and_then(|w| w.get(37 + i).copied())
+                    .unwrap_or(1.0);
+                let scaled = (smoothed * weight).clamp(0.0, 1.0);
+                if scaled > 0.01 {
                     let addr = format!("/avatar/parameters/{}", EYE_NAMES[i]);
-                    if let Some(msg) = encode_osc_float(&addr, smoothed) {
+                    if let Some(msg) = encode_osc_float(&addr, scaled) {
                         let _ = socket.send_to(&msg, target);
                     }
                 }
@@ -119,6 +132,20 @@ impl OscBridge {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    /// Set the active expression profile weights. None = no scaling (all 1.0).
+    pub fn set_profile(&mut self, profile: Option<&super::profiles::FtProfile>) {
+        self.profile_weights = profile.map(|p| p.weights.clone());
+        if let Some(p) = profile {
+            log::info!("FT profile activated: {}", p.name);
+            // Apply smoothing override if present
+            if let Some(s) = p.smoothing_override {
+                self.smoothing = s.clamp(0.0, 0.99);
+            }
+        } else {
+            log::info!("FT profile cleared (using defaults)");
+        }
     }
 }
 

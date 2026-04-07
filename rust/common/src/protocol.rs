@@ -84,6 +84,8 @@ pub mod msg_type {
     pub const CONFIG_UPDATE_ACK: u8 = 0x56;
     pub const AUDIO_CONFIG: u8 = 0x40;
     pub const AUDIO_START: u8 = 0x41;
+    pub const CALIBRATE_START: u8 = 0x60;
+    pub const CALIBRATE_STATUS: u8 = 0x61;
     pub const DISCONNECT: u8 = 0xFF;
 }
 
@@ -186,6 +188,7 @@ mod tests {
             msg_type::TRACKING_DATA, msg_type::CONTROLLER_DATA, msg_type::IDR_REQUEST,
             msg_type::FACE_DATA, msg_type::HAPTIC_EVENT, msg_type::SLEEP_ENTER,
             msg_type::SLEEP_EXIT, msg_type::CONFIG_UPDATE, msg_type::CONFIG_UPDATE_ACK,
+            msg_type::CALIBRATE_START, msg_type::CALIBRATE_STATUS,
             msg_type::AUDIO_CONFIG, msg_type::AUDIO_START, msg_type::DISCONNECT,
         ];
         for i in 0..types.len() {
