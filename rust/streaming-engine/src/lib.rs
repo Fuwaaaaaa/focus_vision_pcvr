@@ -164,6 +164,8 @@ pub unsafe extern "C" fn fvp_submit_encoded_nal(
     // Reuse a thread-local buffer to avoid per-frame allocation.
     // The Vec retains its capacity across calls, so after the first large frame,
     // subsequent frames reuse the same heap memory.
+    // std::mem::take() transfers ownership without copying — the thread-local
+    // is left empty (capacity 0) and will be replenished on the next call.
     thread_local! {
         static NAL_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(256 * 1024));
     }
@@ -175,7 +177,7 @@ pub unsafe extern "C" fn fvp_submit_encoded_nal(
         let mut b = buf.borrow_mut();
         b.clear();
         b.extend_from_slice(nal_slice);
-        b.clone()
+        std::mem::take(&mut *b)
     });
 
     let timestamps = FrameTimestamps::new(frame_index);
