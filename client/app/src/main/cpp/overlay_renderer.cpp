@@ -109,3 +109,21 @@ void OverlayRenderer::render(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHe
     glBindVertexArray(0);
     glUseProgram(0);
 }
+
+void OverlayRenderer::renderSleepDimming(GLuint framebuffer, uint32_t fbWidth, uint32_t fbHeight, float alpha) {
+    if (!m_initialized || alpha <= 0.01f) return;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glViewport(0, 0, fbWidth, fbHeight);
+    glUseProgram(m_program);
+    glBindVertexArray(m_vao);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // Full-screen black quad with variable alpha
+    renderBar(-1.0f, -1.0f, 2.0f, 2.0f, 0.0f, 0.0f, 0.0f);
+
+    glDisable(GL_BLEND);
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
