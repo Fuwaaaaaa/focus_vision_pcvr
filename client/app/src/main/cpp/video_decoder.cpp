@@ -6,6 +6,22 @@
 #include <chrono>
 #include <unordered_map>
 
+void VideoDecoder::cleanupSurfaceResources(JNIEnv* env) {
+    if (m_surface) {
+        ANativeWindow_release(m_surface);
+        m_surface = nullptr;
+    }
+    if (m_surfaceTexture) {
+        ASurfaceTexture_release(m_surfaceTexture);
+        m_surfaceTexture = nullptr;
+    }
+    if (m_javaSurfaceTexture && env) {
+        env->DeleteGlobalRef(m_javaSurfaceTexture);
+        m_javaSurfaceTexture = nullptr;
+    }
+    m_useSurfaceOutput = false;
+}
+
 bool VideoDecoder::init(JNIEnv* env, int width, int height, const char* mimeType) {
     m_width = width;
     m_height = height;
@@ -94,6 +110,7 @@ bool VideoDecoder::init(JNIEnv* env, int width, int height, const char* mimeType
         LOGE("Failed to configure MediaCodec: %d", (int)status);
         AMediaCodec_delete(m_codec);
         m_codec = nullptr;
+        cleanupSurfaceResources(env);
         return false;
     }
 
@@ -102,6 +119,7 @@ bool VideoDecoder::init(JNIEnv* env, int width, int height, const char* mimeType
         LOGE("Failed to start MediaCodec: %d", (int)status);
         AMediaCodec_delete(m_codec);
         m_codec = nullptr;
+        cleanupSurfaceResources(env);
         return false;
     }
 

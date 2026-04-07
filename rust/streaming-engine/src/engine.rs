@@ -133,7 +133,13 @@ impl StreamingEngine {
         let cancel = cancel_token.clone();
         runtime.spawn(async move {
             let receiver = TrackingReceiver::new(tracking_head, tracking_ctrl);
-            let addr: SocketAddr = format!("0.0.0.0:{}", tracking_port).parse().unwrap();
+            let addr: SocketAddr = match format!("0.0.0.0:{}", tracking_port).parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("Invalid tracking port {}: {}", tracking_port, e);
+                    return;
+                }
+            };
             tokio::select! {
                 result = receiver.run(addr) => {
                     if let Err(e) = result {
@@ -174,7 +180,7 @@ impl StreamingEngine {
 
     /// Get latest tracking data. Called from C++ thread.
     pub fn get_tracking(&self) -> Option<TrackingData> {
-        self.latest_tracking.lock().map_err(|e| log::error!("Tracking lock poisoned: {}", e)).ok()?.clone()
+        *self.latest_tracking.lock().map_err(|e| log::error!("Tracking lock poisoned: {}", e)).ok()?
     }
 
     /// Get latest controller state. Called from C++ thread.
@@ -216,8 +222,9 @@ pub struct HmdStats {
 
 /// Read TCP control messages after handshake (IDR_REQUEST, HEARTBEAT, DISCONNECT).
 /// When the connection closes or errors, cancels the provided token to stop streaming.
+/// Accepts any async stream (TLS-wrapped or plaintext) from the handshake.
 async fn handle_tcp_control(
-    mut stream: tokio::net::TcpStream,
+    mut stream: Box<dyn crate::control::tcp_server::AsyncStream>,
     cancel: tokio_util::sync::CancellationToken,
     hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -425,7 +432,7 @@ async fn run_streaming(
             _ = cancel.cancelled() => { break; }
         };
 
-        let (tcp_stream, peer_addr) = match accept_result {
+        let (tcp_control_stream, peer_addr) = match accept_result {
             Ok(r) => r,
             Err(e) => {
                 log::error!("TCP accept failed: {}", e);
@@ -447,11 +454,11 @@ async fn run_streaming(
         // Shared HMD stats for adaptive bitrate (fed by heartbeat messages)
         let hmd_stats: Arc<StdMutex<Option<HmdStats>>> = Arc::new(StdMutex::new(None));
 
-        // Spawn TCP control reader
+        // Spawn TCP control reader (uses the same TLS/plain stream from handshake)
         let tcp_session = session_cancel.clone();
         let stats_clone = hmd_stats.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp_control(tcp_stream, tcp_session, stats_clone).await {
+            if let Err(e) = handle_tcp_control(tcp_control_stream, tcp_session, stats_clone).await {
                 log::warn!("TCP control reader ended: {}", e);
             }
         });
@@ -528,7 +535,7 @@ async fn run_streaming(
                     frame_count += 1;
 
                     // Adaptive bitrate: use HMD-reported stats (real packet loss)
-                    if frame_count % 90 == 0 {
+                    if frame_count.is_multiple_of(90) {
                         if let Ok(mut guard) = hmd_stats.lock() {
                             if let Some(stats) = guard.take() {
                                 bw_estimator.update(
@@ -545,7 +552,7 @@ async fn run_streaming(
                     }
 
                     // Log stats every 5 seconds
-                    if frame_count % 450 == 0 {
+                    if frame_count.is_multiple_of(450) {
                         if let Ok(tracker) = latency_tracker.lock() {
                             if let Some(avg) = tracker.avg_pc_latency_us() {
                                 log::info!("PC latency: avg={}us encode={}us",

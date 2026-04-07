@@ -588,8 +588,8 @@ impl CompanionApp {
         ui.group(|ui| {
             ui.label(egui::RichText::new("Driver").size(13.0).color(text_muted));
 
-            if self.driver_installed {
-                if ui.button("Uninstall Driver").clicked() {
+            if self.driver_installed
+                && ui.button("Uninstall Driver").clicked() {
                     if let Some(ref dir) = self.steamvr_dir {
                         match driver::uninstall_driver(dir) {
                             Ok(()) => {
@@ -602,7 +602,6 @@ impl CompanionApp {
                         }
                     }
                 }
-            }
 
             if let Some(ref dir) = self.steamvr_dir {
                 ui.label(egui::RichText::new(format!("SteamVR: {}", dir.display())).size(11.0).color(text_muted));

@@ -62,7 +62,7 @@ fn config_path() -> PathBuf {
         .join("..")
         .join("config")
         .join("local.toml");
-    if dev_path.parent().map_or(false, |p| p.exists()) {
+    if dev_path.parent().is_some_and(|p| p.exists()) {
         return dev_path;
     }
 

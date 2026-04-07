@@ -14,6 +14,12 @@ pub struct BandwidthEstimator {
     has_data: bool,
 }
 
+impl Default for BandwidthEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BandwidthEstimator {
     pub fn new() -> Self {
         Self {
