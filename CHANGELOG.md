@@ -2,6 +2,25 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [2.1.0] - 2026-04-07
+
+### Added
+- **FT表情プロファイル:** アバターごとの51ブレンドシェイプ感度調整（JSON保存/読込/削除）。OscBridgeがEMAスムージング後にweight適用
+- **FT自動キャリブレーション:** 2ステップガイド式（リラックス→誇張）でmin/max収集、自動weight計算。CALIBRATE_START (0x60) / CALIBRATE_STATUS (0x61) プロトコル
+- **フォベアテッドプリセット:** subtle (+3/+8)、balanced (+5/+15)、aggressive (+8/+25)、custom。`foveated.preset` config
+- **GoogleTest基盤:** driver/CMakeLists.txtにGoogleTest v1.15.2追加。QPマップ計算テスト7件
+- **QPマップ純粋関数化:** `computeQpDeltaMap()` を `qp_map.h` に抽出（テスト可能、NVENC非依存）
+
+### Changed
+- **FoveatedConfig:** preset enum追加、`effective_qp_offsets()` でプリセットから実効値を解決
+- **OscBridge:** プロファイルweight適用対応、`set_profile()` メソッド追加
+
+### Tests
+- **テスト180件に増加**（168→180、+12件）
+- FT表情プロファイル6テスト（デフォルト、weight、正規化、serialize、roundtrip）
+- FTキャリブレーション6テスト（ステップ遷移、フレーム収集、full flow、定数値、index）
+- C++ QPマップテスト7件（CTUグリッド、中心/角gaze、プリセット、サイズ検証）
+
 ## [2.0.0] - 2026-04-07
 
 ### Strategy
