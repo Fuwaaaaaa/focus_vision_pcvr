@@ -136,4 +136,9 @@ private:
     bool m_streamingActive = false;
     std::chrono::steady_clock::time_point m_lastPacketTime;
     static constexpr int DISCONNECT_TIMEOUT_MS = 2000; // 2s without packets = disconnected
+
+    // HMD dashboard state
+    uint32_t m_dashboardBitrate = 80;
+    bool m_dashboardCodecH265 = true;
+    bool m_menuWasPressed = false; // Edge detection for menu button toggle
 };
