@@ -380,9 +380,11 @@ async fn handle_tcp_control(
                             let mut ack_payload = Vec::with_capacity(8);
                             ack_payload.extend_from_slice(&encode_us.to_le_bytes());
                             ack_payload.extend_from_slice(&total_us.to_le_bytes());
-                            let _ = send_msg(&mut writer,
+                            if let Err(e) = send_msg(&mut writer,
                                 fvp_common::protocol::msg_type::HEARTBEAT_ACK,
-                                &ack_payload).await;
+                                &ack_payload).await {
+                                log::warn!("Failed to send HEARTBEAT_ACK: {}", e);
+                            }
                         }
                     }
                     fvp_common::protocol::msg_type::FACE_DATA => {
@@ -695,7 +697,8 @@ async fn run_streaming(
                     frame.timestamps.mark_encode_end();
 
                     let framerate = config.video.framerate as u64;
-                    let timestamp_90khz = (frame_count * (fvp_common::RTP_CLOCK_RATE as u64 / framerate)) as u32;
+                    // Multiply first to avoid integer division truncation drift (e.g. 90000/96=937.5)
+                    let timestamp_90khz = (frame_count * fvp_common::RTP_CLOCK_RATE as u64 / framerate) as u32;
 
                     let packets = pipeline::encode_frame_to_packets_with_fec(
                         &frame.nal_data,
@@ -957,14 +960,17 @@ mod tests {
 
     #[test]
     fn test_rtp_timestamp_at_96fps() {
-        // At 96fps: each frame increments by 90000/96 = 937
+        // At 96fps with multiply-first: frame_count * 90000 / 96
         let framerate = 96u64;
-        let tick = fvp_common::RTP_CLOCK_RATE as u64 / framerate;
-        assert_eq!(tick, 937); // 90000 / 96 = 937.5, truncated to 937
+        let clock = fvp_common::RTP_CLOCK_RATE as u64;
 
-        // Frame 96 → ~90000 (1 second)
-        let ts_1s = (96u64 * tick) as u32;
-        assert!(ts_1s >= 89900 && ts_1s <= 90100, "1s timestamp should be ~90000, got {}", ts_1s);
+        // Frame 96 → exactly 90000 (1 second, no drift)
+        let ts_1s = (96u64 * clock / framerate) as u32;
+        assert_eq!(ts_1s, 90000, "1s timestamp should be exactly 90000");
+
+        // Frame 1 → 937 (90000/96 truncated, but drift-free over time)
+        let ts_f1 = (1u64 * clock / framerate) as u32;
+        assert_eq!(ts_f1, 937);
     }
 
     #[test]
