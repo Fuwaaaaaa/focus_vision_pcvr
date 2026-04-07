@@ -54,7 +54,7 @@ impl FecEncoder {
 
         let rs = self.cached_rs.as_ref().unwrap();
 
-        // Append empty parity shards (data shards are moved in, not cloned)
+        // Append empty parity shards
         for _ in 0..parity_count {
             data_shards.push(vec![0u8; shard_len]);
         }

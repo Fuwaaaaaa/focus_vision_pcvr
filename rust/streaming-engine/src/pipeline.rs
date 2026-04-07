@@ -31,9 +31,9 @@ pub fn encode_frame_to_packets_with_fec(
     let data_shards: Vec<Vec<u8>> = frame_data
         .chunks(shard_size)
         .map(|chunk| {
-            let mut shard = chunk.to_vec();
-            // Pad last shard to equal length
-            shard.resize(shard_size, 0);
+            // Pre-allocate exact size, copy data, zero-pad remainder
+            let mut shard = vec![0u8; shard_size];
+            shard[..chunk.len()].copy_from_slice(chunk);
             shard
         })
         .collect();
