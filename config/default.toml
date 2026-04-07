@@ -27,6 +27,11 @@ mid_radius = 0.35
 mid_qp_offset = 5
 peripheral_qp_offset = 15
 
+[face_tracking]
+enabled = true
+smoothing = 0.6    # EMA factor (0.0 = no smoothing, 0.99 = very smooth)
+osc_port = 9000
+
 [pairing]
 max_attempts = 5
 lockout_seconds = 300

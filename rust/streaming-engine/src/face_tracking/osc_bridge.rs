@@ -1,11 +1,19 @@
 use std::net::UdpSocket;
 
+/// Default EMA smoothing factor (0.0 = no smoothing, 1.0 = frozen).
+/// 0.6 gives a good balance between responsiveness and jitter reduction.
+const DEFAULT_SMOOTHING: f32 = 0.6;
+
 /// VRCFaceTracking OSC bridge.
 /// Receives HTC facial blendshapes (51 floats) from HMD via TCP,
-/// converts to VRChat OSC parameters, and sends to localhost:9000.
+/// applies EMA smoothing to reduce jitter, converts to VRChat OSC
+/// parameters, and sends to localhost:9000.
 pub struct OscBridge {
     socket: Option<UdpSocket>,
     enabled: bool,
+    smoothing: f32,
+    prev_lip: [f32; 37],
+    prev_eye: [f32; 14],
 }
 
 // HTC lip expression names (37), in order of XrLipExpressionHTC enum
@@ -44,20 +52,28 @@ impl Default for OscBridge {
 
 impl OscBridge {
     pub fn new() -> Self {
+        Self::with_smoothing(DEFAULT_SMOOTHING)
+    }
+
+    pub fn with_smoothing(smoothing: f32) -> Self {
         let socket = UdpSocket::bind("0.0.0.0:0").ok();
         if socket.is_some() {
-            log::info!("OSC bridge initialized (target: 127.0.0.1:9000)");
+            log::info!("OSC bridge initialized (target: 127.0.0.1:9000, smoothing={:.2})", smoothing);
         }
         Self {
             socket,
             enabled: true,
+            smoothing: smoothing.clamp(0.0, 0.99),
+            prev_lip: [0.0; 37],
+            prev_eye: [0.0; 14],
         }
     }
 
     /// Send face data as OSC messages to VRChat (port 9000).
+    /// Applies EMA smoothing: smoothed = α * prev + (1-α) * raw.
     /// lip: 37 floats, eye: 14 floats.
     pub fn send_face_data(
-        &self,
+        &mut self,
         lip_valid: bool,
         eye_valid: bool,
         lip: &[f32; 37],
@@ -72,12 +88,15 @@ impl OscBridge {
         };
 
         let target = "127.0.0.1:9000";
+        let alpha = self.smoothing;
 
         if lip_valid {
-            for (i, &value) in lip.iter().enumerate() {
-                if value > 0.01 { // Skip near-zero to reduce OSC spam
+            for (i, &raw) in lip.iter().enumerate() {
+                let smoothed = alpha * self.prev_lip[i] + (1.0 - alpha) * raw;
+                self.prev_lip[i] = smoothed;
+                if smoothed > 0.01 {
                     let addr = format!("/avatar/parameters/{}", LIP_NAMES[i]);
-                    if let Some(msg) = encode_osc_float(&addr, value) {
+                    if let Some(msg) = encode_osc_float(&addr, smoothed) {
                         let _ = socket.send_to(&msg, target);
                     }
                 }
@@ -85,10 +104,12 @@ impl OscBridge {
         }
 
         if eye_valid {
-            for (i, &value) in eye.iter().enumerate() {
-                if value > 0.01 {
+            for (i, &raw) in eye.iter().enumerate() {
+                let smoothed = alpha * self.prev_eye[i] + (1.0 - alpha) * raw;
+                self.prev_eye[i] = smoothed;
+                if smoothed > 0.01 {
                     let addr = format!("/avatar/parameters/{}", EYE_NAMES[i]);
-                    if let Some(msg) = encode_osc_float(&addr, value) {
+                    if let Some(msg) = encode_osc_float(&addr, smoothed) {
                         let _ = socket.send_to(&msg, target);
                     }
                 }
@@ -203,7 +224,7 @@ mod tests {
         // Verify that near-zero values don't generate OSC traffic.
         // We can't easily observe UDP, but we test that the code path runs
         // without error. The bridge sends only values > 0.01.
-        let bridge = OscBridge::new();
+        let mut bridge = OscBridge::new();
         let mut lip = [0.0f32; 37];
         let mut eye = [0.0f32; 14];
 
@@ -283,5 +304,31 @@ mod tests {
         let (lv, ev, _, _) = parse_face_data(&payload).unwrap();
         assert!(!lv);
         assert!(ev);
+    }
+
+    #[test]
+    fn test_ema_smoothing_converges() {
+        // With smoothing=0.5, value should converge toward input over multiple frames
+        let mut bridge = OscBridge::with_smoothing(0.5);
+        let lip = [1.0f32; 37];
+        let eye = [0.0f32; 14];
+
+        // Feed same value multiple times — prev_lip should converge toward 1.0
+        for _ in 0..10 {
+            bridge.send_face_data(true, false, &lip, &eye);
+        }
+        // After 10 frames with α=0.5, prev should be very close to 1.0
+        // Each step: prev = 0.5 * prev + 0.5 * 1.0 → converges to 1.0
+        assert!((bridge.prev_lip[0] - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_no_smoothing() {
+        let mut bridge = OscBridge::with_smoothing(0.0);
+        let lip = [0.75f32; 37];
+        let eye = [0.0f32; 14];
+        bridge.send_face_data(true, false, &lip, &eye);
+        // With α=0.0, output = raw value immediately
+        assert!((bridge.prev_lip[0] - 0.75).abs() < 1e-6);
     }
 }
