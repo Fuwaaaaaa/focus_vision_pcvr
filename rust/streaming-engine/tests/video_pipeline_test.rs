@@ -93,7 +93,7 @@ fn test_fec_pipeline_with_packet_loss() {
     let data_count = data_shards.len();
 
     // FEC encode
-    let all_shards = encoder.encode(&data_shards).unwrap();
+    let all_shards = encoder.encode(data_shards).unwrap();
     let total = all_shards.len();
     let parity_count = total - data_count;
 
