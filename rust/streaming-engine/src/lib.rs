@@ -332,8 +332,14 @@ pub unsafe extern "C" fn fvp_get_config(out: *mut FvpConfig) -> i32 {
         foveated_enabled: if cfg.foveated.enabled { 1 } else { 0 },
         fovea_radius: cfg.foveated.fovea_radius,
         mid_radius: cfg.foveated.mid_radius,
-        mid_qp_offset: cfg.foveated.mid_qp_offset,
-        peripheral_qp_offset: cfg.foveated.peripheral_qp_offset,
+        mid_qp_offset: {
+            let (mid, _) = cfg.foveated.effective_qp_offsets();
+            mid
+        },
+        peripheral_qp_offset: {
+            let (_, periph) = cfg.foveated.effective_qp_offsets();
+            periph
+        },
     });
     0
 }
