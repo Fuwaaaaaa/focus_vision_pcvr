@@ -7,6 +7,7 @@
 //! 4. Save result to config/local.toml
 
 use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BenchPhase {
@@ -126,12 +127,97 @@ impl CodecBenchmark {
         );
     }
 
+    /// Export benchmark results as a structured report.
+    pub fn export_results(&self) -> Option<BenchmarkReport> {
+        if self.phase != BenchPhase::Complete {
+            return None;
+        }
+        Some(BenchmarkReport {
+            hevc: BenchmarkResult::from_samples("h265", &self.hevc_samples),
+            h264: BenchmarkResult::from_samples("h264", &self.h264_samples),
+            selected: match self.result? {
+                CodecChoice::Hevc => "h265".to_string(),
+                CodecChoice::H264 => "h264".to_string(),
+            },
+            timestamp: chrono_timestamp(),
+        })
+    }
+
     fn avg(samples: &[u32]) -> u32 {
         if samples.is_empty() {
             return 0;
         }
         (samples.iter().map(|&s| s as u64).sum::<u64>() / samples.len() as u64) as u32
     }
+
+    fn stddev(samples: &[u32]) -> f64 {
+        if samples.len() < 2 {
+            return 0.0;
+        }
+        let mean = samples.iter().map(|&s| s as f64).sum::<f64>() / samples.len() as f64;
+        let variance = samples.iter()
+            .map(|&s| { let d = s as f64 - mean; d * d })
+            .sum::<f64>() / (samples.len() - 1) as f64;
+        variance.sqrt()
+    }
+}
+
+/// Structured benchmark result for one codec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkResult {
+    pub codec: String,
+    pub avg_decode_us: u32,
+    pub sample_count: usize,
+    pub stddev_us: f64,
+    pub min_us: u32,
+    pub max_us: u32,
+}
+
+impl BenchmarkResult {
+    fn from_samples(codec: &str, samples: &[u32]) -> Self {
+        Self {
+            codec: codec.to_string(),
+            avg_decode_us: CodecBenchmark::avg(samples),
+            sample_count: samples.len(),
+            stddev_us: CodecBenchmark::stddev(samples),
+            min_us: samples.iter().copied().min().unwrap_or(0),
+            max_us: samples.iter().copied().max().unwrap_or(0),
+        }
+    }
+}
+
+/// Complete benchmark report with both codecs and selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkReport {
+    pub hevc: BenchmarkResult,
+    pub h264: BenchmarkResult,
+    pub selected: String,
+    pub timestamp: String,
+}
+
+impl BenchmarkReport {
+    /// Save report to JSON file.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(std::io::Error::other)?;
+        std::fs::write(path, json)
+    }
+
+    /// Load report from JSON file.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        serde_json::from_str(&json)
+            .map_err(std::io::Error::other)
+    }
+}
+
+fn chrono_timestamp() -> String {
+    // Simple ISO-8601 timestamp without external dependency
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{}", now)
 }
 
 #[cfg(test)]
@@ -163,6 +249,82 @@ mod tests {
 
         assert!(bench.is_complete());
         assert!(matches!(bench.result(), Some(CodecChoice::H264)));
+    }
+
+    #[test]
+    fn test_benchmark_result_from_samples() {
+        let samples = vec![1000, 2000, 3000, 4000, 5000];
+        let result = BenchmarkResult::from_samples("h265", &samples);
+        assert_eq!(result.codec, "h265");
+        assert_eq!(result.avg_decode_us, 3000);
+        assert_eq!(result.sample_count, 5);
+        assert_eq!(result.min_us, 1000);
+        assert_eq!(result.max_us, 5000);
+        assert!(result.stddev_us > 0.0);
+    }
+
+    #[test]
+    fn test_benchmark_result_empty_samples() {
+        let result = BenchmarkResult::from_samples("h264", &[]);
+        assert_eq!(result.avg_decode_us, 0);
+        assert_eq!(result.sample_count, 0);
+        assert_eq!(result.min_us, 0);
+        assert_eq!(result.max_us, 0);
+        assert_eq!(result.stddev_us, 0.0);
+    }
+
+    #[test]
+    fn test_benchmark_report_json_roundtrip() {
+        let report = BenchmarkReport {
+            hevc: BenchmarkResult::from_samples("h265", &[3000, 3100, 2900]),
+            h264: BenchmarkResult::from_samples("h264", &[2500, 2600, 2400]),
+            selected: "h264".to_string(),
+            timestamp: "1234567890".to_string(),
+        };
+
+        let json = serde_json::to_string(&report).unwrap();
+        let loaded: BenchmarkReport = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.selected, "h264");
+        assert_eq!(loaded.hevc.avg_decode_us, 3000);
+        assert_eq!(loaded.h264.avg_decode_us, 2500);
+        assert_eq!(loaded.hevc.sample_count, 3);
+    }
+
+    #[test]
+    fn test_benchmark_report_save_load() {
+        let report = BenchmarkReport {
+            hevc: BenchmarkResult::from_samples("h265", &[4000, 4100]),
+            h264: BenchmarkResult::from_samples("h264", &[3500, 3600]),
+            selected: "h264".to_string(),
+            timestamp: "9999".to_string(),
+        };
+
+        let dir = std::env::temp_dir().join("fvp_test_benchmark");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("benchmark_results.json");
+
+        report.save(&path).unwrap();
+        let loaded = BenchmarkReport::load(&path).unwrap();
+
+        assert_eq!(loaded.selected, "h264");
+        assert_eq!(loaded.hevc.sample_count, 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_export_results_before_complete_returns_none() {
+        let bench = CodecBenchmark::new();
+        assert!(bench.export_results().is_none());
+    }
+
+    #[test]
+    fn test_stddev_calculation() {
+        // stddev of [2, 4, 4, 4, 5, 5, 7, 9] ≈ 2.14
+        let samples = vec![2, 4, 4, 4, 5, 5, 7, 9];
+        let sd = CodecBenchmark::stddev(&samples);
+        assert!((sd - 2.14).abs() < 0.1);
     }
 
     #[test]
