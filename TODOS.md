@@ -179,6 +179,44 @@
 - **Context:** HMD側カメラフィードが必要。OpenXR passthrough拡張依存
 - **Depends on:** 実機入手
 
+## v2.2 スコープ（実機入手後）
+
+### Protocol v3 flags bit layout + 後方互換ゲート
+- **What:** FVPヘッダのflagsフィールドにslice_index(4bit), slice_count(4bit), stream_id(2bit)をパッキングする際、v2クライアントとの互換性ゲートを実装
+- **Why:** Outside Voice指摘: v2クライアントは新bitを誤解釈する。プロトコルバージョンネゴシエーション（HELLO/HELLO_ACKのversion）でv3がネゴシエートされた場合のみ新flagsを使用する必要がある
+- **Context:** 現在flags:u16でbit0(keyframe)のみ使用。bit1-10を新用途に使う。v2クライアントはbit1-15を無視するが、新しいフィールド値をkeyframeと誤判定する可能性あり
+- **Depends on:** v2.2.0のProtocol v3基盤実装後
+
+### メモリ監視: staticlibアロケータ問題
+- **What:** ヒープ使用量監視をシステムアロケータ経由で実装（jemallocではなくGetProcessMemoryInfo / /proc/self/status）
+- **Why:** Outside Voice指摘: streaming-engineはstaticlibとしてC++ DLLにリンクされるため、Rustのjemallocアロケータは使えない。プロセス全体のメモリ使用量をOS API経由で取得する必要がある
+- **Context:** Windows: GetProcessMemoryInfo()でWorkingSetSize取得。Linux/Android: /proc/self/status のVmRSS。1時間で50MB以上の増加を検知→警告ログ
+- **Depends on:** 実機でのメモリ使用パターン確認
+
+### TCP再接続PINスキップ: SECURITY.md脅威モデル更新
+- **What:** 5秒間のPINなし再接続ウィンドウのMITMリスクをSECURITY.mdに追記し、TLSチャネルバインディングによる緩和策を実装
+- **Why:** Outside Voice指摘: PIN不要の再接続は短時間のMITMウィンドウを開く。ただしTLS session resumptionが同一クライアントを暗号学的に検証するため、実質的なリスクは低い
+- **Context:** TLS session ticket + TOFU certificate pinning（SHA-256 fingerprint）で再接続元を検証。新規接続は常にPIN必須。SECURITY.mdの「Session Management」セクションに記載が必要
+- **Depends on:** v2.2.0のTCP再接続実装後
+
+### GCC推定器（delay-based帯域推定）— 実機待ち
+- **What:** パケット到着時間のdelay variationからネットワーク帯域逼迫を検出。ロス発生前に制御可能に
+- **Why:** 現行のloss-basedコントローラーはロスが発生してから反応する。delay-basedは予兆を検出できる
+- **Context:** EWMA簡略化版で実装予定（Kalmanフィルタは実機データ後にアップグレード）。パラメータ（alpha、閾値）は実機Wi-Fi環境でチューニング必須
+- **Depends on:** 実機入手 + TRANSPORT_FEEDBACK (0x12) のクライアント側実装
+
+### スライスベースFEC — Client側FecFrameDecoder変更必須
+- **What:** フレームをN個のスライスに分割し、各スライスで独立FECエンコード。デコーダ側で早期デコード開始可能
+- **Why:** フレーム送信開始の遅延を3-5ms→1-2msに短縮
+- **Context:** Outside Voice指摘: サーバー側だけでなくClient側FecFrameDecoderの変更が必須。4つの独立RSデコードコンテキストが必要。Androidクライアントの`fec_decoder.cpp`を4スライス対応に変更する必要がある
+- **Depends on:** Protocol v3 flags bit layout実装 + Client側FecFrameDecoder改修
+
+### Thermal Governor — 実機待ち
+- **What:** NVML API経由でGPU温度を監視し、過熱時に品質を段階的に制限
+- **Why:** 4時間連続稼働でGPU過熱→フレームドロップ→ユーザー体験悪化を防止
+- **Context:** nvml-wrapper crateをoptional依存として追加。spawn_blockingでポーリング。NVML非対応環境では無効化。温度閾値: 75°C警告, 85°C制限, 90°C緊急
+- **Depends on:** 実機でのGPU温度プロファイル確認
+
 ## v3.0 スコープ（Phase 3+ — 未着手）
 
 ### コミュニティプラグインAPI

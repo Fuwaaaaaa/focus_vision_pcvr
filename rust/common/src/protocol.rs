@@ -84,6 +84,7 @@ pub mod msg_type {
     pub const CONFIG_UPDATE_ACK: u8 = 0x56;
     pub const AUDIO_CONFIG: u8 = 0x40;
     pub const AUDIO_START: u8 = 0x41;
+    pub const TRANSPORT_FEEDBACK: u8 = 0x12; // HMD → PC: per-packet receive timestamps (GCC)
     pub const CALIBRATE_START: u8 = 0x60;
     pub const CALIBRATE_STATUS: u8 = 0x61;
     pub const FT_MIRROR_REQUEST: u8 = 0x65;   // PC → HMD: request camera feed
@@ -94,7 +95,8 @@ pub mod msg_type {
 /// Protocol version. Bumped when new message types are added.
 /// v1 = initial release (v1.0-v1.3)
 /// v2 = added protocol versioning, latency waterfall, UDP optimization (v2.0)
-pub const PROTOCOL_VERSION: u16 = 2;
+/// v3 = TRANSPORT_FEEDBACK, FVP flags bit layout (slice/stream fields), adaptive FEC (v2.2)
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Parse protocol version from HELLO payload. Returns 1 if payload is empty (v1 client).
 pub fn parse_hello_version(payload: &[u8]) -> u16 {
@@ -108,6 +110,86 @@ pub fn parse_hello_version(payload: &[u8]) -> u16 {
 /// Encode protocol version for HELLO/HELLO_ACK payload.
 pub fn encode_version(version: u16) -> [u8; 2] {
     version.to_le_bytes()
+}
+
+/// FVP header flags bit layout (u16):
+///   bit 0:     keyframe
+///   bit 1-4:   slice_index (0-15, for slice-based FEC)
+///   bit 5-8:   slice_count (0-15, 0 = single slice / legacy)
+///   bit 9-10:  stream_id (0=single, 1=fovea, 2=periphery)
+///   bit 11-15: reserved
+pub mod fvp_flags {
+    pub const KEYFRAME: u16       = 1 << 0;
+    pub const SLICE_INDEX_SHIFT: u32 = 1;
+    pub const SLICE_INDEX_MASK: u16  = 0b1111 << 1;   // bits 1-4
+    pub const SLICE_COUNT_SHIFT: u32 = 5;
+    pub const SLICE_COUNT_MASK: u16  = 0b1111 << 5;   // bits 5-8
+    pub const STREAM_ID_SHIFT: u32   = 9;
+    pub const STREAM_ID_MASK: u16    = 0b11 << 9;     // bits 9-10
+
+    /// Encode flags for a single-slice, single-stream packet (v2 compatible).
+    pub fn encode_simple(is_keyframe: bool) -> u16 {
+        if is_keyframe { KEYFRAME } else { 0 }
+    }
+
+    /// Encode full flags with slice and stream information.
+    pub fn encode(is_keyframe: bool, slice_index: u8, slice_count: u8, stream_id: u8) -> u16 {
+        let mut flags: u16 = 0;
+        if is_keyframe { flags |= KEYFRAME; }
+        flags |= ((slice_index as u16) & 0xF) << SLICE_INDEX_SHIFT;
+        flags |= ((slice_count as u16) & 0xF) << SLICE_COUNT_SHIFT;
+        flags |= ((stream_id as u16) & 0x3) << STREAM_ID_SHIFT;
+        flags
+    }
+
+    pub fn is_keyframe(flags: u16) -> bool { flags & KEYFRAME != 0 }
+    pub fn slice_index(flags: u16) -> u8 { ((flags & SLICE_INDEX_MASK) >> SLICE_INDEX_SHIFT) as u8 }
+    pub fn slice_count(flags: u16) -> u8 { ((flags & SLICE_COUNT_MASK) >> SLICE_COUNT_SHIFT) as u8 }
+    pub fn stream_id(flags: u16) -> u8 { ((flags & STREAM_ID_MASK) >> STREAM_ID_SHIFT) as u8 }
+}
+
+/// Transport feedback: per-packet receive timestamps for delay-based bandwidth estimation.
+/// Maximum 256 entries per message.
+pub const TRANSPORT_FEEDBACK_MAX_ENTRIES: usize = 256;
+
+/// A single transport feedback entry: sequence number + receive timestamp delta (µs).
+#[derive(Debug, Clone, Copy)]
+pub struct TransportFeedbackEntry {
+    pub sequence: u16,
+    pub recv_delta_us: i32,
+}
+
+/// Parse TRANSPORT_FEEDBACK payload into entries.
+/// Format: [count:u16][entries: (seq:u16 + delta:i32) × count]
+pub fn parse_transport_feedback(payload: &[u8]) -> Option<Vec<TransportFeedbackEntry>> {
+    if payload.len() < 2 { return None; }
+    let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    if count > TRANSPORT_FEEDBACK_MAX_ENTRIES { return None; }
+    let entry_size = 6; // u16 + i32
+    if payload.len() < 2 + count * entry_size { return None; }
+
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 2 + i * entry_size;
+        let sequence = u16::from_le_bytes([payload[off], payload[off + 1]]);
+        let recv_delta_us = i32::from_le_bytes([
+            payload[off + 2], payload[off + 3], payload[off + 4], payload[off + 5],
+        ]);
+        entries.push(TransportFeedbackEntry { sequence, recv_delta_us });
+    }
+    Some(entries)
+}
+
+/// Encode transport feedback entries into payload bytes.
+pub fn encode_transport_feedback(entries: &[TransportFeedbackEntry]) -> Vec<u8> {
+    let count = entries.len().min(TRANSPORT_FEEDBACK_MAX_ENTRIES);
+    let mut buf = Vec::with_capacity(2 + count * 6);
+    buf.extend_from_slice(&(count as u16).to_le_bytes());
+    for entry in &entries[..count] {
+        buf.extend_from_slice(&entry.sequence.to_le_bytes());
+        buf.extend_from_slice(&entry.recv_delta_us.to_le_bytes());
+    }
+    buf
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +269,7 @@ mod tests {
             msg_type::HELLO, msg_type::HELLO_ACK, msg_type::PIN_REQUEST,
             msg_type::PIN_RESPONSE, msg_type::PIN_RESULT, msg_type::STREAM_CONFIG,
             msg_type::STREAM_START, msg_type::HEARTBEAT, msg_type::HEARTBEAT_ACK,
+            msg_type::TRANSPORT_FEEDBACK,
             msg_type::TRACKING_DATA, msg_type::CONTROLLER_DATA, msg_type::IDR_REQUEST,
             msg_type::FACE_DATA, msg_type::HAPTIC_EVENT, msg_type::SLEEP_ENTER,
             msg_type::SLEEP_EXIT, msg_type::CONFIG_UPDATE, msg_type::CONFIG_UPDATE_ACK,
@@ -199,5 +282,104 @@ mod tests {
                     "Duplicate msg_type at index {} and {}", i, j);
             }
         }
+    }
+
+    #[test]
+    fn fvp_flags_simple_keyframe() {
+        let flags = fvp_flags::encode_simple(true);
+        assert!(fvp_flags::is_keyframe(flags));
+        assert_eq!(fvp_flags::slice_index(flags), 0);
+        assert_eq!(fvp_flags::slice_count(flags), 0);
+        assert_eq!(fvp_flags::stream_id(flags), 0);
+    }
+
+    #[test]
+    fn fvp_flags_simple_non_keyframe() {
+        let flags = fvp_flags::encode_simple(false);
+        assert!(!fvp_flags::is_keyframe(flags));
+    }
+
+    #[test]
+    fn fvp_flags_full_roundtrip() {
+        let flags = fvp_flags::encode(true, 3, 4, 2);
+        assert!(fvp_flags::is_keyframe(flags));
+        assert_eq!(fvp_flags::slice_index(flags), 3);
+        assert_eq!(fvp_flags::slice_count(flags), 4);
+        assert_eq!(fvp_flags::stream_id(flags), 2);
+    }
+
+    #[test]
+    fn fvp_flags_max_values() {
+        let flags = fvp_flags::encode(true, 15, 15, 3);
+        assert!(fvp_flags::is_keyframe(flags));
+        assert_eq!(fvp_flags::slice_index(flags), 15);
+        assert_eq!(fvp_flags::slice_count(flags), 15);
+        assert_eq!(fvp_flags::stream_id(flags), 3);
+    }
+
+    #[test]
+    fn fvp_flags_no_overlap_with_keyframe_bit() {
+        // slice_index=0, slice_count=0, stream_id=0 with keyframe
+        let kf = fvp_flags::encode(true, 0, 0, 0);
+        assert_eq!(kf, 1); // only keyframe bit set
+
+        // slice_index=1 should not set keyframe
+        let s1 = fvp_flags::encode(false, 1, 0, 0);
+        assert!(!fvp_flags::is_keyframe(s1));
+        assert_eq!(fvp_flags::slice_index(s1), 1);
+    }
+
+    #[test]
+    fn transport_feedback_roundtrip() {
+        let entries = vec![
+            TransportFeedbackEntry { sequence: 100, recv_delta_us: 500 },
+            TransportFeedbackEntry { sequence: 101, recv_delta_us: -200 },
+            TransportFeedbackEntry { sequence: 102, recv_delta_us: 0 },
+        ];
+        let encoded = encode_transport_feedback(&entries);
+        let decoded = parse_transport_feedback(&encoded).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].sequence, 100);
+        assert_eq!(decoded[0].recv_delta_us, 500);
+        assert_eq!(decoded[1].sequence, 101);
+        assert_eq!(decoded[1].recv_delta_us, -200);
+        assert_eq!(decoded[2].recv_delta_us, 0);
+    }
+
+    #[test]
+    fn transport_feedback_empty() {
+        let encoded = encode_transport_feedback(&[]);
+        let decoded = parse_transport_feedback(&encoded).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn transport_feedback_rejects_oversized() {
+        // Fake a count of 257 (> max 256)
+        let mut buf = vec![0u8; 2];
+        buf[0] = 0x01;
+        buf[1] = 0x01; // count = 257
+        assert!(parse_transport_feedback(&buf).is_none());
+    }
+
+    #[test]
+    fn transport_feedback_rejects_truncated() {
+        // count=2 but only 1 entry worth of data
+        let mut buf = 2u16.to_le_bytes().to_vec();
+        buf.extend_from_slice(&100u16.to_le_bytes());
+        buf.extend_from_slice(&500i32.to_le_bytes());
+        // Missing second entry
+        assert!(parse_transport_feedback(&buf).is_none());
+    }
+
+    #[test]
+    fn transport_feedback_rejects_too_short() {
+        assert!(parse_transport_feedback(&[]).is_none());
+        assert!(parse_transport_feedback(&[0]).is_none());
+    }
+
+    #[test]
+    fn protocol_version_is_3() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 }
