@@ -2,6 +2,8 @@
 tcp_port = 9944
 udp_port = 9945
 fec_redundancy = 0.2
+fec_redundancy_min = 0.05    # Adaptive FEC minimum (low loss → bandwidth saving)
+fec_redundancy_max = 0.40    # Adaptive FEC maximum (high loss → max protection)
 
 [video]
 codec = "h265"

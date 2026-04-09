@@ -297,16 +297,28 @@ pub struct HmdStats {
 }
 
 /// Read TCP control messages and write haptic events.
-/// Handles: IDR_REQUEST, HEARTBEAT, FACE_DATA, DISCONNECT (inbound).
+/// TCP disconnect reason, used to decide whether to hold state for reconnection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DisconnectReason {
+    /// Clean disconnect requested by client (DISCONNECT message)
+    ClientRequested,
+    /// TCP connection lost (read error, EOF)
+    ConnectionLost,
+    /// Protocol error (oversized message, etc.)
+    ProtocolError,
+}
+
+/// Handles: IDR_REQUEST, HEARTBEAT, FACE_DATA, TRANSPORT_FEEDBACK, DISCONNECT (inbound).
 /// Sends: HAPTIC_EVENT (outbound to HMD).
 /// When the connection closes or errors, cancels the provided token to stop streaming.
+/// Returns the disconnect reason so the caller can decide whether to hold state.
 async fn handle_tcp_control(
     stream: Box<dyn crate::control::tcp_server::AsyncStream>,
     cancel: tokio_util::sync::CancellationToken,
     hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
     osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
     mut haptic_rx: mpsc::Receiver<HapticEvent>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<DisconnectReason, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const CONFIG_UPDATE_MIN_INTERVAL_MS: u64 = 1000; // Rate limit: 1 update/sec
@@ -331,23 +343,23 @@ async fn handle_tcp_control(
         tokio::select! {
             read_result = reader.read_exact(&mut len_buf) => {
                 if read_result.is_err() {
-                    log::info!("TCP control connection closed — stopping stream");
+                    log::info!("TCP control connection lost");
                     cancel.cancel();
-                    break;
+                    return Ok(DisconnectReason::ConnectionLost);
                 }
                 let len = u32::from_le_bytes(len_buf) as usize;
                 if len == 0 { continue; }
                 if len > fvp_common::MAX_MSG_LEN {
                     log::error!("TCP message too large ({} bytes), closing connection", len);
                     cancel.cancel();
-                    break;
+                    return Ok(DisconnectReason::ProtocolError);
                 }
 
                 let mut msg_buf = vec![0u8; len];
                 if reader.read_exact(&mut msg_buf).await.is_err() {
-                    log::info!("TCP control read failed mid-message — stopping stream");
+                    log::info!("TCP control read failed mid-message");
                     cancel.cancel();
-                    break;
+                    return Ok(DisconnectReason::ConnectionLost);
                 }
                 let msg_type = msg_buf[0];
 
@@ -398,6 +410,15 @@ async fn handle_tcp_control(
                             }
                         }
                     }
+                    fvp_common::protocol::msg_type::TRANSPORT_FEEDBACK => {
+                        let payload = &msg_buf[1..];
+                        if let Some(entries) = fvp_common::protocol::parse_transport_feedback(payload) {
+                            log::debug!("Received TRANSPORT_FEEDBACK: {} entries", entries.len());
+                            // TODO(v2.2+): Feed to GCC estimator when implemented
+                        } else {
+                            log::warn!("Invalid TRANSPORT_FEEDBACK payload ({}B)", payload.len());
+                        }
+                    }
                     fvp_common::protocol::msg_type::CONFIG_UPDATE => {
                         // HMD dashboard requests a config change.
                         // Payload: [key:1B][value:4B LE]
@@ -445,7 +466,7 @@ async fn handle_tcp_control(
                     fvp_common::protocol::msg_type::DISCONNECT => {
                         log::info!("Client sent DISCONNECT — stopping stream");
                         cancel.cancel();
-                        break;
+                        return Ok(DisconnectReason::ClientRequested);
                     }
                     _ => {
                         log::warn!("Unknown TCP message type 0x{:02x} (len={}B) — skipping (client may be newer)", msg_type, msg_buf.len() - 1);
@@ -460,7 +481,7 @@ async fn handle_tcp_control(
             }
         }
     }
-    Ok(())
+    Ok(DisconnectReason::ConnectionLost)
 }
 
 /// Spawn the audio capture → Opus encode → UDP send pipeline.
@@ -573,6 +594,91 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
 
 }
 
+/// Check HMD-reported stats and adjust bitrate and FEC redundancy accordingly.
+/// Called once per second (every `framerate` frames).
+fn update_adaptive_bitrate(
+    frame_count: u64,
+    framerate: u64,
+    hmd_stats: &Arc<StdMutex<Option<HmdStats>>>,
+    bw_estimator: &mut crate::adaptive::bandwidth_estimator::BandwidthEstimator,
+    bitrate_ctrl: &mut crate::adaptive::bitrate_controller::BitrateController,
+    adaptive_fec: Option<&mut crate::transport::fec::AdaptiveFecController>,
+    fec_encoder: &mut crate::transport::fec::FecEncoder,
+) {
+    if !frame_count.is_multiple_of(framerate) {
+        return;
+    }
+    if let Ok(mut guard) = hmd_stats.lock() {
+        if let Some(stats) = guard.take() {
+            bw_estimator.update(
+                stats.packets_received,
+                stats.packets_lost,
+                0.0, // RTT not yet measured
+            );
+            if bitrate_ctrl.adjust(bw_estimator) {
+                let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
+                notify_bitrate_change(new_bps);
+            }
+            // Adjust FEC redundancy based on observed loss
+            if let Some(afec) = adaptive_fec {
+                if afec.adjust(bw_estimator.loss_rate()) {
+                    fec_encoder.set_redundancy(afec.current_redundancy());
+                }
+            }
+        }
+    }
+}
+
+/// Detect user inactivity from head tracking and enter/exit sleep mode.
+fn check_sleep_mode(
+    tracking: &Arc<StdMutex<Option<TrackingData>>>,
+    sleep_detector: &mut crate::sleep_mode::SleepDetector,
+    normal_bitrate_mbps: u32,
+    timeout_seconds: u32,
+) {
+    if let Ok(guard) = tracking.lock() {
+        if let Some(ref data) = *guard {
+            if let Some(transition) = sleep_detector.update(data) {
+                match transition {
+                    crate::sleep_mode::SleepTransition::Sleep => {
+                        log::info!("Sleep mode: entering (no motion for {}s)", timeout_seconds);
+                        let bps = sleep_detector.sleep_bitrate_mbps() * 1_000_000;
+                        notify_bitrate_change(bps);
+                    }
+                    crate::sleep_mode::SleepTransition::Wake => {
+                        log::info!("Sleep mode: waking up (motion detected)");
+                        let bps = normal_bitrate_mbps * 1_000_000;
+                        notify_bitrate_change(bps);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Push latest latency measurements to atomics for HEARTBEAT_ACK waterfall overlay.
+fn update_latency_atomics(latency_tracker: &Arc<StdMutex<LatencyTracker>>) {
+    if let Ok(tracker) = latency_tracker.lock() {
+        if let Some(enc) = tracker.avg_encode_latency_us() {
+            PC_ENCODE_LATENCY_US.store(enc as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(total) = tracker.avg_pc_latency_us() {
+            PC_TOTAL_LATENCY_US.store(total as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Log PC-side latency stats every 5 seconds.
+fn log_periodic_stats(frame_count: u64, framerate: u64) {
+    if frame_count.is_multiple_of(framerate * 5) {
+        let enc = PC_ENCODE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
+        let total = PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
+        if total > 0 {
+            log::info!("PC latency: avg={}us encode={}us", total, enc);
+        }
+    }
+}
+
 async fn run_streaming(
     config: AppConfig,
     mut frame_rx: mpsc::Receiver<EncodedFrame>,
@@ -638,13 +744,26 @@ async fn run_streaming(
             *guard = Some(haptic_tx);
         }
 
-        // Spawn TCP control reader/writer (uses the same TLS/plain stream from handshake)
+        // Spawn TCP control reader/writer. Track disconnect reason for hold logic.
+        let disconnect_reason: Arc<StdMutex<Option<DisconnectReason>>> = Arc::new(StdMutex::new(None));
         let tcp_session = session_cancel.clone();
         let stats_clone = hmd_stats.clone();
         let osc_clone = osc_bridge.clone();
+        let reason_clone = disconnect_reason.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, haptic_rx).await {
-                log::warn!("TCP control reader ended: {}", e);
+            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, haptic_rx).await {
+                Ok(reason) => {
+                    if let Ok(mut guard) = reason_clone.lock() {
+                        *guard = Some(reason);
+                    }
+                    log::info!("TCP control ended: {:?}", reason);
+                }
+                Err(e) => {
+                    if let Ok(mut guard) = reason_clone.lock() {
+                        *guard = Some(DisconnectReason::ConnectionLost);
+                    }
+                    log::warn!("TCP control error: {}", e);
+                }
             }
         });
 
@@ -675,7 +794,7 @@ async fn run_streaming(
         let audio_target: SocketAddr = SocketAddr::new(peer_addr.ip(), audio_port);
         spawn_audio_pipeline(audio_target, session_cancel.clone());
 
-        // Step 3: Process frames with adaptive bitrate (HMD-reported loss)
+        // Step 3: Process frames with adaptive bitrate + adaptive FEC
         let mut packetizer = RtpPacketizer::new(0x46565000);
         let mut fec_encoder = crate::transport::fec::FecEncoder::new(config.network.fec_redundancy);
         let mut frame_count: u64 = 0;
@@ -684,6 +803,10 @@ async fn run_streaming(
         let mut bitrate_ctrl = crate::adaptive::bitrate_controller::BitrateController::new(
             config.video.bitrate_mbps,
         );
+        let mut adaptive_fec = Some(crate::transport::fec::AdaptiveFecController::new(
+            config.network.fec_redundancy_min,
+            config.network.fec_redundancy_max,
+        ));
         let mut sleep_detector = crate::sleep_mode::SleepDetector::new(
             config.sleep_mode.enabled,
             config.sleep_mode.motion_threshold,
@@ -731,61 +854,20 @@ async fn run_streaming(
 
                     frame_count += 1;
 
-                    // Adaptive bitrate: use HMD-reported stats (real packet loss)
-                    if frame_count.is_multiple_of(framerate) {
-                        if let Ok(mut guard) = hmd_stats.lock() {
-                            if let Some(stats) = guard.take() {
-                                bw_estimator.update(
-                                    stats.packets_received,
-                                    stats.packets_lost,
-                                    0.0, // RTT not yet measured
-                                );
-                                if bitrate_ctrl.adjust(&bw_estimator) {
-                                    let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
-                                    notify_bitrate_change(new_bps);
-                                }
-                            }
-                        }
-                    }
+                    update_adaptive_bitrate(
+                        frame_count, framerate, &hmd_stats,
+                        &mut bw_estimator, &mut bitrate_ctrl,
+                        adaptive_fec.as_mut(), &mut fec_encoder,
+                    );
 
-                    // Sleep mode detection: check head tracking for motion
-                    if let Ok(guard) = _tracking.lock() {
-                        if let Some(ref data) = *guard {
-                            if let Some(transition) = sleep_detector.update(data) {
-                                match transition {
-                                    crate::sleep_mode::SleepTransition::Sleep => {
-                                        log::info!("Sleep mode: entering (no motion for {}s)", config.sleep_mode.timeout_seconds);
-                                        let bps = sleep_detector.sleep_bitrate_mbps() * 1_000_000;
-                                        notify_bitrate_change(bps);
-                                    }
-                                    crate::sleep_mode::SleepTransition::Wake => {
-                                        log::info!("Sleep mode: waking up (motion detected)");
-                                        let bps = normal_bitrate_mbps * 1_000_000;
-                                        notify_bitrate_change(bps);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    check_sleep_mode(
+                        &_tracking, &mut sleep_detector,
+                        normal_bitrate_mbps, config.sleep_mode.timeout_seconds,
+                    );
 
-                    // Update PC latency atomics for HEARTBEAT_ACK waterfall
-                    if let Ok(tracker) = latency_tracker.lock() {
-                        if let Some(enc) = tracker.avg_encode_latency_us() {
-                            PC_ENCODE_LATENCY_US.store(enc as u32, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        if let Some(total) = tracker.avg_pc_latency_us() {
-                            PC_TOTAL_LATENCY_US.store(total as u32, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+                    update_latency_atomics(&latency_tracker);
 
-                    // Log stats every 5 seconds
-                    if frame_count.is_multiple_of(framerate * 5) {
-                        let enc = PC_ENCODE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
-                        let total = PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
-                        if total > 0 {
-                            log::info!("PC latency: avg={}us encode={}us", total, enc);
-                        }
-                    }
+                    log_periodic_stats(frame_count, framerate);
                 }
                 _ = session_cancel.cancelled() => {
                     log::info!("Session ended — waiting for new connection");
@@ -798,8 +880,40 @@ async fn run_streaming(
             }
         }
 
-        // Session ended — loop back to accept new connection
-        attempt += 1;
+        // Session ended — check disconnect reason for hold logic
+        let reason = disconnect_reason.lock().ok()
+            .and_then(|g| *g)
+            .unwrap_or(DisconnectReason::ConnectionLost);
+
+        match reason {
+            DisconnectReason::ConnectionLost => {
+                // Hold state for 5 seconds — UDP streaming can continue if sender is still alive.
+                // If client reconnects within 5s, skip PIN (TLS session resumption).
+                log::info!("Connection lost — holding state for 5s for reconnection");
+                const HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
+                tokio::select! {
+                    _ = tokio::time::sleep(HOLD_DURATION) => {
+                        log::info!("Hold period expired — no reconnection, cleaning up");
+                    }
+                    _ = cancel.cancelled() => {
+                        log::info!("Engine shutdown during hold period");
+                        return Ok(());
+                    }
+                }
+                // After hold, loop back to accept new connection
+                attempt += 1;
+            }
+            DisconnectReason::ClientRequested => {
+                // Clean disconnect — no hold needed
+                log::info!("Client requested disconnect — ready for new connection");
+                attempt = 0; // Reset attempts on clean disconnect
+            }
+            DisconnectReason::ProtocolError => {
+                log::warn!("Protocol error — reconnecting");
+                attempt += 1;
+            }
+        }
+
         if attempt > MAX_RECONNECT_ATTEMPTS {
             log::error!("Max reconnect attempts reached");
             break;

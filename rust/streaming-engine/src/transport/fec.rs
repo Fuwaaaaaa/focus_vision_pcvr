@@ -100,6 +100,87 @@ impl FecDecoder {
     }
 }
 
+impl FecEncoder {
+    /// Update the redundancy ratio dynamically. Clamped to [0.0, 1.0].
+    pub fn set_redundancy(&mut self, redundancy: f32) {
+        let new = redundancy.clamp(0.0, 1.0);
+        if (new - self.redundancy).abs() > f32::EPSILON {
+            self.redundancy = new;
+            // Invalidate cache so next encode() picks up the new parity count
+            self.cached_rs = None;
+        }
+    }
+
+    pub fn redundancy(&self) -> f32 { self.redundancy }
+}
+
+/// Adaptive FEC controller that adjusts redundancy based on observed packet loss.
+///
+/// Loss thresholds:
+///   < 1% → 5% redundancy (bandwidth saving)
+///   1-3% → 15%
+///   3-5% → 25%
+///   > 5% → 40% (maximum protection)
+///
+/// Change rate limited to ±5% per evaluation to avoid oscillation.
+pub struct AdaptiveFecController {
+    current_redundancy: f32,
+    min_redundancy: f32,
+    max_redundancy: f32,
+    max_change_per_step: f32,
+}
+
+impl AdaptiveFecController {
+    pub fn new(min_redundancy: f32, max_redundancy: f32) -> Self {
+        let min = min_redundancy.clamp(0.0, 1.0);
+        let max = max_redundancy.clamp(min, 1.0);
+        Self {
+            current_redundancy: 0.20, // start at default 20%
+            min_redundancy: min,
+            max_redundancy: max,
+            max_change_per_step: 0.05,
+        }
+    }
+
+    /// Evaluate loss rate and return the new redundancy ratio.
+    /// Returns true if redundancy changed.
+    pub fn adjust(&mut self, loss_rate: f64) -> bool {
+        let loss = if loss_rate.is_nan() || loss_rate.is_infinite() {
+            log::warn!("AdaptiveFEC: invalid loss_rate ({loss_rate}), treating as 0");
+            0.0
+        } else {
+            loss_rate.clamp(0.0, 1.0)
+        };
+
+        let target: f32 = if loss < 0.01 {
+            0.05
+        } else if loss < 0.03 {
+            0.15
+        } else if loss < 0.05 {
+            0.25
+        } else {
+            0.40
+        };
+
+        let target = target.clamp(self.min_redundancy, self.max_redundancy);
+        let diff = target - self.current_redundancy;
+        let clamped_diff = diff.clamp(-self.max_change_per_step, self.max_change_per_step);
+        let new_redundancy = (self.current_redundancy + clamped_diff)
+            .clamp(self.min_redundancy, self.max_redundancy);
+
+        if (new_redundancy - self.current_redundancy).abs() > f32::EPSILON {
+            log::info!("AdaptiveFEC: {:.0}% → {:.0}% (loss={:.1}%)",
+                self.current_redundancy * 100.0, new_redundancy * 100.0, loss * 100.0);
+            self.current_redundancy = new_redundancy;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn current_redundancy(&self) -> f32 { self.current_redundancy }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FecError {
     #[error("empty input")]
@@ -159,6 +240,90 @@ mod tests {
 
         let result = FecDecoder::decode(&mut shards, 4);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_redundancy() {
+        let mut enc = FecEncoder::new(0.2);
+        assert!((enc.redundancy() - 0.2).abs() < 0.01);
+        enc.set_redundancy(0.4);
+        assert!((enc.redundancy() - 0.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_set_redundancy_clamp() {
+        let mut enc = FecEncoder::new(0.2);
+        enc.set_redundancy(2.0); // > 1.0
+        assert!((enc.redundancy() - 1.0).abs() < 0.01);
+        enc.set_redundancy(-0.5); // < 0.0
+        assert!(enc.redundancy().abs() < 0.01);
+    }
+
+    #[test]
+    fn test_adaptive_fec_low_loss() {
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        // Start at 20%, low loss → target 5%, but max step is 5%
+        ctrl.adjust(0.005); // < 1%
+        assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01); // 20% - 5% = 15%
+    }
+
+    #[test]
+    fn test_adaptive_fec_high_loss() {
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        // Start at 20%, high loss → target 40%, max step 5%
+        ctrl.adjust(0.10); // > 5%
+        assert!((ctrl.current_redundancy() - 0.25).abs() < 0.01); // 20% + 5% = 25%
+    }
+
+    #[test]
+    fn test_adaptive_fec_moderate_loss() {
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        ctrl.adjust(0.02); // 2% → target 15%, diff = -5%
+        assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_adaptive_fec_step_limit() {
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        // Multiple steps to reach target
+        ctrl.adjust(0.005); // 20→15
+        ctrl.adjust(0.005); // 15→10
+        ctrl.adjust(0.005); // 10→5
+        assert!((ctrl.current_redundancy() - 0.05).abs() < 0.01);
+        // Already at min, no further change
+        let changed = ctrl.adjust(0.005);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_adaptive_fec_nan_loss() {
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        ctrl.adjust(f64::NAN); // should treat as 0
+        assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01); // target 5%, step -5%
+    }
+
+    #[test]
+    fn test_adaptive_fec_boundary_1_percent() {
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        // Exactly 1% → falls into 1-3% bracket (target 15%)
+        ctrl.adjust(0.01);
+        assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_adaptive_fec_boundary_3_percent() {
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        // Exactly 3% → falls into 3-5% bracket (target 25%)
+        ctrl.adjust(0.03);
+        assert!((ctrl.current_redundancy() - 0.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_adaptive_fec_boundary_5_percent() {
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        // Exactly 5% → falls into >5% bracket (target 40%)
+        ctrl.adjust(0.05);
+        assert!((ctrl.current_redundancy() - 0.25).abs() < 0.01); // 20+5=25 (clamped step)
     }
 
     #[test]
