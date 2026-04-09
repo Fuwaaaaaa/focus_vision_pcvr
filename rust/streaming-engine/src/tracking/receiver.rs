@@ -327,4 +327,71 @@ mod tests {
         assert_eq!(ls.controller_id, 0);
         assert_eq!(rs.controller_id, 1);
     }
+
+    #[tokio::test]
+    async fn test_tracking_receiver_controller_packet() {
+        let head = Arc::new(Mutex::new(None));
+        let controllers = Arc::new(Mutex::new([None, None]));
+
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = tmp.local_addr().unwrap();
+        drop(tmp);
+
+        let head2 = head.clone();
+        let controllers2 = controllers.clone();
+        let recv_handle = tokio::spawn(async move {
+            let r = TrackingReceiver::new(head2, controllers2);
+            r.run(recv_addr).await.ok();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Send a controller packet (left hand, trigger = 0.75)
+        let pkt = make_controller_packet(0, 0.75);
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&pkt, recv_addr).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let ctrls = controllers.lock().unwrap().clone();
+        assert!(ctrls[0].is_some(), "Left controller should be updated");
+        let c = ctrls[0].as_ref().unwrap();
+        assert_eq!(c.controller_id, 0);
+        assert!((c.trigger - 0.75).abs() < 1e-6);
+
+        recv_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_tracking_receiver_unknown_type_ignored() {
+        let head = Arc::new(Mutex::new(None));
+        let controllers = Arc::new(Mutex::new([None, None]));
+
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = tmp.local_addr().unwrap();
+        drop(tmp);
+
+        let head2 = head.clone();
+        let controllers2 = controllers.clone();
+        let recv_handle = tokio::spawn(async move {
+            let r = TrackingReceiver::new(head2, controllers2);
+            r.run(recv_addr).await.ok();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Send packet with unknown type 0xFF
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&[0xFF, 0x01, 0x02, 0x03], recv_addr).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Neither head nor controllers should be updated
+        assert!(head.lock().unwrap().is_none());
+        let ctrls = controllers.lock().unwrap().clone();
+        assert!(ctrls[0].is_none());
+        assert!(ctrls[1].is_none());
+
+        recv_handle.abort();
+    }
 }
