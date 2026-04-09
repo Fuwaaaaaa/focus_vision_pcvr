@@ -197,8 +197,6 @@ pub(crate) async fn read_message_generic<S>(stream: &mut S) -> std::io::Result<(
 where
     S: AsyncRead + Unpin,
 {
-    const MAX_MSG_LEN: usize = 65536;
-
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
@@ -206,7 +204,7 @@ where
     if len == 0 {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty message"));
     }
-    if len > MAX_MSG_LEN {
+    if len > fvp_common::MAX_MSG_LEN {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
             format!("message too large: {} bytes", len)));
     }

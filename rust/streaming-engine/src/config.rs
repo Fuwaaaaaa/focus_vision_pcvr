@@ -326,6 +326,16 @@ impl AppConfig {
             self.sleep_mode.motion_threshold = 0.002;
         }
 
+        // Audio
+        if self.audio.sample_rate != 48000 {
+            errors.push(ConfigError { field: "audio.sample_rate", message: format!("{} unsupported, clamped to 48000", self.audio.sample_rate) });
+            self.audio.sample_rate = 48000;
+        }
+        if self.audio.bitrate_kbps < 32 || self.audio.bitrate_kbps > 512 {
+            errors.push(ConfigError { field: "audio.bitrate_kbps", message: format!("{} out of range [32-512], clamped to 128", self.audio.bitrate_kbps) });
+            self.audio.bitrate_kbps = 128;
+        }
+
         // Foveated
         if self.foveated.fovea_radius <= 0.0 || self.foveated.fovea_radius > 0.5
             || self.foveated.fovea_radius.is_nan()
@@ -469,5 +479,28 @@ mod tests {
         cfg.face_tracking.smoothing = 0.0; // min
         let errors = cfg.validate();
         assert!(errors.is_empty(), "Edge values should be valid: {:?}", errors);
+    }
+
+    #[test]
+    fn test_validate_audio_sample_rate() {
+        let mut cfg = AppConfig::default();
+        cfg.audio.sample_rate = 44100; // unsupported
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "audio.sample_rate"));
+        assert_eq!(cfg.audio.sample_rate, 48000);
+    }
+
+    #[test]
+    fn test_validate_audio_bitrate_out_of_range() {
+        let mut cfg = AppConfig::default();
+        cfg.audio.bitrate_kbps = 1000; // too high
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "audio.bitrate_kbps"));
+        assert_eq!(cfg.audio.bitrate_kbps, 128);
+
+        cfg.audio.bitrate_kbps = 16; // too low
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "audio.bitrate_kbps"));
+        assert_eq!(cfg.audio.bitrate_kbps, 128);
     }
 }

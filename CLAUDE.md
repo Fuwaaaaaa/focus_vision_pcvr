@@ -27,15 +27,16 @@ See `ARCHITECTURE.md` for detailed system diagrams and data flow.
 ./build.bat   # Windows full build
 cargo build --release -p streaming-engine    # Rust streaming engine
 cargo build --release -p focus-vision-companion  # PC companion app
-cargo test --workspace  # Run 180+ tests
+cargo test --workspace  # Run 204+ tests
 ```
 
 ## Testing
 ```bash
-cargo test --workspace              # All tests (180+)
-cargo test -p streaming-engine      # Engine: 139 tests (FEC, RTP, pairing, TLS, haptics, sleep, FT, profiles, calibration, config, 96fps)
+cargo test --workspace              # All tests (204+)
+cargo test -p streaming-engine      # Engine: 163 tests (FEC, RTP, pairing, TLS, haptics, sleep, FT, profiles, calibration, config, TCP handler, latency, benchmarks)
 cargo test -p focus-vision-companion # Companion: 25 tests (config, ADB, export)
 cargo test -p fvp-common            # Common: 9 tests (protocol structs, flags, versioning)
+cargo bench -p streaming-engine     # Criterion benchmarks (RTP, FEC, config)
 # C++ tests (requires CMake build):
 cd driver/build && ctest            # GoogleTest: QPマップ計算 7 tests
 ```
