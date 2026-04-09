@@ -95,6 +95,8 @@ impl OscBridge {
 
         if lip_valid {
             for (i, &raw) in lip.iter().enumerate() {
+                // Guard against NaN: a single NaN would permanently poison the EMA state
+                if raw.is_nan() { continue; }
                 let smoothed = alpha * self.prev_lip[i] + (1.0 - alpha) * raw;
                 self.prev_lip[i] = smoothed;
                 // Apply profile weight (lip indices 0-36)
@@ -113,6 +115,7 @@ impl OscBridge {
 
         if eye_valid {
             for (i, &raw) in eye.iter().enumerate() {
+                if raw.is_nan() { continue; }
                 let smoothed = alpha * self.prev_eye[i] + (1.0 - alpha) * raw;
                 self.prev_eye[i] = smoothed;
                 // Apply profile weight (eye indices 37-50)
@@ -130,12 +133,18 @@ impl OscBridge {
         }
     }
 
+    /// Get the current smoothed lip values (for testing).
+    #[cfg(test)]
+    pub fn prev_lip(&self) -> &[f32; 37] {
+        &self.prev_lip
+    }
+
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
 
     /// Set the active expression profile weights. None = no scaling (all 1.0).
-    pub fn set_profile(&mut self, profile: Option<&super::profiles::FtProfile>) {
+    pub fn set_profile(&mut self, profile: Option<&crate::face_tracking::profiles::FtProfile>) {
         self.profile_weights = profile.map(|p| p.weights.clone());
         if let Some(p) = profile {
             log::info!("FT profile activated: {}", p.name);
@@ -357,5 +366,132 @@ mod tests {
         bridge.send_face_data(true, false, &lip, &eye);
         // With α=0.0, output = raw value immediately
         assert!((bridge.prev_lip[0] - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_send_face_data_with_profile_weights() {
+        let mut bridge = OscBridge::with_smoothing(0.0); // no smoothing for predictable output
+        let profile = crate::face_tracking::profiles::FtProfile {
+            name: "test".to_string(),
+            weights: {
+                let mut w = vec![1.0; 51];
+                w[3] = 2.0; // JawOpen weight = 2x
+                w
+            },
+            smoothing_override: None,
+        };
+        bridge.set_profile(Some(&profile));
+
+        let mut lip = [0.0f32; 37];
+        lip[3] = 0.4; // JawOpen raw = 0.4
+        let eye = [0.0f32; 14];
+        bridge.send_face_data(true, false, &lip, &eye);
+
+        // smoothed = 0.0 * 0.0 + 1.0 * 0.4 = 0.4 (no smoothing)
+        assert!((bridge.prev_lip[3] - 0.4).abs() < 1e-6);
+        // The scaled value sent would be 0.4 * 2.0 = 0.8 (clamped to [0,1])
+    }
+
+    #[test]
+    fn test_send_face_data_nan_blendshapes() {
+        // NaN in input should NOT poison the EMA state (bug fix: NaN guard)
+        let mut bridge = OscBridge::with_smoothing(0.5);
+        let eye = [0.0f32; 14];
+
+        // First: set a valid value
+        let mut lip = [0.0f32; 37];
+        lip[3] = 0.8;
+        bridge.send_face_data(true, false, &lip, &eye);
+        let prev_after_valid = bridge.prev_lip[3];
+        assert!(!prev_after_valid.is_nan());
+
+        // Then: send NaN — should be skipped, prev_lip stays valid
+        lip[3] = f32::NAN;
+        bridge.send_face_data(true, false, &lip, &eye);
+        assert!(!bridge.prev_lip[3].is_nan(), "NaN should not poison EMA state");
+        assert!((bridge.prev_lip[3] - prev_after_valid).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_send_face_data_profile_clamps_over_1() {
+        let mut bridge = OscBridge::with_smoothing(0.0);
+        let profile = crate::face_tracking::profiles::FtProfile {
+            name: "high-weight".to_string(),
+            weights: {
+                let mut w = vec![1.0; 51];
+                w[0] = 3.0; // 3x weight
+                w
+            },
+            smoothing_override: None,
+        };
+        bridge.set_profile(Some(&profile));
+
+        let mut lip = [0.0f32; 37];
+        lip[0] = 0.5; // 0.5 * 3.0 = 1.5, should be clamped to 1.0
+        let eye = [0.0f32; 14];
+        bridge.send_face_data(true, false, &lip, &eye);
+        // prev_lip stores the smoothed (unscaled) value
+        assert!((bridge.prev_lip[0] - 0.5).abs() < 1e-6);
+        // The actual sent value would be clamped, but we can't observe UDP.
+        // This test verifies no panic from weight * value > 1.0.
+    }
+
+    #[test]
+    fn test_smoothing_override_from_profile() {
+        let mut bridge = OscBridge::with_smoothing(0.6);
+        assert!((bridge.smoothing - 0.6).abs() < 1e-6);
+
+        let profile = crate::face_tracking::profiles::FtProfile {
+            name: "smooth".to_string(),
+            weights: vec![1.0; 51],
+            smoothing_override: Some(0.3),
+        };
+        bridge.set_profile(Some(&profile));
+        assert!((bridge.smoothing - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_osc_float_encoding_matches_spec() {
+        let msg = encode_osc_float("/avatar/parameters/JawOpen", 0.5).unwrap();
+        // Address: "/avatar/parameters/JawOpen\0" = 27 bytes → padded to 28
+        assert_eq!(&msg[0..26], b"/avatar/parameters/JawOpen");
+        assert_eq!(msg[26], 0); // null terminator
+        assert_eq!(msg[27], 0); // padding to 28 bytes (4-byte boundary)
+        // Type tag at offset 28: ",f\0\0"
+        assert_eq!(&msg[28..32], b",f\0\0");
+        // Float at offset 32: 0.5 in big-endian
+        let float_bytes: [u8; 4] = msg[32..36].try_into().unwrap();
+        let value = f32::from_be_bytes(float_bytes);
+        assert!((value - 0.5).abs() < 1e-6);
+        // Total length: 28 + 4 + 4 = 36
+        assert_eq!(msg.len(), 36);
+    }
+
+    #[test]
+    fn test_parse_face_data_extra_bytes_ignored() {
+        // Payload longer than 206 bytes should still parse fine
+        let mut payload = vec![0u8; 300];
+        payload[0] = 1; // lip_valid
+        payload[1] = 1; // eye_valid
+        let jaw_off = 2 + 3 * 4;
+        payload[jaw_off..jaw_off + 4].copy_from_slice(&0.5f32.to_le_bytes());
+
+        let result = parse_face_data(&payload);
+        assert!(result.is_some());
+        let (lv, ev, lip, _) = result.unwrap();
+        assert!(lv);
+        assert!(ev);
+        assert!((lip[3] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_eye_and_lip_both_invalid_skips_all() {
+        let mut bridge = OscBridge::with_smoothing(0.5);
+        let lip = [1.0f32; 37];
+        let eye = [1.0f32; 14];
+        bridge.send_face_data(false, false, &lip, &eye);
+        // Neither lip nor eye should be updated
+        assert!((bridge.prev_lip[0] - 0.0).abs() < 1e-6);
+        assert!((bridge.prev_eye[0] - 0.0).abs() < 1e-6);
     }
 }
