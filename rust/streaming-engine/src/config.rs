@@ -65,6 +65,10 @@ pub struct NetworkConfig {
     pub udp_port: u16,
     #[serde(default = "default_fec_redundancy")]
     pub fec_redundancy: f32,
+    #[serde(default = "default_fec_redundancy_min")]
+    pub fec_redundancy_min: f32,
+    #[serde(default = "default_fec_redundancy_max")]
+    pub fec_redundancy_max: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +229,8 @@ fn default_ft_osc_port() -> u16 { 9000 }
 fn default_tcp_port() -> u16 { fvp_common::DEFAULT_TCP_PORT }
 fn default_udp_port() -> u16 { fvp_common::DEFAULT_UDP_PORT }
 fn default_fec_redundancy() -> f32 { fvp_common::DEFAULT_FEC_REDUNDANCY }
+fn default_fec_redundancy_min() -> f32 { 0.05 }
+fn default_fec_redundancy_max() -> f32 { 0.40 }
 fn default_bitrate() -> u32 { 80 }
 fn default_resolution() -> [u32; 2] { [1832, 1920] }
 fn default_framerate() -> u32 { 90 }
@@ -240,7 +246,13 @@ fn default_lockout_seconds() -> u64 { fvp_common::PIN_LOCKOUT_SECONDS }
 
 impl Default for NetworkConfig {
     fn default() -> Self {
-        Self { tcp_port: default_tcp_port(), udp_port: default_udp_port(), fec_redundancy: default_fec_redundancy() }
+        Self {
+            tcp_port: default_tcp_port(),
+            udp_port: default_udp_port(),
+            fec_redundancy: default_fec_redundancy(),
+            fec_redundancy_min: default_fec_redundancy_min(),
+            fec_redundancy_max: default_fec_redundancy_max(),
+        }
     }
 }
 impl Default for VideoConfig {
@@ -294,6 +306,21 @@ impl AppConfig {
         if self.network.tcp_port == self.network.udp_port {
             errors.push(ConfigError { field: "network.udp_port", message: format!("== tcp_port ({}), offsetting", self.network.tcp_port) });
             self.network.udp_port = self.network.tcp_port + 1;
+        }
+
+        // FEC redundancy
+        if self.network.fec_redundancy_min < 0.0 || self.network.fec_redundancy_min > 1.0
+            || self.network.fec_redundancy_min.is_nan()
+        {
+            errors.push(ConfigError { field: "network.fec_redundancy_min", message: format!("{} invalid, clamped to 0.05", self.network.fec_redundancy_min) });
+            self.network.fec_redundancy_min = 0.05;
+        }
+        if self.network.fec_redundancy_max < self.network.fec_redundancy_min
+            || self.network.fec_redundancy_max > 1.0
+            || self.network.fec_redundancy_max.is_nan()
+        {
+            errors.push(ConfigError { field: "network.fec_redundancy_max", message: format!("{} invalid, clamped to 0.40", self.network.fec_redundancy_max) });
+            self.network.fec_redundancy_max = 0.40;
         }
 
         // Video
