@@ -27,3 +27,5 @@ pub const RTP_CLOCK_RATE: u32 = 90_000;
 pub const RTP_PT_H265: u8 = 97;
 /// RTP payload type for H.264
 pub const RTP_PT_H264: u8 = 96;
+/// Maximum TCP control message length (64KB)
+pub const MAX_MSG_LEN: usize = 65536;

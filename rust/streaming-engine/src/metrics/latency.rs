@@ -123,4 +123,54 @@ mod tests {
         assert_eq!(tracker.frame_count(), 5);
         assert!(tracker.avg_pc_latency_us().is_some());
     }
+
+    #[test]
+    fn test_latency_tracker_rolling_window() {
+        let mut tracker = LatencyTracker::new(5);
+        for i in 0..10 {
+            let mut ts = FrameTimestamps::new(i);
+            ts.mark_encode_start();
+            ts.mark_encode_end();
+            ts.mark_send();
+            tracker.record(ts);
+        }
+        // Should evict oldest, keeping only 5
+        assert_eq!(tracker.frame_count(), 5);
+    }
+
+    #[test]
+    fn test_latency_tracker_empty_returns_none() {
+        let tracker = LatencyTracker::new(10);
+        assert_eq!(tracker.frame_count(), 0);
+        assert!(tracker.avg_pc_latency_us().is_none());
+        assert!(tracker.avg_encode_latency_us().is_none());
+    }
+
+    #[test]
+    fn test_encode_latency_without_start_returns_none() {
+        let mut ts = FrameTimestamps::new(0);
+        // Only mark encode_end and send, skip encode_start
+        ts.mark_encode_end();
+        ts.mark_send();
+        assert!(ts.encode_latency_us().is_none());
+        assert!(ts.pc_latency_us().is_some()); // present→send still works
+    }
+
+    #[test]
+    fn test_frame_timestamps_roundtrip() {
+        let mut ts = FrameTimestamps::new(42);
+        assert_eq!(ts.frame_index, 42);
+        assert!(ts.pc_latency_us().is_none()); // no send yet
+        assert!(ts.encode_latency_us().is_none()); // no encode yet
+
+        ts.mark_encode_start();
+        thread::sleep(Duration::from_millis(1));
+        ts.mark_encode_end();
+        ts.mark_send();
+
+        let enc = ts.encode_latency_us().unwrap();
+        let total = ts.pc_latency_us().unwrap();
+        assert!(enc >= 1000); // >= 1ms encode
+        assert!(total >= enc); // total >= encode
+    }
 }

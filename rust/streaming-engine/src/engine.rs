@@ -309,10 +309,11 @@ async fn handle_tcp_control(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const MAX_MSG_LEN: usize = 65536; // 64KB — control messages are small
+    const CONFIG_UPDATE_MIN_INTERVAL_MS: u64 = 1000; // Rate limit: 1 update/sec
 
     // Split stream for concurrent read (inbound messages) and write (haptic events)
     let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut last_config_update = std::time::Instant::now() - std::time::Duration::from_secs(2);
 
     /// Send a framed message to the HMD.
     async fn send_msg<W: AsyncWriteExt + Unpin>(writer: &mut W, msg_type: u8, payload: &[u8]) -> std::io::Result<()> {
@@ -336,7 +337,7 @@ async fn handle_tcp_control(
                 }
                 let len = u32::from_le_bytes(len_buf) as usize;
                 if len == 0 { continue; }
-                if len > MAX_MSG_LEN {
+                if len > fvp_common::MAX_MSG_LEN {
                     log::error!("TCP message too large ({} bytes), closing connection", len);
                     cancel.cancel();
                     break;
@@ -403,7 +404,13 @@ async fn handle_tcp_control(
                         // Keys: 0x01=bitrate_mbps(u32), 0x02=codec(0=h264,1=h265)
                         // Rate limit: ignore if <1s since last update
                         let payload = &msg_buf[1..];
+                        let elapsed = last_config_update.elapsed();
+                        if elapsed < std::time::Duration::from_millis(CONFIG_UPDATE_MIN_INTERVAL_MS) {
+                            log::warn!("CONFIG_UPDATE rate limited ({:?} since last)", elapsed);
+                            continue;
+                        }
                         if payload.len() >= 5 {
+                            last_config_update = std::time::Instant::now();
                             let key = payload[0];
                             let value = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
                             let mut ack_status: u8 = 0x00; // 0=rejected, 1=accepted
@@ -982,6 +989,190 @@ mod tests {
 
         // Frame 120 → 90000 (exactly 1 second)
         assert_eq!((120u64 * tick) as u32, 90000);
+    }
+
+    /// Helper: build a framed TCP message (4-byte LE length + msg_type + payload)
+    fn build_tcp_msg(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+        let len = (1 + payload.len()) as u32;
+        let mut buf = Vec::with_capacity(4 + len as usize);
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.push(msg_type);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    /// Helper: create a tcp_test_harness with mock duplex stream
+    struct TcpTestHarness {
+        cancel: CancellationToken,
+        hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
+        osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
+    }
+
+    impl TcpTestHarness {
+        fn new() -> Self {
+            Self {
+                cancel: CancellationToken::new(),
+                hmd_stats: Arc::new(StdMutex::new(None)),
+                osc_bridge: Arc::new(StdMutex::new(
+                    crate::face_tracking::osc_bridge::OscBridge::with_smoothing(0.5)
+                )),
+            }
+        }
+
+        async fn run_with_input(self, input: &[u8]) -> Self {
+            let (client, server) = tokio::io::duplex(4096);
+            let (_haptic_tx, haptic_rx) = mpsc::channel::<HapticEvent>(16);
+
+            // Write input to client side, then close
+            let (mut client_read, mut client_write) = tokio::io::split(client);
+            use tokio::io::AsyncWriteExt;
+            client_write.write_all(input).await.unwrap();
+            drop(client_write); // Close write side → EOF for server reader
+
+            let cancel = self.cancel.clone();
+            let stats = self.hmd_stats.clone();
+            let osc = self.osc_bridge.clone();
+
+            // Run handle_tcp_control (will read until EOF)
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                handle_tcp_control(Box::new(server), cancel, stats, osc, haptic_rx)
+            ).await;
+
+            // Read any response from server (ACK messages)
+            let mut response = Vec::new();
+            use tokio::io::AsyncReadExt;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                client_read.read_to_end(&mut response)
+            ).await;
+
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_config_update_valid_bitrate() {
+        let mut payload = vec![0x01u8]; // key = bitrate
+        payload.extend_from_slice(&100u32.to_le_bytes()); // value = 100 Mbps
+        let msg = build_tcp_msg(fvp_common::protocol::msg_type::CONFIG_UPDATE, &payload);
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&msg).await;
+        // Should not cancel (valid update)
+        assert!(!harness.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_config_update_invalid_bitrate() {
+        let mut payload = vec![0x01u8]; // key = bitrate
+        payload.extend_from_slice(&0u32.to_le_bytes()); // value = 0 (out of range)
+        let msg = build_tcp_msg(fvp_common::protocol::msg_type::CONFIG_UPDATE, &payload);
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&msg).await;
+        assert!(!harness.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_config_update_unknown_key() {
+        let mut payload = vec![0xFFu8]; // unknown key
+        payload.extend_from_slice(&50u32.to_le_bytes());
+        let msg = build_tcp_msg(fvp_common::protocol::msg_type::CONFIG_UPDATE, &payload);
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&msg).await;
+        assert!(!harness.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_config_update_short_payload() {
+        // Only 3 bytes payload (< 5 needed)
+        let msg = build_tcp_msg(fvp_common::protocol::msg_type::CONFIG_UPDATE, &[0x01, 0x00, 0x00]);
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&msg).await;
+        assert!(!harness.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_disconnect_cancels_token() {
+        let msg = build_tcp_msg(fvp_common::protocol::msg_type::DISCONNECT, &[]);
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&msg).await;
+        assert!(harness.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_oversized_message_rejected() {
+        // Write a length field of 70000 (> MAX_MSG_LEN)
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&70000u32.to_le_bytes());
+        // Don't need actual data — handler should reject based on length alone
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&msg).await;
+        assert!(harness.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_heartbeat_parses_stats() {
+        // HEARTBEAT payload: 12 bytes padding + 14 bytes stats = 26+ bytes
+        let mut payload = vec![0u8; 26];
+        // Stats at offset 12: packets_received(4) + packets_lost(4) + avg_decode_us(4) + fps(2)
+        let stats_start = 12;
+        payload[stats_start..stats_start + 4].copy_from_slice(&1000u32.to_le_bytes()); // packets_received
+        payload[stats_start + 4..stats_start + 8].copy_from_slice(&5u32.to_le_bytes()); // packets_lost
+        payload[stats_start + 8..stats_start + 12].copy_from_slice(&3000u32.to_le_bytes()); // avg_decode_us
+        payload[stats_start + 12..stats_start + 14].copy_from_slice(&90u16.to_le_bytes()); // fps
+
+        let msg = build_tcp_msg(fvp_common::protocol::msg_type::HEARTBEAT, &payload);
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&msg).await;
+
+        let stats = harness.hmd_stats.lock().unwrap();
+        assert!(stats.is_some(), "HmdStats should be populated after HEARTBEAT");
+        let s = stats.as_ref().unwrap();
+        assert_eq!(s.packets_received, 1000);
+        assert_eq!(s.packets_lost, 5);
+        assert_eq!(s.avg_decode_us, 3000);
+        assert_eq!(s.fps, 90);
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_face_data_forwarded() {
+        // Build FACE_DATA payload: [lip_valid:1][eye_valid:1][lip:37*4][eye:14*4] = 206 bytes
+        let mut payload = vec![0u8; 206];
+        payload[0] = 1; // lip_valid
+        payload[1] = 0; // eye not valid
+        // Set JawOpen (index 3) = 0.9
+        let jaw_off = 2 + 3 * 4;
+        payload[jaw_off..jaw_off + 4].copy_from_slice(&0.9f32.to_le_bytes());
+
+        let msg = build_tcp_msg(fvp_common::protocol::msg_type::FACE_DATA, &payload);
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&msg).await;
+
+        // Check that osc_bridge was updated (prev_lip[3] should be non-zero)
+        let bridge = harness.osc_bridge.lock().unwrap();
+        // With smoothing=0.5: smoothed = 0.5 * 0.0 + 0.5 * 0.9 = 0.45
+        assert!(bridge.prev_lip()[3] > 0.1, "osc_bridge should have received face data");
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_unknown_msg_type_skipped() {
+        // Unknown message followed by DISCONNECT. Verifies the unknown msg
+        // doesn't crash and the loop continues to process the next message.
+        let mut input = build_tcp_msg(0xFF, &[0x01, 0x02, 0x03]);
+        input.extend_from_slice(&build_tcp_msg(fvp_common::protocol::msg_type::DISCONNECT, &[]));
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&input).await;
+        // Cancel comes from DISCONNECT, not the unknown msg — proves the loop continued
+        assert!(harness.cancel.is_cancelled());
     }
 
     #[test]
