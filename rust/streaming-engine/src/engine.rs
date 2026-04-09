@@ -1120,6 +1120,7 @@ mod tests {
         cancel: CancellationToken,
         hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
         osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
+        disconnect_reason: Option<DisconnectReason>,
     }
 
     impl TcpTestHarness {
@@ -1130,10 +1131,11 @@ mod tests {
                 osc_bridge: Arc::new(StdMutex::new(
                     crate::face_tracking::osc_bridge::OscBridge::with_smoothing(0.5)
                 )),
+                disconnect_reason: None,
             }
         }
 
-        async fn run_with_input(self, input: &[u8]) -> Self {
+        async fn run_with_input(mut self, input: &[u8]) -> Self {
             let (client, server) = tokio::io::duplex(4096);
             let (_haptic_tx, haptic_rx) = mpsc::channel::<HapticEvent>(16);
 
@@ -1148,10 +1150,15 @@ mod tests {
             let osc = self.osc_bridge.clone();
 
             // Run handle_tcp_control (will read until EOF)
-            let _ = tokio::time::timeout(
+            let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 handle_tcp_control(Box::new(server), cancel, stats, osc, haptic_rx)
             ).await;
+
+            // Capture disconnect reason
+            if let Ok(Ok(reason)) = result {
+                self.disconnect_reason = Some(reason);
+            }
 
             // Read any response from server (ACK messages)
             let mut response = Vec::new();
@@ -1300,5 +1307,62 @@ mod tests {
             // Verify the interval represents ~1 second
             assert_eq!(interval, fps);
         }
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_reason_client_requested() {
+        let msg = build_tcp_msg(fvp_common::protocol::msg_type::DISCONNECT, &[]);
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&msg).await;
+        assert_eq!(harness.disconnect_reason, Some(DisconnectReason::ClientRequested));
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_reason_protocol_error() {
+        // Oversized message → ProtocolError → cancel is called
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&70000u32.to_le_bytes());
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&msg).await;
+        // ProtocolError always cancels
+        assert!(harness.cancel.is_cancelled());
+        assert_eq!(harness.disconnect_reason, Some(DisconnectReason::ProtocolError));
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_reason_enum_values() {
+        // Verify enum variants are distinct
+        assert_ne!(DisconnectReason::ClientRequested, DisconnectReason::ConnectionLost);
+        assert_ne!(DisconnectReason::ConnectionLost, DisconnectReason::ProtocolError);
+        assert_ne!(DisconnectReason::ClientRequested, DisconnectReason::ProtocolError);
+    }
+
+    #[tokio::test]
+    async fn test_transport_feedback_valid_not_crash() {
+        // Send valid TRANSPORT_FEEDBACK followed by DISCONNECT
+        let entries = vec![
+            fvp_common::protocol::TransportFeedbackEntry { sequence: 1, recv_delta_us: 100 },
+        ];
+        let payload = fvp_common::protocol::encode_transport_feedback(&entries);
+        let mut input = build_tcp_msg(fvp_common::protocol::msg_type::TRANSPORT_FEEDBACK, &payload);
+        input.extend_from_slice(&build_tcp_msg(fvp_common::protocol::msg_type::DISCONNECT, &[]));
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&input).await;
+        assert!(harness.cancel.is_cancelled());
+        assert_eq!(harness.disconnect_reason, Some(DisconnectReason::ClientRequested));
+    }
+
+    #[tokio::test]
+    async fn test_transport_feedback_invalid_not_crash() {
+        // Send invalid TRANSPORT_FEEDBACK (truncated) followed by DISCONNECT
+        let mut input = build_tcp_msg(fvp_common::protocol::msg_type::TRANSPORT_FEEDBACK, &[0x01]); // too short
+        input.extend_from_slice(&build_tcp_msg(fvp_common::protocol::msg_type::DISCONNECT, &[]));
+
+        let harness = TcpTestHarness::new();
+        let harness = harness.run_with_input(&input).await;
+        // Should warn but continue to DISCONNECT
+        assert!(harness.cancel.is_cancelled());
+        assert_eq!(harness.disconnect_reason, Some(DisconnectReason::ClientRequested));
     }
 }

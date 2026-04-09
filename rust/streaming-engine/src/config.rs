@@ -530,4 +530,41 @@ mod tests {
         assert!(errors.iter().any(|e| e.field == "audio.bitrate_kbps"));
         assert_eq!(cfg.audio.bitrate_kbps, 128);
     }
+
+    #[test]
+    fn test_validate_fec_redundancy_min_nan() {
+        let mut cfg = AppConfig::default();
+        cfg.network.fec_redundancy_min = f32::NAN;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "network.fec_redundancy_min"));
+        assert!((cfg.network.fec_redundancy_min - 0.05).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_validate_fec_redundancy_min_negative() {
+        let mut cfg = AppConfig::default();
+        cfg.network.fec_redundancy_min = -0.1;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "network.fec_redundancy_min"));
+        assert!((cfg.network.fec_redundancy_min - 0.05).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_validate_fec_redundancy_max_less_than_min() {
+        let mut cfg = AppConfig::default();
+        cfg.network.fec_redundancy_min = 0.10;
+        cfg.network.fec_redundancy_max = 0.05; // max < min
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "network.fec_redundancy_max"));
+        assert!((cfg.network.fec_redundancy_max - 0.40).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_validate_fec_redundancy_valid_range() {
+        let mut cfg = AppConfig::default();
+        cfg.network.fec_redundancy_min = 0.05;
+        cfg.network.fec_redundancy_max = 0.40;
+        let errors = cfg.validate();
+        assert!(!errors.iter().any(|e| e.field.contains("fec_redundancy")));
+    }
 }
