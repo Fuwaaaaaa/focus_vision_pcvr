@@ -82,10 +82,16 @@ bool NvencEncoder::encode(ID3D11Texture2D* srcTexture,
     outIsIdr = isIdr;
     m_frameCount++;
 
-    // Read gaze data for foveated encoding
+    // Read gaze data for foveated encoding.
+    // Uses ROI if supported, falls back to QP delta map otherwise.
     if (m_foveatedEnabled && m_gazeValid.load()) {
         float gx = m_gazeX.load();
         float gy = m_gazeY.load();
+        if (m_roiSupported) {
+            // TODO: NVENC ROI path — set per-region quality via ROI API
+            // For now, fall through to QP delta map
+        }
+        // Fallback: QP delta map (always available)
         computeQpDeltaMap(gx, gy);
     }
 
@@ -185,6 +191,17 @@ void NvencEncoder::setGaze(float gazeX, float gazeY, bool valid) {
     m_gazeValid.store(valid);
 }
 
+bool NvencEncoder::queryRoiCapability() {
+    // TODO: Query NVENC for ROI support via nvEncGetEncodeCaps()
+    // NV_ENC_CAPS_SUPPORT_EMPHASIS_LEVEL_MAP or similar.
+    // For now, always return false (ROI not supported).
+    // When NVENC SDK 12.x ROI is available, query here and return true.
+    //
+    // Fallback behavior: use QP delta map (already implemented and tested).
+    m_roiSupported = false;
+    return m_roiSupported;
+}
+
 void NvencEncoder::computeQpDeltaMap(float gazeX, float gazeY) {
     const uint32_t ctuSize = m_config.use_hevc ? 64 : 16;
     computeCtuGrid(m_config.width, m_config.height, ctuSize, m_ctuCols, m_ctuRows);
@@ -253,6 +270,28 @@ bool NvencEncoder::createEncoderSession() {
         encConfig.rcParams.qpMapMode = NV_ENC_QP_MAP_DELTA;
     }
 
+    // Set VUI (Video Usability Information) parameters for color space signaling.
+    // This tells the decoder whether the stream is full range (0-255) or limited (16-235).
+    if (m_config.use_hevc) {
+        auto& vui = encConfig.encodeCodecConfig.hevcConfig.hevcVUIParameters;
+        vui.videoSignalTypePresentFlag = 1;
+        vui.videoFormat = 5; // Unspecified
+        vui.videoFullRangeFlag = m_config.full_range ? 1 : 0;
+        vui.colourDescriptionPresentFlag = 1;
+        vui.colourPrimaries = 1;            // BT.709
+        vui.transferCharacteristics = 1;    // BT.709
+        vui.matrixCoeffs = 1;               // BT.709
+    } else {
+        auto& vui = encConfig.encodeCodecConfig.h264Config.h264VUIParameters;
+        vui.videoSignalTypePresentFlag = 1;
+        vui.videoFormat = 5;
+        vui.videoFullRangeFlag = m_config.full_range ? 1 : 0;
+        vui.colourDescriptionPresentFlag = 1;
+        vui.colourPrimaries = 1;
+        vui.transferCharacteristics = 1;
+        vui.matrixCoeffs = 1;
+    }
+
     NV_ENC_INITIALIZE_PARAMS initParams = {};
     initParams.version = NVENCAPI_STRUCT_VERSION(NV_ENC_INITIALIZE_PARAMS, 5);
     initParams.encodeGUID = m_config.use_hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
@@ -275,6 +314,9 @@ bool NvencEncoder::createEncoderSession() {
         OutputDebugStringA(buf);
         return false;
     }
+
+    // Query ROI capability after encoder is initialized
+    queryRoiCapability();
 
     return true;
 }

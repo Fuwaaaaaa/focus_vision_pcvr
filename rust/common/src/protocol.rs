@@ -86,6 +86,8 @@ pub mod msg_type {
     pub const AUDIO_START: u8 = 0x41;
     pub const CALIBRATE_START: u8 = 0x60;
     pub const CALIBRATE_STATUS: u8 = 0x61;
+    pub const FT_MIRROR_REQUEST: u8 = 0x65;   // PC → HMD: request camera feed
+    pub const FT_MIRROR_FRAME: u8 = 0x66;     // HMD → PC: camera frame data
     pub const DISCONNECT: u8 = 0xFF;
 }
 

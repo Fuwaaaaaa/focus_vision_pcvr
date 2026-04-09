@@ -76,14 +76,37 @@ struct NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
 
 struct NV_ENC_PRESET_CONFIG;  // Forward; not directly used
 
+/// VUI (Video Usability Information) parameters.
+/// Controls color space signaling in the bitstream.
+/// Shared layout for HEVC and H.264 VUI structs.
+struct NV_ENC_CONFIG_HEVC_VUI {
+    uint32_t overscanInfoPresentFlag;
+    uint32_t overscanAppropriateFlag;
+    uint32_t videoSignalTypePresentFlag;
+    uint32_t videoFormat;
+    uint32_t videoFullRangeFlag;         // 0 = limited (16-235), 1 = full (0-255)
+    uint32_t colourDescriptionPresentFlag;
+    uint32_t colourPrimaries;            // 1 = BT.709
+    uint32_t transferCharacteristics;    // 1 = BT.709
+    uint32_t matrixCoeffs;               // 1 = BT.709
+    uint32_t reserved[23];               // pad to 32 uint32_t
+};
+using NV_ENC_CONFIG_H264_VUI = NV_ENC_CONFIG_HEVC_VUI;
+
 struct NV_ENC_CONFIG_HEVC {
     uint32_t level;
     uint32_t tier;
-    uint32_t reserved[254];
+    uint32_t minCUSize;
+    uint32_t maxCUSize;
+    uint32_t reserved1[4];
+    NV_ENC_CONFIG_HEVC_VUI hevcVUIParameters; // 32 uint32_t
+    uint32_t reserved[216];              // total: 8 + 32 + 216 = 256
 };
 
 struct NV_ENC_CONFIG_H264 {
-    uint32_t reserved[256];
+    uint32_t reserved1[8];
+    NV_ENC_CONFIG_H264_VUI h264VUIParameters; // 32 uint32_t
+    uint32_t reserved[216];              // total: 8 + 32 + 216 = 256
 };
 
 struct NV_ENC_RC_PARAMS {
@@ -280,6 +303,12 @@ public:
         uint32_t fps = 90;
         uint32_t bitrate_bps = 80'000'000;
         bool use_hevc = true;
+        bool full_range = true;  // Full RGB (0-255) vs limited (16-235)
+        // Foveated encoding parameters (from Rust config via FFI)
+        float fovea_radius = 0.15f;
+        float mid_radius = 0.35f;
+        int32_t mid_qp_offset = 5;
+        int32_t peripheral_qp_offset = 15;
     };
 
     NvencEncoder() = default;
@@ -308,6 +337,18 @@ public:
     /// Enable/disable foveated encoding.
     void setFoveatedEnabled(bool enabled) { m_foveatedEnabled = enabled; }
 
+    /// Check if NVENC ROI (Region of Interest) encoding is supported.
+    /// ROI provides per-region quality control, superior to QP delta maps.
+    /// Falls back to QP delta map if ROI is not available.
+    bool isRoiSupported() const { return m_roiSupported; }
+
+    /// Get the current foveated encoding mode description.
+    const char* foveatedModeStr() const {
+        if (!m_foveatedEnabled) return "disabled";
+        if (m_roiSupported) return "roi";
+        return "qp_delta_map";
+    }
+
 private:
     // NVENC session
     void* m_encoder = nullptr;
@@ -331,6 +372,7 @@ private:
 
     // Foveated encoding state
     bool m_foveatedEnabled = false;
+    bool m_roiSupported = false;  // Set by queryRoiCapability() during init
     std::atomic<float> m_gazeX{0.5f};
     std::atomic<float> m_gazeY{0.5f};
     std::atomic<bool> m_gazeValid{false};
@@ -339,6 +381,7 @@ private:
     uint32_t m_ctuRows = 0;
 
     void computeQpDeltaMap(float gazeX, float gazeY);
+    bool queryRoiCapability();
 
     bool loadNvencApi();
     bool createEncoderSession();
