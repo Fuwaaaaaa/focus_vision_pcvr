@@ -211,6 +211,18 @@
 - **Context:** Outside Voice指摘: サーバー側だけでなくClient側FecFrameDecoderの変更が必須。4つの独立RSデコードコンテキストが必要。Androidクライアントの`fec_decoder.cpp`を4スライス対応に変更する必要がある
 - **Depends on:** Protocol v3 flags bit layout実装 + Client側FecFrameDecoder改修
 
+### TCP再接続holdのステートフル化 — 実機待ち
+- **What:** 現在のhold logic（engine.rs:880-910）はcancel token発火後に5秒sleepしているだけで、リスナーが開いていない＋UDP停止済み。真のステートフル再接続には、セッション状態を保持したままリスナーを開き続ける必要がある。またattemptカウンタがaccept失敗とconnection-lostで共有されており、Wi-Fi断5回でMAX_RECONNECT_ATTEMPTS到達→永久停止のリスクがある
+- **Why:** Outside Voice指摘（2026-04-10 eng review）: holdは「セッション破棄後の待機」であって「状態保持」ではない。HMDは再接続先がない
+- **Context:** 修正方針: (1) session_cancelをhold中は発火させない、(2) TCPリスナーをhold中も維持、(3) attemptカウンタをaccept失敗用とconnection-lost用に分離。TLS session resumption（session ticket）で再接続時のPINスキップは既に設計済み
+- **Depends on:** 実機でのWi-Fi断テスト
+
+### Adaptive FEC無効化オプション
+- **What:** config.tomlにadaptive_fec_enabled（デフォルトtrue）を追加し、falseの場合は固定fec_redundancy値を使用する
+- **Why:** デバッグ・比較テスト時に固定FEC冗長度で動作させたい。現在はadaptive_fecが常にSome()で初期化され無効化不可
+- **Context:** engine.rs:806でSome→Noneの分岐追加。config.rs + default.tomlにフィールド追加。adaptive_fecがNoneの場合はFecEncoder.set_redundancy()を呼ばない
+- **Depends on:** なし（純粋なconfig追加）
+
 ### Thermal Governor — 実機待ち
 - **What:** NVML API経由でGPU温度を監視し、過熱時に品質を段階的に制限
 - **Why:** 4時間連続稼働でGPU過熱→フレームドロップ→ユーザー体験悪化を防止
