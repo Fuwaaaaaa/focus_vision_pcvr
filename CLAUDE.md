@@ -1,6 +1,6 @@
 # Focus Vision PCVR
 
-VIVE Focus Vision向けPCVRストリーミングツール（v2.1）。
+VIVE Focus Vision向けPCVRストリーミングツール（v2.2）。
 
 ## Architecture
 - `rust/streaming-engine/` — Rust static library (C ABI via cbindgen)
@@ -16,9 +16,11 @@ Key modules in streaming-engine:
 - `face_tracking/profiles.rs` — Per-avatar expression profiles (51 blendshape weights, JSON)
 - `face_tracking/calibration.rs` — Guided auto-calibration (min/max → weight computation)
 - `config.rs` — TOML config with validation (structured ConfigError, range checks, NaN rejection)
-- `transport/` — RTP packetization, FEC, UDP with buffer pool
+- `transport/` — RTP packetization, FEC (adaptive + fixed), UDP with buffer pool
 - `adaptive/` — Bandwidth estimation, bitrate controller
 - `control/` — TCP server with TLS, PIN pairing, CONFIG_UPDATE protocol
+- `metrics/session_log.rs` — JSONL session logging with rotation
+- `metrics/memory.rs` — Process RSS monitoring (GetProcessMemoryInfo / /proc/self/status)
 
 See `ARCHITECTURE.md` for detailed system diagrams and data flow.
 
@@ -27,16 +29,16 @@ See `ARCHITECTURE.md` for detailed system diagrams and data flow.
 ./build.bat   # Windows full build
 cargo build --release -p streaming-engine    # Rust streaming engine
 cargo build --release -p focus-vision-companion  # PC companion app
-cargo test --workspace  # Run 204+ tests
+cargo test --workspace  # Run 263+ tests
 ```
 
 ## Testing
 ```bash
-cargo test --workspace              # All tests (204+)
-cargo test -p streaming-engine      # Engine: 163 tests (FEC, RTP, pairing, TLS, haptics, sleep, FT, profiles, calibration, config, TCP handler, latency, benchmarks)
+cargo test --workspace              # All tests (263+)
+cargo test -p streaming-engine      # Engine: 208 tests (FEC, adaptive FEC, RTP, pairing, TLS, haptics, sleep, FT, profiles, calibration, config, TCP handler, disconnect reason, transport feedback, session log, memory monitor, latency, benchmarks)
 cargo test -p focus-vision-companion # Companion: 25 tests (config, ADB, export)
-cargo test -p fvp-common            # Common: 9 tests (protocol structs, flags, versioning)
-cargo bench -p streaming-engine     # Criterion benchmarks (RTP, FEC, config)
+cargo test -p fvp-common            # Common: 23 tests (protocol structs, flags, versioning, transport feedback, fvp_flags compat gate)
+cargo bench -p streaming-engine     # Criterion benchmarks (RTP, FEC, adaptive FEC, config, memory)
 # C++ tests (requires CMake build):
 cd driver/build && ctest            # GoogleTest: QPマップ計算 7 tests
 ```
