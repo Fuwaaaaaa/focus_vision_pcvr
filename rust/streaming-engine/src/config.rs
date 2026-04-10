@@ -322,6 +322,17 @@ impl AppConfig {
             errors.push(ConfigError { field: "network.fec_redundancy_max", message: format!("{} invalid, clamped to 0.40", self.network.fec_redundancy_max) });
             self.network.fec_redundancy_max = 0.40;
         }
+        // Validate initial fec_redundancy is within [min, max]
+        if self.network.fec_redundancy.is_nan()
+            || self.network.fec_redundancy < self.network.fec_redundancy_min
+            || self.network.fec_redundancy > self.network.fec_redundancy_max
+        {
+            let clamped = self.network.fec_redundancy.clamp(
+                self.network.fec_redundancy_min, self.network.fec_redundancy_max
+            );
+            errors.push(ConfigError { field: "network.fec_redundancy", message: format!("{} out of [{}, {}], clamped to {}", self.network.fec_redundancy, self.network.fec_redundancy_min, self.network.fec_redundancy_max, clamped) });
+            self.network.fec_redundancy = clamped;
+        }
 
         // Video
         if self.video.bitrate_mbps < 10 || self.video.bitrate_mbps > 200 {
@@ -566,5 +577,24 @@ mod tests {
         cfg.network.fec_redundancy_max = 0.40;
         let errors = cfg.validate();
         assert!(!errors.iter().any(|e| e.field.contains("fec_redundancy")));
+    }
+
+    #[test]
+    fn test_validate_fec_redundancy_outside_min_max() {
+        let mut cfg = AppConfig::default();
+        cfg.network.fec_redundancy_min = 0.30;
+        cfg.network.fec_redundancy_max = 0.40;
+        cfg.network.fec_redundancy = 0.20; // below min
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "network.fec_redundancy"));
+        assert!((cfg.network.fec_redundancy - 0.30).abs() < 0.01); // clamped to min
+    }
+
+    #[test]
+    fn test_validate_fec_redundancy_nan() {
+        let mut cfg = AppConfig::default();
+        cfg.network.fec_redundancy = f32::NAN;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "network.fec_redundancy"));
     }
 }
