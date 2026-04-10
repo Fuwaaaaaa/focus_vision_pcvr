@@ -55,6 +55,31 @@ fn bench_fec_encode_large(c: &mut Criterion) {
     });
 }
 
+fn bench_adaptive_fec_adjust(c: &mut Criterion) {
+    use streaming_engine::transport::fec::AdaptiveFecController;
+
+    c.bench_function("adaptive_fec_adjust_cycle", |b| {
+        b.iter(|| {
+            let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+            // Simulate a sequence of loss rate changes
+            for loss in [0.005, 0.01, 0.02, 0.04, 0.06, 0.03, 0.01, 0.005] {
+                ctrl.adjust(black_box(loss));
+            }
+            black_box(ctrl.current_redundancy());
+        })
+    });
+}
+
+fn bench_memory_rss_read(c: &mut Criterion) {
+    use streaming_engine::metrics::memory::MemoryMonitor;
+
+    c.bench_function("memory_rss_read", |b| {
+        b.iter(|| {
+            black_box(MemoryMonitor::current_rss_mb());
+        })
+    });
+}
+
 fn bench_config_parse_validate(c: &mut Criterion) {
     use streaming_engine::config::AppConfig;
 
@@ -74,6 +99,8 @@ criterion_group!(
     bench_rtp_packetize_idr_frame,
     bench_fec_encode,
     bench_fec_encode_large,
+    bench_adaptive_fec_adjust,
+    bench_memory_rss_read,
     bench_config_parse_validate,
 );
 criterion_main!(benches);

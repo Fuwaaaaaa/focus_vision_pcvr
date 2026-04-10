@@ -2,6 +2,38 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [2.2.0] - 2026-04-10
+
+### Added
+- **適応FEC:** パケットロス率に応じてFEC冗長度を5-40%で自動調整。`AdaptiveFecController`がBandwidthEstimatorと連携
+- **TCP再接続強化:** `DisconnectReason` enum（ClientRequested/ConnectionLost/ProtocolError）で切断理由を識別。ConnectionLost時は5秒間再接続待機
+- **セッションログ:** JSONL形式のストリーミング統計記録（10秒間隔、60秒フラッシュ、7日ローテーション）
+- **Protocol v3:** TRANSPORT_FEEDBACK (0x12) メッセージタイプ、FVPヘッダにslice_index/slice_count/stream_idフィールド追加
+- **Protocol v3互換ゲート:** `fvp_flags::encode_compat()`でv2クライアントにはkeyframeビットのみ送信（後方互換性保証）
+- **Adaptive FEC無効化オプション:** `adaptive_fec_enabled = false`で固定冗長度モード（デバッグ用）
+- **メモリ監視:** `metrics/memory.rs` — GetProcessMemoryInfo (Win) / /proc/self/status (Linux) でプロセスRSS監視、1時間50MB超過で警告
+- **SECURITY.md更新:** TCP再接続5秒PINスキップウィンドウの脅威モデル・緩和策を追記
+
+### Changed
+- **chronoクレート導入:** session_log.rsのカスタムISO 8601タイムスタンプをchrono::Utcに置換（カレンダー計算バグ根絶）
+- **AdaptiveFecController:** ハードコード初期値20%を廃止、config.fec_redundancyを初期値として使用
+- **engine.rs リファクタ:** ストリーミングループからupdate_adaptive_bitrate/check_sleep_mode/update_latency_atomics/log_periodic_statsを関数抽出
+
+### Fixed
+- **FEC config検証:** fec_redundancyが[min, max]範囲外の場合にクランプ + 警告ログ
+- **FECテストコメント:** boundary_5_percent テストが>=5%ブラケットに入ることを正確に明記
+
+### Tests
+- **テスト263件に増加**（180→263、+83件）
+- 適応FEC 12テスト（低/中/高ロス、ステップ制限、NaN、境界値、初期値クランプ）
+- DisconnectReason 5テスト（ClientRequested、ProtocolError、enum一意性、TransportFeedback正常/異常）
+- セッションログ 7テスト（ディレクトリ作成、書込、Drop、空フラッシュ、タイムスタンプ、ローテーション）
+- メモリ監視 4テスト（ベースライン、ポーリング間隔、RSS取得、閾値ロジック）
+- Protocol v3互換ゲート 3テスト（v1/v2/v3）
+- FEC config検証 2テスト（範囲外クランプ、NaN）
+- TransportFeedback 5テスト（ラウンドトリップ、空、oversized、truncated、too_short）
+- FVP flags 4テスト（simple、full、max、overlap）
+
 ## [2.1.0] - 2026-04-07
 
 ### Added
