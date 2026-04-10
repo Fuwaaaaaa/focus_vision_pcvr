@@ -8,8 +8,8 @@
 
 [![License: Dual](https://img.shields.io/badge/License-MIT%20%7C%20Commercial-34D399.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-stable-e8e8ec.svg?logo=rust&logoColor=e8e8ec)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-180%2B-34D399.svg)](#testing)
-[![Version](https://img.shields.io/badge/version-2.1.0-34D399.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-263%2B-34D399.svg)](#testing)
+[![Version](https://img.shields.io/badge/version-2.2.0-34D399.svg)](CHANGELOG.md)
 
 </div>
 
@@ -24,7 +24,7 @@
 ### Streaming
 - **ワイヤレスPCVR** — Wi-Fi経由でSteamVRゲームをストリーミング
 - **低レイテンシー** — NVENC H.265/H.264ハードウェアエンコード
-- **適応ビットレート** — RTP+FEC、パケットロスに応じて自動調整
+- **適応ビットレート** — RTP+適応FEC（5-40%）、パケットロスに応じて自動調整
 - **96fps対応** — 30〜120fpsまで動的フレームレート
 - **フルRGBカラーレンジ** — 色表現の忠実度を向上
 
@@ -53,8 +53,9 @@
 
 ### 品質 & 安全性
 - **レイテンシーウォーターフォール** — encode/network/decode/renderの内訳をHMD内表示
-- **プロトコルバージョニング** — 後方互換性を維持した安全なアップデート
-- **コンフィグバリデーション** — 起動時に自動検証、不正値はフォールバック
+- **Protocol v3** — 後方互換ゲート付きプロトコル進化
+- **メモリ監視** — プロセスRSS監視、リーク検知（50MB/h閾値）
+- **セッションログ** — JSONL記録、7日ローテーション
 - **ハプティクスフィードバック** — SteamVR → HMD 完全振動パイプライン
 
 </td>
@@ -125,7 +126,7 @@ cargo build --release -p streaming-engine
 cargo build --release -p focus-vision-companion
 
 # テスト
-cargo test --workspace  # 180+ tests
+cargo test --workspace  # 263+ tests
 ```
 
 <details>
