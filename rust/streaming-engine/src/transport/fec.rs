@@ -131,11 +131,12 @@ pub struct AdaptiveFecController {
 }
 
 impl AdaptiveFecController {
-    pub fn new(min_redundancy: f32, max_redundancy: f32) -> Self {
+    pub fn new(min_redundancy: f32, max_redundancy: f32, initial: f32) -> Self {
         let min = min_redundancy.clamp(0.0, 1.0);
         let max = max_redundancy.clamp(min, 1.0);
+        debug_assert!(min <= max, "FEC min_redundancy ({min}) > max_redundancy ({max})");
         Self {
-            current_redundancy: 0.20, // start at default 20%
+            current_redundancy: initial.clamp(min, max),
             min_redundancy: min,
             max_redundancy: max,
             max_change_per_step: 0.05,
@@ -261,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_low_loss() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
         // Start at 20%, low loss → target 5%, but max step is 5%
         ctrl.adjust(0.005); // < 1%
         assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01); // 20% - 5% = 15%
@@ -269,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_high_loss() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
         // Start at 20%, high loss → target 40%, max step 5%
         ctrl.adjust(0.10); // > 5%
         assert!((ctrl.current_redundancy() - 0.25).abs() < 0.01); // 20% + 5% = 25%
@@ -277,14 +278,14 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_moderate_loss() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
         ctrl.adjust(0.02); // 2% → target 15%, diff = -5%
         assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01);
     }
 
     #[test]
     fn test_adaptive_fec_step_limit() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
         // Multiple steps to reach target
         ctrl.adjust(0.005); // 20→15
         ctrl.adjust(0.005); // 15→10
@@ -297,14 +298,14 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_nan_loss() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
         ctrl.adjust(f64::NAN); // should treat as 0
         assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01); // target 5%, step -5%
     }
 
     #[test]
     fn test_adaptive_fec_boundary_1_percent() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
         // Exactly 1% → falls into 1-3% bracket (target 15%)
         ctrl.adjust(0.01);
         assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01);
@@ -312,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_boundary_3_percent() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
         // Exactly 3% → falls into 3-5% bracket (target 25%)
         ctrl.adjust(0.03);
         assert!((ctrl.current_redundancy() - 0.25).abs() < 0.01);
@@ -320,10 +321,26 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_boundary_5_percent() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40);
-        // Exactly 5% → falls into >5% bracket (target 40%)
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        // Exactly 5% → loss < 0.05 is false, so falls into >=5% bracket (target 40%).
+        // From 20%, step-limited to +5% = 25%.
         ctrl.adjust(0.05);
-        assert!((ctrl.current_redundancy() - 0.25).abs() < 0.01); // 20+5=25 (clamped step)
+        assert!((ctrl.current_redundancy() - 0.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_adaptive_fec_initial_clamped_to_range() {
+        // Initial value below min should be clamped to min
+        let ctrl = AdaptiveFecController::new(0.30, 0.40, 0.20);
+        assert!((ctrl.current_redundancy() - 0.30).abs() < 0.01);
+
+        // Initial value above max should be clamped to max
+        let ctrl = AdaptiveFecController::new(0.05, 0.25, 0.40);
+        assert!((ctrl.current_redundancy() - 0.25).abs() < 0.01);
+
+        // Initial value within range stays as-is
+        let ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        assert!((ctrl.current_redundancy() - 0.20).abs() < 0.01);
     }
 
     #[test]

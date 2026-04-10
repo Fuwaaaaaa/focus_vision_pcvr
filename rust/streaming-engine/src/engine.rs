@@ -806,6 +806,7 @@ async fn run_streaming(
         let mut adaptive_fec = Some(crate::transport::fec::AdaptiveFecController::new(
             config.network.fec_redundancy_min,
             config.network.fec_redundancy_max,
+            config.network.fec_redundancy,
         ));
         let mut sleep_detector = crate::sleep_mode::SleepDetector::new(
             config.sleep_mode.enabled,

@@ -1,3 +1,4 @@
+use chrono::Utc;
 use serde::Serialize;
 use std::fs;
 use std::io::Write;
@@ -35,8 +36,8 @@ impl SessionLogger {
     pub fn new(dir: &Path, retention_days: u32) -> Result<Self, std::io::Error> {
         fs::create_dir_all(dir)?;
 
-        let now = chrono_timestamp();
-        let file_name = format!("session_{}.jsonl", now.replace(':', "-").replace('T', "_").split('.').next().unwrap_or(&now));
+        let now = Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+        let file_name = format!("session_{}.jsonl", now);
         let file_path = dir.join(file_name);
 
         Ok(Self {
@@ -132,41 +133,9 @@ impl Drop for SessionLogger {
     }
 }
 
-fn chrono_timestamp() -> String {
-    // Simple ISO 8601 timestamp without chrono dependency
-    let duration = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-    // Approximate: not leap-second accurate, but sufficient for file naming
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Calculate year/month/day from days since epoch (simplified)
-    let mut y = 1970i32;
-    let mut remaining_days = days as i32;
-    loop {
-        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        y += 1;
-    }
-    let is_leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = [31, if is_leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut m = 0;
-    for md in month_days {
-        if remaining_days < md {
-            break;
-        }
-        remaining_days -= md;
-        m += 1;
-    }
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m + 1, remaining_days + 1, hours, minutes, seconds)
+/// Generate ISO 8601 UTC timestamp for session records.
+fn utc_timestamp() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 #[cfg(test)]
@@ -245,11 +214,61 @@ mod tests {
     }
 
     #[test]
-    fn test_chrono_timestamp_format() {
-        let ts = chrono_timestamp();
+    fn test_utc_timestamp_format() {
+        let ts = utc_timestamp();
         // Should look like "2026-04-09T12:00:00Z"
         assert!(ts.contains('T'));
         assert!(ts.ends_with('Z'));
         assert_eq!(ts.len(), 20);
+        // Verify year is reasonable
+        let year: u32 = ts[0..4].parse().unwrap();
+        assert!(year >= 2024 && year <= 2100);
+    }
+
+    #[test]
+    fn test_session_logger_rotate_preserves_recent_files() {
+        // Test that rotate() doesn't delete recent files
+        let dir = std::env::temp_dir().join("fvp_test_session_log_rotate");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create a fresh .jsonl file (mtime = now)
+        let recent_file = dir.join("session_recent.jsonl");
+        fs::write(&recent_file, "recent data\n").unwrap();
+
+        // Create a non-jsonl file (should be ignored)
+        let txt_file = dir.join("notes.txt");
+        fs::write(&txt_file, "not a log\n").unwrap();
+
+        let logger = SessionLogger::new(&dir, 7).unwrap();
+        logger.rotate();
+
+        // Recent .jsonl file should be preserved (mtime < 7 days old)
+        assert!(recent_file.exists(), "Recent jsonl file should be preserved");
+        // Non-jsonl file should be untouched
+        assert!(txt_file.exists(), "Non-jsonl file should be ignored");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_session_logger_rotate_skips_non_jsonl() {
+        let dir = std::env::temp_dir().join("fvp_test_session_log_rotate_ext");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let txt_file = dir.join("old.txt");
+        fs::write(&txt_file, "data\n").unwrap();
+        let json_file = dir.join("old.json");
+        fs::write(&json_file, "data\n").unwrap();
+
+        let logger = SessionLogger::new(&dir, 0).unwrap(); // 0-day retention
+        logger.rotate();
+
+        // Non-jsonl files should never be deleted regardless of age
+        assert!(txt_file.exists());
+        assert!(json_file.exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
