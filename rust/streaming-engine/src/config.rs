@@ -33,6 +33,8 @@ pub struct AppConfig {
     pub face_tracking: FaceTrackingConfig,
     #[serde(default)]
     pub sleep_mode: SleepModeConfig,
+    #[serde(default)]
+    pub memory_monitor: MemoryMonitorConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +71,8 @@ pub struct NetworkConfig {
     pub fec_redundancy_min: f32,
     #[serde(default = "default_fec_redundancy_max")]
     pub fec_redundancy_max: f32,
+    #[serde(default = "default_adaptive_fec_enabled")]
+    pub adaptive_fec_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +226,32 @@ fn default_sleep_timeout() -> u32 { 300 }
 fn default_sleep_motion_threshold() -> f32 { 0.002 }
 fn default_sleep_bitrate() -> u32 { 8 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryMonitorConfig {
+    #[serde(default = "default_memory_monitor_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_memory_poll_seconds")]
+    pub poll_interval_seconds: u32,
+    /// Warn if process memory grows by this many MB within 1 hour.
+    #[serde(default = "default_memory_growth_threshold_mb")]
+    pub growth_threshold_mb: u32,
+}
+
+impl Default for MemoryMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_memory_monitor_enabled(),
+            poll_interval_seconds: default_memory_poll_seconds(),
+            growth_threshold_mb: default_memory_growth_threshold_mb(),
+        }
+    }
+}
+
+fn default_memory_monitor_enabled() -> bool { true }
+fn default_memory_poll_seconds() -> u32 { 60 }
+fn default_memory_growth_threshold_mb() -> u32 { 50 }
+fn default_adaptive_fec_enabled() -> bool { true }
+
 fn default_ft_enabled() -> bool { true }
 fn default_ft_smoothing() -> f32 { 0.6 }
 fn default_ft_osc_port() -> u16 { 9000 }
@@ -252,6 +282,7 @@ impl Default for NetworkConfig {
             fec_redundancy: default_fec_redundancy(),
             fec_redundancy_min: default_fec_redundancy_min(),
             fec_redundancy_max: default_fec_redundancy_max(),
+            adaptive_fec_enabled: default_adaptive_fec_enabled(),
         }
     }
 }
