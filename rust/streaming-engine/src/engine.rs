@@ -481,7 +481,6 @@ async fn handle_tcp_control(
             }
         }
     }
-    Ok(DisconnectReason::ConnectionLost)
 }
 
 /// Spawn the audio capture → Opus encode → UDP send pipeline.

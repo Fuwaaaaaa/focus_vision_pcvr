@@ -103,7 +103,14 @@ void OpenXRApp::getSystem() {
 
 void OpenXRApp::initEGL() {
     m_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    eglInitialize(m_eglDisplay, nullptr, nullptr);
+    if (m_eglDisplay == EGL_NO_DISPLAY) {
+        LOGE("eglGetDisplay failed");
+        return;
+    }
+    if (!eglInitialize(m_eglDisplay, nullptr, nullptr)) {
+        LOGE("eglInitialize failed: 0x%x", eglGetError());
+        return;
+    }
 
     EGLint configAttribs[] = {
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
@@ -117,16 +124,30 @@ void OpenXRApp::initEGL() {
     };
 
     EGLint numConfigs;
-    eglChooseConfig(m_eglDisplay, configAttribs, &m_eglConfig, 1, &numConfigs);
+    if (!eglChooseConfig(m_eglDisplay, configAttribs, &m_eglConfig, 1, &numConfigs) || numConfigs == 0) {
+        LOGE("eglChooseConfig failed: 0x%x", eglGetError());
+        return;
+    }
 
     EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
     m_eglContext = eglCreateContext(m_eglDisplay, m_eglConfig, EGL_NO_CONTEXT, contextAttribs);
+    if (m_eglContext == EGL_NO_CONTEXT) {
+        LOGE("eglCreateContext failed: 0x%x", eglGetError());
+        return;
+    }
 
     // Create a small pbuffer surface (required for making context current)
     EGLint pbufferAttribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
     m_eglSurface = eglCreatePbufferSurface(m_eglDisplay, m_eglConfig, pbufferAttribs);
+    if (m_eglSurface == EGL_NO_SURFACE) {
+        LOGE("eglCreatePbufferSurface failed: 0x%x", eglGetError());
+        return;
+    }
 
-    eglMakeCurrent(m_eglDisplay, m_eglSurface, m_eglSurface, m_eglContext);
+    if (!eglMakeCurrent(m_eglDisplay, m_eglSurface, m_eglSurface, m_eglContext)) {
+        LOGE("eglMakeCurrent failed: 0x%x", eglGetError());
+        return;
+    }
     LOGI("EGL context created (GLES 3.0)");
 }
 
