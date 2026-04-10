@@ -803,11 +803,16 @@ async fn run_streaming(
         let mut bitrate_ctrl = crate::adaptive::bitrate_controller::BitrateController::new(
             config.video.bitrate_mbps,
         );
-        let mut adaptive_fec = Some(crate::transport::fec::AdaptiveFecController::new(
-            config.network.fec_redundancy_min,
-            config.network.fec_redundancy_max,
-            config.network.fec_redundancy,
-        ));
+        let mut adaptive_fec = if config.network.adaptive_fec_enabled {
+            Some(crate::transport::fec::AdaptiveFecController::new(
+                config.network.fec_redundancy_min,
+                config.network.fec_redundancy_max,
+                config.network.fec_redundancy,
+            ))
+        } else {
+            log::info!("Adaptive FEC disabled — using fixed redundancy {:.0}%", config.network.fec_redundancy * 100.0);
+            None
+        };
         let mut sleep_detector = crate::sleep_mode::SleepDetector::new(
             config.sleep_mode.enabled,
             config.sleep_mode.motion_threshold,

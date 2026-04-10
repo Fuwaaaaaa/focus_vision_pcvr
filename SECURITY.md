@@ -22,6 +22,7 @@ Focus Vision PCVR communicates over Wi-Fi between a Windows PC and an Android HM
 | UDP stream encryption | Not implemented | Video/audio/tracking sent as plaintext UDP. SRTP planned for future. |
 | Replay attacks | Partially mitigated | TLS prevents replay on control channel. UDP streams have no replay protection. |
 | Session hijacking | Low risk | Once paired, no re-authentication. Session bound to TCP connection lifetime. |
+| TCP reconnect PIN skip | Low risk | 5s window after connection loss where client can reconnect without PIN. Mitigated by TLS session resumption (session ticket verifies same client cryptographically) + TOFU certificate pinning (SHA-256 fingerprint). New clients always require PIN. Window is short (5s) and attacker would need to impersonate the TLS session. |
 | Certificate rotation | Manual | New cert generated each server restart. No automated rotation. |
 
 ### Architecture
