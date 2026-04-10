@@ -217,7 +217,12 @@ std::optional<FecFrameDecoder::DecodedFrame> FecFrameDecoder::tryDecode() {
     DecodedFrame frame;
     frame.frameIndex = m_frameIndex;
     frame.isKeyframe = m_isKeyframe;
-    frame.data.resize(m_dataShards * m_shardSize, 0);
+    size_t totalSize = (size_t)m_dataShards * m_shardSize;
+    if (m_shardSize > 0 && totalSize / m_shardSize != m_dataShards) {
+        LOGE("FEC: integer overflow in frame size (%u * %d)", m_dataShards, m_shardSize);
+        return {};
+    }
+    frame.data.resize(totalSize, 0);
 
     for (uint16_t di = 0; di < m_dataShards; di++) {
         for (int byteIdx = 0; byteIdx < m_shardSize; byteIdx++) {

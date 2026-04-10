@@ -88,6 +88,7 @@ void CDirectModeComponent::CreateSwapTextureSet(
     }
 
     uint32_t setId = m_nextSetId++;
+    size_t swapStartIdx = m_swapTextures.size();
     for (uint32_t i = 0; i < 3; i++)
     {
         vr::SharedTextureHandle_t handle = m_nextHandle++;
@@ -104,6 +105,8 @@ void CDirectModeComponent::CreateSwapTextureSet(
             snprintf(buf, sizeof(buf),
                 "Focus Vision PCVR: CreateTexture2D failed for swap set (hr=0x%08lx)\n", hr);
             vr::VRDriverLog()->Log(buf);
+            // Clean up partially created textures for this set
+            m_swapTextures.erase(m_swapTextures.begin() + swapStartIdx, m_swapTextures.end());
             return;
         }
 

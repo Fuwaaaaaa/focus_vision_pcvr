@@ -133,15 +133,14 @@ impl Drop for SessionLogger {
     }
 }
 
-/// Generate ISO 8601 UTC timestamp for session records.
-fn utc_timestamp() -> String {
-    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    fn utc_timestamp() -> String {
+        Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    }
 
     fn make_record() -> SessionRecord {
         SessionRecord {

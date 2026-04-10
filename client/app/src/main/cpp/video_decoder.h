@@ -56,6 +56,7 @@ private:
     bool m_useSurfaceOutput = false;
 
     // JNI references for SurfaceTexture lifecycle
+    // m_javaVM is set once in init() and read in shutdown(); process-global and immutable after init.
     JavaVM* m_javaVM = nullptr;
     jobject m_javaSurfaceTexture = nullptr;
 

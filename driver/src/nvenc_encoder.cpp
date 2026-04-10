@@ -223,6 +223,8 @@ bool NvencEncoder::loadNvencApi() {
         GetProcAddress(lib, "NvEncodeAPICreateInstance");
     if (!createInstance) {
         OutputDebugStringA("NvencEncoder: NvEncodeAPICreateInstance not found\n");
+        FreeLibrary(lib);
+        m_nvencLib = nullptr;
         return false;
     }
 

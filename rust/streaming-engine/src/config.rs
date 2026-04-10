@@ -418,6 +418,14 @@ impl AppConfig {
             errors.push(ConfigError { field: "foveated.mid_radius", message: format!("{} invalid (must be > fovea_radius), clamped to 0.35", self.foveated.mid_radius) });
             self.foveated.mid_radius = 0.35;
         }
+        if self.foveated.mid_qp_offset < 0 || self.foveated.mid_qp_offset > 51 {
+            errors.push(ConfigError { field: "foveated.mid_qp_offset", message: format!("{} out of range [0-51], clamped to 5", self.foveated.mid_qp_offset) });
+            self.foveated.mid_qp_offset = 5;
+        }
+        if self.foveated.peripheral_qp_offset < 0 || self.foveated.peripheral_qp_offset > 51 {
+            errors.push(ConfigError { field: "foveated.peripheral_qp_offset", message: format!("{} out of range [0-51], clamped to 10", self.foveated.peripheral_qp_offset) });
+            self.foveated.peripheral_qp_offset = 10;
+        }
 
         errors
     }
@@ -627,5 +635,41 @@ mod tests {
         cfg.network.fec_redundancy = f32::NAN;
         let errors = cfg.validate();
         assert!(errors.iter().any(|e| e.field == "network.fec_redundancy"));
+    }
+
+    #[test]
+    fn test_validate_qp_offset_negative() {
+        let mut cfg = AppConfig::default();
+        cfg.foveated.mid_qp_offset = -1;
+        cfg.foveated.peripheral_qp_offset = -100;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "foveated.mid_qp_offset"));
+        assert!(errors.iter().any(|e| e.field == "foveated.peripheral_qp_offset"));
+        assert_eq!(cfg.foveated.mid_qp_offset, 5);
+        assert_eq!(cfg.foveated.peripheral_qp_offset, 10);
+    }
+
+    #[test]
+    fn test_validate_qp_offset_too_high() {
+        let mut cfg = AppConfig::default();
+        cfg.foveated.mid_qp_offset = 52;
+        cfg.foveated.peripheral_qp_offset = 1000;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "foveated.mid_qp_offset"));
+        assert!(errors.iter().any(|e| e.field == "foveated.peripheral_qp_offset"));
+        assert_eq!(cfg.foveated.mid_qp_offset, 5);
+        assert_eq!(cfg.foveated.peripheral_qp_offset, 10);
+    }
+
+    #[test]
+    fn test_validate_qp_offset_valid_boundaries() {
+        let mut cfg = AppConfig::default();
+        cfg.foveated.mid_qp_offset = 0;
+        cfg.foveated.peripheral_qp_offset = 51;
+        let errors = cfg.validate();
+        assert!(!errors.iter().any(|e| e.field == "foveated.mid_qp_offset"));
+        assert!(!errors.iter().any(|e| e.field == "foveated.peripheral_qp_offset"));
+        assert_eq!(cfg.foveated.mid_qp_offset, 0);
+        assert_eq!(cfg.foveated.peripheral_qp_offset, 51);
     }
 }
