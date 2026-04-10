@@ -181,23 +181,18 @@
 
 ## v2.2 スコープ（実機入手後）
 
-### Protocol v3 flags bit layout + 後方互換ゲート
-- **What:** FVPヘッダのflagsフィールドにslice_index(4bit), slice_count(4bit), stream_id(2bit)をパッキングする際、v2クライアントとの互換性ゲートを実装
-- **Why:** Outside Voice指摘: v2クライアントは新bitを誤解釈する。プロトコルバージョンネゴシエーション（HELLO/HELLO_ACKのversion）でv3がネゴシエートされた場合のみ新flagsを使用する必要がある
-- **Context:** 現在flags:u16でbit0(keyframe)のみ使用。bit1-10を新用途に使う。v2クライアントはbit1-15を無視するが、新しいフィールド値をkeyframeと誤判定する可能性あり
-- **Depends on:** v2.2.0のProtocol v3基盤実装後
+### ~~Protocol v3 flags bit layout + 後方互換ゲート~~ (完了)
+- fvp_flags::encode_compat()でnegotiated versionに基づきv2互換/v3フルflags切替を実装
+- v1/v2クライアントにはkeyframeビットのみ送信。テスト3件追加。
 
-### メモリ監視: staticlibアロケータ問題
-- **What:** ヒープ使用量監視をシステムアロケータ経由で実装（jemallocではなくGetProcessMemoryInfo / /proc/self/status）
-- **Why:** Outside Voice指摘: streaming-engineはstaticlibとしてC++ DLLにリンクされるため、Rustのjemallocアロケータは使えない。プロセス全体のメモリ使用量をOS API経由で取得する必要がある
-- **Context:** Windows: GetProcessMemoryInfo()でWorkingSetSize取得。Linux/Android: /proc/self/status のVmRSS。1時間で50MB以上の増加を検知→警告ログ
-- **Depends on:** 実機でのメモリ使用パターン確認
+### ~~メモリ監視: staticlibアロケータ問題~~ (完了)
+- metrics/memory.rs: GetProcessMemoryInfo (Win) / /proc/self/status (Linux) でプロセスRSS取得
+- MemoryMonitor構造体: 60秒ポーリング、1時間で50MB以上増加→警告ログ
+- config: [memory_monitor] enabled/poll_interval_seconds/growth_threshold_mb
 
-### TCP再接続PINスキップ: SECURITY.md脅威モデル更新
-- **What:** 5秒間のPINなし再接続ウィンドウのMITMリスクをSECURITY.mdに追記し、TLSチャネルバインディングによる緩和策を実装
-- **Why:** Outside Voice指摘: PIN不要の再接続は短時間のMITMウィンドウを開く。ただしTLS session resumptionが同一クライアントを暗号学的に検証するため、実質的なリスクは低い
-- **Context:** TLS session ticket + TOFU certificate pinning（SHA-256 fingerprint）で再接続元を検証。新規接続は常にPIN必須。SECURITY.mdの「Session Management」セクションに記載が必要
-- **Depends on:** v2.2.0のTCP再接続実装後
+### ~~TCP再接続PINスキップ: SECURITY.md脅威モデル更新~~ (完了)
+- SECURITY.mdのKnown Limitationsテーブルに5秒PINスキップウィンドウの脅威分析を追記
+- TLS session resumption + TOFUピニングによる緩和を明記
 
 ### GCC推定器（delay-based帯域推定）— 実機待ち
 - **What:** パケット到着時間のdelay variationからネットワーク帯域逼迫を検出。ロス発生前に制御可能に
@@ -217,11 +212,9 @@
 - **Context:** 修正方針: (1) session_cancelをhold中は発火させない、(2) TCPリスナーをhold中も維持、(3) attemptカウンタをaccept失敗用とconnection-lost用に分離。TLS session resumption（session ticket）で再接続時のPINスキップは既に設計済み
 - **Depends on:** 実機でのWi-Fi断テスト
 
-### Adaptive FEC無効化オプション
-- **What:** config.tomlにadaptive_fec_enabled（デフォルトtrue）を追加し、falseの場合は固定fec_redundancy値を使用する
-- **Why:** デバッグ・比較テスト時に固定FEC冗長度で動作させたい。現在はadaptive_fecが常にSome()で初期化され無効化不可
-- **Context:** engine.rs:806でSome→Noneの分岐追加。config.rs + default.tomlにフィールド追加。adaptive_fecがNoneの場合はFecEncoder.set_redundancy()を呼ばない
-- **Depends on:** なし（純粋なconfig追加）
+### ~~Adaptive FEC無効化オプション~~ (完了)
+- config.toml: adaptive_fec_enabled（デフォルトtrue）を追加
+- engine.rs: false時はAdaptiveFecControllerを生成しない（None）、固定fec_redundancyを使用
 
 ### Thermal Governor — 実機待ち
 - **What:** NVML API経由でGPU温度を監視し、過熱時に品質を段階的に制限

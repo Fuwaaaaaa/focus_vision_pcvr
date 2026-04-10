@@ -4,6 +4,7 @@ udp_port = 9945
 fec_redundancy = 0.2
 fec_redundancy_min = 0.05    # Adaptive FEC minimum (low loss → bandwidth saving)
 fec_redundancy_max = 0.40    # Adaptive FEC maximum (high loss → max protection)
+adaptive_fec_enabled = true  # Set false to use fixed fec_redundancy for debugging
 
 [video]
 codec = "h265"
@@ -42,6 +43,11 @@ enabled = true
 timeout_seconds = 300       # 5 minutes of inactivity → sleep
 motion_threshold = 0.002    # meters per frame (~0.18m/s at 90fps)
 sleep_bitrate_mbps = 8      # reduced bitrate during sleep
+
+[memory_monitor]
+enabled = true
+poll_interval_seconds = 60
+growth_threshold_mb = 50     # Warn if RSS grows by 50+ MB in 1 hour
 
 [pairing]
 max_attempts = 5

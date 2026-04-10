@@ -142,6 +142,23 @@ pub mod fvp_flags {
         flags
     }
 
+    /// Encode flags with backward compatibility gate.
+    /// If negotiated protocol version < 3, only use keyframe bit (v2 compat).
+    /// v2 clients may misinterpret bits 1-10 as keyframe if set.
+    pub fn encode_compat(
+        negotiated_version: u16,
+        is_keyframe: bool,
+        slice_index: u8,
+        slice_count: u8,
+        stream_id: u8,
+    ) -> u16 {
+        if negotiated_version >= 3 {
+            encode(is_keyframe, slice_index, slice_count, stream_id)
+        } else {
+            encode_simple(is_keyframe)
+        }
+    }
+
     pub fn is_keyframe(flags: u16) -> bool { flags & KEYFRAME != 0 }
     pub fn slice_index(flags: u16) -> u8 { ((flags & SLICE_INDEX_MASK) >> SLICE_INDEX_SHIFT) as u8 }
     pub fn slice_count(flags: u16) -> u8 { ((flags & SLICE_COUNT_MASK) >> SLICE_COUNT_SHIFT) as u8 }
@@ -381,5 +398,33 @@ mod tests {
     #[test]
     fn protocol_version_is_3() {
         assert_eq!(PROTOCOL_VERSION, 3);
+    }
+
+    #[test]
+    fn fvp_flags_compat_v2_uses_simple() {
+        // v2 client: only keyframe bit should be set, even if slice/stream data provided
+        let flags = fvp_flags::encode_compat(2, true, 3, 4, 2);
+        assert!(fvp_flags::is_keyframe(flags));
+        assert_eq!(fvp_flags::slice_index(flags), 0); // v2: no slice info
+        assert_eq!(fvp_flags::slice_count(flags), 0);
+        assert_eq!(fvp_flags::stream_id(flags), 0);
+    }
+
+    #[test]
+    fn fvp_flags_compat_v3_uses_full() {
+        // v3 client: all fields should be encoded
+        let flags = fvp_flags::encode_compat(3, true, 3, 4, 2);
+        assert!(fvp_flags::is_keyframe(flags));
+        assert_eq!(fvp_flags::slice_index(flags), 3);
+        assert_eq!(fvp_flags::slice_count(flags), 4);
+        assert_eq!(fvp_flags::stream_id(flags), 2);
+    }
+
+    #[test]
+    fn fvp_flags_compat_v1_uses_simple() {
+        // v1 (legacy): same as v2
+        let flags = fvp_flags::encode_compat(1, false, 5, 6, 1);
+        assert!(!fvp_flags::is_keyframe(flags));
+        assert_eq!(flags, 0); // no bits set
     }
 }
