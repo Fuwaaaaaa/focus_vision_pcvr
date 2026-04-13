@@ -1,5 +1,6 @@
 [workspace]
 members = ["rust/streaming-engine", "rust/common", "rust/companion-app"]
+exclude = ["rust/streaming-engine/fuzz"]
 resolver = "2"
 
 [workspace.dependencies]
