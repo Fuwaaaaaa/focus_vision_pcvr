@@ -29,16 +29,18 @@ See `ARCHITECTURE.md` for detailed system diagrams and data flow.
 ./build.bat   # Windows full build
 cargo build --release -p streaming-engine    # Rust streaming engine
 cargo build --release -p focus-vision-companion  # PC companion app
-cargo test --workspace  # Run 263+ tests
+cargo test --workspace  # Run 270+ tests
 ```
 
 ## Testing
 ```bash
-cargo test --workspace              # All tests (263+)
-cargo test -p streaming-engine      # Engine: 208 tests (FEC, adaptive FEC, RTP, pairing, TLS, haptics, sleep, FT, profiles, calibration, config, TCP handler, disconnect reason, transport feedback, session log, memory monitor, latency, benchmarks)
+cargo test --workspace              # All tests (270+)
+cargo test -p streaming-engine      # Engine: 215 tests (FEC, adaptive FEC, RTP, pairing, TLS, haptics, sleep, FT, profiles, calibration, config, TCP handler, disconnect reason, transport feedback, session log, memory monitor, latency, benchmarks, fuzz property tests)
 cargo test -p focus-vision-companion # Companion: 25 tests (config, ADB, export)
 cargo test -p fvp-common            # Common: 23 tests (protocol structs, flags, versioning, transport feedback, fvp_flags compat gate)
 cargo bench -p streaming-engine     # Criterion benchmarks (RTP, FEC, adaptive FEC, config, memory)
+# Fuzz targets (Linux CI / cargo-fuzz):
+cd rust/streaming-engine && cargo fuzz list  # fuzz_rtp, fuzz_fec, fuzz_protocol, fuzz_config
 # C++ tests (requires CMake build):
 cd driver/build && ctest            # GoogleTest: QPマップ計算 7 tests
 ```
