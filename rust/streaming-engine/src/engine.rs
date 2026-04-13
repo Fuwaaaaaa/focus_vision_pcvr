@@ -317,6 +317,7 @@ async fn handle_tcp_control(
     cancel: tokio_util::sync::CancellationToken,
     hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
     osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
+    transport_feedback: Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>>,
     mut haptic_rx: mpsc::Receiver<HapticEvent>,
 ) -> Result<DisconnectReason, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -417,7 +418,9 @@ async fn handle_tcp_control(
                         let payload = &msg_buf[1..];
                         if let Some(entries) = fvp_common::protocol::parse_transport_feedback(payload) {
                             log::debug!("Received TRANSPORT_FEEDBACK: {} entries", entries.len());
-                            // TODO(v2.2+): Feed to GCC estimator when implemented
+                            if let Ok(mut guard) = transport_feedback.try_lock() {
+                                *guard = entries;
+                            }
                         } else {
                             log::warn!("Invalid TRANSPORT_FEEDBACK payload ({}B)", payload.len());
                         }
@@ -602,6 +605,7 @@ fn update_adaptive_bitrate(
     frame_count: u64,
     framerate: u64,
     hmd_stats: &Arc<StdMutex<Option<HmdStats>>>,
+    transport_feedback: &Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>>,
     bw_estimator: &mut crate::adaptive::bandwidth_estimator::BandwidthEstimator,
     bitrate_ctrl: &mut crate::adaptive::bitrate_controller::BitrateController,
     adaptive_fec: Option<&mut crate::transport::fec::AdaptiveFecController>,
@@ -610,6 +614,15 @@ fn update_adaptive_bitrate(
     if !frame_count.is_multiple_of(framerate) {
         return;
     }
+
+    // Process transport feedback for delay-based estimation
+    if let Ok(mut guard) = transport_feedback.try_lock() {
+        if !guard.is_empty() {
+            bw_estimator.process_feedback(&guard);
+            guard.clear();
+        }
+    }
+
     if let Ok(mut guard) = hmd_stats.lock() {
         if let Some(stats) = guard.take() {
             bw_estimator.update(
@@ -735,6 +748,10 @@ async fn run_streaming(
         // Shared HMD stats for adaptive bitrate (fed by heartbeat messages)
         let hmd_stats: Arc<StdMutex<Option<HmdStats>>> = Arc::new(StdMutex::new(None));
 
+        // Transport feedback entries for delay-based bandwidth estimation
+        let transport_feedback: Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+
         // OSC bridge for face tracking data (HMD → VRChat)
         let osc_bridge = Arc::new(StdMutex::new(
             crate::face_tracking::osc_bridge::OscBridge::with_smoothing(config.face_tracking.smoothing)
@@ -751,9 +768,10 @@ async fn run_streaming(
         let tcp_session = session_cancel.clone();
         let stats_clone = hmd_stats.clone();
         let osc_clone = osc_bridge.clone();
+        let feedback_clone = transport_feedback.clone();
         let reason_clone = disconnect_reason.clone();
         tokio::spawn(async move {
-            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, haptic_rx).await {
+            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, feedback_clone, haptic_rx).await {
                 Ok(reason) => {
                     if let Ok(mut guard) = reason_clone.lock() {
                         *guard = Some(reason);
@@ -870,6 +888,7 @@ async fn run_streaming(
 
                     update_adaptive_bitrate(
                         frame_count, framerate, &hmd_stats,
+                        &transport_feedback,
                         &mut bw_estimator, &mut bitrate_ctrl,
                         adaptive_fec.as_mut(), &mut fec_encoder,
                     );
@@ -1134,6 +1153,7 @@ mod tests {
         cancel: CancellationToken,
         hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
         osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
+        transport_feedback: Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>>,
         disconnect_reason: Option<DisconnectReason>,
     }
 
@@ -1142,6 +1162,7 @@ mod tests {
             Self {
                 cancel: CancellationToken::new(),
                 hmd_stats: Arc::new(StdMutex::new(None)),
+                transport_feedback: Arc::new(StdMutex::new(Vec::new())),
                 osc_bridge: Arc::new(StdMutex::new(
                     crate::face_tracking::osc_bridge::OscBridge::with_smoothing(0.5)
                 )),
@@ -1166,7 +1187,7 @@ mod tests {
             // Run handle_tcp_control (will read until EOF)
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                handle_tcp_control(Box::new(server), cancel, stats, osc, haptic_rx)
+                handle_tcp_control(Box::new(server), cancel, stats, osc, self.transport_feedback.clone(), haptic_rx)
             ).await;
 
             // Capture disconnect reason
