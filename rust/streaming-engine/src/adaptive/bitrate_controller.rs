@@ -34,8 +34,19 @@ impl BitrateController {
         }
 
         let loss = estimator.loss_rate();
+        let gradient = estimator.delay_gradient();
         let old_bitrate = self.current_bitrate_bps;
 
+        // Delay-based detection: react to congestion before loss occurs
+        if gradient > 2.0 {
+            // OVERUSE: queuing delay increasing >2ms/packet
+            self.current_bitrate_bps = (self.current_bitrate_bps as f64 * 0.90) as u64;
+            self.last_adjustment = Instant::now();
+            log::warn!("Delay overuse (gradient {:.1}ms), bitrate -10% → {} Mbps",
+                gradient, self.current_bitrate_bps / 1_000_000);
+        }
+
+        // Loss-based detection: stronger reduction if packets are actually lost
         if loss > 0.05 {
             // High loss (>5%): aggressive reduction -20%
             self.current_bitrate_bps = (self.current_bitrate_bps as f64 * 0.80) as u64;
@@ -49,9 +60,18 @@ impl BitrateController {
             log::info!("Moderate packet loss ({:.1}%), bitrate -5% → {} Mbps",
                 loss * 100.0, self.current_bitrate_bps / 1_000_000);
         } else if loss < 0.01
+            && gradient < -1.0
             && self.last_adjustment.elapsed() > self.hysteresis_duration
         {
-            // Low loss (<1%) and stable for 10s: cautious increase +5%
+            // UNDERUSE: low loss + delay recovering + stable → cautious increase +5%
+            self.current_bitrate_bps = (self.current_bitrate_bps as f64 * 1.05) as u64;
+            self.last_adjustment = Instant::now();
+            log::info!("Low loss + delay recovery (gradient {:.1}ms), bitrate +5% → {} Mbps",
+                gradient, self.current_bitrate_bps / 1_000_000);
+        } else if loss < 0.01
+            && self.last_adjustment.elapsed() > self.hysteresis_duration
+        {
+            // Low loss, stable delay → cautious increase +5%
             self.current_bitrate_bps = (self.current_bitrate_bps as f64 * 1.05) as u64;
             self.last_adjustment = Instant::now();
             log::info!("Low packet loss ({:.1}%), bitrate +5% → {} Mbps",
@@ -116,5 +136,47 @@ mod tests {
         est.update(97, 3, 8.0); // 3% loss
         ctrl.adjust(&est);
         assert_eq!(ctrl.current_bitrate_mbps(), 95); // -5%
+    }
+
+    #[test]
+    fn test_adjust_overuse_without_loss() {
+        use fvp_common::protocol::TransportFeedbackEntry;
+        let mut ctrl = BitrateController::new(100);
+        let mut est = BandwidthEstimator::new();
+        est.update(100, 0, 5.0); // 0% loss
+
+        // Simulate congestion: increasing inter-arrival deltas
+        let entries = vec![
+            TransportFeedbackEntry { sequence: 0, recv_delta_us: 10_000 },
+            TransportFeedbackEntry { sequence: 1, recv_delta_us: 13_000 },
+            TransportFeedbackEntry { sequence: 2, recv_delta_us: 17_000 },
+            TransportFeedbackEntry { sequence: 3, recv_delta_us: 22_000 },
+        ];
+        est.process_feedback(&entries);
+        assert!(est.delay_gradient() > 2.0, "gradient should be >2.0, got {}", est.delay_gradient());
+
+        let changed = ctrl.adjust(&est);
+        assert!(changed, "Bitrate should have decreased");
+        assert!(ctrl.current_bitrate_mbps() < 100, "Expected reduction, got {}", ctrl.current_bitrate_mbps());
+    }
+
+    #[test]
+    fn test_adjust_delay_and_loss_combined() {
+        use fvp_common::protocol::TransportFeedbackEntry;
+        let mut ctrl = BitrateController::new(100);
+        let mut est = BandwidthEstimator::new();
+        est.update(90, 10, 10.0); // 10% loss (high)
+
+        // Also simulate delay overuse
+        let entries = vec![
+            TransportFeedbackEntry { sequence: 0, recv_delta_us: 10_000 },
+            TransportFeedbackEntry { sequence: 1, recv_delta_us: 15_000 },
+            TransportFeedbackEntry { sequence: 2, recv_delta_us: 22_000 },
+        ];
+        est.process_feedback(&entries);
+
+        ctrl.adjust(&est);
+        // Both delay (-10%) and loss (-20%) should fire, result should be significantly reduced
+        assert!(ctrl.current_bitrate_mbps() <= 72, "Expected heavy reduction, got {}", ctrl.current_bitrate_mbps());
     }
 }
