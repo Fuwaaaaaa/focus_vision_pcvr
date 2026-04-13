@@ -1,0 +1,41 @@
+[package]
+name = "streaming-engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.streaming-engine]
+path = ".."
+
+[dependencies.fvp-common]
+path = "../../common"
+
+[dependencies.toml]
+version = "0.8"
+
+[[bin]]
+name = "fuzz_rtp"
+path = "fuzz_targets/fuzz_rtp.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_fec"
+path = "fuzz_targets/fuzz_fec.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_protocol"
+path = "fuzz_targets/fuzz_protocol.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_config"
+path = "fuzz_targets/fuzz_config.rs"
+doc = false
