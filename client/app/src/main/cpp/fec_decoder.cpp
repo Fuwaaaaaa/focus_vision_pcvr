@@ -1,5 +1,6 @@
 #include "fec_decoder.h"
 #include "xr_utils.h"
+#include <mutex>
 
 void FecFrameDecoder::beginFrame(uint32_t frameIndex, uint16_t totalShards,
                                   uint16_t dataShards, bool isKeyframe) {
@@ -14,8 +15,11 @@ void FecFrameDecoder::beginFrame(uint32_t frameIndex, uint16_t totalShards,
 }
 
 void FecFrameDecoder::addShard(uint16_t shardIndex, const uint8_t* data, int dataLen) {
+    if (dataLen <= 0) return;
     if (shardIndex >= m_totalShards) return;
     if (m_received[shardIndex]) return; // duplicate
+
+    if (m_shardSize != 0 && dataLen != m_shardSize) return; // mismatched shard size
 
     m_shards[shardIndex].assign(data, data + dataLen);
     m_received[shardIndex] = true;
@@ -68,6 +72,11 @@ std::optional<FecFrameDecoder::DecodedFrame> FecFrameDecoder::tryDecode() {
         if (m_received[i]) availableParity++;
     }
 
+    if (m_shardSize == 0) {
+        LOGW("FEC: frame %u has zero shard size, cannot reconstruct", m_frameIndex);
+        return std::nullopt;
+    }
+
     if (missing > availableParity) {
         // Not enough parity shards to reconstruct — too much loss
         LOGW("FEC: frame %u unrecoverable (%u data missing, %u parity available)",
@@ -87,11 +96,11 @@ std::optional<FecFrameDecoder::DecodedFrame> FecFrameDecoder::tryDecode() {
     // primitive polynomial 0x11d (x^8 + x^4 + x^3 + x^2 + 1),
     // matching reed-solomon-erasure's default.
 
-    // Build GF(2^8) tables
-    static bool gfTablesInit = false;
+    // Build GF(2^8) tables (thread-safe initialization)
     static uint8_t gfExp[512];
     static uint8_t gfLog[256];
-    if (!gfTablesInit) {
+    static std::once_flag gfOnce;
+    std::call_once(gfOnce, []() {
         // Primitive polynomial: x^8 + x^4 + x^3 + x^2 + 1 = 0x11d
         uint16_t x = 1;
         for (int i = 0; i < 255; i++) {
@@ -102,8 +111,7 @@ std::optional<FecFrameDecoder::DecodedFrame> FecFrameDecoder::tryDecode() {
         }
         for (int i = 255; i < 512; i++) gfExp[i] = gfExp[i - 255];
         gfLog[0] = 0; // undefined, but avoid garbage
-        gfTablesInit = true;
-    }
+    });
 
     auto gfMul = [&](uint8_t a, uint8_t b) -> uint8_t {
         if (a == 0 || b == 0) return 0;
