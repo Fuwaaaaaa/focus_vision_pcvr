@@ -25,7 +25,7 @@ fuzz_target!(|input: FecInput| {
     let redundancy = (input.redundancy_pct as f32).clamp(1.0, 100.0) / 100.0;
 
     // Split data into fixed-size shards
-    let mut data_shards: Vec<Vec<u8>> = input.data
+    let data_shards: Vec<Vec<u8>> = input.data
         .chunks(shard_size)
         .map(|chunk| {
             let mut shard = chunk.to_vec();
@@ -49,7 +49,7 @@ fuzz_target!(|input: FecInput| {
         Err(_) => return, // Invalid params, skip
     };
 
-    let total = all_shards.len();
+    let _total = all_shards.len();
 
     // Simulate packet loss using drop_mask
     let mut shards_with_loss: Vec<Option<Vec<u8>>> = all_shards
