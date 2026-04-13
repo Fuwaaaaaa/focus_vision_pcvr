@@ -59,6 +59,8 @@ impl TrackingReceiver {
                             let idx = state.controller_id as usize;
                             if idx < 2 {
                                 guard[idx] = Some(state);
+                            } else {
+                                log::debug!("Ignoring controller_id {} (out of range 0..2)", idx);
                             }
                         }
                     }

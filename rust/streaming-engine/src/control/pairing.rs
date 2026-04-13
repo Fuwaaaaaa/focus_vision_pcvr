@@ -46,7 +46,11 @@ impl PairingState {
             return Err(PairingError::LockedOut);
         }
 
-        if submitted_pin == self.pin {
+        // Constant-time comparison to mitigate timing side-channel on PIN.
+        // Accepted risk: black_box prevents compiler optimization but doesn't
+        // guarantee CPU-level constant-time on all architectures. Practical risk
+        // is low: 6-digit PIN over TLS, 5-attempt lockout, local Wi-Fi only.
+        if std::hint::black_box((submitted_pin ^ self.pin) == 0) {
             self.paired = true;
             self.attempts = 0;
             self.lockout_until = None;

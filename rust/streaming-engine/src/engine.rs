@@ -337,6 +337,8 @@ async fn handle_tcp_control(
         Ok(())
     }
 
+    let mut msg_buf: Vec<u8> = Vec::with_capacity(256);
+
     loop {
         // Concurrently: read inbound messages OR send haptic events
         let mut len_buf = [0u8; 4];
@@ -355,7 +357,8 @@ async fn handle_tcp_control(
                     return Ok(DisconnectReason::ProtocolError);
                 }
 
-                let mut msg_buf = vec![0u8; len];
+                msg_buf.clear();
+                msg_buf.resize(len, 0);
                 if reader.read_exact(&mut msg_buf).await.is_err() {
                     log::info!("TCP control read failed mid-message");
                     cancel.cancel();
@@ -405,7 +408,7 @@ async fn handle_tcp_control(
                         if let Some((lip_valid, eye_valid, lip, eye)) =
                             crate::face_tracking::osc_bridge::parse_face_data(payload)
                         {
-                            if let Ok(mut bridge) = osc_bridge.lock() {
+                            if let Ok(mut bridge) = osc_bridge.try_lock() {
                                 bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
                             }
                         }
@@ -797,6 +800,7 @@ async fn run_streaming(
         let mut packetizer = RtpPacketizer::new(0x46565000);
         let mut fec_encoder = crate::transport::fec::FecEncoder::new(config.network.fec_redundancy);
         let mut frame_count: u64 = 0;
+        let mut latency_skip_count: u64 = 0;
 
         let mut bw_estimator = crate::adaptive::bandwidth_estimator::BandwidthEstimator::new();
         let mut bitrate_ctrl = crate::adaptive::bitrate_controller::BitrateController::new(
@@ -853,8 +857,13 @@ async fn run_streaming(
 
                     frame.timestamps.mark_send();
 
-                    if let Ok(mut tracker) = latency_tracker.lock() {
+                    if let Ok(mut tracker) = latency_tracker.try_lock() {
                         tracker.record(frame.timestamps);
+                    } else {
+                        latency_skip_count += 1;
+                        if latency_skip_count % 90 == 1 {
+                            log::debug!("Latency tracker lock contention (skipped {} samples)", latency_skip_count);
+                        }
                     }
 
                     frame_count += 1;
