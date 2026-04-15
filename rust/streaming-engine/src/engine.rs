@@ -621,8 +621,9 @@ fn update_adaptive_bitrate(
     gcc_estimator: &Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>>,
     bw_estimator: &mut crate::adaptive::bandwidth_estimator::BandwidthEstimator,
     bitrate_ctrl: &mut crate::adaptive::bitrate_controller::BitrateController,
-    adaptive_fec: Option<&mut crate::transport::fec::AdaptiveFecController>,
+    mut adaptive_fec: Option<&mut crate::transport::fec::AdaptiveFecController>,
     fec_encoder: &mut crate::transport::fec::FecEncoder,
+    burst_detector: &Arc<StdMutex<crate::adaptive::burst_detector::BurstDetector>>,
 ) {
     if !frame_count.is_multiple_of(framerate) {
         return;
@@ -635,10 +636,30 @@ fn update_adaptive_bitrate(
                 stats.packets_lost,
                 0.0, // RTT not yet measured
             );
+
+            // Update burst detector with current loss rate
+            if let Ok(mut burst_guard) = burst_detector.lock() {
+                burst_guard.record(bw_estimator.loss_rate());
+            }
+
             if let Ok(gcc_guard) = gcc_estimator.lock() {
-                if bitrate_ctrl.adjust(bw_estimator, &gcc_guard) {
-                    let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
-                    notify_bitrate_change(new_bps);
+                if let Ok(burst_guard) = burst_detector.lock() {
+                    if bitrate_ctrl.adjust(bw_estimator, &gcc_guard, &burst_guard) {
+                        let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
+                        notify_bitrate_change(new_bps);
+                    }
+
+                    // If burst detected, boost FEC temporarily
+                    if burst_guard.recommend_fec_boost() {
+                        if let Some(ref mut afec) = adaptive_fec {
+                            log::info!("Burst loss: boosting FEC redundancy");
+                            // Force a loss-based FEC bump
+                            if afec.adjust(bw_estimator.loss_rate()) {
+                                fec_encoder.set_redundancy(afec.current_redundancy());
+                            }
+                            return;
+                        }
+                    }
                 }
             }
             // Adjust FEC redundancy based on observed loss
@@ -754,6 +775,10 @@ async fn run_streaming(
 
         // Shared HMD stats for adaptive bitrate (fed by heartbeat messages)
         let hmd_stats: Arc<StdMutex<Option<HmdStats>>> = Arc::new(StdMutex::new(None));
+
+        // Burst detector: classifies transient burst loss vs sustained congestion
+        let burst_detector: Arc<StdMutex<crate::adaptive::burst_detector::BurstDetector>> =
+            Arc::new(StdMutex::new(crate::adaptive::burst_detector::BurstDetector::new()));
 
         // GCC delay-based bandwidth estimator (shared between TCP handler and adaptive loop)
         let gcc_estimator: Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>> =
@@ -929,6 +954,7 @@ async fn run_streaming(
                         &gcc_estimator,
                         &mut bw_estimator, &mut bitrate_ctrl,
                         adaptive_fec.as_mut(), &mut fec_encoder,
+                        &burst_detector,
                     );
 
                     check_sleep_mode(
