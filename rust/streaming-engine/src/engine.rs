@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::runtime::Runtime;
@@ -317,8 +318,10 @@ async fn handle_tcp_control(
     cancel: tokio_util::sync::CancellationToken,
     hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
     osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
-    transport_feedback: Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>>,
+    gcc_estimator: Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>>,
+    sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>>,
     mut haptic_rx: mpsc::Receiver<HapticEvent>,
+    gcc_enabled: bool,
 ) -> Result<DisconnectReason, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -339,6 +342,8 @@ async fn handle_tcp_control(
     }
 
     let mut msg_buf: Vec<u8> = Vec::with_capacity(256);
+    let mut last_idr_time = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut idr_suppressed: u64 = 0;
 
     loop {
         // Concurrently: read inbound messages OR send haptic events
@@ -369,8 +374,22 @@ async fn handle_tcp_control(
 
                 match msg_type {
                     fvp_common::protocol::msg_type::IDR_REQUEST => {
-                        log::info!("Received IDR_REQUEST from client");
-                        notify_idr_request();
+                        // Rate limit IDR requests: max 2/sec to prevent storm from slice timeouts
+                        let now = std::time::Instant::now();
+                        let should_fire = {
+                            let elapsed = now.duration_since(last_idr_time);
+                            elapsed >= std::time::Duration::from_millis(500)
+                        };
+                        if should_fire {
+                            last_idr_time = now;
+                            log::info!("Received IDR_REQUEST from client");
+                            notify_idr_request();
+                        } else {
+                            idr_suppressed += 1;
+                            if idr_suppressed % 10 == 1 {
+                                log::warn!("IDR_REQUEST suppressed (rate limit, {} total)", idr_suppressed);
+                            }
+                        }
                     }
                     fvp_common::protocol::msg_type::HEARTBEAT => {
                         let payload = &msg_buf[1..];
@@ -418,8 +437,22 @@ async fn handle_tcp_control(
                         let payload = &msg_buf[1..];
                         if let Some(entries) = fvp_common::protocol::parse_transport_feedback(payload) {
                             log::debug!("Received TRANSPORT_FEEDBACK: {} entries", entries.len());
-                            if let Ok(mut guard) = transport_feedback.try_lock() {
-                                *guard = entries;
+                            // Enrich feedback entries with PC-side send timestamps
+                            if let Ok(guard) = sent_packet_log.try_lock() {
+                                for entry in &entries {
+                                    if let Some(&send_us) = guard.get(&entry.sequence) {
+                                        log::trace!(
+                                            "FEEDBACK seq={} send_us={} recv_delta_us={}",
+                                            entry.sequence, send_us, entry.recv_delta_us
+                                        );
+                                    }
+                                }
+                            }
+                            // Only feed GCC estimator when delay-based congestion control is enabled
+                            if gcc_enabled {
+                                if let Ok(mut guard) = gcc_estimator.try_lock() {
+                                    guard.process_feedback(&entries);
+                                }
                             }
                         } else {
                             log::warn!("Invalid TRANSPORT_FEEDBACK payload ({}B)", payload.len());
@@ -605,22 +638,16 @@ fn update_adaptive_bitrate(
     frame_count: u64,
     framerate: u64,
     hmd_stats: &Arc<StdMutex<Option<HmdStats>>>,
-    transport_feedback: &Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>>,
+    gcc_estimator: &Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>>,
     bw_estimator: &mut crate::adaptive::bandwidth_estimator::BandwidthEstimator,
     bitrate_ctrl: &mut crate::adaptive::bitrate_controller::BitrateController,
-    adaptive_fec: Option<&mut crate::transport::fec::AdaptiveFecController>,
+    mut adaptive_fec: Option<&mut crate::transport::fec::AdaptiveFecController>,
     fec_encoder: &mut crate::transport::fec::FecEncoder,
+    burst_detector: &Arc<StdMutex<crate::adaptive::burst_detector::BurstDetector>>,
+    gcc_enabled: bool,
 ) {
     if !frame_count.is_multiple_of(framerate) {
         return;
-    }
-
-    // Process transport feedback for delay-based estimation
-    if let Ok(mut guard) = transport_feedback.try_lock() {
-        if !guard.is_empty() {
-            bw_estimator.process_feedback(&guard);
-            guard.clear();
-        }
     }
 
     if let Ok(mut guard) = hmd_stats.lock() {
@@ -630,14 +657,53 @@ fn update_adaptive_bitrate(
                 stats.packets_lost,
                 0.0, // RTT not yet measured
             );
-            if bitrate_ctrl.adjust(bw_estimator) {
-                let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
-                notify_bitrate_change(new_bps);
+
+            if gcc_enabled {
+                // Delay-based mode: use GCC estimator and burst detector
+                // Update burst detector with current loss rate
+                if let Ok(mut burst_guard) = burst_detector.lock() {
+                    burst_guard.record(bw_estimator.loss_rate());
+                }
+
+                if let Ok(gcc_guard) = gcc_estimator.lock() {
+                    if let Ok(burst_guard) = burst_detector.lock() {
+                        if bitrate_ctrl.adjust(bw_estimator, &gcc_guard, &burst_guard) {
+                            let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
+                            notify_bitrate_change(new_bps);
+                        }
+
+                        // If burst detected, boost FEC temporarily
+                        if burst_guard.recommend_fec_boost() {
+                            if let Some(ref mut afec) = adaptive_fec {
+                                log::info!("Burst loss: boosting FEC redundancy");
+                                afec.activate_boost();
+                                fec_encoder.set_redundancy(afec.effective_redundancy());
+                                return;
+                            }
+                        } else if let Some(ref mut afec) = adaptive_fec {
+                            if afec.effective_redundancy() != afec.current_redundancy() {
+                                // Burst ended, deactivate boost
+                                afec.deactivate_boost();
+                                fec_encoder.set_redundancy(afec.effective_redundancy());
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Loss-only mode: use default (no-op) GCC and burst state for bitrate adjustment
+                let default_gcc = crate::adaptive::gcc_estimator::GccEstimator::new(
+                    bitrate_ctrl.current_bitrate_bps(),
+                );
+                let default_burst = crate::adaptive::burst_detector::BurstDetector::new();
+                if bitrate_ctrl.adjust(bw_estimator, &default_gcc, &default_burst) {
+                    let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
+                    notify_bitrate_change(new_bps);
+                }
             }
             // Adjust FEC redundancy based on observed loss
             if let Some(afec) = adaptive_fec {
                 if afec.adjust(bw_estimator.loss_rate()) {
-                    fec_encoder.set_redundancy(afec.current_redundancy());
+                    fec_encoder.set_redundancy(afec.effective_redundancy());
                 }
             }
         }
@@ -703,16 +769,18 @@ async fn run_streaming(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Reconnect loop: when a session ends (TCP disconnect, Wi-Fi drop),
     // clean up and re-listen for a new HMD connection.
-    let mut attempt: u32 = 0;
-    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+    let mut accept_failures: u32 = 0;
+    let mut reconnect_attempts: u32 = 0;
+    const MAX_ACCEPT_FAILURES: u32 = 5;
+    const MAX_RECONNECT_ATTEMPTS: u32 = 10; // more lenient for Wi-Fi drops
     let backoff_base = std::time::Duration::from_secs(1);
 
     loop {
         if cancel.is_cancelled() { break; }
 
-        if attempt > 0 {
-            let delay = backoff_base * 2u32.pow((attempt - 1).min(4));
-            log::info!("Reconnecting in {:?} (attempt {}/{})", delay, attempt, MAX_RECONNECT_ATTEMPTS);
+        if accept_failures > 0 {
+            let delay = backoff_base * 2u32.pow((accept_failures - 1).min(4));
+            log::info!("Retrying accept in {:?} (failure {}/{})", delay, accept_failures, MAX_ACCEPT_FAILURES);
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
                 _ = cancel.cancelled() => { break; }
@@ -730,9 +798,9 @@ async fn run_streaming(
             Ok(r) => r,
             Err(e) => {
                 log::error!("TCP accept failed: {}", e);
-                attempt += 1;
-                if attempt > MAX_RECONNECT_ATTEMPTS {
-                    log::error!("Max reconnect attempts reached, stopping");
+                accept_failures += 1;
+                if accept_failures > MAX_ACCEPT_FAILURES {
+                    log::error!("Max accept failures reached ({}) — stopping engine", accept_failures);
                     break;
                 }
                 continue;
@@ -740,7 +808,7 @@ async fn run_streaming(
         };
 
         log::info!("HMD connected from {}, starting video stream", peer_addr);
-        attempt = 0; // Reset on successful connection
+        accept_failures = 0; // Reset on successful accept
 
         // Per-session cancel: fires when TCP drops or HMD disconnects
         let session_cancel = CancellationToken::new();
@@ -748,9 +816,22 @@ async fn run_streaming(
         // Shared HMD stats for adaptive bitrate (fed by heartbeat messages)
         let hmd_stats: Arc<StdMutex<Option<HmdStats>>> = Arc::new(StdMutex::new(None));
 
-        // Transport feedback entries for delay-based bandwidth estimation
-        let transport_feedback: Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        // Burst detector: classifies transient burst loss vs sustained congestion
+        let burst_detector: Arc<StdMutex<crate::adaptive::burst_detector::BurstDetector>> =
+            Arc::new(StdMutex::new(crate::adaptive::burst_detector::BurstDetector::new()));
+
+        // GCC delay-based bandwidth estimator (shared between TCP handler and adaptive loop)
+        // When congestion_control == "loss", GCC feedback is not processed (loss-only mode).
+        let gcc_enabled = config.network.congestion_control == "gcc";
+        let gcc_estimator: Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>> =
+            Arc::new(StdMutex::new(crate::adaptive::gcc_estimator::GccEstimator::new(
+                config.video.bitrate_mbps as u64 * 1_000_000,
+            )));
+
+        // Sent packet log: maps RTP sequence number → PC-side send timestamp (µs)
+        // Shared between the video send loop (writer) and TCP handler (reader)
+        let sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
 
         // OSC bridge for face tracking data (HMD → VRChat)
         let osc_bridge = Arc::new(StdMutex::new(
@@ -768,10 +849,11 @@ async fn run_streaming(
         let tcp_session = session_cancel.clone();
         let stats_clone = hmd_stats.clone();
         let osc_clone = osc_bridge.clone();
-        let feedback_clone = transport_feedback.clone();
+        let gcc_clone = gcc_estimator.clone();
+        let sent_log_clone = sent_packet_log.clone();
         let reason_clone = disconnect_reason.clone();
         tokio::spawn(async move {
-            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, feedback_clone, haptic_rx).await {
+            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, gcc_clone, sent_log_clone, haptic_rx, gcc_enabled).await {
                 Ok(reason) => {
                     if let Ok(mut guard) = reason_clone.lock() {
                         *guard = Some(reason);
@@ -804,7 +886,7 @@ async fn run_streaming(
             Err(e) => {
                 log::error!("UDP sender failed: {}", e);
                 session_cancel.cancel();
-                attempt += 1;
+                accept_failures += 1;
                 continue;
             }
         };
@@ -817,6 +899,11 @@ async fn run_streaming(
         // Step 3: Process frames with adaptive bitrate + adaptive FEC
         let mut packetizer = RtpPacketizer::new(0x46565000);
         let mut fec_encoder = crate::transport::fec::FecEncoder::new(config.network.fec_redundancy);
+        let slice_count = config.network.slice_count;
+        let slice_fec_enabled = config.network.slice_fec_enabled;
+        let mut slice_fec_encoders: Vec<crate::transport::fec::FecEncoder> = (0..slice_count)
+            .map(|_| crate::transport::fec::FecEncoder::new(config.network.fec_redundancy))
+            .collect();
         let mut frame_count: u64 = 0;
         let mut latency_skip_count: u64 = 0;
 
@@ -857,21 +944,82 @@ async fn run_streaming(
                     // Multiply first to avoid integer division truncation drift (e.g. 90000/96=937.5)
                     let timestamp_90khz = (frame_count * fvp_common::RTP_CLOCK_RATE as u64 / framerate) as u32;
 
-                    let packets = pipeline::encode_frame_to_packets_with_fec(
-                        &frame.nal_data,
-                        frame.frame_index,
-                        timestamp_90khz,
-                        frame.is_idr,
-                        &mut fec_encoder,
-                        &mut packetizer,
-                    );
+                    // Choose slice FEC for large frames, bulk FEC for small ones
+                    let use_slice_fec = slice_fec_enabled
+                        && frame.nal_data.len() >= pipeline::MIN_SLICE_SIZE;
 
-                    if let Err(e) = udp_sender.send_all(&packets).await {
-                        log::warn!("UDP send error: {}", e);
+                    if use_slice_fec {
+                        // Slice FEC: split frame → RS encode per slice → send each slice immediately
+                        let slice_batches = pipeline::encode_frame_sliced(
+                            &frame.nal_data,
+                            frame.frame_index,
+                            timestamp_90khz,
+                            frame.is_idr,
+                            slice_count,
+                            &mut slice_fec_encoders,
+                            &mut packetizer,
+                        );
+                        for slice_packets in &slice_batches {
+                            if slice_packets.is_empty() { continue; }
+                            if let Err(e) = udp_sender.send_all(slice_packets).await {
+                                log::warn!("UDP send error (slice FEC): {}", e);
+                            }
+                            // Record send timestamps per-slice for GCC
+                            let send_us = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_micros() as u64;
+                            if let Ok(mut log_guard) = sent_packet_log.try_lock() {
+                                for packet in slice_packets {
+                                    if packet.data.len() >= 4 {
+                                        let seq = u16::from_be_bytes([packet.data[2], packet.data[3]]);
+                                        log_guard.insert(seq, send_us);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Bulk FEC: existing path
+                        let packets = pipeline::encode_frame_to_packets_with_fec(
+                            &frame.nal_data,
+                            frame.frame_index,
+                            timestamp_90khz,
+                            frame.is_idr,
+                            &mut fec_encoder,
+                            &mut packetizer,
+                        );
+
+                        if let Err(e) = udp_sender.send_all(&packets).await {
+                            log::warn!("UDP send error: {}", e);
+                        }
+
+                        // Record send timestamps for GCC
+                        let send_us = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64;
+                        if let Ok(mut log_guard) = sent_packet_log.try_lock() {
+                            for packet in &packets {
+                                if packet.data.len() >= 4 {
+                                    let seq = u16::from_be_bytes([packet.data[2], packet.data[3]]);
+                                    log_guard.insert(seq, send_us);
+                                }
+                            }
+                        }
                     }
 
-                    // Return packet buffers to the pool for reuse on the next frame
-                    packetizer.recycle(packets);
+                    // Prune sent_packet_log to bound memory usage
+                    if let Ok(mut log_guard) = sent_packet_log.try_lock() {
+                        if log_guard.len() > 5000 {
+                            let mut entries: Vec<(u16, u64)> = log_guard.drain().collect();
+                            entries.sort_unstable_by_key(|&(_, ts)| std::cmp::Reverse(ts));
+                            entries.truncate(2500);
+                            log_guard.extend(entries);
+                        }
+                    }
+
+                    // Buffer pool recycle is handled by packetizer internally
+                    // (slice path sends per-slice, bulk path sends all at once)
 
                     frame.timestamps.mark_send();
 
@@ -888,10 +1036,20 @@ async fn run_streaming(
 
                     update_adaptive_bitrate(
                         frame_count, framerate, &hmd_stats,
-                        &transport_feedback,
+                        &gcc_estimator,
                         &mut bw_estimator, &mut bitrate_ctrl,
                         adaptive_fec.as_mut(), &mut fec_encoder,
+                        &burst_detector,
+                        gcc_enabled,
                     );
+
+                    // Sync slice FEC encoders with current redundancy
+                    if slice_fec_enabled {
+                        let r = fec_encoder.redundancy();
+                        for se in &mut slice_fec_encoders {
+                            se.set_redundancy(r);
+                        }
+                    }
 
                     check_sleep_mode(
                         &_tracking, &mut sleep_detector,
@@ -920,35 +1078,56 @@ async fn run_streaming(
 
         match reason {
             DisconnectReason::ConnectionLost => {
-                // Hold state for 5 seconds — UDP streaming can continue if sender is still alive.
-                // If client reconnects within 5s, skip PIN (TLS session resumption).
-                log::info!("Connection lost — holding state for 5s for reconnection");
-                const HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
-                tokio::select! {
-                    _ = tokio::time::sleep(HOLD_DURATION) => {
-                        log::info!("Hold period expired — no reconnection, cleaning up");
-                    }
+                log::info!("Connection lost — listening for reconnection (5s hold)");
+                reconnect_attempts += 1;
+                if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
+                    log::warn!("Wi-Fi reconnect attempts: {}/{} — still accepting connections", reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                }
+
+                // Re-create TCP server and listen during hold period
+                let tcp_server = TcpControlServer::new(config.clone());
+                let hold_duration = std::time::Duration::from_secs(5);
+
+                let reconnect_result = tokio::select! {
+                    r = tcp_server.listen_and_accept() => Some(r),
+                    _ = tokio::time::sleep(hold_duration) => None,
                     _ = cancel.cancelled() => {
                         log::info!("Engine shutdown during hold period");
                         return Ok(());
                     }
+                };
+
+                match reconnect_result {
+                    Some(Ok((_stream, addr))) => {
+                        log::info!("HMD reconnected from {} during hold period", addr);
+                        // HMD reconnected — loop will accept again immediately.
+                        // The key improvement: listener was open, so HMD could find us.
+                        reconnect_attempts = 0;
+                        continue; // Skip backoff, go directly to new session
+                    }
+                    Some(Err(e)) => {
+                        log::warn!("Accept failed during hold: {}", e);
+                        accept_failures += 1;
+                    }
+                    None => {
+                        log::info!("Hold period expired — no reconnection");
+                    }
                 }
-                // After hold, loop back to accept new connection
-                attempt += 1;
             }
             DisconnectReason::ClientRequested => {
                 // Clean disconnect — no hold needed
                 log::info!("Client requested disconnect — ready for new connection");
-                attempt = 0; // Reset attempts on clean disconnect
+                accept_failures = 0;
+                reconnect_attempts = 0;
             }
             DisconnectReason::ProtocolError => {
                 log::warn!("Protocol error — reconnecting");
-                attempt += 1;
+                reconnect_attempts += 1;
             }
         }
 
-        if attempt > MAX_RECONNECT_ATTEMPTS {
-            log::error!("Max reconnect attempts reached");
+        if accept_failures > MAX_ACCEPT_FAILURES {
+            log::error!("Max accept failures reached ({}) — stopping engine", accept_failures);
             break;
         }
     }
@@ -1153,7 +1332,8 @@ mod tests {
         cancel: CancellationToken,
         hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
         osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
-        transport_feedback: Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>>,
+        gcc_estimator: Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>>,
+        sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>>,
         disconnect_reason: Option<DisconnectReason>,
     }
 
@@ -1162,7 +1342,10 @@ mod tests {
             Self {
                 cancel: CancellationToken::new(),
                 hmd_stats: Arc::new(StdMutex::new(None)),
-                transport_feedback: Arc::new(StdMutex::new(Vec::new())),
+                gcc_estimator: Arc::new(StdMutex::new(
+                    crate::adaptive::gcc_estimator::GccEstimator::new(80_000_000)
+                )),
+                sent_packet_log: Arc::new(StdMutex::new(HashMap::new())),
                 osc_bridge: Arc::new(StdMutex::new(
                     crate::face_tracking::osc_bridge::OscBridge::with_smoothing(0.5)
                 )),
@@ -1187,7 +1370,7 @@ mod tests {
             // Run handle_tcp_control (will read until EOF)
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                handle_tcp_control(Box::new(server), cancel, stats, osc, self.transport_feedback.clone(), haptic_rx)
+                handle_tcp_control(Box::new(server), cancel, stats, osc, self.gcc_estimator.clone(), self.sent_packet_log.clone(), haptic_rx, true)
             ).await;
 
             // Capture disconnect reason

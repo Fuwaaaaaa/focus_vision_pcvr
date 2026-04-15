@@ -2,6 +2,31 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [2.2.1] - 2026-04-15
+
+### Added
+- **GccEstimator:** 独立した遅延ベース帯域推定モジュール。DelayTrend状態判定(Normal/Increasing/Overuse)、bitrate_multiplier、プロービング準備
+- **BurstDetector:** Wi-Fi干渉(burst) vs 持続的混雑(sustained)の分類。LossPattern enum、500ms閾値でburst→sustained遷移
+- **sent_packet_log:** engine.rsにRTP送信タイムスタンプ記録（HashMap<u16, u64>、5000エントリ上限）。GCC推定器の入力
+- **congestion_controlトグル:** config.tomlで`congestion_control = "gcc" | "loss"`を選択可能。"loss"モードでは既存ロスベースのみ使用
+- **AdaptiveFEC boost:** BurstDetector連携のboost機能（activate/deactivate）、1秒レート制限、effective_redundancy()
+
+### Changed
+- **BitrateController:** adjust()がGccEstimatorとBurstDetectorの3引数に拡張。burst時はFEC吸収、sustained時は積極減速
+- **BandwidthEstimator:** 遅延計算をGccEstimatorに分離。ロス率EWMAとRTT追跡のみに専念（単一責務）
+- **engine.rs:** TRANSPORT_FEEDBACK受信時にGccEstimator.process_feedback()を即時実行（バッチ処理→リアルタイム処理）
+
+### Fixed
+- **max reductionバグ:** delay overuse(-10%)とloss(-20%)が累積して-28%になるバグを修正。候補の大きい方のみ採用するmax reduction方式に変更
+
+### Tests
+- **テスト296件に増加**（277→296、+19件）
+- GccEstimator 7テスト（初期状態、安定リンク、overuse検出、underuse、単一/空feedback、multiplier範囲）
+- BurstDetector 6テスト（初期状態、ロスなし、burst検出、sustained検出、閾値以下、回復）
+- BitrateController +5テスト（burst抑制、sustained減速、UNDERUSE増速、天井clamp、データなし）
+- congestion_control 3テスト（デフォルト、無効値、"loss"モード）
+- AdaptiveFEC +3テスト（boost、レート制限、bandwidth_delta）
+
 ## [2.2.0] - 2026-04-10
 
 ### Added
