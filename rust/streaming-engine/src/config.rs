@@ -75,6 +75,10 @@ pub struct NetworkConfig {
     pub adaptive_fec_enabled: bool,
     #[serde(default = "default_congestion_control")]
     pub congestion_control: String,
+    #[serde(default = "default_slice_fec_enabled")]
+    pub slice_fec_enabled: bool,
+    #[serde(default = "default_slice_count")]
+    pub slice_count: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +258,8 @@ fn default_memory_poll_seconds() -> u32 { 60 }
 fn default_memory_growth_threshold_mb() -> u32 { 50 }
 fn default_adaptive_fec_enabled() -> bool { true }
 fn default_congestion_control() -> String { "gcc".to_string() }
+fn default_slice_fec_enabled() -> bool { true }
+fn default_slice_count() -> u8 { 4 }
 
 fn default_ft_enabled() -> bool { true }
 fn default_ft_smoothing() -> f32 { 0.6 }
@@ -287,6 +293,8 @@ impl Default for NetworkConfig {
             fec_redundancy_max: default_fec_redundancy_max(),
             adaptive_fec_enabled: default_adaptive_fec_enabled(),
             congestion_control: default_congestion_control(),
+            slice_fec_enabled: default_slice_fec_enabled(),
+            slice_count: default_slice_count(),
         }
     }
 }
@@ -376,6 +384,15 @@ impl AppConfig {
                 message: format!("must be \"gcc\" or \"loss\", got \"{}\"", self.network.congestion_control),
             });
             self.network.congestion_control = "gcc".to_string();
+        }
+
+        // Slice FEC
+        if self.network.slice_count < 2 || self.network.slice_count > 15 {
+            errors.push(ConfigError {
+                field: "network.slice_count",
+                message: format!("{} out of range [2-15], clamped to 4", self.network.slice_count),
+            });
+            self.network.slice_count = 4;
         }
 
         // Video
@@ -707,5 +724,36 @@ mod tests {
         config.network.congestion_control = "loss".to_string();
         let errors = config.validate();
         assert!(!errors.iter().any(|e| e.field == "network.congestion_control"));
+    }
+
+    #[test]
+    fn test_default_slice_fec() {
+        let config = AppConfig::default();
+        assert!(config.network.slice_fec_enabled);
+        assert_eq!(config.network.slice_count, 4);
+    }
+
+    #[test]
+    fn test_validate_slice_count_out_of_range() {
+        let mut config = AppConfig::default();
+        config.network.slice_count = 1; // below 2
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.field == "network.slice_count"));
+        assert_eq!(config.network.slice_count, 4); // clamped
+
+        let mut config2 = AppConfig::default();
+        config2.network.slice_count = 16; // above 15
+        let errors2 = config2.validate();
+        assert!(errors2.iter().any(|e| e.field == "network.slice_count"));
+        assert_eq!(config2.network.slice_count, 4);
+    }
+
+    #[test]
+    fn test_validate_slice_count_valid() {
+        let mut config = AppConfig::default();
+        config.network.slice_count = 8;
+        let errors = config.validate();
+        assert!(!errors.iter().any(|e| e.field == "network.slice_count"));
+        assert_eq!(config.network.slice_count, 8);
     }
 }
