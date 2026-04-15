@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::runtime::Runtime;
@@ -318,6 +319,7 @@ async fn handle_tcp_control(
     hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
     osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
     transport_feedback: Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>>,
+    sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>>,
     mut haptic_rx: mpsc::Receiver<HapticEvent>,
 ) -> Result<DisconnectReason, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -418,6 +420,17 @@ async fn handle_tcp_control(
                         let payload = &msg_buf[1..];
                         if let Some(entries) = fvp_common::protocol::parse_transport_feedback(payload) {
                             log::debug!("Received TRANSPORT_FEEDBACK: {} entries", entries.len());
+                            // Enrich feedback entries with PC-side send timestamps
+                            if let Ok(guard) = sent_packet_log.try_lock() {
+                                for entry in &entries {
+                                    if let Some(&send_us) = guard.get(&entry.sequence) {
+                                        log::trace!(
+                                            "FEEDBACK seq={} send_us={} recv_delta_us={}",
+                                            entry.sequence, send_us, entry.recv_delta_us
+                                        );
+                                    }
+                                }
+                            }
                             if let Ok(mut guard) = transport_feedback.try_lock() {
                                 *guard = entries;
                             }
@@ -752,6 +765,11 @@ async fn run_streaming(
         let transport_feedback: Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>> =
             Arc::new(StdMutex::new(Vec::new()));
 
+        // Sent packet log: maps RTP sequence number → PC-side send timestamp (µs)
+        // Shared between the video send loop (writer) and TCP handler (reader)
+        let sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+
         // OSC bridge for face tracking data (HMD → VRChat)
         let osc_bridge = Arc::new(StdMutex::new(
             crate::face_tracking::osc_bridge::OscBridge::with_smoothing(config.face_tracking.smoothing)
@@ -769,9 +787,10 @@ async fn run_streaming(
         let stats_clone = hmd_stats.clone();
         let osc_clone = osc_bridge.clone();
         let feedback_clone = transport_feedback.clone();
+        let sent_log_clone = sent_packet_log.clone();
         let reason_clone = disconnect_reason.clone();
         tokio::spawn(async move {
-            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, feedback_clone, haptic_rx).await {
+            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, feedback_clone, sent_log_clone, haptic_rx).await {
                 Ok(reason) => {
                     if let Ok(mut guard) = reason_clone.lock() {
                         *guard = Some(reason);
@@ -868,6 +887,29 @@ async fn run_streaming(
 
                     if let Err(e) = udp_sender.send_all(&packets).await {
                         log::warn!("UDP send error: {}", e);
+                    }
+
+                    // Record send timestamps for delay-based bandwidth estimation (GCC)
+                    {
+                        let send_us = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64;
+                        if let Ok(mut log_guard) = sent_packet_log.try_lock() {
+                            for packet in &packets {
+                                if packet.data.len() >= 4 {
+                                    let seq = u16::from_be_bytes([packet.data[2], packet.data[3]]);
+                                    log_guard.insert(seq, send_us);
+                                }
+                            }
+                            // Prune old entries to bound memory usage
+                            if log_guard.len() > 5000 {
+                                let mut entries: Vec<(u16, u64)> = log_guard.drain().collect();
+                                entries.sort_unstable_by_key(|&(_, ts)| std::cmp::Reverse(ts));
+                                entries.truncate(2500);
+                                log_guard.extend(entries);
+                            }
+                        }
                     }
 
                     // Return packet buffers to the pool for reuse on the next frame
@@ -1154,6 +1196,7 @@ mod tests {
         hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
         osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
         transport_feedback: Arc<StdMutex<Vec<fvp_common::protocol::TransportFeedbackEntry>>>,
+        sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>>,
         disconnect_reason: Option<DisconnectReason>,
     }
 
@@ -1163,6 +1206,7 @@ mod tests {
                 cancel: CancellationToken::new(),
                 hmd_stats: Arc::new(StdMutex::new(None)),
                 transport_feedback: Arc::new(StdMutex::new(Vec::new())),
+                sent_packet_log: Arc::new(StdMutex::new(HashMap::new())),
                 osc_bridge: Arc::new(StdMutex::new(
                     crate::face_tracking::osc_bridge::OscBridge::with_smoothing(0.5)
                 )),
@@ -1187,7 +1231,7 @@ mod tests {
             // Run handle_tcp_control (will read until EOF)
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                handle_tcp_control(Box::new(server), cancel, stats, osc, self.transport_feedback.clone(), haptic_rx)
+                handle_tcp_control(Box::new(server), cancel, stats, osc, self.transport_feedback.clone(), self.sent_packet_log.clone(), haptic_rx)
             ).await;
 
             // Capture disconnect reason
