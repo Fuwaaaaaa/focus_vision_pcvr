@@ -93,6 +93,49 @@ fn bench_config_parse_validate(c: &mut Criterion) {
     });
 }
 
+fn bench_slice_fec_vs_bulk(c: &mut Criterion) {
+    use streaming_engine::transport::fec::FecEncoder;
+    use streaming_engine::pipeline;
+    use streaming_engine::transport::rtp::RtpPacketizer;
+
+    let idr_frame = vec![0xABu8; 200_000]; // 200KB IDR frame
+
+    c.bench_function("bulk_fec_200kb_idr", |b| {
+        let mut enc = FecEncoder::new(0.20);
+        let mut pkt = RtpPacketizer::new(0x42);
+        b.iter(|| {
+            let packets = pipeline::encode_frame_to_packets_with_fec(
+                black_box(&idr_frame), 0, 1000, true, &mut enc, &mut pkt,
+            );
+            black_box(packets.len());
+        })
+    });
+
+    c.bench_function("slice_fec_200kb_idr_4slices", |b| {
+        let mut encs: Vec<FecEncoder> = (0..4).map(|_| FecEncoder::new(0.20)).collect();
+        let mut pkt = RtpPacketizer::new(0x42);
+        b.iter(|| {
+            let batches = pipeline::encode_frame_sliced(
+                black_box(&idr_frame), 0, 1000, true, 4, &mut encs, &mut pkt,
+            );
+            black_box(batches.len());
+        })
+    });
+
+    // Measure time-to-first-slice (the key latency improvement metric)
+    c.bench_function("slice_fec_first_slice_latency", |b| {
+        let mut encs: Vec<FecEncoder> = (0..4).map(|_| FecEncoder::new(0.20)).collect();
+        let mut pkt = RtpPacketizer::new(0x42);
+        b.iter(|| {
+            let batches = pipeline::encode_frame_sliced(
+                black_box(&idr_frame), 0, 1000, true, 4, &mut encs, &mut pkt,
+            );
+            // First slice is ready — this is what we measure
+            black_box(&batches[0]);
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_rtp_packetize_p_frame,
@@ -102,5 +145,6 @@ criterion_group!(
     bench_adaptive_fec_adjust,
     bench_memory_rss_read,
     bench_config_parse_validate,
+    bench_slice_fec_vs_bulk,
 );
 criterion_main!(benches);
