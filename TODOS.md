@@ -227,11 +227,11 @@
 - **Context:** Outside Voice指摘: サーバー側だけでなくClient側FecFrameDecoderの変更が必須。4つの独立RSデコードコンテキストが必要。Androidクライアントの`fec_decoder.cpp`を4スライス対応に変更する必要がある
 - **Depends on:** Protocol v3 flags bit layout実装 + Client側FecFrameDecoder改修
 
-### TCP再接続holdのステートフル化 — 実機待ち
-- **What:** 現在のhold logic（engine.rs:880-910）はcancel token発火後に5秒sleepしているだけで、リスナーが開いていない＋UDP停止済み。真のステートフル再接続には、セッション状態を保持したままリスナーを開き続ける必要がある。またattemptカウンタがaccept失敗とconnection-lostで共有されており、Wi-Fi断5回でMAX_RECONNECT_ATTEMPTS到達→永久停止のリスクがある
-- **Why:** Outside Voice指摘（2026-04-10 eng review）: holdは「セッション破棄後の待機」であって「状態保持」ではない。HMDは再接続先がない
-- **Context:** 修正方針: (1) session_cancelをhold中は発火させない、(2) TCPリスナーをhold中も維持、(3) attemptカウンタをaccept失敗用とconnection-lost用に分離。TLS session resumption（session ticket）で再接続時のPINスキップは既に設計済み
-- **Depends on:** 実機でのWi-Fi断テスト
+### ~~TCP再接続holdのステートフル化~~ (完了)
+- hold中にTCPリスナーを再作成しHMDが再接続可能に
+- accept_failures(5回で停止)とreconnect_attempts(10回で警告のみ)を分離
+- Wi-Fi断でエンジンが永久停止するリスクを解消
+- 残: TLS session resumption（session ticket）による再接続時PINスキップは実機テスト後
 
 ### ~~Adaptive FEC無効化オプション~~ (完了)
 - config.toml: adaptive_fec_enabled（デフォルトtrue）を追加
