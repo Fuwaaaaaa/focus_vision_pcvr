@@ -64,6 +64,7 @@ private:
     void receiveAndDecodeVideo();
 
     void handleSessionStateChange(XrSessionState newState);
+    void submitDecodedFrame(const uint8_t* nalData, int nalSize, uint32_t frameIndex);
 
     // Android app reference (for JNI access)
     android_app* m_androidApp = nullptr;
@@ -97,7 +98,8 @@ private:
 
     // Network + decode pipeline
     NetworkReceiver m_networkReceiver;
-    FecFrameDecoder m_fecDecoder;
+    FecFrameDecoder m_fecDecoder;          // bulk FEC (slice_count=0)
+    SlicedFecFrameDecoder m_slicedDecoder; // slice FEC (slice_count>0)
     VideoDecoder m_videoDecoder;
     TcpControlClient m_tcpClient;
 
