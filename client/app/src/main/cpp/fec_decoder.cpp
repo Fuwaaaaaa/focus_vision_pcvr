@@ -249,3 +249,97 @@ std::optional<FecFrameDecoder::DecodedFrame> FecFrameDecoder::tryDecode() {
          m_frameIndex, missing, availableParity);
     return frame;
 }
+
+// --- SlicedFecFrameDecoder ---
+
+void SlicedFecFrameDecoder::beginFrame(uint32_t frameIndex, uint8_t sliceCount, bool isKeyframe) {
+    m_frameIndex = frameIndex;
+    m_sliceCount = (sliceCount > MAX_SLICES) ? MAX_SLICES : sliceCount;
+    m_isKeyframe = isKeyframe;
+    m_sliceCompleted = 0;
+    m_started = false;
+    for (int i = 0; i < m_sliceCount; i++) {
+        m_sliceData[i].clear();
+    }
+}
+
+void SlicedFecFrameDecoder::addShard(uint8_t sliceIndex, uint16_t shardIndex,
+                                      uint16_t totalShards, uint16_t dataShards,
+                                      const uint8_t* data, int dataLen) {
+    if (sliceIndex >= m_sliceCount) return;
+
+    if (!m_started) {
+        m_startTime = std::chrono::steady_clock::now();
+        m_started = true;
+    }
+
+    // Initialize the per-slice context if this is the first shard for this slice
+    auto& ctx = m_contexts[sliceIndex];
+    if (ctx.currentFrameIndex() != m_frameIndex) {
+        ctx.beginFrame(m_frameIndex, totalShards, dataShards, m_isKeyframe);
+    }
+
+    ctx.addShard(shardIndex, data, dataLen);
+
+    // If this slice is now complete and not yet decoded, try to decode it
+    if (!(m_sliceCompleted & (1 << sliceIndex)) && ctx.isComplete()) {
+        auto decoded = ctx.tryDecode();
+        if (decoded.has_value()) {
+            // Strip u32 length prefix from decoded data
+            if (decoded->data.size() >= 4) {
+                uint32_t originalLen = (uint32_t)decoded->data[0]
+                    | ((uint32_t)decoded->data[1] << 8)
+                    | ((uint32_t)decoded->data[2] << 16)
+                    | ((uint32_t)decoded->data[3] << 24);
+
+                if (originalLen + 4 <= decoded->data.size()) {
+                    m_sliceData[sliceIndex].assign(
+                        decoded->data.begin() + 4,
+                        decoded->data.begin() + 4 + originalLen
+                    );
+                } else {
+                    // Length prefix exceeds data — use all data after prefix
+                    m_sliceData[sliceIndex].assign(
+                        decoded->data.begin() + 4,
+                        decoded->data.end()
+                    );
+                }
+            } else {
+                m_sliceData[sliceIndex] = std::move(decoded->data);
+            }
+            m_sliceCompleted |= (1 << sliceIndex);
+        }
+    }
+}
+
+bool SlicedFecFrameDecoder::isComplete() const {
+    uint16_t allBits = (1 << m_sliceCount) - 1;
+    return (m_sliceCompleted & allBits) == allBits;
+}
+
+bool SlicedFecFrameDecoder::isTimedOut() const {
+    if (!m_started) return false;
+    return (std::chrono::steady_clock::now() - m_startTime) > SLICE_TIMEOUT;
+}
+
+std::optional<SlicedFecFrameDecoder::DecodedFrame> SlicedFecFrameDecoder::tryDecode() {
+    if (!isComplete()) {
+        return std::nullopt;
+    }
+
+    DecodedFrame frame;
+    frame.frameIndex = m_frameIndex;
+    frame.isKeyframe = m_isKeyframe;
+
+    // Concatenate all slice data in order
+    size_t totalSize = 0;
+    for (int i = 0; i < m_sliceCount; i++) {
+        totalSize += m_sliceData[i].size();
+    }
+    frame.data.reserve(totalSize);
+    for (int i = 0; i < m_sliceCount; i++) {
+        frame.data.insert(frame.data.end(), m_sliceData[i].begin(), m_sliceData[i].end());
+    }
+
+    return frame;
+}
