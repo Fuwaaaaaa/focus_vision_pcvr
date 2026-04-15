@@ -753,16 +753,18 @@ async fn run_streaming(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Reconnect loop: when a session ends (TCP disconnect, Wi-Fi drop),
     // clean up and re-listen for a new HMD connection.
-    let mut attempt: u32 = 0;
-    const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+    let mut accept_failures: u32 = 0;
+    let mut reconnect_attempts: u32 = 0;
+    const MAX_ACCEPT_FAILURES: u32 = 5;
+    const MAX_RECONNECT_ATTEMPTS: u32 = 10; // more lenient for Wi-Fi drops
     let backoff_base = std::time::Duration::from_secs(1);
 
     loop {
         if cancel.is_cancelled() { break; }
 
-        if attempt > 0 {
-            let delay = backoff_base * 2u32.pow((attempt - 1).min(4));
-            log::info!("Reconnecting in {:?} (attempt {}/{})", delay, attempt, MAX_RECONNECT_ATTEMPTS);
+        if accept_failures > 0 {
+            let delay = backoff_base * 2u32.pow((accept_failures - 1).min(4));
+            log::info!("Retrying accept in {:?} (failure {}/{})", delay, accept_failures, MAX_ACCEPT_FAILURES);
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
                 _ = cancel.cancelled() => { break; }
@@ -780,9 +782,9 @@ async fn run_streaming(
             Ok(r) => r,
             Err(e) => {
                 log::error!("TCP accept failed: {}", e);
-                attempt += 1;
-                if attempt > MAX_RECONNECT_ATTEMPTS {
-                    log::error!("Max reconnect attempts reached, stopping");
+                accept_failures += 1;
+                if accept_failures > MAX_ACCEPT_FAILURES {
+                    log::error!("Max accept failures reached ({}) — stopping engine", accept_failures);
                     break;
                 }
                 continue;
@@ -790,7 +792,7 @@ async fn run_streaming(
         };
 
         log::info!("HMD connected from {}, starting video stream", peer_addr);
-        attempt = 0; // Reset on successful connection
+        accept_failures = 0; // Reset on successful accept
 
         // Per-session cancel: fires when TCP drops or HMD disconnects
         let session_cancel = CancellationToken::new();
@@ -868,7 +870,7 @@ async fn run_streaming(
             Err(e) => {
                 log::error!("UDP sender failed: {}", e);
                 session_cancel.cancel();
-                attempt += 1;
+                accept_failures += 1;
                 continue;
             }
         };
@@ -1009,35 +1011,56 @@ async fn run_streaming(
 
         match reason {
             DisconnectReason::ConnectionLost => {
-                // Hold state for 5 seconds — UDP streaming can continue if sender is still alive.
-                // If client reconnects within 5s, skip PIN (TLS session resumption).
-                log::info!("Connection lost — holding state for 5s for reconnection");
-                const HOLD_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
-                tokio::select! {
-                    _ = tokio::time::sleep(HOLD_DURATION) => {
-                        log::info!("Hold period expired — no reconnection, cleaning up");
-                    }
+                log::info!("Connection lost — listening for reconnection (5s hold)");
+                reconnect_attempts += 1;
+                if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
+                    log::warn!("Wi-Fi reconnect attempts: {}/{} — still accepting connections", reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                }
+
+                // Re-create TCP server and listen during hold period
+                let tcp_server = TcpControlServer::new(config.clone());
+                let hold_duration = std::time::Duration::from_secs(5);
+
+                let reconnect_result = tokio::select! {
+                    r = tcp_server.listen_and_accept() => Some(r),
+                    _ = tokio::time::sleep(hold_duration) => None,
                     _ = cancel.cancelled() => {
                         log::info!("Engine shutdown during hold period");
                         return Ok(());
                     }
+                };
+
+                match reconnect_result {
+                    Some(Ok((_stream, addr))) => {
+                        log::info!("HMD reconnected from {} during hold period", addr);
+                        // HMD reconnected — loop will accept again immediately.
+                        // The key improvement: listener was open, so HMD could find us.
+                        reconnect_attempts = 0;
+                        continue; // Skip backoff, go directly to new session
+                    }
+                    Some(Err(e)) => {
+                        log::warn!("Accept failed during hold: {}", e);
+                        accept_failures += 1;
+                    }
+                    None => {
+                        log::info!("Hold period expired — no reconnection");
+                    }
                 }
-                // After hold, loop back to accept new connection
-                attempt += 1;
             }
             DisconnectReason::ClientRequested => {
                 // Clean disconnect — no hold needed
                 log::info!("Client requested disconnect — ready for new connection");
-                attempt = 0; // Reset attempts on clean disconnect
+                accept_failures = 0;
+                reconnect_attempts = 0;
             }
             DisconnectReason::ProtocolError => {
                 log::warn!("Protocol error — reconnecting");
-                attempt += 1;
+                reconnect_attempts += 1;
             }
         }
 
-        if attempt > MAX_RECONNECT_ATTEMPTS {
-            log::error!("Max reconnect attempts reached");
+        if accept_failures > MAX_ACCEPT_FAILURES {
+            log::error!("Max accept failures reached ({}) — stopping engine", accept_failures);
             break;
         }
     }
