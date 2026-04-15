@@ -10,6 +10,10 @@ All notable changes to Focus Vision PCVR will be documented in this file.
 - **sent_packet_log:** engine.rsにRTP送信タイムスタンプ記録（HashMap<u16, u64>、5000エントリ上限）。GCC推定器の入力
 - **congestion_controlトグル:** config.tomlで`congestion_control = "gcc" | "loss"`を選択可能。"loss"モードでは既存ロスベースのみ使用
 - **AdaptiveFEC boost:** BurstDetector連携のboost機能（activate/deactivate）、1秒レート制限、effective_redundancy()
+- **スライスFEC:** NALフレームを4分割し独立RSエンコード。IDRフレーム(>=16KB)で送信開始遅延を3-5ms→1-2msに短縮。`slice_fec_enabled`/`slice_count`設定
+- **SlicedFecFrameDecoder (Client C++):** 4独立RSコンテキスト、u32 length prefix、100ms timeout、fvp_flags解析
+- **IDR_REQUESTレート制限:** max 2/sec (500ms debounce)。スライスタイムアウトからのIDRストーム防止
+- **fvp_flags統合:** pipeline.rsのflags hardcode → `fvp_flags::encode_simple()`に修正
 
 ### Changed
 - **BitrateController:** adjust()がGccEstimatorとBurstDetectorの3引数に拡張。burst時はFEC吸収、sustained時は積極減速
@@ -20,12 +24,15 @@ All notable changes to Focus Vision PCVR will be documented in this file.
 - **max reductionバグ:** delay overuse(-10%)とloss(-20%)が累積して-28%になるバグを修正。候補の大きい方のみ採用するmax reduction方式に変更
 
 ### Tests
-- **テスト296件に増加**（277→296、+19件）
+- **テスト313件に増加**（277→313、+36件）
 - GccEstimator 7テスト（初期状態、安定リンク、overuse検出、underuse、単一/空feedback、multiplier範囲）
 - BurstDetector 6テスト（初期状態、ロスなし、burst検出、sustained検出、閾値以下、回復）
 - BitrateController +5テスト（burst抑制、sustained減速、UNDERUSE増速、天井clamp、データなし）
 - congestion_control 3テスト（デフォルト、無効値、"loss"モード）
 - AdaptiveFEC +3テスト（boost、レート制限、bandwidth_delta）
+- SliceSplitter 8テスト（等分割、不均等、小フレーム、1バイト、空、データ整合性、count=2/8、count=0）
+- スライスFECパイプライン 6テスト（4スライスencode、backward compat、payload len、空スライス、パケット数、flags統合）
+- slice_count設定 3テスト（デフォルト、範囲外、正常値）
 
 ## [2.2.0] - 2026-04-10
 
