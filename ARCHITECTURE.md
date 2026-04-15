@@ -70,14 +70,17 @@ focus_vision_psvr/
 │   │   │   └── tls.rs         Self-signed cert + TlsAcceptor
 │   │   ├── transport/
 │   │   │   ├── rtp.rs         RTP packetization
-│   │   │   ├── fec.rs         Reed-Solomon FEC
+│   │   │   ├── fec.rs         Reed-Solomon FEC + AdaptiveFecController
+│   │   │   ├── slice.rs       SliceSplitter (NAL → N slices)
 │   │   │   └── udp.rs         UDP send/recv
 │   │   ├── audio/
 │   │   │   ├── capture.rs     WASAPI loopback
 │   │   │   └── encoder.rs     Opus encoding
 │   │   ├── adaptive/
 │   │   │   ├── bandwidth_estimator.rs  EWMA loss tracking
-│   │   │   └── bitrate_controller.rs  CBR adjustment
+│   │   │   ├── bitrate_controller.rs   CBR adjustment (GCC + burst aware)
+│   │   │   ├── gcc_estimator.rs        Delay-based bandwidth estimation
+│   │   │   └── burst_detector.rs       Wi-Fi burst vs sustained loss
 │   │   ├── tracking/
 │   │   │   └── receiver.rs    UDP head pose + gaze
 │   │   └── metrics/
@@ -143,14 +146,23 @@ focus_vision_psvr/
   │       │                          │          │       │                          │
   │  RTP packetize + FVP header      │          │  Timewarp (rotation correction)  │
   │       │                          │          │       │                          │
-  │  FEC encode (20% redundancy)     │          │  OpenXR swapchain render         │
-  │       │                          │          │       │                          │
+  │  ┌────▼───────────────────┐      │          │  OpenXR swapchain render         │
+  │  │ NAL >= 16KB?           │      │          │       │                          │
+  │  │ YES → Slice FEC        │      │          │                                  │
+  │  │   SliceSplitter (4x)   │      │          │                                  │
+  │  │   RS encode per-slice  │      │          │                                  │
+  │  │   Send as each slice   │      │          │                                  │
+  │  │   completes            │      │          │                                  │
+  │  │ NO → Bulk FEC (20%)    │      │          │                                  │
+  │  └────┬───────────────────┘      │          │                                  │
+  │       │                          │          │                                  │
   │  UDP send (port 9946)     ───────┼── Wi-Fi──┼───────┘                          │
   │                                  │          │                                  │
   └──────────────────────────────────┘          └──────────────────────────────────┘
 
   Latency budget: 50ms target
   ├─ Encode:    3-5ms (NVENC hardware)
+  ├─ FEC:       1-2ms (slice) / 3-5ms (bulk IDR)
   ├─ Network:   2-5ms (Wi-Fi 6)
   ├─ Decode:    3-8ms (MediaCodec hardware)
   ├─ Timewarp:  <1ms (GPU shader)
@@ -205,6 +217,64 @@ focus_vision_psvr/
   - 6-digit PIN (cryptographic RNG, 1M combinations)
   - 5 attempts then 300s lockout
   - TOFU certificate pinning (SHA-256 fingerprint)
+```
+
+## Slice-Based FEC
+
+```
+  NAL >= 16KB (typically IDR frames):
+
+  PC Server                                    HMD Client
+  ┌────────────────────────────┐              ┌──────────────────────────────┐
+  │ NAL data (100-300KB)       │              │ UDP recv                     │
+  │      │                     │              │      │                       │
+  │ SliceSplitter (4 slices)   │              │ fvp_flags → slice_count > 0? │
+  │ ├── Slice 0 (25%)         │              │      │ YES                   │
+  │ ├── Slice 1 (25%)         │              │ SlicedFecFrameDecoder        │
+  │ ├── Slice 2 (25%)         │              │ ├── Context[0] (独立RS)     │
+  │ └── Slice 3 (25%)         │              │ ├── Context[1]              │
+  │      │                     │              │ ├── Context[2]              │
+  │ FecEncoder ×4 (独立RS)    │              │ └── Context[3]              │
+  │ + u32 length prefix        │              │      │                       │
+  │      │                     │              │ 全スライス完了?             │
+  │ RTP packets               │              │ ├── YES → strip prefix       │
+  │ (fvp_flags: slice_index,  │              │ │         → concatenate      │
+  │  slice_count)              │              │ │         → MediaCodec       │
+  │      │                     │              │ └── NO (100ms) → discard     │
+  │ UDP send (each slice       │   Wi-Fi     │          → IDR_REQUEST       │
+  │ sent as it completes)  ────┼─────────────┤                               │
+  └────────────────────────────┘              └──────────────────────────────┘
+
+  NAL < 16KB: uses existing bulk FEC (single RS context, no slicing overhead).
+  Backward compat: slice_count=0 in fvp_flags → legacy FecFrameDecoder.
+  IDR_REQUEST rate limited to max 2/sec (500ms debounce).
+```
+
+## Congestion Control
+
+```
+  Two modes (config.toml: congestion_control = "gcc" | "loss"):
+
+  GCC mode (default):
+  ┌─────────────────────────────────────────────────────┐
+  │ TRANSPORT_FEEDBACK → GccEstimator                   │
+  │ (per-packet delay gradient → DelayTrend)            │
+  │      │                                              │
+  │ BurstDetector (loss pattern classification)         │
+  │ ├── Burst: skip bitrate adjust, boost FEC to max    │
+  │ ├── Sustained: aggressive bitrate reduction (-20%)  │
+  │ └── None: normal GCC delay-based control            │
+  │      │                                              │
+  │ BitrateController.adjust(estimator, gcc, burst)     │
+  │ + AdaptiveFecController (5%-40% redundancy)         │
+  └─────────────────────────────────────────────────────┘
+
+  Loss-only mode:
+  ┌─────────────────────────────────────────────────────┐
+  │ HEARTBEAT loss stats → BandwidthEstimator           │
+  │ BitrateController with default GCC/burst (no-op)    │
+  │ No delay-based detection, no burst classification   │
+  └─────────────────────────────────────────────────────┘
 ```
 
 ## Foveated Encoding
@@ -267,8 +337,9 @@ focus_vision_psvr/
 
 ## Test Coverage
 
-104 tests (all passing):
-- **streaming-engine**: 66 (unit + integration)
+313 tests (all passing):
+- **streaming-engine**: 254 (FEC, adaptive FEC, slice FEC, RTP, pairing, TLS, haptics, sleep, face tracking, profiles, calibration, config, TCP handler, disconnect reason, transport feedback, GCC estimator, burst detector, session log, memory monitor, latency, benchmarks, fuzz property tests)
 - **companion-app**: 25 (config, ADB, stats, export, PII)
-- **common**: 6 (protocol structs, flags, msg types)
+- **common**: 23 (protocol structs, flags, versioning, transport feedback, fvp_flags compat gate)
 - **integration**: 7 (full video pipeline RTP/FEC roundtrip)
+- **fuzz targets**: fuzz_rtp, fuzz_fec, fuzz_protocol, fuzz_config, fuzz_slice
