@@ -5,6 +5,9 @@ fec_redundancy = 0.2
 fec_redundancy_min = 0.05    # Adaptive FEC minimum (low loss → bandwidth saving)
 fec_redundancy_max = 0.40    # Adaptive FEC maximum (high loss → max protection)
 adaptive_fec_enabled = true  # Set false to use fixed fec_redundancy for debugging
+congestion_control = "gcc"   # "gcc" = delay-based (GCC), "loss" = loss-only
+slice_fec_enabled = true     # Split frames into slices for independent FEC (reduces IDR send latency)
+slice_count = 4              # Number of slices per frame (2-15, only for frames >= 16KB)
 
 [video]
 codec = "h265"

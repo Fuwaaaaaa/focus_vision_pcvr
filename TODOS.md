@@ -194,11 +194,32 @@
 - SECURITY.mdのKnown Limitationsテーブルに5秒PINスキップウィンドウの脅威分析を追記
 - TLS session resumption + TOFUピニングによる緩和を明記
 
-### GCC推定器（delay-based帯域推定）— 実機待ち
-- **What:** パケット到着時間のdelay variationからネットワーク帯域逼迫を検出。ロス発生前に制御可能に
-- **Why:** 現行のloss-basedコントローラーはロスが発生してから反応する。delay-basedは予兆を検出できる
-- **Context:** EWMA簡略化版で実装予定（Kalmanフィルタは実機データ後にアップグレード）。パラメータ（alpha、閾値）は実機Wi-Fi環境でチューニング必須
-- **Depends on:** 実機入手 + TRANSPORT_FEEDBACK (0x12) のクライアント側実装
+### ~~GCC Lite（遅延ベース帯域推定の簡易版）~~ (完了)
+- BandwidthEstimator.process_feedback() + delay_gradient() 実装済み
+- BitrateController.adjust()に遅延判定(OVERUSE/UNDERUSE)を統合済み
+- engine.rsでTRANSPORT_FEEDBACKを受信しBandwidthEstimatorに接続済み
+
+### ~~GccEstimator独立モジュール~~ (完了)
+- adaptive/gcc_estimator.rs: DelayTrend状態判定、bitrate_multiplier、プロービング準備
+- BandwidthEstimatorから遅延計算を分離、テスト7件
+
+### ~~BurstDetector~~ (完了)
+- adaptive/burst_detector.rs: LossPattern(None/Burst/Sustained)、500ms閾値
+- BitrateControllerとAdaptiveFecControllerに統合、テスト8件
+
+### ~~BitrateController max reductionバグ修正~~ (完了)
+- 累積バグ解消、max reduction方式に変更、テスト3件追加
+
+### ~~congestion_control設定トグル~~ (完了)
+- config.toml: congestion_control = "gcc" | "loss"、デフォルト="gcc"
+- "loss"モードではGCC/Burst無効化、ロスベースのみ
+
+### ~~sent_packet_log~~ (完了)
+- engine.rs: HashMap<u16, u64>で送信タイムスタンプ記録、5000エントリ上限
+
+### ~~AdaptiveFecController拡張~~ (完了)
+- boost機能(activate/deactivate)、1秒レート制限、bandwidth_delta_from_default()
+- transport/fec.rsに維持（Outside Voice指摘の循環依存を回避）、テスト3件追加
 
 ### スライスベースFEC — Client側FecFrameDecoder変更必須
 - **What:** フレームをN個のスライスに分割し、各スライスで独立FECエンコード。デコーダ側で早期デコード開始可能
@@ -206,15 +227,21 @@
 - **Context:** Outside Voice指摘: サーバー側だけでなくClient側FecFrameDecoderの変更が必須。4つの独立RSデコードコンテキストが必要。Androidクライアントの`fec_decoder.cpp`を4スライス対応に変更する必要がある
 - **Depends on:** Protocol v3 flags bit layout実装 + Client側FecFrameDecoder改修
 
-### TCP再接続holdのステートフル化 — 実機待ち
-- **What:** 現在のhold logic（engine.rs:880-910）はcancel token発火後に5秒sleepしているだけで、リスナーが開いていない＋UDP停止済み。真のステートフル再接続には、セッション状態を保持したままリスナーを開き続ける必要がある。またattemptカウンタがaccept失敗とconnection-lostで共有されており、Wi-Fi断5回でMAX_RECONNECT_ATTEMPTS到達→永久停止のリスクがある
-- **Why:** Outside Voice指摘（2026-04-10 eng review）: holdは「セッション破棄後の待機」であって「状態保持」ではない。HMDは再接続先がない
-- **Context:** 修正方針: (1) session_cancelをhold中は発火させない、(2) TCPリスナーをhold中も維持、(3) attemptカウンタをaccept失敗用とconnection-lost用に分離。TLS session resumption（session ticket）で再接続時のPINスキップは既に設計済み
-- **Depends on:** 実機でのWi-Fi断テスト
+### ~~TCP再接続holdのステートフル化~~ (完了)
+- hold中にTCPリスナーを再作成しHMDが再接続可能に
+- accept_failures(5回で停止)とreconnect_attempts(10回で警告のみ)を分離
+- Wi-Fi断でエンジンが永久停止するリスクを解消
+- 残: TLS session resumption（session ticket）による再接続時PINスキップは実機テスト後
 
 ### ~~Adaptive FEC無効化オプション~~ (完了)
 - config.toml: adaptive_fec_enabled（デフォルトtrue）を追加
 - engine.rs: false時はAdaptiveFecControllerを生成しない（None）、固定fec_redundancyを使用
+
+### Client側FecDecoder RSキャッシュ化 — 実機プロファイル後
+- **What:** Android C++ `fec_decoder.cpp`のReedSolomonインスタンスをスライスFEC導入に合わせてキャッシュ化
+- **Why:** スライスFECでRS初期化が4倍に増加。現在は毎デコード呼び出しでnew()。RSキャッシュで受信側遅延を削減
+- **Context:** サーバー側FecEncoderは既にRSキャッシュ済み（`fec.rs`）。同パターンをC++側に適用。autoplan eng reviewで指摘
+- **Depends on:** スライスベースFEC実装完了 + 実機でのプロファイル確認
 
 ### Thermal Governor — 実機待ち
 - **What:** NVML API経由でGPU温度を監視し、過熱時に品質を段階的に制限
