@@ -183,7 +183,8 @@ mod tests {
         let mut mon = MemoryMonitor::new(0, 50);
         // Simulate baseline
         mon.baseline_mb = Some(100);
-        mon.baseline_time = Some(Instant::now() - std::time::Duration::from_secs(3700)); // >1h ago
+        mon.baseline_time = Some(Instant::now().checked_sub(std::time::Duration::from_secs(3700))
+            .unwrap_or(Instant::now()));
         // The check() will use the real RSS, but the growth logic is what matters
         // Since we can't control OS RSS, we verify the struct state
         assert_eq!(mon.growth_threshold_mb, 50);
