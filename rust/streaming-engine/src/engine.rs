@@ -653,11 +653,15 @@ fn update_adaptive_bitrate(
                     if burst_guard.recommend_fec_boost() {
                         if let Some(ref mut afec) = adaptive_fec {
                             log::info!("Burst loss: boosting FEC redundancy");
-                            // Force a loss-based FEC bump
-                            if afec.adjust(bw_estimator.loss_rate()) {
-                                fec_encoder.set_redundancy(afec.current_redundancy());
-                            }
+                            afec.activate_boost();
+                            fec_encoder.set_redundancy(afec.effective_redundancy());
                             return;
+                        }
+                    } else if let Some(ref mut afec) = adaptive_fec {
+                        if afec.effective_redundancy() != afec.current_redundancy() {
+                            // Burst ended, deactivate boost
+                            afec.deactivate_boost();
+                            fec_encoder.set_redundancy(afec.effective_redundancy());
                         }
                     }
                 }
@@ -665,7 +669,7 @@ fn update_adaptive_bitrate(
             // Adjust FEC redundancy based on observed loss
             if let Some(afec) = adaptive_fec {
                 if afec.adjust(bw_estimator.loss_rate()) {
-                    fec_encoder.set_redundancy(afec.current_redundancy());
+                    fec_encoder.set_redundancy(afec.effective_redundancy());
                 }
             }
         }
