@@ -321,6 +321,7 @@ async fn handle_tcp_control(
     gcc_estimator: Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>>,
     sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>>,
     mut haptic_rx: mpsc::Receiver<HapticEvent>,
+    gcc_enabled: bool,
 ) -> Result<DisconnectReason, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -431,8 +432,11 @@ async fn handle_tcp_control(
                                     }
                                 }
                             }
-                            if let Ok(mut guard) = gcc_estimator.try_lock() {
-                                guard.process_feedback(&entries);
+                            // Only feed GCC estimator when delay-based congestion control is enabled
+                            if gcc_enabled {
+                                if let Ok(mut guard) = gcc_estimator.try_lock() {
+                                    guard.process_feedback(&entries);
+                                }
                             }
                         } else {
                             log::warn!("Invalid TRANSPORT_FEEDBACK payload ({}B)", payload.len());
@@ -624,6 +628,7 @@ fn update_adaptive_bitrate(
     mut adaptive_fec: Option<&mut crate::transport::fec::AdaptiveFecController>,
     fec_encoder: &mut crate::transport::fec::FecEncoder,
     burst_detector: &Arc<StdMutex<crate::adaptive::burst_detector::BurstDetector>>,
+    gcc_enabled: bool,
 ) {
     if !frame_count.is_multiple_of(framerate) {
         return;
@@ -637,33 +642,46 @@ fn update_adaptive_bitrate(
                 0.0, // RTT not yet measured
             );
 
-            // Update burst detector with current loss rate
-            if let Ok(mut burst_guard) = burst_detector.lock() {
-                burst_guard.record(bw_estimator.loss_rate());
-            }
+            if gcc_enabled {
+                // Delay-based mode: use GCC estimator and burst detector
+                // Update burst detector with current loss rate
+                if let Ok(mut burst_guard) = burst_detector.lock() {
+                    burst_guard.record(bw_estimator.loss_rate());
+                }
 
-            if let Ok(gcc_guard) = gcc_estimator.lock() {
-                if let Ok(burst_guard) = burst_detector.lock() {
-                    if bitrate_ctrl.adjust(bw_estimator, &gcc_guard, &burst_guard) {
-                        let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
-                        notify_bitrate_change(new_bps);
-                    }
+                if let Ok(gcc_guard) = gcc_estimator.lock() {
+                    if let Ok(burst_guard) = burst_detector.lock() {
+                        if bitrate_ctrl.adjust(bw_estimator, &gcc_guard, &burst_guard) {
+                            let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
+                            notify_bitrate_change(new_bps);
+                        }
 
-                    // If burst detected, boost FEC temporarily
-                    if burst_guard.recommend_fec_boost() {
-                        if let Some(ref mut afec) = adaptive_fec {
-                            log::info!("Burst loss: boosting FEC redundancy");
-                            afec.activate_boost();
-                            fec_encoder.set_redundancy(afec.effective_redundancy());
-                            return;
-                        }
-                    } else if let Some(ref mut afec) = adaptive_fec {
-                        if afec.effective_redundancy() != afec.current_redundancy() {
-                            // Burst ended, deactivate boost
-                            afec.deactivate_boost();
-                            fec_encoder.set_redundancy(afec.effective_redundancy());
+                        // If burst detected, boost FEC temporarily
+                        if burst_guard.recommend_fec_boost() {
+                            if let Some(ref mut afec) = adaptive_fec {
+                                log::info!("Burst loss: boosting FEC redundancy");
+                                afec.activate_boost();
+                                fec_encoder.set_redundancy(afec.effective_redundancy());
+                                return;
+                            }
+                        } else if let Some(ref mut afec) = adaptive_fec {
+                            if afec.effective_redundancy() != afec.current_redundancy() {
+                                // Burst ended, deactivate boost
+                                afec.deactivate_boost();
+                                fec_encoder.set_redundancy(afec.effective_redundancy());
+                            }
                         }
                     }
+                }
+            } else {
+                // Loss-only mode: use default (no-op) GCC and burst state for bitrate adjustment
+                let default_gcc = crate::adaptive::gcc_estimator::GccEstimator::new(
+                    bitrate_ctrl.current_bitrate_bps(),
+                );
+                let default_burst = crate::adaptive::burst_detector::BurstDetector::new();
+                if bitrate_ctrl.adjust(bw_estimator, &default_gcc, &default_burst) {
+                    let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
+                    notify_bitrate_change(new_bps);
                 }
             }
             // Adjust FEC redundancy based on observed loss
@@ -785,6 +803,8 @@ async fn run_streaming(
             Arc::new(StdMutex::new(crate::adaptive::burst_detector::BurstDetector::new()));
 
         // GCC delay-based bandwidth estimator (shared between TCP handler and adaptive loop)
+        // When congestion_control == "loss", GCC feedback is not processed (loss-only mode).
+        let gcc_enabled = config.network.congestion_control == "gcc";
         let gcc_estimator: Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>> =
             Arc::new(StdMutex::new(crate::adaptive::gcc_estimator::GccEstimator::new(
                 config.video.bitrate_mbps as u64 * 1_000_000,
@@ -815,7 +835,7 @@ async fn run_streaming(
         let sent_log_clone = sent_packet_log.clone();
         let reason_clone = disconnect_reason.clone();
         tokio::spawn(async move {
-            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, gcc_clone, sent_log_clone, haptic_rx).await {
+            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, gcc_clone, sent_log_clone, haptic_rx, gcc_enabled).await {
                 Ok(reason) => {
                     if let Ok(mut guard) = reason_clone.lock() {
                         *guard = Some(reason);
@@ -959,6 +979,7 @@ async fn run_streaming(
                         &mut bw_estimator, &mut bitrate_ctrl,
                         adaptive_fec.as_mut(), &mut fec_encoder,
                         &burst_detector,
+                        gcc_enabled,
                     );
 
                     check_sleep_mode(
@@ -1259,7 +1280,7 @@ mod tests {
             // Run handle_tcp_control (will read until EOF)
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                handle_tcp_control(Box::new(server), cancel, stats, osc, self.gcc_estimator.clone(), self.sent_packet_log.clone(), haptic_rx)
+                handle_tcp_control(Box::new(server), cancel, stats, osc, self.gcc_estimator.clone(), self.sent_packet_log.clone(), haptic_rx, true)
             ).await;
 
             // Capture disconnect reason
