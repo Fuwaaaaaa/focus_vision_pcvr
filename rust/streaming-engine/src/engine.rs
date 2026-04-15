@@ -342,6 +342,8 @@ async fn handle_tcp_control(
     }
 
     let mut msg_buf: Vec<u8> = Vec::with_capacity(256);
+    let mut last_idr_time = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut idr_suppressed: u64 = 0;
 
     loop {
         // Concurrently: read inbound messages OR send haptic events
@@ -372,8 +374,22 @@ async fn handle_tcp_control(
 
                 match msg_type {
                     fvp_common::protocol::msg_type::IDR_REQUEST => {
-                        log::info!("Received IDR_REQUEST from client");
-                        notify_idr_request();
+                        // Rate limit IDR requests: max 2/sec to prevent storm from slice timeouts
+                        let now = std::time::Instant::now();
+                        let should_fire = {
+                            let elapsed = now.duration_since(last_idr_time);
+                            elapsed >= std::time::Duration::from_millis(500)
+                        };
+                        if should_fire {
+                            last_idr_time = now;
+                            log::info!("Received IDR_REQUEST from client");
+                            notify_idr_request();
+                        } else {
+                            idr_suppressed += 1;
+                            if idr_suppressed % 10 == 1 {
+                                log::warn!("IDR_REQUEST suppressed (rate limit, {} total)", idr_suppressed);
+                            }
+                        }
                     }
                     fvp_common::protocol::msg_type::HEARTBEAT => {
                         let payload = &msg_buf[1..];
@@ -883,6 +899,11 @@ async fn run_streaming(
         // Step 3: Process frames with adaptive bitrate + adaptive FEC
         let mut packetizer = RtpPacketizer::new(0x46565000);
         let mut fec_encoder = crate::transport::fec::FecEncoder::new(config.network.fec_redundancy);
+        let slice_count = config.network.slice_count;
+        let slice_fec_enabled = config.network.slice_fec_enabled;
+        let mut slice_fec_encoders: Vec<crate::transport::fec::FecEncoder> = (0..slice_count)
+            .map(|_| crate::transport::fec::FecEncoder::new(config.network.fec_redundancy))
+            .collect();
         let mut frame_count: u64 = 0;
         let mut latency_skip_count: u64 = 0;
 
@@ -923,21 +944,56 @@ async fn run_streaming(
                     // Multiply first to avoid integer division truncation drift (e.g. 90000/96=937.5)
                     let timestamp_90khz = (frame_count * fvp_common::RTP_CLOCK_RATE as u64 / framerate) as u32;
 
-                    let packets = pipeline::encode_frame_to_packets_with_fec(
-                        &frame.nal_data,
-                        frame.frame_index,
-                        timestamp_90khz,
-                        frame.is_idr,
-                        &mut fec_encoder,
-                        &mut packetizer,
-                    );
+                    // Choose slice FEC for large frames, bulk FEC for small ones
+                    let use_slice_fec = slice_fec_enabled
+                        && frame.nal_data.len() >= pipeline::MIN_SLICE_SIZE;
 
-                    if let Err(e) = udp_sender.send_all(&packets).await {
-                        log::warn!("UDP send error: {}", e);
-                    }
+                    if use_slice_fec {
+                        // Slice FEC: split frame → RS encode per slice → send each slice immediately
+                        let slice_batches = pipeline::encode_frame_sliced(
+                            &frame.nal_data,
+                            frame.frame_index,
+                            timestamp_90khz,
+                            frame.is_idr,
+                            slice_count,
+                            &mut slice_fec_encoders,
+                            &mut packetizer,
+                        );
+                        for slice_packets in &slice_batches {
+                            if slice_packets.is_empty() { continue; }
+                            if let Err(e) = udp_sender.send_all(slice_packets).await {
+                                log::warn!("UDP send error (slice FEC): {}", e);
+                            }
+                            // Record send timestamps per-slice for GCC
+                            let send_us = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_micros() as u64;
+                            if let Ok(mut log_guard) = sent_packet_log.try_lock() {
+                                for packet in slice_packets {
+                                    if packet.data.len() >= 4 {
+                                        let seq = u16::from_be_bytes([packet.data[2], packet.data[3]]);
+                                        log_guard.insert(seq, send_us);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Bulk FEC: existing path
+                        let packets = pipeline::encode_frame_to_packets_with_fec(
+                            &frame.nal_data,
+                            frame.frame_index,
+                            timestamp_90khz,
+                            frame.is_idr,
+                            &mut fec_encoder,
+                            &mut packetizer,
+                        );
 
-                    // Record send timestamps for delay-based bandwidth estimation (GCC)
-                    {
+                        if let Err(e) = udp_sender.send_all(&packets).await {
+                            log::warn!("UDP send error: {}", e);
+                        }
+
+                        // Record send timestamps for GCC
                         let send_us = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
@@ -949,18 +1005,21 @@ async fn run_streaming(
                                     log_guard.insert(seq, send_us);
                                 }
                             }
-                            // Prune old entries to bound memory usage
-                            if log_guard.len() > 5000 {
-                                let mut entries: Vec<(u16, u64)> = log_guard.drain().collect();
-                                entries.sort_unstable_by_key(|&(_, ts)| std::cmp::Reverse(ts));
-                                entries.truncate(2500);
-                                log_guard.extend(entries);
-                            }
                         }
                     }
 
-                    // Return packet buffers to the pool for reuse on the next frame
-                    packetizer.recycle(packets);
+                    // Prune sent_packet_log to bound memory usage
+                    if let Ok(mut log_guard) = sent_packet_log.try_lock() {
+                        if log_guard.len() > 5000 {
+                            let mut entries: Vec<(u16, u64)> = log_guard.drain().collect();
+                            entries.sort_unstable_by_key(|&(_, ts)| std::cmp::Reverse(ts));
+                            entries.truncate(2500);
+                            log_guard.extend(entries);
+                        }
+                    }
+
+                    // Buffer pool recycle is handled by packetizer internally
+                    // (slice path sends per-slice, bulk path sends all at once)
 
                     frame.timestamps.mark_send();
 
@@ -983,6 +1042,14 @@ async fn run_streaming(
                         &burst_detector,
                         gcc_enabled,
                     );
+
+                    // Sync slice FEC encoders with current redundancy
+                    if slice_fec_enabled {
+                        let r = fec_encoder.redundancy();
+                        for se in &mut slice_fec_encoders {
+                            se.set_redundancy(r);
+                        }
+                    }
 
                     check_sleep_mode(
                         &_tracking, &mut sleep_detector,
