@@ -73,6 +73,8 @@ pub struct NetworkConfig {
     pub fec_redundancy_max: f32,
     #[serde(default = "default_adaptive_fec_enabled")]
     pub adaptive_fec_enabled: bool,
+    #[serde(default = "default_congestion_control")]
+    pub congestion_control: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +253,7 @@ fn default_memory_monitor_enabled() -> bool { true }
 fn default_memory_poll_seconds() -> u32 { 60 }
 fn default_memory_growth_threshold_mb() -> u32 { 50 }
 fn default_adaptive_fec_enabled() -> bool { true }
+fn default_congestion_control() -> String { "gcc".to_string() }
 
 fn default_ft_enabled() -> bool { true }
 fn default_ft_smoothing() -> f32 { 0.6 }
@@ -283,6 +286,7 @@ impl Default for NetworkConfig {
             fec_redundancy_min: default_fec_redundancy_min(),
             fec_redundancy_max: default_fec_redundancy_max(),
             adaptive_fec_enabled: default_adaptive_fec_enabled(),
+            congestion_control: default_congestion_control(),
         }
     }
 }
@@ -363,6 +367,15 @@ impl AppConfig {
             );
             errors.push(ConfigError { field: "network.fec_redundancy", message: format!("{} out of [{}, {}], clamped to {}", self.network.fec_redundancy, self.network.fec_redundancy_min, self.network.fec_redundancy_max, clamped) });
             self.network.fec_redundancy = clamped;
+        }
+
+        // Congestion control mode
+        if self.network.congestion_control != "gcc" && self.network.congestion_control != "loss" {
+            errors.push(ConfigError {
+                field: "network.congestion_control",
+                message: format!("must be \"gcc\" or \"loss\", got \"{}\"", self.network.congestion_control),
+            });
+            self.network.congestion_control = "gcc".to_string();
         }
 
         // Video
@@ -671,5 +684,28 @@ mod tests {
         assert!(!errors.iter().any(|e| e.field == "foveated.peripheral_qp_offset"));
         assert_eq!(cfg.foveated.mid_qp_offset, 0);
         assert_eq!(cfg.foveated.peripheral_qp_offset, 51);
+    }
+
+    #[test]
+    fn test_default_congestion_control() {
+        let config = AppConfig::default();
+        assert_eq!(config.network.congestion_control, "gcc");
+    }
+
+    #[test]
+    fn test_validate_congestion_control_invalid() {
+        let mut config = AppConfig::default();
+        config.network.congestion_control = "invalid".to_string();
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.field == "network.congestion_control"));
+        assert_eq!(config.network.congestion_control, "gcc");
+    }
+
+    #[test]
+    fn test_validate_congestion_control_loss() {
+        let mut config = AppConfig::default();
+        config.network.congestion_control = "loss".to_string();
+        let errors = config.validate();
+        assert!(!errors.iter().any(|e| e.field == "network.congestion_control"));
     }
 }
