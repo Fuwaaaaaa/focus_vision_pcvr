@@ -25,6 +25,15 @@ impl BitrateController {
         }
     }
 
+    /// Constructor with custom hysteresis duration (for testing).
+    #[cfg(test)]
+    pub(crate) fn new_with_hysteresis(initial_bitrate_mbps: u32, hysteresis: Duration) -> Self {
+        Self {
+            hysteresis_duration: hysteresis,
+            ..Self::new(initial_bitrate_mbps)
+        }
+    }
+
     /// Evaluate network conditions and adjust bitrate.
     /// Call this periodically (every ~1 second).
     /// Returns true if bitrate was changed.
@@ -35,55 +44,43 @@ impl BitrateController {
 
         let loss = estimator.loss_rate();
         let gradient = estimator.delay_gradient();
-        let old_bitrate = self.current_bitrate_bps;
+        let mut multiplier = 1.0f64;
 
         // Delay-based detection: react to congestion before loss occurs
         if gradient > 2.0 {
-            // OVERUSE: queuing delay increasing >2ms/packet
-            self.current_bitrate_bps = (self.current_bitrate_bps as f64 * 0.90) as u64;
-            self.last_adjustment = Instant::now();
-            log::warn!("Delay overuse (gradient {:.1}ms), bitrate -10% → {} Mbps",
-                gradient, self.current_bitrate_bps / 1_000_000);
+            multiplier = multiplier.min(0.90);
+            log::warn!("Delay overuse (gradient {:.1}ms)", gradient);
         }
 
         // Loss-based detection: stronger reduction if packets are actually lost
         if loss > 0.05 {
-            // High loss (>5%): aggressive reduction -20%
-            self.current_bitrate_bps = (self.current_bitrate_bps as f64 * 0.80) as u64;
-            self.last_adjustment = Instant::now();
-            log::warn!("High packet loss ({:.1}%), bitrate -20% → {} Mbps",
-                loss * 100.0, self.current_bitrate_bps / 1_000_000);
+            multiplier = multiplier.min(0.80);
+            log::warn!("High packet loss ({:.1}%)", loss * 100.0);
         } else if loss > self.target_loss_rate {
-            // Moderate loss (>2%): gentle reduction -5%
-            self.current_bitrate_bps = (self.current_bitrate_bps as f64 * 0.95) as u64;
-            self.last_adjustment = Instant::now();
-            log::info!("Moderate packet loss ({:.1}%), bitrate -5% → {} Mbps",
-                loss * 100.0, self.current_bitrate_bps / 1_000_000);
-        } else if loss < 0.01
-            && gradient < -1.0
-            && self.last_adjustment.elapsed() > self.hysteresis_duration
-        {
-            // UNDERUSE: low loss + delay recovering + stable → cautious increase +5%
-            self.current_bitrate_bps = (self.current_bitrate_bps as f64 * 1.05) as u64;
-            self.last_adjustment = Instant::now();
-            log::info!("Low loss + delay recovery (gradient {:.1}ms), bitrate +5% → {} Mbps",
-                gradient, self.current_bitrate_bps / 1_000_000);
-        } else if loss < 0.01
-            && self.last_adjustment.elapsed() > self.hysteresis_duration
-        {
-            // Low loss, stable delay → cautious increase +5%
-            self.current_bitrate_bps = (self.current_bitrate_bps as f64 * 1.05) as u64;
-            self.last_adjustment = Instant::now();
-            log::info!("Low packet loss ({:.1}%), bitrate +5% → {} Mbps",
-                loss * 100.0, self.current_bitrate_bps / 1_000_000);
+            multiplier = multiplier.min(0.95);
+            log::info!("Moderate packet loss ({:.1}%)", loss * 100.0);
         }
 
-        // Clamp
-        self.current_bitrate_bps = self.current_bitrate_bps
-            .max(self.min_bitrate_bps)
-            .min(self.max_bitrate_bps);
+        // Increase conditions (only if no reduction)
+        if multiplier >= 1.0 {
+            if loss < 0.01 && gradient < -1.0 && self.last_adjustment.elapsed() > self.hysteresis_duration {
+                multiplier = 1.05;
+                log::info!("Low loss + delay recovery (gradient {:.1}ms)", gradient);
+            } else if loss < 0.01 && self.last_adjustment.elapsed() > self.hysteresis_duration {
+                multiplier = 1.05;
+                log::info!("Low packet loss ({:.1}%)", loss * 100.0);
+            }
+        }
 
-        self.current_bitrate_bps != old_bitrate
+        if (multiplier - 1.0).abs() > f64::EPSILON {
+            self.current_bitrate_bps = (self.current_bitrate_bps as f64 * multiplier) as u64;
+            self.current_bitrate_bps = self.current_bitrate_bps.max(self.min_bitrate_bps).min(self.max_bitrate_bps);
+            self.last_adjustment = Instant::now();
+            log::info!("Bitrate adjusted → {} Mbps", self.current_bitrate_bps / 1_000_000);
+            return true;
+        }
+
+        false
     }
 
     pub fn current_bitrate_bps(&self) -> u64 { self.current_bitrate_bps }
@@ -176,7 +173,56 @@ mod tests {
         est.process_feedback(&entries);
 
         ctrl.adjust(&est);
-        // Both delay (-10%) and loss (-20%) should fire, result should be significantly reduced
-        assert!(ctrl.current_bitrate_mbps() <= 72, "Expected heavy reduction, got {}", ctrl.current_bitrate_mbps());
+        // Max-of-reductions: loss -20% dominates delay -10%, so 100 * 0.80 = 80 Mbps
+        assert_eq!(ctrl.current_bitrate_mbps(), 80, "Expected max reduction (0.80), got {}", ctrl.current_bitrate_mbps());
+    }
+
+    #[test]
+    fn test_underuse_increases_bitrate() {
+        use fvp_common::protocol::TransportFeedbackEntry;
+        // Use short hysteresis so we don't need to sleep 10 seconds
+        let mut ctrl = BitrateController::new_with_hysteresis(100, Duration::from_millis(10));
+        let mut est = BandwidthEstimator::new();
+        est.update(100, 0, 5.0); // 0% loss
+
+        // Simulate delay recovery: decreasing inter-arrival deltas (gradient < -1.0)
+        let entries = vec![
+            TransportFeedbackEntry { sequence: 0, recv_delta_us: 20_000 },
+            TransportFeedbackEntry { sequence: 1, recv_delta_us: 17_000 },
+            TransportFeedbackEntry { sequence: 2, recv_delta_us: 13_000 },
+            TransportFeedbackEntry { sequence: 3, recv_delta_us: 8_000 },
+        ];
+        est.process_feedback(&entries);
+        assert!(est.delay_gradient() < -1.0, "gradient should be < -1.0, got {}", est.delay_gradient());
+
+        // Wait for hysteresis to elapse
+        std::thread::sleep(Duration::from_millis(20));
+
+        let changed = ctrl.adjust(&est);
+        assert!(changed, "Bitrate should have increased");
+        assert_eq!(ctrl.current_bitrate_mbps(), 105, "Expected +5% increase, got {}", ctrl.current_bitrate_mbps());
+    }
+
+    #[test]
+    fn test_ceiling_enforced() {
+        let mut ctrl = BitrateController::new_with_hysteresis(195, Duration::from_millis(10));
+        let mut est = BandwidthEstimator::new();
+        est.update(100, 0, 5.0); // 0% loss, no congestion
+
+        // Wait for hysteresis to elapse
+        std::thread::sleep(Duration::from_millis(20));
+
+        ctrl.adjust(&est);
+        // 195 * 1.05 = 204.75 → clamped to 200 Mbps ceiling
+        assert_eq!(ctrl.current_bitrate_mbps(), 200, "Expected ceiling at 200 Mbps, got {}", ctrl.current_bitrate_mbps());
+    }
+
+    #[test]
+    fn test_no_change_without_data() {
+        let mut ctrl = BitrateController::new(100);
+        let est = BandwidthEstimator::new(); // no data fed
+        let changed = ctrl.adjust(&est);
+        assert!(!changed, "Should not change without data");
+        assert_eq!(ctrl.current_bitrate_mbps(), 100);
     }
 }
