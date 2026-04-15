@@ -1,6 +1,6 @@
 # Focus Vision PCVR
 
-VIVE Focus Vision向けPCVRストリーミングツール（v2.2）。
+VIVE Focus Vision向けPCVRストリーミングツール（v2.2.1）。
 
 ## Architecture
 - `rust/streaming-engine/` — Rust static library (C ABI via cbindgen)
@@ -16,7 +16,8 @@ Key modules in streaming-engine:
 - `face_tracking/profiles.rs` — Per-avatar expression profiles (51 blendshape weights, JSON)
 - `face_tracking/calibration.rs` — Guided auto-calibration (min/max → weight computation)
 - `config.rs` — TOML config with validation (structured ConfigError, range checks, NaN rejection)
-- `transport/` — RTP packetization, FEC (adaptive + fixed), UDP with buffer pool
+- `transport/` — RTP packetization, FEC (adaptive + fixed + slice), UDP with buffer pool
+- `transport/slice.rs` — SliceSplitter: NAL → N slices at byte boundaries
 - `adaptive/` — Bandwidth estimation, bitrate controller, GCC delay estimator, burst detector
 - `control/` — TCP server with TLS, PIN pairing, CONFIG_UPDATE protocol
 - `metrics/session_log.rs` — JSONL session logging with rotation
@@ -29,18 +30,18 @@ See `ARCHITECTURE.md` for detailed system diagrams and data flow.
 ./build.bat   # Windows full build
 cargo build --release -p streaming-engine    # Rust streaming engine
 cargo build --release -p focus-vision-companion  # PC companion app
-cargo test --workspace  # Run 296+ tests
+cargo test --workspace  # Run 313+ tests
 ```
 
 ## Testing
 ```bash
-cargo test --workspace              # All tests (296+)
-cargo test -p streaming-engine      # Engine: 237 tests (FEC, adaptive FEC, RTP, pairing, TLS, haptics, sleep, FT, profiles, calibration, config, TCP handler, disconnect reason, transport feedback, GCC estimator, burst detector, session log, memory monitor, latency, benchmarks, fuzz property tests)
+cargo test --workspace              # All tests (313+)
+cargo test -p streaming-engine      # Engine: 254 tests (FEC, adaptive FEC, slice FEC, RTP, pairing, TLS, haptics, sleep, FT, profiles, calibration, config, TCP handler, disconnect reason, transport feedback, GCC estimator, burst detector, session log, memory monitor, latency, benchmarks, fuzz property tests)
 cargo test -p focus-vision-companion # Companion: 25 tests (config, ADB, export)
 cargo test -p fvp-common            # Common: 23 tests (protocol structs, flags, versioning, transport feedback, fvp_flags compat gate)
 cargo bench -p streaming-engine     # Criterion benchmarks (RTP, FEC, adaptive FEC, config, memory)
 # Fuzz targets (Linux CI / cargo-fuzz):
-cd rust/streaming-engine && cargo fuzz list  # fuzz_rtp, fuzz_fec, fuzz_protocol, fuzz_config
+cd rust/streaming-engine && cargo fuzz list  # fuzz_rtp, fuzz_fec, fuzz_protocol, fuzz_config, fuzz_slice
 # C++ tests (requires CMake build):
 cd driver/build && ctest            # GoogleTest: QPマップ計算 7 tests
 ```
