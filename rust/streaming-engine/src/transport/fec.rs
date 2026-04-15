@@ -1,4 +1,5 @@
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use std::time::{Duration, Instant};
 
 /// Forward Error Correction encoder using Reed-Solomon.
 ///
@@ -128,6 +129,11 @@ pub struct AdaptiveFecController {
     min_redundancy: f32,
     max_redundancy: f32,
     max_change_per_step: f32,
+    /// Temporary boost from burst detector
+    boost_active: bool,
+    /// Rate limiting: minimum interval between adjustments
+    last_adjustment: Instant,
+    adjustment_interval: Duration,
 }
 
 impl AdaptiveFecController {
@@ -140,12 +146,19 @@ impl AdaptiveFecController {
             min_redundancy: min,
             max_redundancy: max,
             max_change_per_step: 0.05,
+            boost_active: false,
+            last_adjustment: Instant::now(),
+            adjustment_interval: Duration::from_secs(1),
         }
     }
 
     /// Evaluate loss rate and return the new redundancy ratio.
     /// Returns true if redundancy changed.
     pub fn adjust(&mut self, loss_rate: f64) -> bool {
+        if self.last_adjustment.elapsed() < self.adjustment_interval {
+            return false;
+        }
+
         let loss = if loss_rate.is_nan() || loss_rate.is_infinite() {
             log::warn!("AdaptiveFEC: invalid loss_rate ({loss_rate}), treating as 0");
             0.0
@@ -173,6 +186,7 @@ impl AdaptiveFecController {
             log::info!("AdaptiveFEC: {:.0}% → {:.0}% (loss={:.1}%)",
                 self.current_redundancy * 100.0, new_redundancy * 100.0, loss * 100.0);
             self.current_redundancy = new_redundancy;
+            self.last_adjustment = Instant::now();
             true
         } else {
             false
@@ -180,6 +194,40 @@ impl AdaptiveFecController {
     }
 
     pub fn current_redundancy(&self) -> f32 { self.current_redundancy }
+
+    /// Activate a temporary FEC boost (e.g., during a burst).
+    pub fn activate_boost(&mut self) {
+        self.boost_active = true;
+    }
+
+    /// Deactivate the temporary FEC boost.
+    pub fn deactivate_boost(&mut self) {
+        self.boost_active = false;
+    }
+
+    /// Returns the effective FEC redundancy (accounting for boost).
+    /// During boost, returns max_redundancy regardless of current_redundancy.
+    pub fn effective_redundancy(&self) -> f32 {
+        if self.boost_active {
+            self.max_redundancy.max(self.current_redundancy)
+        } else {
+            self.current_redundancy
+        }
+    }
+
+    /// Returns how much bandwidth is "saved" compared to the default 20%.
+    /// Positive = saving, negative = using more.
+    pub fn bandwidth_delta_from_default(&self) -> f32 {
+        0.20 - self.effective_redundancy()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_interval(min: f32, max: f32, initial: f32, interval: Duration) -> Self {
+        Self {
+            adjustment_interval: interval,
+            ..Self::new(min, max, initial)
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -262,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_low_loss() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        let mut ctrl = AdaptiveFecController::new_with_interval(0.05, 0.40, 0.20, Duration::ZERO);
         // Start at 20%, low loss → target 5%, but max step is 5%
         ctrl.adjust(0.005); // < 1%
         assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01); // 20% - 5% = 15%
@@ -270,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_high_loss() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        let mut ctrl = AdaptiveFecController::new_with_interval(0.05, 0.40, 0.20, Duration::ZERO);
         // Start at 20%, high loss → target 40%, max step 5%
         ctrl.adjust(0.10); // > 5%
         assert!((ctrl.current_redundancy() - 0.25).abs() < 0.01); // 20% + 5% = 25%
@@ -278,14 +326,14 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_moderate_loss() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        let mut ctrl = AdaptiveFecController::new_with_interval(0.05, 0.40, 0.20, Duration::ZERO);
         ctrl.adjust(0.02); // 2% → target 15%, diff = -5%
         assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01);
     }
 
     #[test]
     fn test_adaptive_fec_step_limit() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        let mut ctrl = AdaptiveFecController::new_with_interval(0.05, 0.40, 0.20, Duration::ZERO);
         // Multiple steps to reach target
         ctrl.adjust(0.005); // 20→15
         ctrl.adjust(0.005); // 15→10
@@ -298,14 +346,14 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_nan_loss() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        let mut ctrl = AdaptiveFecController::new_with_interval(0.05, 0.40, 0.20, Duration::ZERO);
         ctrl.adjust(f64::NAN); // should treat as 0
         assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01); // target 5%, step -5%
     }
 
     #[test]
     fn test_adaptive_fec_boundary_1_percent() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        let mut ctrl = AdaptiveFecController::new_with_interval(0.05, 0.40, 0.20, Duration::ZERO);
         // Exactly 1% → falls into 1-3% bracket (target 15%)
         ctrl.adjust(0.01);
         assert!((ctrl.current_redundancy() - 0.15).abs() < 0.01);
@@ -313,7 +361,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_boundary_3_percent() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        let mut ctrl = AdaptiveFecController::new_with_interval(0.05, 0.40, 0.20, Duration::ZERO);
         // Exactly 3% → falls into 3-5% bracket (target 25%)
         ctrl.adjust(0.03);
         assert!((ctrl.current_redundancy() - 0.25).abs() < 0.01);
@@ -321,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_fec_boundary_5_percent() {
-        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        let mut ctrl = AdaptiveFecController::new_with_interval(0.05, 0.40, 0.20, Duration::ZERO);
         // Exactly 5% → loss < 0.05 is false, so falls into >=5% bracket (target 40%).
         // From 20%, step-limited to +5% = 25%.
         ctrl.adjust(0.05);
@@ -341,6 +389,30 @@ mod tests {
         // Initial value within range stays as-is
         let ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
         assert!((ctrl.current_redundancy() - 0.20).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_boost_overrides() {
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.15);
+        assert_eq!(ctrl.effective_redundancy(), 0.15);
+        ctrl.activate_boost();
+        assert_eq!(ctrl.effective_redundancy(), 0.40);
+        ctrl.deactivate_boost();
+        assert_eq!(ctrl.effective_redundancy(), 0.15);
+    }
+
+    #[test]
+    fn test_no_change_within_interval() {
+        let mut ctrl = AdaptiveFecController::new(0.05, 0.40, 0.20);
+        // Don't wait — should return false
+        let result = ctrl.adjust(0.10);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_bandwidth_delta() {
+        let ctrl = AdaptiveFecController::new(0.05, 0.40, 0.10);
+        assert!((ctrl.bandwidth_delta_from_default() - 0.10).abs() < 0.001);
     }
 
     #[test]
