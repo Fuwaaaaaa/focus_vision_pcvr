@@ -237,6 +237,12 @@
 - config.toml: adaptive_fec_enabled（デフォルトtrue）を追加
 - engine.rs: false時はAdaptiveFecControllerを生成しない（None）、固定fec_redundancyを使用
 
+### Client側FecDecoder RSキャッシュ化 — 実機プロファイル後
+- **What:** Android C++ `fec_decoder.cpp`のReedSolomonインスタンスをスライスFEC導入に合わせてキャッシュ化
+- **Why:** スライスFECでRS初期化が4倍に増加。現在は毎デコード呼び出しでnew()。RSキャッシュで受信側遅延を削減
+- **Context:** サーバー側FecEncoderは既にRSキャッシュ済み（`fec.rs`）。同パターンをC++側に適用。autoplan eng reviewで指摘
+- **Depends on:** スライスベースFEC実装完了 + 実機でのプロファイル確認
+
 ### Thermal Governor — 実機待ち
 - **What:** NVML API経由でGPU温度を監視し、過熱時に品質を段階的に制限
 - **Why:** 4時間連続稼働でGPU過熱→フレームドロップ→ユーザー体験悪化を防止
