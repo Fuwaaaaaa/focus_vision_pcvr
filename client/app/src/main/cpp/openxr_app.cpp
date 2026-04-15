@@ -237,7 +237,9 @@ void OpenXRApp::receiveAndDecodeVideo() {
         uint16_t shardIndex = (uint16_t)fvp[4] | ((uint16_t)fvp[5] << 8);
         uint16_t totalShards = (uint16_t)fvp[6] | ((uint16_t)fvp[7] << 8);
         uint16_t flags = (uint16_t)fvp[8] | ((uint16_t)fvp[9] << 8);
-        bool isKeyframe = (flags & 0x01) != 0;
+        bool isKeyframe = fvp_flags::isKeyframe(flags);
+        uint8_t sliceIdx = fvp_flags::sliceIndex(flags);
+        uint8_t sliceCnt = fvp_flags::sliceCount(flags);
         // Sanity check: reject absurd shard counts
         if (totalShards == 0 || totalShards > 4096 || shardIndex >= totalShards) continue;
 
@@ -251,75 +253,83 @@ void OpenXRApp::receiveAndDecodeVideo() {
         const uint8_t* payload = m_recvBuffer.data() + 22;
         int payloadSize = received - 22;
 
-        // New frame? Start collecting shards.
-        if (frameIndex != m_fecDecoder.currentFrameIndex()) {
-            // Try to decode previous frame first
-            auto prevFrame = m_fecDecoder.tryDecode();
-            if (prevFrame.has_value()) {
-                // Validate NAL data before submitting to decoder
-                const uint8_t* nalData = prevFrame->data.data();
-                int nalSize = (int)prevFrame->data.size();
-
-                // Skip Annex B start code: 4-byte (00 00 00 01) or 3-byte (00 00 01)
-                const uint8_t* nalStart = nalData;
-                int nalLen = nalSize;
-                if (nalSize >= 4 && nalData[0] == 0 && nalData[1] == 0 &&
-                    nalData[2] == 0 && nalData[3] == 1) {
-                    nalStart = nalData + 4;
-                    nalLen = nalSize - 4;
-                } else if (nalSize >= 3 && nalData[0] == 0 && nalData[1] == 0 && nalData[2] == 1) {
-                    nalStart = nalData + 3;
-                    nalLen = nalSize - 3;
-                }
-
-                auto result = NalValidator::validate(nalStart, nalLen);
-                if (result == NalValidator::Result::Valid) {
-                    int64_t timestampUs = (int64_t)prevFrame->frameIndex * 11111; // cast before multiply
-                    m_videoDecoder.submitPacket(nalData, nalSize, timestampUs);
-                } else {
-                    LOGW("NAL validation failed for frame %u, requesting IDR",
-                         prevFrame->frameIndex);
+        if (sliceCnt > 0) {
+            // --- Slice FEC path ---
+            // New frame? Try to decode or timeout the previous sliced frame.
+            if (frameIndex != m_slicedDecoder.currentFrameIndex()) {
+                auto prevFrame = m_slicedDecoder.tryDecode();
+                if (prevFrame.has_value()) {
+                    submitDecodedFrame(prevFrame->data.data(), (int)prevFrame->data.size(),
+                                       prevFrame->frameIndex);
+                } else if (m_slicedDecoder.isTimedOut()) {
+                    LOGW("Slice FEC: frame %u timed out (%u/%u slices), requesting IDR",
+                         m_slicedDecoder.currentFrameIndex(),
+                         __builtin_popcount(m_slicedDecoder.isComplete() ? 0xFFFF : 0),
+                         m_slicedDecoder.sliceCount());
                     m_tcpClient.requestIdr();
-                    m_videoDecoder.flush();
                 }
+                m_slicedDecoder.beginFrame(frameIndex, sliceCnt, isKeyframe);
             }
-            m_fecDecoder.beginFrame(frameIndex, totalShards, dataShards, isKeyframe);
+            m_slicedDecoder.addShard(sliceIdx, shardIndex, totalShards, dataShards,
+                                     payload, payloadSize);
+        } else {
+            // --- Bulk FEC path (legacy, slice_count=0) ---
+            if (frameIndex != m_fecDecoder.currentFrameIndex()) {
+                auto prevFrame = m_fecDecoder.tryDecode();
+                if (prevFrame.has_value()) {
+                    submitDecodedFrame(prevFrame->data.data(), (int)prevFrame->data.size(),
+                                       prevFrame->frameIndex);
+                }
+                m_fecDecoder.beginFrame(frameIndex, totalShards, dataShards, isKeyframe);
+            }
+            m_fecDecoder.addShard(shardIndex, payload, payloadSize);
         }
-
-        m_fecDecoder.addShard(shardIndex, payload, payloadSize);
     }
 
-    // Flush: if we have a complete frame but no new frame triggered decode, decode it now.
-    // This handles the last frame in a sequence and prevents off-by-one at stream end.
+    // Flush: decode complete frames that haven't been triggered by a new frame arrival.
     if (m_fecDecoder.isComplete()) {
         auto lastFrame = m_fecDecoder.tryDecode();
         if (lastFrame.has_value()) {
-            const uint8_t* nalData = lastFrame->data.data();
-            int nalSize = (int)lastFrame->data.size();
-
-            const uint8_t* nalStart = nalData;
-            int nalLen = nalSize;
-            // Handle both 4-byte (00 00 00 01) and 3-byte (00 00 01) Annex B start codes
-            if (nalSize >= 4 && nalData[0] == 0 && nalData[1] == 0 &&
-                nalData[2] == 0 && nalData[3] == 1) {
-                nalStart = nalData + 4;
-                nalLen = nalSize - 4;
-            } else if (nalSize >= 3 && nalData[0] == 0 && nalData[1] == 0 && nalData[2] == 1) {
-                nalStart = nalData + 3;
-                nalLen = nalSize - 3;
-            }
-
-            auto result = NalValidator::validate(nalStart, nalLen);
-            if (result == NalValidator::Result::Valid) {
-                int64_t timestampUs = (int64_t)lastFrame->frameIndex * 11111; // cast before multiply to avoid overflow
-                m_videoDecoder.submitPacket(nalData, nalSize, timestampUs);
-            } else {
-                LOGW("NAL validation failed for frame %u, requesting IDR",
-                     lastFrame->frameIndex);
-                m_tcpClient.requestIdr();
-                m_videoDecoder.flush();
-            }
+            submitDecodedFrame(lastFrame->data.data(), (int)lastFrame->data.size(),
+                               lastFrame->frameIndex);
         }
+    }
+    if (m_slicedDecoder.isComplete()) {
+        auto lastFrame = m_slicedDecoder.tryDecode();
+        if (lastFrame.has_value()) {
+            submitDecodedFrame(lastFrame->data.data(), (int)lastFrame->data.size(),
+                               lastFrame->frameIndex);
+        }
+    }
+    // Slice timeout check: if sliced frame started but isn't complete after 100ms
+    if (m_slicedDecoder.sliceCount() > 0 && !m_slicedDecoder.isComplete()
+        && m_slicedDecoder.isTimedOut()) {
+        LOGW("Slice FEC: frame %u timed out, requesting IDR", m_slicedDecoder.currentFrameIndex());
+        m_tcpClient.requestIdr();
+    }
+}
+
+void OpenXRApp::submitDecodedFrame(const uint8_t* nalData, int nalSize, uint32_t frameIndex) {
+    // Skip Annex B start code: 4-byte (00 00 00 01) or 3-byte (00 00 01)
+    const uint8_t* nalStart = nalData;
+    int nalLen = nalSize;
+    if (nalSize >= 4 && nalData[0] == 0 && nalData[1] == 0 &&
+        nalData[2] == 0 && nalData[3] == 1) {
+        nalStart = nalData + 4;
+        nalLen = nalSize - 4;
+    } else if (nalSize >= 3 && nalData[0] == 0 && nalData[1] == 0 && nalData[2] == 1) {
+        nalStart = nalData + 3;
+        nalLen = nalSize - 3;
+    }
+
+    auto result = NalValidator::validate(nalStart, nalLen);
+    if (result == NalValidator::Result::Valid) {
+        int64_t timestampUs = (int64_t)frameIndex * 11111;
+        m_videoDecoder.submitPacket(nalData, nalSize, timestampUs);
+    } else {
+        LOGW("NAL validation failed for frame %u, requesting IDR", frameIndex);
+        m_tcpClient.requestIdr();
+        m_videoDecoder.flush();
     }
 }
 

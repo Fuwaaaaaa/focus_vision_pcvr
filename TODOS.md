@@ -221,11 +221,12 @@
 - boost機能(activate/deactivate)、1秒レート制限、bandwidth_delta_from_default()
 - transport/fec.rsに維持（Outside Voice指摘の循環依存を回避）、テスト3件追加
 
-### スライスベースFEC — Client側FecFrameDecoder変更必須
-- **What:** フレームをN個のスライスに分割し、各スライスで独立FECエンコード。デコーダ側で早期デコード開始可能
-- **Why:** フレーム送信開始の遅延を3-5ms→1-2msに短縮
-- **Context:** Outside Voice指摘: サーバー側だけでなくClient側FecFrameDecoderの変更が必須。4つの独立RSデコードコンテキストが必要。Androidクライアントの`fec_decoder.cpp`を4スライス対応に変更する必要がある
-- **Depends on:** Protocol v3 flags bit layout実装 + Client側FecFrameDecoder改修
+### ~~スライスベースFEC~~ (完了)
+- Server側: SliceSplitter + encode_frame_sliced (pipeline.rs)、4独立FecEncoder、fvp_flags統合
+- Client側: SlicedFecFrameDecoder (fec_decoder.cpp)、4独立RSコンテキスト、u32 length prefix、100ms timeout
+- Config: slice_fec_enabled / slice_count、MIN_SLICE_SIZE = 16KB
+- IDR_REQUESTレート制限 (max 2/sec) 追加
+- テスト17件追加（Rust側）、313 tests total
 
 ### ~~TCP再接続holdのステートフル化~~ (完了)
 - hold中にTCPリスナーを再作成しHMDが再接続可能に
