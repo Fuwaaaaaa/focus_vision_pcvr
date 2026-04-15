@@ -194,11 +194,46 @@
 - SECURITY.mdのKnown Limitationsテーブルに5秒PINスキップウィンドウの脅威分析を追記
 - TLS session resumption + TOFUピニングによる緩和を明記
 
-### GCC推定器（delay-based帯域推定）— 実機待ち
-- **What:** パケット到着時間のdelay variationからネットワーク帯域逼迫を検出。ロス発生前に制御可能に
-- **Why:** 現行のloss-basedコントローラーはロスが発生してから反応する。delay-basedは予兆を検出できる
-- **Context:** EWMA簡略化版で実装予定（Kalmanフィルタは実機データ後にアップグレード）。パラメータ（alpha、閾値）は実機Wi-Fi環境でチューニング必須
-- **Depends on:** 実機入手 + TRANSPORT_FEEDBACK (0x12) のクライアント側実装
+### ~~GCC Lite（遅延ベース帯域推定の簡易版）~~ (完了)
+- BandwidthEstimator.process_feedback() + delay_gradient() 実装済み
+- BitrateController.adjust()に遅延判定(OVERUSE/UNDERUSE)を統合済み
+- engine.rsでTRANSPORT_FEEDBACKを受信しBandwidthEstimatorに接続済み
+
+### GccEstimator独立モジュール — フルプラン実装
+- **What:** BandwidthEstimatorからdelay_gradient/process_feedbackを分離し、GccEstimator独立モジュールを作成。DelayTrend状態判定(Normal/Increasing/Overuse)、bitrate_multiplier()、プロービング準備を含む
+- **Why:** 単一責務原則。BandwidthEstimatorはロス率EWMAのみに専念。GccEstimatorはdelay-based判定に専念。実機チューニング時にGccEstimatorだけを差し替え可能にする
+- **Context:** 現行のGCC Lite（EWMA簡易版）を基に拡張。カルマンフィルタは実機データ収集後にアップグレード。2026-04-15 eng reviewで承認
+- **Depends on:** sent_packet_log実装
+
+### BurstDetector実装
+- **What:** Wi-Fi干渉（バースト）vs持続的混雑（sustained）の分類。LossPattern enum(None/Burst/Sustained)、500ms閾値でburst→sustained遷移
+- **Why:** GCC LiteはEWMAのみでカルマンフィルタなし。カルマンのノイズモデルがないため、バースト検出が別途必要。バースト時はFEC boost、sustained時はビットレート減速と適切に使い分ける
+- **Context:** AdaptiveFecControllerのboost機能と連携。BitrateControllerでバースト時はビットレート変更を抑制。独立実装可能（依存なし）。2026-04-15 eng reviewで承認
+- **Depends on:** なし
+
+### BitrateController max reductionバグ修正
+- **What:** adjust()でdelay overuse(-10%)とloss(-20%)が累積して-28%になるバグを修正。候補を先に計算し大きい方を採用する
+- **Why:** Wi-Fi環境では遅延とロスが同時発生する。累積すると90Mbps→64Mbps→46Mbps...と急速に下限に到達し、回復が遅い
+- **Context:** GCC Lite設計ドキュメントでは「max reduction」と明記されているが実装で乖離。2026-04-15 eng reviewで発見
+- **Depends on:** なし（即修正可能）
+
+### congestion_control設定トグル
+- **What:** config.tomlにcongestion_control = "loss" | "gcc" フィールド追加。デフォルト="gcc"
+- **Why:** 実機テストでGCCが悪化した場合のセーフティネット。既存ロスベースコントローラーへのフォールバック
+- **Context:** Outside Voice指摘（2026-04-15 eng review）: ロールバック/A/B戦略がない。adaptive_fec_enabledと同様のパターン
+- **Depends on:** GccEstimator分離後（loss/gccで分岐するため）
+
+### sent_packet_log実装
+- **What:** engine.rsにHashMap<u16, u64>で送信パケットのタイムスタンプを記録。TRANSPORT_FEEDBACK受信時にseq_numでルックアップ。5000エントリ上限でプルーニング
+- **Why:** GccEstimator.on_feedback(send_us, recv_us)にPC側送信タイムスタンプが必要。Outside Voice指摘: HMDはPC側送信時刻を知らない
+- **Context:** デルタ形式（recv_delta_us）を維持。PC側でsend_usを記録し、HMDのrecv_delta_usとペアリングしてone-way delay variationを計算。RTPヘッダーのseq_numでマッチング
+- **Depends on:** なし（即実装可能）
+
+### AdaptiveFecController拡張
+- **What:** (1) boost機能追加（BurstDetector連携） (2) adjustment_interval 1秒レート制限 (3) bandwidth_delta_from_default()。配置場所（transport/fec.rs維持 vs adaptive/移動）は実装時に再評価
+- **Why:** 現行のAdaptiveFecControllerにはboost/レート制限がない。バースト時の一時的FEC増加でパケットロスを吸収
+- **Context:** Outside Voice指摘: adaptive/移動は循環依存になる可能性あり。FEC適用側（transport/fec.rs）が制御ロジックを所有する方が自然な場合も。2026-04-15 eng reviewで承認
+- **Depends on:** BurstDetector実装
 
 ### スライスベースFEC — Client側FecFrameDecoder変更必須
 - **What:** フレームをN個のスライスに分割し、各スライスで独立FECエンコード。デコーダ側で早期デコード開始可能
