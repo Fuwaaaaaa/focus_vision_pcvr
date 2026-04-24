@@ -94,40 +94,47 @@ impl OscBridge {
         let alpha = self.smoothing;
 
         if lip_valid {
-            for (i, &raw) in lip.iter().enumerate() {
-                // Guard against NaN: a single NaN would permanently poison the EMA state
-                if raw.is_nan() { continue; }
-                let smoothed = alpha * self.prev_lip[i] + (1.0 - alpha) * raw;
-                self.prev_lip[i] = smoothed;
-                // Apply profile weight (lip indices 0-36)
-                let weight = self.profile_weights.as_ref()
-                    .and_then(|w| w.get(i).copied())
-                    .unwrap_or(1.0);
-                let scaled = (smoothed * weight).clamp(0.0, 1.0);
-                if scaled > 0.01 {
-                    let addr = format!("/avatar/parameters/{}", LIP_NAMES[i]);
-                    if let Some(msg) = encode_osc_float(&addr, scaled) {
-                        let _ = socket.send_to(&msg, target);
-                    }
-                }
-            }
+            Self::apply_smoothing_and_send(
+                socket, target, lip, &mut self.prev_lip,
+                &LIP_NAMES, 0, alpha, self.profile_weights.as_deref(),
+            );
         }
 
         if eye_valid {
-            for (i, &raw) in eye.iter().enumerate() {
-                if raw.is_nan() { continue; }
-                let smoothed = alpha * self.prev_eye[i] + (1.0 - alpha) * raw;
-                self.prev_eye[i] = smoothed;
-                // Apply profile weight (eye indices 37-50)
-                let weight = self.profile_weights.as_ref()
-                    .and_then(|w| w.get(37 + i).copied())
-                    .unwrap_or(1.0);
-                let scaled = (smoothed * weight).clamp(0.0, 1.0);
-                if scaled > 0.01 {
-                    let addr = format!("/avatar/parameters/{}", EYE_NAMES[i]);
-                    if let Some(msg) = encode_osc_float(&addr, scaled) {
-                        let _ = socket.send_to(&msg, target);
-                    }
+            Self::apply_smoothing_and_send(
+                socket, target, eye, &mut self.prev_eye,
+                &EYE_NAMES, 37, alpha, self.profile_weights.as_deref(),
+            );
+        }
+    }
+
+    /// EMA smoothing + profile weighting + OSC send for one blendshape group.
+    /// `weight_offset` is the starting index in `profile_weights` (lip=0, eye=37).
+    /// Values <= 0.01 after scaling are skipped. NaN inputs are dropped to avoid
+    /// poisoning EMA state.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_smoothing_and_send(
+        socket: &UdpSocket,
+        target: &str,
+        raw: &[f32],
+        prev: &mut [f32],
+        names: &[&str],
+        weight_offset: usize,
+        alpha: f32,
+        profile_weights: Option<&[f32]>,
+    ) {
+        for (i, &r) in raw.iter().enumerate() {
+            if r.is_nan() { continue; }
+            let smoothed = alpha * prev[i] + (1.0 - alpha) * r;
+            prev[i] = smoothed;
+            let weight = profile_weights
+                .and_then(|w| w.get(weight_offset + i).copied())
+                .unwrap_or(1.0);
+            let scaled = (smoothed * weight).clamp(0.0, 1.0);
+            if scaled > 0.01 {
+                let addr = format!("/avatar/parameters/{}", names[i]);
+                if let Some(msg) = encode_osc_float(&addr, scaled) {
+                    let _ = socket.send_to(&msg, target);
                 }
             }
         }
