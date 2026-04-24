@@ -9,6 +9,9 @@
 //! to the streaming pipeline. A recording that starts failing mid-session
 //! simply stops writing; the stream continues uninterrupted.
 
+pub mod audio;
+pub use audio::{AudioRecorder, default_audio_filename};
+
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
