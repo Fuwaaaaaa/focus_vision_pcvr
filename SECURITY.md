@@ -24,6 +24,7 @@ Focus Vision PCVR communicates over Wi-Fi between a Windows PC and an Android HM
 | Session hijacking | Low risk | Once paired, no re-authentication. Session bound to TCP connection lifetime. |
 | TCP reconnect PIN skip | Low risk | 5s window after connection loss where client can reconnect without PIN. Mitigated by TLS session resumption (session ticket verifies same client cryptographically) + TOFU certificate pinning (SHA-256 fingerprint). New clients always require PIN. Window is short (5s) and attacker would need to impersonate the TLS session. |
 | Certificate rotation | Manual | New cert generated each server restart. No automated rotation. |
+| Session recording file disclosure | Low risk / user-controlled | Disabled by default. When `[recording] enabled = true`, raw Annex B video (.h265/.h264) and 16-bit PCM WAV audio are written to `%APPDATA%/FocusVisionPCVR/recordings/` (or user-specified dir). Protected only by OS filesystem permissions on the user's profile. Files may contain gaze coordinates, controller inputs, and desktop screen contents — **review before sharing externally**. No in-product PII scrubbing. |
 
 ### Architecture
 
@@ -39,6 +40,10 @@ Data Channels (UDP):
   Video (9946): RTP + FEC, plaintext
   Tracking (9947): Head pose + eye gaze, plaintext
   Audio (9948): Opus encoded, plaintext
+
+Recording (optional, user-enabled):
+  Local filesystem write to %APPDATA%/FocusVisionPCVR/recordings/
+  Disabled by default; no network exposure
 ```
 
 ### Responsible Disclosure
