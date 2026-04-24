@@ -10,6 +10,10 @@ ships without requiring real hardware to validate; items that need a
 NVIDIA GPU or Focus Vision headset are explicitly tagged as
 "hardware-pending" in the Out-of-Scope section at the bottom.
 
+### Security
+- **TOFU 証明書ピン留めをクライアント側で実装:** TLS ハンドシェイク後にサーバ leaf cert の SHA-256 を `<app internal storage>/server_fingerprint.hex` に保存し、以降の接続で fingerprint 不一致なら接続を拒否する。これまで `MBEDTLS_SSL_VERIFY_NONE` で**証明書を一切検証していなかった**ため、同一 LAN 上の攻撃者が自前 TLS 証明書で MITM し PIN を盗聴可能だった。SECURITY.md が宣言していた緩和策が実際に動作するようになる
+- **TLS 失敗時の平文フォールバック削除:** `TcpControlClient::connect()` は TLS / pinning に失敗した場合、平文に降格せず接続を拒否する。これまではハンドシェイクを破壊するだけで暗号化を剥がせる構造だった
+
 ### Companion App (Demo + UX)
 - **`--demo` flag:** new `demo` module synthesizes a 60 s scripted
   state cycle (Disconnected → WaitingForPin "847251" → Connected with

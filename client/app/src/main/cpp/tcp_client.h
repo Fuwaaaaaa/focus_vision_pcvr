@@ -12,6 +12,11 @@
 #include <mbedtls/sha256.h>
 
 /// TCP control channel client. Handles handshake, PIN pairing, stream config.
+///
+/// Security model: TLS 1.3 with TOFU (Trust-On-First-Use) certificate pinning.
+/// Caller MUST call setFingerprintStorePath() before connect() — without it the
+/// client refuses to connect, since accepting any cert without persistence would
+/// allow silent MITM substitution between sessions.
 class TcpControlClient {
 public:
     struct StreamConfig {
@@ -21,6 +26,15 @@ public:
         uint32_t framerate = 0;
         uint8_t codec = 1; // 0=H264, 1=H265
     };
+
+    /// Set the file path used to persist the pinned server cert SHA-256.
+    /// Recommended location: <ANativeActivity::internalDataPath>/server_fingerprint.hex
+    /// Must be called before connect().
+    void setFingerprintStorePath(std::string path) { m_fingerprintStorePath = std::move(path); }
+
+    /// Forget the pinned fingerprint (e.g. after the user explicitly re-pairs
+    /// with a new server). Removes the on-disk file if present.
+    void clearPinnedFingerprint();
 
     bool connect(const char* serverAddress, int port);
     void disconnect();
@@ -53,10 +67,17 @@ private:
     mbedtls_entropy_context m_entropy;
     mbedtls_ctr_drbg_context m_ctrDrbg;
     mbedtls_net_context m_netCtx;
-    std::string m_certFingerprint; // TOFU: saved on first connect
+
+    // TOFU pinning state.
+    std::string m_fingerprintStorePath; // empty == not configured (connect refused)
+    std::string m_pinnedFingerprint;    // hex sha256, loaded from disk on first verify
 
     bool initTls();
     void shutdownTls();
     int tlsSend(const uint8_t* data, int len);
     int tlsRecv(uint8_t* data, int len);
+
+    /// After TLS handshake, pin or verify the leaf certificate SHA-256.
+    /// Returns true to allow the connection, false to abort it.
+    bool verifyOrPinServerCert();
 };
