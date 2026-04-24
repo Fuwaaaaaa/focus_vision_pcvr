@@ -3,6 +3,24 @@ use fvp_common::{MTU_SIZE, RTP_PT_H265};
 /// Maximum payload per RTP packet (MTU minus RTP header 12B minus FVP header 10B)
 const MAX_PAYLOAD: usize = MTU_SIZE - 12 - 10;
 
+/// Append a 12-byte RTP header to `buf`.
+/// Format: V=2, P=0, X=0, CC=0 | M,PT | seq(BE) | timestamp(BE) | SSRC(BE).
+pub fn write_rtp_header(
+    buf: &mut Vec<u8>,
+    payload_type: u8,
+    marker: bool,
+    sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
+) {
+    buf.push(0x80); // V=2, P=0, X=0, CC=0
+    let mpt = if marker { 0x80 | (payload_type & 0x7F) } else { payload_type & 0x7F };
+    buf.push(mpt);
+    buf.extend_from_slice(&sequence.to_be_bytes());
+    buf.extend_from_slice(&timestamp.to_be_bytes());
+    buf.extend_from_slice(&ssrc.to_be_bytes());
+}
+
 /// A single RTP packet ready for transmission.
 #[derive(Debug, Clone)]
 pub struct RtpPacket {
@@ -72,12 +90,7 @@ impl RtpPacketizer {
             let mut buf = self.take_buf(12 + 10 + chunk.len());
 
             // RTP header (12 bytes)
-            buf.push(0x80); // V=2, P=0, X=0, CC=0
-            let mpt = if is_last { 0x80 | RTP_PT_H265 } else { RTP_PT_H265 };
-            buf.push(mpt);
-            buf.extend_from_slice(&seq.to_be_bytes());
-            buf.extend_from_slice(&timestamp_90khz.to_be_bytes());
-            buf.extend_from_slice(&self.ssrc.to_be_bytes());
+            write_rtp_header(&mut buf, RTP_PT_H265, is_last, seq, timestamp_90khz, self.ssrc);
 
             // FVP header (10 bytes) — shard fields are u16 to support large keyframes
             buf.extend_from_slice(&frame_index.to_le_bytes());
@@ -196,6 +209,34 @@ pub struct ReassembledFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_write_rtp_header_layout() {
+        let mut buf = Vec::new();
+        write_rtp_header(&mut buf, 96, true, 0x1234, 0xAABBCCDD, 0x11223344);
+        assert_eq!(buf.len(), 12);
+        assert_eq!(buf[0], 0x80); // V=2
+        assert_eq!(buf[1], 0x80 | 96); // marker + PT
+        assert_eq!(&buf[2..4], &[0x12, 0x34]); // seq BE
+        assert_eq!(&buf[4..8], &[0xAA, 0xBB, 0xCC, 0xDD]); // timestamp BE
+        assert_eq!(&buf[8..12], &[0x11, 0x22, 0x33, 0x44]); // SSRC BE
+    }
+
+    #[test]
+    fn test_write_rtp_header_no_marker() {
+        let mut buf = Vec::new();
+        write_rtp_header(&mut buf, 96, false, 0, 0, 0);
+        assert_eq!(buf[1], 96); // marker bit clear
+    }
+
+    #[test]
+    fn test_write_rtp_header_masks_pt_overflow() {
+        let mut buf = Vec::new();
+        write_rtp_header(&mut buf, 0xFF, false, 0, 0, 0);
+        // PT is 7 bits; top bit must be zeroed (would be misinterpreted as marker)
+        assert_eq!(buf[1] & 0x80, 0);
+        assert_eq!(buf[1] & 0x7F, 0x7F);
+    }
 
     #[test]
     fn test_packetize_small_frame() {
