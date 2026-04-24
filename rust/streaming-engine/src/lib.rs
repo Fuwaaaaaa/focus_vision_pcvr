@@ -43,25 +43,44 @@ pub fn write_status_file(
         None => return,
     };
     let _ = std::fs::create_dir_all(&dir);
-    let pin_str = pin.map(|p| format!("{:06}", p)).unwrap_or_else(|| "------".to_string());
-    let sub = subsystems.map(|s| format!(
-        r#","ft_active":{},"sleep_active":{},"audio_enabled":{},"packet_loss_pct":{:.1}"#,
-        s.ft_active, s.sleep_active, s.audio_enabled, s.packet_loss_pct,
-    )).unwrap_or_default();
-    let json = format!(
-        r#"{{"status":"{}","pin":"{}","latency_us":{},"fps":{},"bitrate_mbps":{}{}}}"#,
-        status, pin_str,
-        latency_us.unwrap_or(0),
-        fps.unwrap_or(0),
-        bitrate_mbps.unwrap_or(0),
-        sub,
-    );
+    let json = build_status_json(status, pin, latency_us, fps, bitrate_mbps, subsystems);
+
     // Atomic write: write to temp file then rename to prevent partial reads
     let path = dir.join("status.json");
     let tmp_path = dir.join("status.json.tmp");
     if std::fs::write(&tmp_path, &json).is_ok() {
         let _ = std::fs::rename(&tmp_path, &path);
     }
+}
+
+/// Build the status.json payload. Separated from `write_status_file` for testability.
+fn build_status_json(
+    status: &str,
+    pin: Option<u32>,
+    latency_us: Option<u64>,
+    fps: Option<u16>,
+    bitrate_mbps: Option<u32>,
+    subsystems: Option<&SubsystemStatus>,
+) -> String {
+    let pin_str = pin.map(|p| format!("{:06}", p)).unwrap_or_else(|| "------".to_string());
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("status".to_string(), serde_json::Value::String(status.to_string()));
+    obj.insert("pin".to_string(), serde_json::Value::String(pin_str));
+    obj.insert("latency_us".to_string(), serde_json::Value::from(latency_us.unwrap_or(0)));
+    obj.insert("fps".to_string(), serde_json::Value::from(fps.unwrap_or(0)));
+    obj.insert("bitrate_mbps".to_string(), serde_json::Value::from(bitrate_mbps.unwrap_or(0)));
+    if let Some(s) = subsystems {
+        obj.insert("ft_active".to_string(), serde_json::Value::Bool(s.ft_active));
+        obj.insert("sleep_active".to_string(), serde_json::Value::Bool(s.sleep_active));
+        obj.insert("audio_enabled".to_string(), serde_json::Value::Bool(s.audio_enabled));
+        // Preserve the prior "{:.1}" rendering: one decimal place as a JSON number.
+        let rounded = (s.packet_loss_pct * 10.0).round() / 10.0;
+        if let Some(n) = serde_json::Number::from_f64(rounded as f64) {
+            obj.insert("packet_loss_pct".to_string(), serde_json::Value::Number(n));
+        }
+    }
+    serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| "{}".to_string())
 }
 
 static INIT: Once = Once::new();
@@ -465,5 +484,49 @@ mod tests {
         let nal_data = vec![0u8; 100];
         let result = unsafe { fvp_submit_encoded_nal(nal_data.as_ptr(), 0, 0, 0) };
         assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_build_status_json_without_subsystems() {
+        let json = build_status_json("idle", Some(123456), Some(5000), Some(90), Some(120), None);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], "idle");
+        assert_eq!(v["pin"], "123456");
+        assert_eq!(v["latency_us"], 5000);
+        assert_eq!(v["fps"], 90);
+        assert_eq!(v["bitrate_mbps"], 120);
+        assert!(v.get("ft_active").is_none());
+        assert!(v.get("packet_loss_pct").is_none());
+    }
+
+    #[test]
+    fn test_build_status_json_with_subsystems_and_defaults() {
+        let sub = SubsystemStatus {
+            ft_active: true,
+            sleep_active: false,
+            audio_enabled: true,
+            packet_loss_pct: 3.27,
+        };
+        let json = build_status_json("streaming", None, None, None, None, Some(&sub));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], "streaming");
+        assert_eq!(v["pin"], "------");
+        assert_eq!(v["latency_us"], 0);
+        assert_eq!(v["fps"], 0);
+        assert_eq!(v["bitrate_mbps"], 0);
+        assert_eq!(v["ft_active"], true);
+        assert_eq!(v["sleep_active"], false);
+        assert_eq!(v["audio_enabled"], true);
+        // Preserve "{:.1}" — 3.27 rounds to 3.3 (tolerance covers f32→f64 cast)
+        let loss = v["packet_loss_pct"].as_f64().unwrap();
+        assert!((loss - 3.3).abs() < 1e-5, "expected 3.3, got {}", loss);
+    }
+
+    #[test]
+    fn test_build_status_json_escapes_special_chars() {
+        // Quote + backslash in status should not break parsing.
+        let json = build_status_json(r#"weird"state\with"#, None, None, None, None, None);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], r#"weird"state\with"#);
     }
 }
