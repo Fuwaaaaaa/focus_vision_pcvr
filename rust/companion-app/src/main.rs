@@ -86,6 +86,10 @@ struct CompanionApp {
     sleep_timeout: u32,
     ft_enabled: bool,
     ft_smoothing: f32,
+
+    // Session Recording settings
+    recording_enabled: bool,
+    recording_output_dir: String,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -204,6 +208,14 @@ impl CompanionApp {
             ft_smoothing: {
                 let cfg = config::LocalConfig::load();
                 cfg.face_tracking.smoothing
+            },
+            recording_enabled: {
+                let cfg = config::LocalConfig::load();
+                cfg.recording.enabled
+            },
+            recording_output_dir: {
+                let cfg = config::LocalConfig::load();
+                cfg.recording.output_dir
             },
         }
     }
@@ -766,6 +778,47 @@ impl CompanionApp {
                 match self.local_config.save() {
                     Ok(()) => self.log(&format!("Face tracking: {} (smoothing {:.2})",
                         if self.ft_enabled { "enabled" } else { "disabled" }, self.ft_smoothing)),
+                    Err(e) => self.log(&format!("Failed to save config: {e}")),
+                }
+            }
+        });
+
+        ui.add_space(16.0);
+
+        // Session Recording
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Session Recording").size(13.0).color(text_muted));
+
+            let prev_rec_enabled = self.recording_enabled;
+            let prev_rec_dir = self.recording_output_dir.clone();
+            ui.checkbox(&mut self.recording_enabled, "Record sessions to disk (video + audio)");
+
+            if self.recording_enabled {
+                ui.horizontal(|ui| {
+                    ui.label("Output dir:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.recording_output_dir)
+                            .hint_text("(blank = %APPDATA%/FocusVisionPCVR/recordings)")
+                            .desired_width(320.0),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new("Video: raw Annex B (.h265/.h264) / Audio: 16-bit PCM (.wav). ffmpeg -i rec.h265 -i rec.wav -c:v copy rec.mp4")
+                        .size(11.0).color(text_muted),
+                );
+                ui.label(
+                    egui::RichText::new("Engine restart required for changes to take effect.")
+                        .size(11.0).color(text_muted),
+                );
+            }
+
+            if self.recording_enabled != prev_rec_enabled || self.recording_output_dir != prev_rec_dir {
+                self.local_config.recording.enabled = self.recording_enabled;
+                self.local_config.recording.output_dir = self.recording_output_dir.clone();
+                match self.local_config.save() {
+                    Ok(()) => self.log(&format!("Recording: {} (dir: {})",
+                        if self.recording_enabled { "enabled" } else { "disabled" },
+                        if self.recording_output_dir.is_empty() { "<default>" } else { &self.recording_output_dir })),
                     Err(e) => self.log(&format!("Failed to save config: {e}")),
                 }
             }

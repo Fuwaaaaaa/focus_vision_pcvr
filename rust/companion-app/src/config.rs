@@ -11,6 +11,8 @@ pub struct LocalConfig {
     pub sleep_mode: SleepModeOverride,
     #[serde(default)]
     pub face_tracking: FaceTrackingOverride,
+    #[serde(default)]
+    pub recording: RecordingOverride,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,6 +57,23 @@ impl Default for FaceTrackingOverride {
         Self { enabled: default_ft_enabled(), smoothing: default_ft_smoothing() }
     }
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecordingOverride {
+    #[serde(default = "default_recording_enabled")]
+    pub enabled: bool,
+    /// Empty = %APPDATA%/FocusVisionPCVR/recordings
+    #[serde(default)]
+    pub output_dir: String,
+}
+
+impl Default for RecordingOverride {
+    fn default() -> Self {
+        Self { enabled: default_recording_enabled(), output_dir: String::new() }
+    }
+}
+
+fn default_recording_enabled() -> bool { false }
 
 fn default_codec() -> String { "h265".to_string() }
 fn default_sleep_enabled() -> bool { true }
@@ -153,5 +172,23 @@ mod tests {
     fn empty_string_toml_falls_back_to_default() {
         let config: LocalConfig = toml::from_str("").expect("empty string should parse as default");
         assert_eq!(config.video.codec, "h265");
+    }
+
+    #[test]
+    fn recording_default_is_disabled_with_empty_dir() {
+        let config = LocalConfig::default();
+        assert!(!config.recording.enabled);
+        assert!(config.recording.output_dir.is_empty());
+    }
+
+    #[test]
+    fn recording_override_roundtrip() {
+        let mut config = LocalConfig::default();
+        config.recording.enabled = true;
+        config.recording.output_dir = "D:/captures".to_string();
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: LocalConfig = toml::from_str(&serialized).unwrap();
+        assert!(deserialized.recording.enabled);
+        assert_eq!(deserialized.recording.output_dir, "D:/captures");
     }
 }
