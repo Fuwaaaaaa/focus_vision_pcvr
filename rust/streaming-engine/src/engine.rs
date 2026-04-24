@@ -1007,13 +1007,20 @@ async fn run_streaming(
                         }
                     }
 
-                    // Prune sent_packet_log to bound memory usage
-                    if let Ok(mut log_guard) = sent_packet_log.try_lock() {
-                        if log_guard.len() > 5000 {
-                            let mut entries: Vec<(u16, u64)> = log_guard.drain().collect();
-                            entries.sort_unstable_by_key(|&(_, ts)| std::cmp::Reverse(ts));
-                            entries.truncate(2500);
-                            log_guard.extend(entries);
+                    // Prune sent_packet_log to bound memory usage.
+                    // Runs only every SENT_LOG_PRUNE_INTERVAL frames to avoid the
+                    // sort + truncate cost on every frame. At 90fps this is ~3.3s.
+                    const SENT_LOG_PRUNE_INTERVAL: u64 = 300;
+                    const SENT_LOG_MAX: usize = 5000;
+                    const SENT_LOG_KEEP: usize = 2500;
+                    if frame_count.is_multiple_of(SENT_LOG_PRUNE_INTERVAL) {
+                        if let Ok(mut log_guard) = sent_packet_log.try_lock() {
+                            if log_guard.len() > SENT_LOG_MAX {
+                                let mut entries: Vec<(u16, u64)> = log_guard.drain().collect();
+                                entries.sort_unstable_by_key(|&(_, ts)| std::cmp::Reverse(ts));
+                                entries.truncate(SENT_LOG_KEEP);
+                                log_guard.extend(entries);
+                            }
                         }
                     }
 
