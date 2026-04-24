@@ -67,17 +67,24 @@ impl SessionLogger {
             return;
         }
 
+        // Join all buffered records into a single write to minimize syscalls.
+        let mut payload = String::with_capacity(
+            self.buffer.iter().map(|l| l.len() + 1).sum(),
+        );
+        for line in &self.buffer {
+            payload.push_str(line);
+            payload.push('\n');
+        }
+
         match fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.file_path)
         {
             Ok(mut file) => {
-                for line in &self.buffer {
-                    if let Err(e) = writeln!(file, "{}", line) {
-                        log::warn!("Session log write error: {}", e);
-                        break;
-                    }
+                if let Err(e) = file.write_all(payload.as_bytes()) {
+                    log::warn!("Session log write error: {}", e);
+                    return;
                 }
                 self.buffer.clear();
                 self.last_flush = Instant::now();
