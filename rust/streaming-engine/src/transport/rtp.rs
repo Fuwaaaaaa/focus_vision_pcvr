@@ -36,6 +36,33 @@ pub fn write_fvp_header(
     buf.extend_from_slice(&flags.to_le_bytes());
 }
 
+/// Parsed FVP header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FvpHeader {
+    pub frame_index: u32,
+    pub shard_index: u16,
+    pub shard_count: u16,
+    pub flags: u16,
+}
+
+impl FvpHeader {
+    pub fn is_keyframe(self) -> bool { (self.flags & 1) != 0 }
+}
+
+/// Parse the 10-byte FVP header from a packet.
+/// Returns None if the packet is shorter than 22 bytes (12 RTP + 10 FVP).
+pub fn read_fvp_header(packet: &[u8]) -> Option<FvpHeader> {
+    if packet.len() < 22 {
+        return None;
+    }
+    Some(FvpHeader {
+        frame_index: u32::from_le_bytes([packet[12], packet[13], packet[14], packet[15]]),
+        shard_index: u16::from_le_bytes([packet[16], packet[17]]),
+        shard_count: u16::from_le_bytes([packet[18], packet[19]]),
+        flags: u16::from_le_bytes([packet[20], packet[21]]),
+    })
+}
+
 /// A single RTP packet ready for transmission.
 #[derive(Debug, Clone)]
 pub struct RtpPacket {
@@ -152,20 +179,14 @@ impl RtpDepacketizer {
 
     /// Feed an RTP packet. Returns Some(frame_data) when a complete frame is assembled.
     pub fn feed(&mut self, packet: &[u8]) -> Option<ReassembledFrame> {
-        if packet.len() < 22 {
-            return None; // Too small (12 RTP + 10 FVP minimum)
-        }
+        // Parse RTP marker bit from byte 1 (length is implicitly validated by read_fvp_header).
+        let hdr = read_fvp_header(packet)?;
+        let marker = (packet[1] & 0x80) != 0;
 
-        // Parse RTP header
-        let _mpt = packet[1];
-        let marker = (_mpt & 0x80) != 0;
-
-        // Parse FVP header (bytes 12..22) — shard fields are u16
-        let frame_index = u32::from_le_bytes([packet[12], packet[13], packet[14], packet[15]]);
-        let shard_index = u16::from_le_bytes([packet[16], packet[17]]) as usize;
-        let shard_count = u16::from_le_bytes([packet[18], packet[19]]) as usize;
-        let flags = u16::from_le_bytes([packet[20], packet[21]]);
-        let is_keyframe = (flags & 1) != 0;
+        let frame_index = hdr.frame_index;
+        let shard_index = hdr.shard_index as usize;
+        let shard_count = hdr.shard_count as usize;
+        let is_keyframe = hdr.is_keyframe();
 
         // Payload starts at byte 22
         let payload = &packet[22..];
@@ -248,6 +269,26 @@ mod tests {
         // PT is 7 bits; top bit must be zeroed (would be misinterpreted as marker)
         assert_eq!(buf[1] & 0x80, 0);
         assert_eq!(buf[1] & 0x7F, 0x7F);
+    }
+
+    #[test]
+    fn test_read_fvp_header_roundtrip() {
+        let mut buf = Vec::new();
+        write_rtp_header(&mut buf, 96, true, 0, 0, 0);
+        write_fvp_header(&mut buf, 0xDEAD_BEEF, 7, 42, 0b11);
+        let hdr = read_fvp_header(&buf).unwrap();
+        assert_eq!(hdr.frame_index, 0xDEAD_BEEF);
+        assert_eq!(hdr.shard_index, 7);
+        assert_eq!(hdr.shard_count, 42);
+        assert_eq!(hdr.flags, 0b11);
+        assert!(hdr.is_keyframe());
+    }
+
+    #[test]
+    fn test_read_fvp_header_too_short() {
+        assert!(read_fvp_header(&[]).is_none());
+        assert!(read_fvp_header(&[0u8; 21]).is_none());
+        assert!(read_fvp_header(&[0u8; 22]).is_some());
     }
 
     #[test]
