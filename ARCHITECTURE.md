@@ -83,8 +83,11 @@ focus_vision_psvr/
 │   │   │   └── burst_detector.rs       Wi-Fi burst vs sustained loss
 │   │   ├── tracking/
 │   │   │   └── receiver.rs    UDP head pose + gaze
-│   │   └── metrics/
-│   │       └── latency.rs     Frame timestamp tracking
+│   │   ├── metrics/
+│   │   │   └── latency.rs     Frame timestamp tracking
+│   │   └── recording/
+│   │       ├── mod.rs         Video Recorder (Annex B .h265/.h264)
+│   │       └── audio.rs       AudioRecorder (16-bit PCM .wav)
 │   │
 │   ├── companion-app/        PC GUI app (egui, single .exe)
 │   │   ├── main.rs           3-tab UI: Home/Deploy/Settings
@@ -335,10 +338,25 @@ focus_vision_psvr/
   └──────────────────────────────────────────────────────────┘
 ```
 
+## Session Recording (Optional)
+
+Enabled via `[recording] enabled = true` in config. Writes lossless archives
+of the active session for later review / debugging.
+
+- **Video** — `recording/mod.rs::Recorder` taps `fvp_submit_encoded_nal` and
+  writes raw Annex B NAL units to `%APPDATA%/FocusVisionPCVR/recordings/
+  recording_YYYY-MM-DDTHH-MM-SS.h265` (or `.h264`).
+- **Audio** — `recording/audio.rs::AudioRecorder` taps the audio pipeline
+  *before* Opus encoding and writes 16-bit PCM WAV (48 kHz stereo).
+- **Resilience** — both recorders are best-effort: I/O errors are logged
+  but never block the streaming pipeline. They use a `poisoned` flag to
+  stop writing after the first failure instead of retrying indefinitely.
+- **mp4 化** — `ffmpeg -i rec.h265 -i rec.wav -c:v copy rec.mp4`
+
 ## Test Coverage
 
-313 tests (all passing):
-- **streaming-engine**: 254 (FEC, adaptive FEC, slice FEC, RTP, pairing, TLS, haptics, sleep, face tracking, profiles, calibration, config, TCP handler, disconnect reason, transport feedback, GCC estimator, burst detector, session log, memory monitor, latency, benchmarks, fuzz property tests)
+330+ tests (all passing):
+- **streaming-engine**: 272+ (FEC, adaptive FEC, slice FEC, RTP/FVP headers, pairing, TLS, haptics, sleep, face tracking, profiles, calibration, config, TCP handler + step helpers, disconnect reason, transport feedback, GCC estimator, burst detector, session log, memory monitor, latency, benchmarks, fuzz property tests, video/audio recording, FtProfile validate, status.json roundtrip, config Default consistency)
 - **companion-app**: 25 (config, ADB, stats, export, PII)
 - **common**: 23 (protocol structs, flags, versioning, transport feedback, fvp_flags compat gate)
 - **integration**: 7 (full video pipeline RTP/FEC roundtrip)
