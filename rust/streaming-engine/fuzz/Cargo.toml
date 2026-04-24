@@ -46,3 +46,8 @@ doc = false
 name = "fuzz_slice"
 path = "fuzz_targets/fuzz_slice.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_recording"
+path = "fuzz_targets/fuzz_recording.rs"
+doc = false
