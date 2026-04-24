@@ -361,3 +361,15 @@ of the active session for later review / debugging.
 - **common**: 23 (protocol structs, flags, versioning, transport feedback, fvp_flags compat gate)
 - **integration**: 7 (full video pipeline RTP/FEC roundtrip)
 - **fuzz targets**: fuzz_rtp, fuzz_fec, fuzz_protocol, fuzz_config, fuzz_slice
+
+## Code Maps
+
+Per-crate / per-component code maps with module-level responsibilities, key types,
+and cross-references. Use these to orient when onboarding or when diffs span
+multiple crates.
+
+- [streaming-engine](docs/CODEMAPS/streaming-engine.md) — Rust static library: pipeline, transport, control, adaptive, recording, metrics, face tracking
+- [companion-app](docs/CODEMAPS/companion-app.md) — PC GUI (egui): driver install, PIN display, ADB deploy, latency graphs, log export
+- [common](docs/CODEMAPS/common.md) — Shared types and constants: protocol structs, FVP flags, ports/MTU, versioning
+- [driver](docs/CODEMAPS/driver.md) — C++ OpenVR driver DLL: DirectMode, NVENC encoder, QP delta map, GoogleTest
+- [client](docs/CODEMAPS/client.md) — Android OpenXR client: renderer, timewarp, video/audio decode, FEC, TCP/TLS, eye tracking, overlays
