@@ -756,4 +756,64 @@ mod tests {
         assert!(!errors.iter().any(|e| e.field == "network.slice_count"));
         assert_eq!(config.network.slice_count, 8);
     }
+
+    /// Catches drift when a new field is added with `#[serde(default = "...")]`
+    /// but the corresponding manual `impl Default for *Config` is not updated
+    /// (or vice versa). Empty TOML → each field hits its serde default fn;
+    /// `AppConfig::default()` → each field hits its `Default::default()`.
+    /// The two paths must agree field-by-field.
+    #[test]
+    fn test_default_matches_empty_toml_parse() {
+        let from_default = AppConfig::default();
+        let from_serde: AppConfig = toml::from_str("").expect("empty TOML must parse");
+
+        // network
+        assert_eq!(from_default.network.tcp_port, from_serde.network.tcp_port);
+        assert_eq!(from_default.network.udp_port, from_serde.network.udp_port);
+        assert_eq!(from_default.network.fec_redundancy, from_serde.network.fec_redundancy);
+        assert_eq!(from_default.network.fec_redundancy_min, from_serde.network.fec_redundancy_min);
+        assert_eq!(from_default.network.fec_redundancy_max, from_serde.network.fec_redundancy_max);
+        assert_eq!(from_default.network.adaptive_fec_enabled, from_serde.network.adaptive_fec_enabled);
+        assert_eq!(from_default.network.congestion_control, from_serde.network.congestion_control);
+        assert_eq!(from_default.network.slice_fec_enabled, from_serde.network.slice_fec_enabled);
+        assert_eq!(from_default.network.slice_count, from_serde.network.slice_count);
+        // video
+        assert_eq!(from_default.video.bitrate_mbps, from_serde.video.bitrate_mbps);
+        assert_eq!(from_default.video.resolution_per_eye, from_serde.video.resolution_per_eye);
+        assert_eq!(from_default.video.framerate, from_serde.video.framerate);
+        assert_eq!(from_default.video.full_range, from_serde.video.full_range);
+        // audio
+        assert_eq!(from_default.audio.enabled, from_serde.audio.enabled);
+        assert_eq!(from_default.audio.bitrate_kbps, from_serde.audio.bitrate_kbps);
+        assert_eq!(from_default.audio.frame_size_ms, from_serde.audio.frame_size_ms);
+        assert_eq!(from_default.audio.sample_rate, from_serde.audio.sample_rate);
+        assert_eq!(from_default.audio.channels, from_serde.audio.channels);
+        // pairing
+        assert_eq!(from_default.pairing.max_attempts, from_serde.pairing.max_attempts);
+        assert_eq!(from_default.pairing.lockout_seconds, from_serde.pairing.lockout_seconds);
+        // display
+        assert_eq!(from_default.display.ipd, from_serde.display.ipd);
+        assert_eq!(from_default.display.seconds_from_vsync_to_photons, from_serde.display.seconds_from_vsync_to_photons);
+        // foveated
+        assert_eq!(from_default.foveated.enabled, from_serde.foveated.enabled);
+        assert_eq!(from_default.foveated.fovea_radius, from_serde.foveated.fovea_radius);
+        assert_eq!(from_default.foveated.mid_radius, from_serde.foveated.mid_radius);
+        assert_eq!(from_default.foveated.mid_qp_offset, from_serde.foveated.mid_qp_offset);
+        assert_eq!(from_default.foveated.peripheral_qp_offset, from_serde.foveated.peripheral_qp_offset);
+        assert_eq!(from_default.foveated.preset, from_serde.foveated.preset);
+        // face_tracking
+        assert_eq!(from_default.face_tracking.enabled, from_serde.face_tracking.enabled);
+        assert_eq!(from_default.face_tracking.smoothing, from_serde.face_tracking.smoothing);
+        assert_eq!(from_default.face_tracking.osc_port, from_serde.face_tracking.osc_port);
+        assert_eq!(from_default.face_tracking.active_profile, from_serde.face_tracking.active_profile);
+        // sleep_mode
+        assert_eq!(from_default.sleep_mode.enabled, from_serde.sleep_mode.enabled);
+        assert_eq!(from_default.sleep_mode.timeout_seconds, from_serde.sleep_mode.timeout_seconds);
+        assert_eq!(from_default.sleep_mode.motion_threshold, from_serde.sleep_mode.motion_threshold);
+        assert_eq!(from_default.sleep_mode.sleep_bitrate_mbps, from_serde.sleep_mode.sleep_bitrate_mbps);
+        // memory_monitor
+        assert_eq!(from_default.memory_monitor.enabled, from_serde.memory_monitor.enabled);
+        assert_eq!(from_default.memory_monitor.poll_interval_seconds, from_serde.memory_monitor.poll_interval_seconds);
+        assert_eq!(from_default.memory_monitor.growth_threshold_mb, from_serde.memory_monitor.growth_threshold_mb);
+    }
 }
