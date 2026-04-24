@@ -387,37 +387,18 @@ impl AppConfig {
         }
 
         // Slice FEC
-        if self.network.slice_count < 2 || self.network.slice_count > 15 {
-            errors.push(ConfigError {
-                field: "network.slice_count",
-                message: format!("{} out of range [2-15], clamped to 4", self.network.slice_count),
-            });
-            self.network.slice_count = 4;
-        }
+        validate_range(&mut self.network.slice_count, 2, 15, 4, "network.slice_count", &mut errors);
 
         // Video
-        if self.video.bitrate_mbps < 10 || self.video.bitrate_mbps > 200 {
-            errors.push(ConfigError { field: "video.bitrate_mbps", message: format!("{} out of range [10-200], clamped to 80", self.video.bitrate_mbps) });
-            self.video.bitrate_mbps = 80;
-        }
-        if self.video.framerate < 30 || self.video.framerate > 120 {
-            errors.push(ConfigError { field: "video.framerate", message: format!("{} out of range [30-120], clamped to 90", self.video.framerate) });
-            self.video.framerate = 90;
-        }
+        validate_range(&mut self.video.bitrate_mbps, 10, 200, 80, "video.bitrate_mbps", &mut errors);
+        validate_range(&mut self.video.framerate, 30, 120, 90, "video.framerate", &mut errors);
 
         // Face tracking
-        if self.face_tracking.smoothing.is_nan() || self.face_tracking.smoothing.is_infinite()
-            || self.face_tracking.smoothing < 0.0 || self.face_tracking.smoothing > 0.99
-        {
-            errors.push(ConfigError { field: "face_tracking.smoothing", message: format!("{} invalid, clamped to 0.6", self.face_tracking.smoothing) });
-            self.face_tracking.smoothing = 0.6;
-        }
+        validate_f32_range(&mut self.face_tracking.smoothing, 0.0, 0.99, 0.6, "face_tracking.smoothing", &mut errors);
 
         // Sleep mode
-        if self.sleep_mode.timeout_seconds < 30 || self.sleep_mode.timeout_seconds > 3600 {
-            errors.push(ConfigError { field: "sleep_mode.timeout_seconds", message: format!("{} out of range [30-3600], clamped to 300", self.sleep_mode.timeout_seconds) });
-            self.sleep_mode.timeout_seconds = 300;
-        }
+        validate_range(&mut self.sleep_mode.timeout_seconds, 30, 3600, 300, "sleep_mode.timeout_seconds", &mut errors);
+        // motion_threshold: min is exclusive (> 0.0) — keep manual check
         if self.sleep_mode.motion_threshold <= 0.0 || self.sleep_mode.motion_threshold > 0.1
             || self.sleep_mode.motion_threshold.is_nan()
         {
@@ -430,34 +411,60 @@ impl AppConfig {
             errors.push(ConfigError { field: "audio.sample_rate", message: format!("{} unsupported, clamped to 48000", self.audio.sample_rate) });
             self.audio.sample_rate = 48000;
         }
-        if self.audio.bitrate_kbps < 32 || self.audio.bitrate_kbps > 512 {
-            errors.push(ConfigError { field: "audio.bitrate_kbps", message: format!("{} out of range [32-512], clamped to 128", self.audio.bitrate_kbps) });
-            self.audio.bitrate_kbps = 128;
-        }
+        validate_range(&mut self.audio.bitrate_kbps, 32, 512, 128, "audio.bitrate_kbps", &mut errors);
 
         // Foveated
+        // fovea_radius: min is exclusive (> 0.0) — keep manual check
         if self.foveated.fovea_radius <= 0.0 || self.foveated.fovea_radius > 0.5
             || self.foveated.fovea_radius.is_nan()
         {
             errors.push(ConfigError { field: "foveated.fovea_radius", message: format!("{} invalid, clamped to 0.15", self.foveated.fovea_radius) });
             self.foveated.fovea_radius = 0.15;
         }
+        // mid_radius: depends on fovea_radius — keep manual check
         if self.foveated.mid_radius <= self.foveated.fovea_radius || self.foveated.mid_radius > 1.0
             || self.foveated.mid_radius.is_nan()
         {
             errors.push(ConfigError { field: "foveated.mid_radius", message: format!("{} invalid (must be > fovea_radius), clamped to 0.35", self.foveated.mid_radius) });
             self.foveated.mid_radius = 0.35;
         }
-        if self.foveated.mid_qp_offset < 0 || self.foveated.mid_qp_offset > 51 {
-            errors.push(ConfigError { field: "foveated.mid_qp_offset", message: format!("{} out of range [0-51], clamped to 5", self.foveated.mid_qp_offset) });
-            self.foveated.mid_qp_offset = 5;
-        }
-        if self.foveated.peripheral_qp_offset < 0 || self.foveated.peripheral_qp_offset > 51 {
-            errors.push(ConfigError { field: "foveated.peripheral_qp_offset", message: format!("{} out of range [0-51], clamped to 10", self.foveated.peripheral_qp_offset) });
-            self.foveated.peripheral_qp_offset = 10;
-        }
+        validate_range(&mut self.foveated.mid_qp_offset, 0, 51, 5, "foveated.mid_qp_offset", &mut errors);
+        validate_range(&mut self.foveated.peripheral_qp_offset, 0, 51, 10, "foveated.peripheral_qp_offset", &mut errors);
 
         errors
+    }
+}
+
+/// Range check + clamp helper for comparable values. If `*value` is outside
+/// [min, max], it is replaced with `default` and an error is pushed.
+fn validate_range<T>(
+    value: &mut T, min: T, max: T, default: T,
+    field: &'static str, errors: &mut Vec<ConfigError>,
+)
+where
+    T: PartialOrd + std::fmt::Display + Copy,
+{
+    if *value < min || *value > max {
+        errors.push(ConfigError {
+            field,
+            message: format!("{} out of range [{}-{}], clamped to {}", value, min, max, default),
+        });
+        *value = default;
+    }
+}
+
+/// f32-specialized range check: also rejects NaN and Infinity. Intended for
+/// cases where min is inclusive; for exclusive-min checks, keep a manual block.
+fn validate_f32_range(
+    value: &mut f32, min: f32, max: f32, default: f32,
+    field: &'static str, errors: &mut Vec<ConfigError>,
+) {
+    if value.is_nan() || value.is_infinite() || *value < min || *value > max {
+        errors.push(ConfigError {
+            field,
+            message: format!("{} invalid or out of [{}, {}], clamped to {}", value, min, max, default),
+        });
+        *value = default;
     }
 }
 
