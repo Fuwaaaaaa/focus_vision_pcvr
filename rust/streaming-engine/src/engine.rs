@@ -607,11 +607,8 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
 
                         // Build RTP packet: header (12 bytes) + Opus payload
                         let mut buf = Vec::with_capacity(12 + opus_data.len());
-                        buf.push(0x80); // V=2, P=0, X=0, CC=0
-                        buf.push(0x80 | 111); // M=1 (always for audio), PT=111 (Opus)
-                        buf.extend_from_slice(&sequence.to_be_bytes());
-                        buf.extend_from_slice(&timestamp.to_be_bytes());
-                        buf.extend_from_slice(&ssrc.to_be_bytes());
+                        // PT=111 (Opus), marker=true (always for audio)
+                        crate::transport::rtp::write_rtp_header(&mut buf, 111, true, sequence, timestamp, ssrc);
                         buf.extend_from_slice(&opus_data);
 
                         let packet = RtpPacket { data: buf };
