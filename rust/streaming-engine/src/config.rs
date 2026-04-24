@@ -35,7 +35,30 @@ pub struct AppConfig {
     pub sleep_mode: SleepModeConfig,
     #[serde(default)]
     pub memory_monitor: MemoryMonitorConfig,
+    #[serde(default)]
+    pub recording: RecordingConfig,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingConfig {
+    /// Enable session recording (writes raw Annex B H.264/H.265 to disk).
+    #[serde(default = "default_recording_enabled")]
+    pub enabled: bool,
+    /// Output directory. Empty string = %APPDATA%/FocusVisionPCVR/recordings.
+    #[serde(default)]
+    pub output_dir: String,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_recording_enabled(),
+            output_dir: String::new(),
+        }
+    }
+}
+
+fn default_recording_enabled() -> bool { false }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {

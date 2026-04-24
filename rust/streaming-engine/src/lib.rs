@@ -243,6 +243,10 @@ pub unsafe extern "C" fn fvp_submit_encoded_nal(
     // SAFETY: Caller (C++ driver) guarantees nal_data_ptr is valid for nal_data_len bytes.
     // Null check is performed above.
     let nal_slice = unsafe { std::slice::from_raw_parts(nal_data_ptr, nal_data_len as usize) };
+
+    // Tap the raw NAL for session recording (no-op when disabled).
+    engine.write_recording_nal(nal_slice);
+
     let nal_data = NAL_BUF.with(|buf| {
         let mut b = buf.borrow_mut();
         b.clear();
