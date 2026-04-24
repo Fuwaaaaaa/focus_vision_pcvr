@@ -2,6 +2,32 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Session Recording MVP:** `[recording]` config セクションで有効化すると、VIDEO は Annex B raw (.h265/.h264)、AUDIO は WAV (16-bit PCM) として `%APPDATA%/FocusVisionPCVR/recordings/` に自動保存。`ffmpeg -i rec.h265 -i rec.wav -c:v copy rec.mp4` で mp4 化可能 (#25, #28, #31)
+- **RTP/FVP header helpers:** `transport::rtp::write_rtp_header` / `write_fvp_header` / `read_fvp_header` を導入。video・audio・pipeline (with_fec / sliced)・depacketizer の 4 箇所で別々に手書きしていた wire format を 1 箇所に集約 (#22, #29, #30)
+- **BurstDetector `new_with_thresholds`:** cfg(test) 専用コンストラクタで `thread::sleep` 依存テストを高速化可能に (#18)
+
+### Changed
+- **osc_bridge EMA:** lip (37) / eye (14) の EMA + profile weight + OSC 送信ループを `apply_smoothing_and_send` ヘルパーに統合。挙動不変 (#14)
+- **FtProfile::validate():** `normalize()` + `sanitize_weights()` の 2 パスを統合。公開 API は温存 (#15)
+- **status.json:** 手書き JSON を `serde_json` に置換。エスケープ必要な文字が混入しても壊れない (#16)
+- **session_log flush:** `writeln!` ループを `write_all` 一回に統合、syscall 数を削減 (#17)
+- **config::validate():** 繰り返しの check→push→clamp パターンを `validate_range` / `validate_f32_range` ヘルパーに統合 (#19)
+- **sent_packet_log pruning:** 毎フレームの sort+truncate を 300 フレーム周期 (~3.3s@90fps) にバッチ化 (#23)
+- **TCP handshake:** 69 LoC のモノリシックな関数を `step_hello_exchange` / `step_pin_pairing` / `step_stream_config` / `step_stream_start` に分解、各ステップに `log::debug!` 追加 (#24)
+
+### Tests
+- 新規テスト合計 **20+** 件追加（FtProfile::validate、status.json round-trip、BurstDetector thresholds、write_rtp_header、write_fvp_header、read_fvp_header、AudioRecorder WAV layout、Recorder start-code handling、config Default consistency、他）
+- **合計テスト数: 313 → 272+ (lib) + 4 (fuzz) + 7 (pipeline)**
+
+### Fixed
+- **CI clippy:** pre-existing な `handle_tcp_control` / `update_adaptive_bitrate` の `too_many_arguments` warning で Rust Streaming Engine ジョブが恒常的に FAIL していたのを修正 (#21)
+
+### Docs
+- README / ARCHITECTURE / TODOS / CHANGELOG を一連のリファクタ/機能追加に合わせて同期
+
 ## [2.2.1] - 2026-04-15
 
 ### Added
