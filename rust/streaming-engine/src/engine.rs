@@ -46,6 +46,27 @@ pub fn is_audio_active() -> bool {
     AUDIO_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Spawn a named long-lived tokio task.
+///
+/// This wrapper exists so every engine task spawn is paired with a
+/// human-readable name at a single call site. The name is logged on spawn
+/// (debug level) so that when a log stream goes quiet we can tell which
+/// subsystem silently stopped — previously `tokio::spawn` with a detached
+/// `JoinHandle` gave us no visibility at all.
+///
+/// Why not `catch_unwind`? The workspace release profile uses
+/// `panic = "abort"`; the abort handler fires before any `catch_unwind`
+/// could observe the panic, so the wrapper would be dead code at runtime.
+/// If the profile ever switches to `panic = "unwind"`, extend this helper
+/// to wrap the future in `FutureExt::catch_unwind` from `futures-util`.
+fn spawn_named<F>(runtime: &tokio::runtime::Handle, name: &'static str, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    log::debug!("spawning engine task: {}", name);
+    runtime.spawn(fut);
+}
+
 /// Get the number of haptic events dropped due to full channel.
 pub fn haptic_drop_count() -> u64 {
     HAPTIC_DROPS.load(std::sync::atomic::Ordering::Relaxed)
@@ -193,7 +214,7 @@ impl StreamingEngine {
         // Spawn the main streaming task
         let cancel = cancel_token.clone();
         let stream_cancel = cancel_token.clone();
-        runtime.spawn(async move {
+        spawn_named(runtime.handle(), "streaming", async move {
             tokio::select! {
                 result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone, stream_cancel) => {
                     if let Err(e) = result {
@@ -211,7 +232,7 @@ impl StreamingEngine {
         let tracking_ctrl = latest_controllers.clone();
         let tracking_port = config.network.udp_port + fvp_common::TRACKING_PORT_OFFSET;
         let cancel = cancel_token.clone();
-        runtime.spawn(async move {
+        spawn_named(runtime.handle(), "tracking-receiver", async move {
             let receiver = TrackingReceiver::new(tracking_head, tracking_ctrl);
             let addr: SocketAddr = match format!("0.0.0.0:{}", tracking_port).parse() {
                 Ok(a) => a,
@@ -588,7 +609,7 @@ fn spawn_audio_pipeline(
     const OPUS_FRAME_SAMPLES: usize = 480; // 10ms at 48kHz
     const STEREO_FRAME_SIZE: usize = OPUS_FRAME_SAMPLES * 2;
 
-    tokio::spawn(async move {
+    spawn_named(&tokio::runtime::Handle::current(), "audio-encoder", async move {
         let mut encoder = match AudioEncoder::new(128_000) {
             Ok(e) => e,
             Err(e) => {
@@ -1005,7 +1026,7 @@ async fn run_streaming(
         let gcc_clone = gcc_estimator.clone();
         let sent_log_clone = sent_packet_log.clone();
         let reason_clone = disconnect_reason.clone();
-        tokio::spawn(async move {
+        spawn_named(&tokio::runtime::Handle::current(), "tcp-control", async move {
             match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, gcc_clone, sent_log_clone, haptic_rx, gcc_enabled).await {
                 Ok(reason) => {
                     if let Ok(mut guard) = reason_clone.lock() {
