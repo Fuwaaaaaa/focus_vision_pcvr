@@ -665,62 +665,58 @@ fn update_adaptive_bitrate(
         return;
     }
 
-    if let Ok(mut guard) = hmd_stats.lock() {
-        if let Some(stats) = guard.take() {
-            bw_estimator.update(
-                stats.packets_received,
-                stats.packets_lost,
-                0.0, // RTT not yet measured
-            );
+    // Take the latest HMD stats snapshot; if none, nothing to do this tick.
+    let stats = match hmd_stats.lock() {
+        Ok(mut g) => match g.take() {
+            Some(s) => s,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    bw_estimator.update(stats.packets_received, stats.packets_lost, 0.0);
 
-            if gcc_enabled {
-                // Delay-based mode: use GCC estimator and burst detector
-                // Update burst detector with current loss rate
-                if let Ok(mut burst_guard) = burst_detector.lock() {
-                    burst_guard.record(bw_estimator.loss_rate());
-                }
+    if gcc_enabled {
+        // Single critical section: lock burst → gcc (consistent order, deadlock-free),
+        // update + read both, run bitrate adjustment.
+        let mut burst = match burst_detector.lock() { Ok(g) => g, Err(_) => return };
+        burst.record(bw_estimator.loss_rate());
 
-                if let Ok(gcc_guard) = gcc_estimator.lock() {
-                    if let Ok(burst_guard) = burst_detector.lock() {
-                        if bitrate_ctrl.adjust(bw_estimator, &gcc_guard, &burst_guard) {
-                            let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
-                            notify_bitrate_change(new_bps);
-                        }
+        let gcc = match gcc_estimator.lock() { Ok(g) => g, Err(_) => return };
+        if bitrate_ctrl.adjust(bw_estimator, &gcc, &burst) {
+            notify_bitrate_change(bitrate_ctrl.current_bitrate_bps() as u32);
+        }
 
-                        // If burst detected, boost FEC temporarily
-                        if burst_guard.recommend_fec_boost() {
-                            if let Some(ref mut afec) = adaptive_fec {
-                                log::info!("Burst loss: boosting FEC redundancy");
-                                afec.activate_boost();
-                                fec_encoder.set_redundancy(afec.effective_redundancy());
-                                return;
-                            }
-                        } else if let Some(ref mut afec) = adaptive_fec {
-                            if afec.effective_redundancy() != afec.current_redundancy() {
-                                // Burst ended, deactivate boost
-                                afec.deactivate_boost();
-                                fec_encoder.set_redundancy(afec.effective_redundancy());
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Loss-only mode: use default (no-op) GCC and burst state for bitrate adjustment
-                let default_gcc = crate::adaptive::gcc_estimator::GccEstimator::new(
-                    bitrate_ctrl.current_bitrate_bps(),
-                );
-                let default_burst = crate::adaptive::burst_detector::BurstDetector::new();
-                if bitrate_ctrl.adjust(bw_estimator, &default_gcc, &default_burst) {
-                    let new_bps = bitrate_ctrl.current_bitrate_bps() as u32;
-                    notify_bitrate_change(new_bps);
-                }
+        // FEC response to burst. On boost activation, skip the loss-based adjust
+        // below so the boost level wins this tick.
+        if burst.recommend_fec_boost() {
+            if let Some(afec) = adaptive_fec.as_deref_mut() {
+                log::info!("Burst loss: boosting FEC redundancy");
+                afec.activate_boost();
+                fec_encoder.set_redundancy(afec.effective_redundancy());
+                return;
             }
-            // Adjust FEC redundancy based on observed loss
-            if let Some(afec) = adaptive_fec {
-                if afec.adjust(bw_estimator.loss_rate()) {
-                    fec_encoder.set_redundancy(afec.effective_redundancy());
-                }
+        } else if let Some(afec) = adaptive_fec.as_deref_mut() {
+            if afec.effective_redundancy() != afec.current_redundancy() {
+                afec.deactivate_boost();
+                fec_encoder.set_redundancy(afec.effective_redundancy());
             }
+        }
+        // drop gcc + burst here
+    } else {
+        // Loss-only mode: adjust with neutral GCC + burst defaults.
+        let default_gcc = crate::adaptive::gcc_estimator::GccEstimator::new(
+            bitrate_ctrl.current_bitrate_bps(),
+        );
+        let default_burst = crate::adaptive::burst_detector::BurstDetector::new();
+        if bitrate_ctrl.adjust(bw_estimator, &default_gcc, &default_burst) {
+            notify_bitrate_change(bitrate_ctrl.current_bitrate_bps() as u32);
+        }
+    }
+
+    // Loss-based FEC adjustment (skipped during burst-boost early return above).
+    if let Some(afec) = adaptive_fec {
+        if afec.adjust(bw_estimator.loss_rate()) {
+            fec_encoder.set_redundancy(afec.effective_redundancy());
         }
     }
 }
