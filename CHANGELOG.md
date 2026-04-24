@@ -4,6 +4,10 @@ All notable changes to Focus Vision PCVR will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **TOFU 証明書ピン留めをクライアント側で実装:** TLS ハンドシェイク後にサーバ leaf cert の SHA-256 を `<app internal storage>/server_fingerprint.hex` に保存し、以降の接続で fingerprint 不一致なら接続を拒否する。これまで `MBEDTLS_SSL_VERIFY_NONE` で**証明書を一切検証していなかった**ため、同一 LAN 上の攻撃者が自前 TLS 証明書で MITM し PIN を盗聴可能だった。SECURITY.md が宣言していた緩和策が実際に動作するようになる
+- **TLS 失敗時の平文フォールバック削除:** `TcpControlClient::connect()` は TLS / pinning に失敗した場合、平文に降格せず接続を拒否する。これまではハンドシェイクを破壊するだけで暗号化を剥がせる構造だった
+
 ### Added
 - **Session Recording MVP:** `[recording]` config セクションで有効化すると、VIDEO は Annex B raw (.h265/.h264)、AUDIO は WAV (16-bit PCM) として `%APPDATA%/FocusVisionPCVR/recordings/` に自動保存。`ffmpeg -i rec.h265 -i rec.wav -c:v copy rec.mp4` で mp4 化可能 (#25, #28, #31)
 - **RTP/FVP header helpers:** `transport::rtp::write_rtp_header` / `write_fvp_header` / `read_fvp_header` を導入。video・audio・pipeline (with_fec / sliced)・depacketizer の 4 箇所で別々に手書きしていた wire format を 1 箇所に集約 (#22, #29, #30)
