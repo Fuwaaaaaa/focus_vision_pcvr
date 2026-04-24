@@ -803,6 +803,101 @@ fn init_recorder(config: &AppConfig) -> Option<Arc<StdMutex<crate::recording::Re
     crate::recording::Recorder::open(path).map(|r| Arc::new(StdMutex::new(r)))
 }
 
+/// Record the current send timestamp for every packet's RTP seq number,
+/// so GCC / delay estimation can correlate transport feedback back to send time.
+/// Skipped silently if the lock is contended.
+fn record_send_timestamps(
+    sent_packet_log: &Arc<StdMutex<HashMap<u16, u64>>>,
+    packets: &[crate::transport::rtp::RtpPacket],
+) {
+    let send_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    if let Ok(mut log_guard) = sent_packet_log.try_lock() {
+        for packet in packets {
+            if packet.data.len() >= 4 {
+                let seq = u16::from_be_bytes([packet.data[2], packet.data[3]]);
+                log_guard.insert(seq, send_us);
+            }
+        }
+    }
+}
+
+/// Periodically bound sent_packet_log memory usage by retaining only the
+/// newest `SENT_LOG_KEEP` entries. Runs every `SENT_LOG_PRUNE_INTERVAL`
+/// frames (~3.3s @ 90fps) to avoid per-frame sort overhead.
+fn prune_sent_packet_log_if_due(
+    sent_packet_log: &Arc<StdMutex<HashMap<u16, u64>>>,
+    frame_count: u64,
+) {
+    const SENT_LOG_PRUNE_INTERVAL: u64 = 300;
+    const SENT_LOG_MAX: usize = 5000;
+    const SENT_LOG_KEEP: usize = 2500;
+    if !frame_count.is_multiple_of(SENT_LOG_PRUNE_INTERVAL) {
+        return;
+    }
+    if let Ok(mut log_guard) = sent_packet_log.try_lock() {
+        if log_guard.len() > SENT_LOG_MAX {
+            let mut entries: Vec<(u16, u64)> = log_guard.drain().collect();
+            entries.sort_unstable_by_key(|&(_, ts)| std::cmp::Reverse(ts));
+            entries.truncate(SENT_LOG_KEEP);
+            log_guard.extend(entries);
+        }
+    }
+}
+
+/// Send one encoded frame: choose slice-based or bulk FEC based on size and
+/// config, UDP-send the resulting packets, and record send timestamps.
+/// Returns after the frame has been dispatched (packets may still be in kernel
+/// queue — the caller's mark_send happens after this).
+#[allow(clippy::too_many_arguments)]
+async fn send_encoded_frame(
+    frame: &EncodedFrame,
+    timestamp_90khz: u32,
+    slice_fec_enabled: bool,
+    slice_count: u8,
+    packetizer: &mut RtpPacketizer,
+    fec_encoder: &mut crate::transport::fec::FecEncoder,
+    slice_fec_encoders: &mut [crate::transport::fec::FecEncoder],
+    udp_sender: &UdpSender,
+    sent_packet_log: &Arc<StdMutex<HashMap<u16, u64>>>,
+) {
+    let use_slice_fec = slice_fec_enabled && frame.nal_data.len() >= pipeline::MIN_SLICE_SIZE;
+
+    if use_slice_fec {
+        let slice_batches = pipeline::encode_frame_sliced(
+            &frame.nal_data,
+            frame.frame_index,
+            timestamp_90khz,
+            frame.is_idr,
+            slice_count,
+            slice_fec_encoders,
+            packetizer,
+        );
+        for slice_packets in &slice_batches {
+            if slice_packets.is_empty() { continue; }
+            if let Err(e) = udp_sender.send_all(slice_packets).await {
+                log::warn!("UDP send error (slice FEC): {}", e);
+            }
+            record_send_timestamps(sent_packet_log, slice_packets);
+        }
+    } else {
+        let packets = pipeline::encode_frame_to_packets_with_fec(
+            &frame.nal_data,
+            frame.frame_index,
+            timestamp_90khz,
+            frame.is_idr,
+            fec_encoder,
+            packetizer,
+        );
+        if let Err(e) = udp_sender.send_all(&packets).await {
+            log::warn!("UDP send error: {}", e);
+        }
+        record_send_timestamps(sent_packet_log, &packets);
+    }
+}
+
 fn log_periodic_stats(frame_count: u64, framerate: u64) {
     if frame_count.is_multiple_of(framerate * 5) {
         let enc = PC_ENCODE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
@@ -1002,86 +1097,19 @@ async fn run_streaming(
                     // Multiply first to avoid integer division truncation drift (e.g. 90000/96=937.5)
                     let timestamp_90khz = (frame_count * fvp_common::RTP_CLOCK_RATE as u64 / framerate) as u32;
 
-                    // Choose slice FEC for large frames, bulk FEC for small ones
-                    let use_slice_fec = slice_fec_enabled
-                        && frame.nal_data.len() >= pipeline::MIN_SLICE_SIZE;
+                    send_encoded_frame(
+                        &frame,
+                        timestamp_90khz,
+                        slice_fec_enabled,
+                        slice_count,
+                        &mut packetizer,
+                        &mut fec_encoder,
+                        &mut slice_fec_encoders,
+                        &udp_sender,
+                        &sent_packet_log,
+                    ).await;
 
-                    if use_slice_fec {
-                        // Slice FEC: split frame → RS encode per slice → send each slice immediately
-                        let slice_batches = pipeline::encode_frame_sliced(
-                            &frame.nal_data,
-                            frame.frame_index,
-                            timestamp_90khz,
-                            frame.is_idr,
-                            slice_count,
-                            &mut slice_fec_encoders,
-                            &mut packetizer,
-                        );
-                        for slice_packets in &slice_batches {
-                            if slice_packets.is_empty() { continue; }
-                            if let Err(e) = udp_sender.send_all(slice_packets).await {
-                                log::warn!("UDP send error (slice FEC): {}", e);
-                            }
-                            // Record send timestamps per-slice for GCC
-                            let send_us = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_micros() as u64;
-                            if let Ok(mut log_guard) = sent_packet_log.try_lock() {
-                                for packet in slice_packets {
-                                    if packet.data.len() >= 4 {
-                                        let seq = u16::from_be_bytes([packet.data[2], packet.data[3]]);
-                                        log_guard.insert(seq, send_us);
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        // Bulk FEC: existing path
-                        let packets = pipeline::encode_frame_to_packets_with_fec(
-                            &frame.nal_data,
-                            frame.frame_index,
-                            timestamp_90khz,
-                            frame.is_idr,
-                            &mut fec_encoder,
-                            &mut packetizer,
-                        );
-
-                        if let Err(e) = udp_sender.send_all(&packets).await {
-                            log::warn!("UDP send error: {}", e);
-                        }
-
-                        // Record send timestamps for GCC
-                        let send_us = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as u64;
-                        if let Ok(mut log_guard) = sent_packet_log.try_lock() {
-                            for packet in &packets {
-                                if packet.data.len() >= 4 {
-                                    let seq = u16::from_be_bytes([packet.data[2], packet.data[3]]);
-                                    log_guard.insert(seq, send_us);
-                                }
-                            }
-                        }
-                    }
-
-                    // Prune sent_packet_log to bound memory usage.
-                    // Runs only every SENT_LOG_PRUNE_INTERVAL frames to avoid the
-                    // sort + truncate cost on every frame. At 90fps this is ~3.3s.
-                    const SENT_LOG_PRUNE_INTERVAL: u64 = 300;
-                    const SENT_LOG_MAX: usize = 5000;
-                    const SENT_LOG_KEEP: usize = 2500;
-                    if frame_count.is_multiple_of(SENT_LOG_PRUNE_INTERVAL) {
-                        if let Ok(mut log_guard) = sent_packet_log.try_lock() {
-                            if log_guard.len() > SENT_LOG_MAX {
-                                let mut entries: Vec<(u16, u64)> = log_guard.drain().collect();
-                                entries.sort_unstable_by_key(|&(_, ts)| std::cmp::Reverse(ts));
-                                entries.truncate(SENT_LOG_KEEP);
-                                log_guard.extend(entries);
-                            }
-                        }
-                    }
+                    prune_sent_packet_log_if_due(&sent_packet_log, frame_count);
 
                     // Buffer pool recycle is handled by packetizer internally
                     // (slice path sends per-slice, bulk path sends all at once)
