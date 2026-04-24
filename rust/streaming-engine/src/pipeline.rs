@@ -76,24 +76,13 @@ pub fn encode_frame_to_packets_with_fec(
 
         let mut buf = packetizer.take_buf(12 + 10 + shard.len());
 
-        // RTP header
-        buf.push(0x80);
-        let mpt = if is_last {
-            0x80 | fvp_common::RTP_PT_H265
-        } else {
-            fvp_common::RTP_PT_H265
-        };
-        buf.push(mpt);
-        buf.extend_from_slice(&seq.to_be_bytes());
-        buf.extend_from_slice(&timestamp_90khz.to_be_bytes());
-        buf.extend_from_slice(&0x42u32.to_be_bytes()); // SSRC
-
-        // FVP header (10 bytes) — shard fields are u16 to support large keyframes
-        buf.extend_from_slice(&frame_index.to_le_bytes());
-        buf.extend_from_slice(&(i as u16).to_le_bytes());            // shard_index
-        buf.extend_from_slice(&(total_shards as u16).to_le_bytes()); // shard_count
+        crate::transport::rtp::write_rtp_header(
+            &mut buf, fvp_common::RTP_PT_H265, is_last, seq, timestamp_90khz, 0x42,
+        );
         let flags = fvp_common::protocol::fvp_flags::encode_simple(is_keyframe);
-        buf.extend_from_slice(&flags.to_le_bytes());
+        crate::transport::rtp::write_fvp_header(
+            &mut buf, frame_index, i as u16, total_shards as u16, flags,
+        );
 
         buf.extend_from_slice(shard);
 
@@ -178,23 +167,12 @@ pub fn encode_frame_sliced(
 
             let mut buf = packetizer.take_buf(12 + 10 + shard.len());
 
-            // RTP header
-            buf.push(0x80);
-            let mpt = if is_last {
-                0x80 | fvp_common::RTP_PT_H265
-            } else {
-                fvp_common::RTP_PT_H265
-            };
-            buf.push(mpt);
-            buf.extend_from_slice(&seq.to_be_bytes());
-            buf.extend_from_slice(&timestamp_90khz.to_be_bytes());
-            buf.extend_from_slice(&0x42u32.to_be_bytes());
-
-            // FVP header (10 bytes)
-            buf.extend_from_slice(&frame_index.to_le_bytes());
-            buf.extend_from_slice(&(i as u16).to_le_bytes());
-            buf.extend_from_slice(&(total_shards as u16).to_le_bytes());
-            buf.extend_from_slice(&flags.to_le_bytes());
+            crate::transport::rtp::write_rtp_header(
+                &mut buf, fvp_common::RTP_PT_H265, is_last, seq, timestamp_90khz, 0x42,
+            );
+            crate::transport::rtp::write_fvp_header(
+                &mut buf, frame_index, i as u16, total_shards as u16, flags,
+            );
 
             buf.extend_from_slice(shard);
             packets.push(RtpPacket { data: buf });
