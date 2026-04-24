@@ -54,7 +54,10 @@ public:
 private:
     void createInstance(android_app* app);
     void getSystem();
-    void initEGL();
+    /// Initialize EGL context. Returns true on success; on failure returns
+    /// false, leaving partial state (caller must abort initialization —
+    /// subsequent createSession() would crash with EGL_NO_CONTEXT).
+    bool initEGL();
     void createSession();
     void createReferenceSpace();
     void createSwapchains();
