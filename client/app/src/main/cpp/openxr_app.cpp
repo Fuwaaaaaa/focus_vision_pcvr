@@ -26,7 +26,12 @@ void OpenXRApp::initialize(android_app* app) {
     m_androidApp = app;
     createInstance(app);
     getSystem();
-    initEGL();
+    if (!initEGL()) {
+        LOGE("EGL initialization failed — aborting OpenXR session creation to "
+             "avoid crashing in createSession() with EGL_NO_CONTEXT");
+        m_running = false;
+        return;
+    }
     createSession();
     createReferenceSpace();
     createSwapchains();
@@ -120,15 +125,15 @@ void OpenXRApp::getSystem() {
         m_viewConfigViews[0].recommendedImageRectHeight);
 }
 
-void OpenXRApp::initEGL() {
+bool OpenXRApp::initEGL() {
     m_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (m_eglDisplay == EGL_NO_DISPLAY) {
         LOGE("eglGetDisplay failed");
-        return;
+        return false;
     }
     if (!eglInitialize(m_eglDisplay, nullptr, nullptr)) {
         LOGE("eglInitialize failed: 0x%x", eglGetError());
-        return;
+        return false;
     }
 
     EGLint configAttribs[] = {
@@ -145,14 +150,14 @@ void OpenXRApp::initEGL() {
     EGLint numConfigs;
     if (!eglChooseConfig(m_eglDisplay, configAttribs, &m_eglConfig, 1, &numConfigs) || numConfigs == 0) {
         LOGE("eglChooseConfig failed: 0x%x", eglGetError());
-        return;
+        return false;
     }
 
     EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
     m_eglContext = eglCreateContext(m_eglDisplay, m_eglConfig, EGL_NO_CONTEXT, contextAttribs);
     if (m_eglContext == EGL_NO_CONTEXT) {
         LOGE("eglCreateContext failed: 0x%x", eglGetError());
-        return;
+        return false;
     }
 
     // Create a small pbuffer surface (required for making context current)
@@ -160,14 +165,15 @@ void OpenXRApp::initEGL() {
     m_eglSurface = eglCreatePbufferSurface(m_eglDisplay, m_eglConfig, pbufferAttribs);
     if (m_eglSurface == EGL_NO_SURFACE) {
         LOGE("eglCreatePbufferSurface failed: 0x%x", eglGetError());
-        return;
+        return false;
     }
 
     if (!eglMakeCurrent(m_eglDisplay, m_eglSurface, m_eglSurface, m_eglContext)) {
         LOGE("eglMakeCurrent failed: 0x%x", eglGetError());
-        return;
+        return false;
     }
     LOGI("EGL context created (GLES 3.0)");
+    return true;
 }
 
 void OpenXRApp::createSession() {
