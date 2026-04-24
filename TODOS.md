@@ -238,6 +238,14 @@
 - config.toml: adaptive_fec_enabled（デフォルトtrue）を追加
 - engine.rs: false時はAdaptiveFecControllerを生成しない（None）、固定fec_redundancyを使用
 
+### ~~Session Recording MVP~~ (完了)
+- recording/mod.rs: Recorder (raw Annex B .h265/.h264)
+- recording/audio.rs: AudioRecorder (16-bit PCM WAV)
+- [recording] enabled/output_dir config
+- engine::write_recording_nal() tap + audio PCM tap (Opus encode 前)
+- best-effort (I/O エラー時 poisoned フラグ、streaming は継続)
+- Companion UI toggle (runtime CONFIG_UPDATE) は次フェーズ
+
 ### Client側FecDecoder RSキャッシュ化 — 実機プロファイル後
 - **What:** Android C++ `fec_decoder.cpp`のReedSolomonインスタンスをスライスFEC導入に合わせてキャッシュ化
 - **Why:** スライスFECでRS初期化が4倍に増加。現在は毎デコード呼び出しでnew()。RSキャッシュで受信側遅延を削減
@@ -265,3 +273,19 @@
 - **Context:** `video.full_range = true` は設定済みだがNVENC側の設定が未接続
 - **Priority:** P2
 - **Depends on:** 実機入手
+
+## v2.2.2 スコープ（作業中 / 近日予定）
+
+### ~~リファクタバンドル（Quick wins + Config + Perf/保守性）~~ (12 PR 完了)
+- PR #14-20, #22-25, #28: osc_bridge EMA helper, FtProfile::validate, status.json serde_json, session_log write_all, BurstDetector cfg(test), config validate_range, config Default consistency, RTP header helper, sent_packet_log periodic, TCP handshake step, Recording MVP
+- PR #21: CI clippy too_many_arguments fix（pre-existing warning を #[allow] で解消）
+- PR #29, #30: pipeline.rs / depacketizer を write_rtp_header + write_fvp_header + read_fvp_header に統一
+
+### 次フェーズ候補（未着手、実機待ちではない）
+- engine.rs run_streaming() 分割（373 LoC → session_loop / frame_loop / reconnection）
+- engine.rs adaptive bitrate lock 整理（AdaptiveState struct 化）
+- FFI 型重複解消（TrackingData / ControllerState を common に統合）
+- CompanionApp 責務分離（tab ごとに別モジュール）
+- Dynamic Resolution Scaling (DRS) - adaptive bitrate の延長
+- Hand Tracking (OpenXR XR_EXT_hand_tracking)
+- Community Plugin API (v3.0)
