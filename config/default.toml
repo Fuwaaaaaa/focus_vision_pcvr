@@ -55,3 +55,11 @@ growth_threshold_mb = 50     # Warn if RSS grows by 50+ MB in 1 hour
 [pairing]
 max_attempts = 5
 lockout_seconds = 300
+
+# Session Recording (optional). When enabled, each streaming session is captured
+# to disk as raw Annex B video (.h265/.h264) plus 16-bit PCM WAV audio.
+# Mux with ffmpeg: `ffmpeg -i rec.h265 -i rec.wav -c:v copy rec.mp4`.
+# Default is disabled — enable only if you need offline review.
+[recording]
+enabled = false
+output_dir = ""             # Empty = %APPDATA%/FocusVisionPCVR/recordings
