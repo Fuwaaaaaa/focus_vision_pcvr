@@ -541,7 +541,11 @@ async fn handle_tcp_control(
 
 /// Spawn the audio capture → Opus encode → UDP send pipeline.
 /// Audio is optional: if capture or encoding fails, streaming continues without audio.
-fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
+fn spawn_audio_pipeline(
+    target: SocketAddr,
+    cancel: CancellationToken,
+    recording_dir: Option<std::path::PathBuf>,
+) {
     use crate::audio::{capture::AudioCapture, encoder::AudioEncoder};
     use crate::transport::rtp::RtpPacket;
 
@@ -601,6 +605,13 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
         let ssrc: u32 = 0x41554449; // "AUDI"
         let mut accum: Vec<f32> = Vec::with_capacity(STEREO_FRAME_SIZE * 2);
 
+        // Open optional WAV recording. PCM sample rate/channels match the capture
+        // pipeline (48 kHz stereo, as assumed by STEREO_FRAME_SIZE above).
+        let mut audio_recorder = recording_dir.and_then(|dir| {
+            let path = dir.join(crate::recording::default_audio_filename());
+            crate::recording::AudioRecorder::open(path, 48000, 2)
+        });
+
         log::info!("Audio streaming started to {}", target);
 
         loop {
@@ -612,6 +623,12 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
                     // Extract and encode complete 10ms frames
                     while accum.len() >= STEREO_FRAME_SIZE {
                         let pcm_frame: Vec<f32> = accum.drain(..STEREO_FRAME_SIZE).collect();
+
+                        // Tap PCM for session recording (before encode) so the WAV
+                        // is lossless and aligned with the captured samples.
+                        if let Some(rec) = audio_recorder.as_mut() {
+                            rec.write_pcm_f32(&pcm_frame);
+                        }
 
                         let opus_data = match encoder.encode(&pcm_frame) {
                             Ok(d) => d,
@@ -765,28 +782,28 @@ fn update_latency_atomics(latency_tracker: &Arc<StdMutex<LatencyTracker>>) {
 }
 
 /// Log PC-side latency stats every 5 seconds.
+/// Resolve the recording output directory from config. Falls back to
+/// %APPDATA%/FocusVisionPCVR/recordings (or platform equivalent).
+fn recording_output_dir(config: &AppConfig) -> std::path::PathBuf {
+    if !config.recording.output_dir.is_empty() {
+        return std::path::PathBuf::from(&config.recording.output_dir);
+    }
+    dirs_next::data_dir()
+        .map(|d| d.join("FocusVisionPCVR").join("recordings"))
+        .unwrap_or_else(|| std::path::PathBuf::from("./recordings"))
+}
+
 /// Build a Recorder if config.recording.enabled is true.
 /// Returns None when disabled or when the output file cannot be opened.
 fn init_recorder(config: &AppConfig) -> Option<Arc<StdMutex<crate::recording::Recorder>>> {
     if !config.recording.enabled {
         return None;
     }
-    let dir: std::path::PathBuf = if config.recording.output_dir.is_empty() {
-        match dirs_next::data_dir() {
-            Some(d) => d.join("FocusVisionPCVR").join("recordings"),
-            None => {
-                log::warn!("recorder: no data_dir() available, recording disabled");
-                return None;
-            }
-        }
-    } else {
-        std::path::PathBuf::from(&config.recording.output_dir)
-    };
     let ext = match config.video.codec {
         fvp_common::protocol::VideoCodec::H264 => "h264",
         fvp_common::protocol::VideoCodec::H265 => "h265",
     };
-    let path = dir.join(crate::recording::default_filename(ext));
+    let path = recording_output_dir(config).join(crate::recording::default_filename(ext));
     crate::recording::Recorder::open(path).map(|r| Arc::new(StdMutex::new(r)))
 }
 
@@ -934,7 +951,12 @@ async fn run_streaming(
         // Audio pipeline (per-session)
         let audio_port = config.network.udp_port + fvp_common::AUDIO_PORT_OFFSET;
         let audio_target: SocketAddr = SocketAddr::new(peer_addr.ip(), audio_port);
-        spawn_audio_pipeline(audio_target, session_cancel.clone());
+        let audio_recording_dir = if config.recording.enabled {
+            Some(recording_output_dir(&config))
+        } else {
+            None
+        };
+        spawn_audio_pipeline(audio_target, session_cancel.clone(), audio_recording_dir);
 
         // Step 3: Process frames with adaptive bitrate + adaptive FEC
         let mut packetizer = RtpPacketizer::new(0x46565000);
