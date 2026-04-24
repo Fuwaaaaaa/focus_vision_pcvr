@@ -51,6 +51,13 @@ impl FtProfile {
             }
         }
     }
+
+    /// Run all post-deserialization checks: pad to TOTAL_BLENDSHAPES, then
+    /// replace invalid values (NaN/Inf/negative) with 1.0.
+    pub fn validate(&mut self) {
+        self.normalize();
+        self.sanitize_weights();
+    }
 }
 
 /// Profile storage directory: %APPDATA%/FocusVisionPCVR/profiles/
@@ -98,8 +105,7 @@ pub fn load_profile(name: &str) -> Option<FtProfile> {
     let path = dir.join(format!("{name}.json"));
     let content = std::fs::read_to_string(&path).ok()?;
     let mut profile: FtProfile = serde_json::from_str(&content).ok()?;
-    profile.normalize();
-    profile.sanitize_weights();
+    profile.validate();
     Some(profile)
 }
 
@@ -226,5 +232,22 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_validate_pads_and_sanitizes() {
+        let mut p = FtProfile {
+            name: "bad".to_string(),
+            weights: vec![2.0, f32::NAN, f32::INFINITY, -1.5],
+            smoothing_override: None,
+        };
+        p.validate();
+        assert_eq!(p.weights.len(), TOTAL_BLENDSHAPES);
+        assert_eq!(p.weights[0], 2.0);
+        assert_eq!(p.weights[1], 1.0); // NaN → 1.0
+        assert_eq!(p.weights[2], 1.0); // Infinity → 1.0
+        assert_eq!(p.weights[3], 1.0); // Negative → 1.0
+        assert_eq!(p.weights[4], 1.0); // Padded
+        assert!(p.weights.iter().all(|w| w.is_finite() && *w >= 0.0));
     }
 }
