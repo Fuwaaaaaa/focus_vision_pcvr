@@ -19,6 +19,30 @@ use engine::{StreamingEngine, EncodedFrame};
 use fvp_common::protocol::{ControllerState, TrackingData};
 use metrics::latency::FrameTimestamps;
 
+/// Guard a C ABI boundary against Rust panic unwinding into C++.
+///
+/// Under the workspace-wide `panic = "abort"` release profile, a panic kills
+/// the process before `catch_unwind` can observe it — the macro is effectively
+/// a no-op at runtime. It is retained as a safety net so that if a future
+/// build profile switches to `panic = "unwind"`, FFI callers are automatically
+/// shielded from cross-ABI unwinding (which is UB). The primary defence is
+/// still removing `.unwrap()/.expect()` from production paths.
+macro_rules! ffi_panic_guard {
+    ($default:expr, $body:block) => {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(v) => v,
+            Err(_) => {
+                log::error!(
+                    "FFI panic caught at {}:{} — returning default",
+                    file!(),
+                    line!()
+                );
+                $default
+            }
+        }
+    };
+}
+
 /// Subsystem status for the companion app.
 #[derive(Debug, Default)]
 pub struct SubsystemStatus {
@@ -108,38 +132,40 @@ pub struct FvpConfig {
 /// Initialize the streaming engine. Returns 0 on success.
 #[no_mangle]
 pub extern "C" fn fvp_init() -> i32 {
-    INIT.call_once(|| { env_logger::init(); });
-    log::info!("Focus Vision PCVR Streaming Engine initializing...");
+    ffi_panic_guard!(-1, {
+        INIT.call_once(|| { env_logger::init(); });
+        log::info!("Focus Vision PCVR Streaming Engine initializing...");
 
-    let mut config = config::AppConfig::load("config/default.toml").unwrap_or_else(|e| {
-        log::warn!("Failed to load config, using defaults: {}", e);
-        config::AppConfig::default()
-    });
+        let mut config = config::AppConfig::load("config/default.toml").unwrap_or_else(|e| {
+            log::warn!("Failed to load config, using defaults: {}", e);
+            config::AppConfig::default()
+        });
 
-    // Validate and fix invalid config values (graceful: clamp + warn)
-    let errors = config.validate();
-    for e in &errors {
-        log::warn!("{}", e);
-    }
+        // Validate and fix invalid config values (graceful: clamp + warn)
+        let errors = config.validate();
+        for e in &errors {
+            log::warn!("{}", e);
+        }
 
-    // Store config for fvp_get_config()
-    if let Ok(mut guard) = CONFIG.write() {
-        *guard = Some(config.clone());
-    }
-    match StreamingEngine::new(config) {
-        Ok(eng) => {
-            if let Ok(mut guard) = ENGINE.write() {
-                *guard = Some(eng);
+        // Store config for fvp_get_config()
+        if let Ok(mut guard) = CONFIG.write() {
+            *guard = Some(config.clone());
+        }
+        match StreamingEngine::new(config) {
+            Ok(eng) => {
+                if let Ok(mut guard) = ENGINE.write() {
+                    *guard = Some(eng);
+                }
+                write_status_file("waiting", None, None, None, None, None);
+                log::info!("Streaming engine started");
+                0
             }
-            write_status_file("waiting", None, None, None, None, None);
-            log::info!("Streaming engine started");
-            0
+            Err(e) => {
+                log::error!("Failed to start engine: {}", e);
+                -1
+            }
         }
-        Err(e) => {
-            log::error!("Failed to start engine: {}", e);
-            -1
-        }
-    }
+    })
 }
 
 /// Shut down the streaming engine.

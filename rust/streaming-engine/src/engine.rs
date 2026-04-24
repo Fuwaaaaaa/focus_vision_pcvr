@@ -556,7 +556,7 @@ fn spawn_audio_pipeline(
     // The thread blocks until the cancel token fires, then drops the capture.
     // Poll is_cancelled() every 100ms — avoids creating a tokio runtime just to wait.
     let hold_cancel = cancel.clone();
-    std::thread::Builder::new()
+    let audio_spawn = std::thread::Builder::new()
         .name("fvp-audio-capture".into())
         .spawn(move || {
             let _capture = match AudioCapture::start(audio_tx) {
@@ -575,8 +575,13 @@ fn spawn_audio_pipeline(
             }
             AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
             log::info!("Audio capture released");
-        })
-        .expect("spawn audio capture thread");
+        });
+    if let Err(e) = audio_spawn {
+        // OS refused to spawn a thread — extremely rare (resource exhaustion).
+        // Do not take video streaming down with us; log and continue without audio.
+        AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        log::warn!("Failed to spawn audio capture thread: {} — no audio", e);
+    }
 
     // Spawn async task: accumulate raw chunks into 10ms frames, encode, send.
     // Accumulation happens here (not in the real-time callback) to avoid Mutex.
