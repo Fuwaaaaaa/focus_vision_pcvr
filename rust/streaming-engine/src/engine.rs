@@ -165,6 +165,9 @@ pub struct StreamingEngine {
     cancel_token: CancellationToken,
     #[allow(dead_code)] // Available for future config queries
     config: AppConfig,
+    /// Optional session recorder. None when recording is disabled in config.
+    /// Drop of StreamingEngine drops this and closes the file.
+    recorder: Option<Arc<StdMutex<crate::recording::Recorder>>>,
 }
 
 impl StreamingEngine {
@@ -229,6 +232,8 @@ impl StreamingEngine {
             }
         });
 
+        let recorder = init_recorder(&config);
+
         Ok(Self {
             runtime,
             frame_tx,
@@ -237,7 +242,18 @@ impl StreamingEngine {
             latency_tracker,
             cancel_token,
             config,
+            recorder,
         })
+    }
+
+    /// Write a NAL to the active recording, if any. No-op when recording
+    /// is disabled or the recorder has been poisoned by a prior I/O error.
+    pub fn write_recording_nal(&self, nal: &[u8]) {
+        if let Some(rec) = &self.recorder {
+            if let Ok(mut r) = rec.try_lock() {
+                r.write_nal(nal);
+            }
+        }
     }
 
     /// Submit a frame for encoding and sending. Called from C++ thread.
@@ -749,6 +765,31 @@ fn update_latency_atomics(latency_tracker: &Arc<StdMutex<LatencyTracker>>) {
 }
 
 /// Log PC-side latency stats every 5 seconds.
+/// Build a Recorder if config.recording.enabled is true.
+/// Returns None when disabled or when the output file cannot be opened.
+fn init_recorder(config: &AppConfig) -> Option<Arc<StdMutex<crate::recording::Recorder>>> {
+    if !config.recording.enabled {
+        return None;
+    }
+    let dir: std::path::PathBuf = if config.recording.output_dir.is_empty() {
+        match dirs_next::data_dir() {
+            Some(d) => d.join("FocusVisionPCVR").join("recordings"),
+            None => {
+                log::warn!("recorder: no data_dir() available, recording disabled");
+                return None;
+            }
+        }
+    } else {
+        std::path::PathBuf::from(&config.recording.output_dir)
+    };
+    let ext = match config.video.codec {
+        fvp_common::protocol::VideoCodec::H264 => "h264",
+        fvp_common::protocol::VideoCodec::H265 => "h265",
+    };
+    let path = dir.join(crate::recording::default_filename(ext));
+    crate::recording::Recorder::open(path).map(|r| Arc::new(StdMutex::new(r)))
+}
+
 fn log_periodic_stats(frame_count: u64, framerate: u64) {
     if frame_count.is_multiple_of(framerate * 5) {
         let enc = PC_ENCODE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
