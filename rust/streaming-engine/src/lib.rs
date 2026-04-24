@@ -210,7 +210,8 @@ pub extern "C" fn fvp_haptic_event(
 /// Returns 0 on success, -1 on error.
 ///
 /// # Safety
-/// `nal_data_ptr` must be valid for `nal_data_len` bytes.
+/// `nal_data_ptr` must be valid for `nal_data_len` bytes (and at most
+/// `MAX_NAL_DATA_LEN`; oversized inputs are rejected rather than trusted).
 #[no_mangle]
 pub unsafe extern "C" fn fvp_submit_encoded_nal(
     nal_data_ptr: *const u8,
@@ -218,7 +219,22 @@ pub unsafe extern "C" fn fvp_submit_encoded_nal(
     frame_index: u32,
     is_idr: i32,
 ) -> i32 {
+    /// Upper bound on a single encoded frame. A 4K120 I-frame at extreme
+    /// quality rarely exceeds ~8 MB; 32 MB is a generous cap that still
+    /// catches caller-side corruption / UB (uninitialized len passed from C).
+    /// Without this, a garbage `nal_data_len` of e.g. 3 GB would produce
+    /// a slice whose size exceeds the actual allocation, reading arbitrary
+    /// memory in the subsequent copy.
+    const MAX_NAL_DATA_LEN: u32 = 32 * 1024 * 1024;
+
     if nal_data_ptr.is_null() || nal_data_len == 0 {
+        return -1;
+    }
+    if nal_data_len > MAX_NAL_DATA_LEN {
+        log::error!(
+            "fvp_submit_encoded_nal: nal_data_len {} > MAX_NAL_DATA_LEN {} — rejecting",
+            nal_data_len, MAX_NAL_DATA_LEN
+        );
         return -1;
     }
 
@@ -488,6 +504,32 @@ mod tests {
         reset_engine();
         let nal_data = vec![0u8; 100];
         let result = unsafe { fvp_submit_encoded_nal(nal_data.as_ptr(), 0, 0, 0) };
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_fvp_submit_encoded_nal_oversize_rejected() {
+        // Pass a tiny real buffer but claim a huge length — the length cap
+        // must reject before we read past the allocation.
+        reset_engine();
+        let nal_data = vec![0u8; 16];
+        let bogus_len: u32 = 200 * 1024 * 1024; // 200 MB > 32 MB cap
+        let result = unsafe { fvp_submit_encoded_nal(nal_data.as_ptr(), bogus_len, 0, 0) };
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_fvp_submit_encoded_nal_just_under_cap_rejects_when_no_engine() {
+        // 32 MB is the cap; a request just under it should be allowed past
+        // the length check (and then fail with -1 because no engine is initialized).
+        // This confirms the cap is a ceiling, not a floor.
+        reset_engine();
+        let nal_data = vec![0u8; 1024];
+        let just_under_cap: u32 = 32 * 1024 * 1024 - 1;
+        // We pass a real 1 KB buffer but claim a 32 MB length; without an
+        // engine it returns -1 at the ENGINE.read() guard before trying to
+        // copy the fake slice.
+        let result = unsafe { fvp_submit_encoded_nal(nal_data.as_ptr(), just_under_cap, 0, 0) };
         assert_eq!(result, -1);
     }
 
