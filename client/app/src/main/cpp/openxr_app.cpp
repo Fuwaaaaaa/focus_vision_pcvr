@@ -38,9 +38,28 @@ void OpenXRApp::initialize(android_app* app) {
 
     // Initialize video decoder with JNI for zero-copy SurfaceTexture output.
     // EGL context is current at this point (initEGL called above).
+    //
+    // JNI attach/detach: follow the pattern used in video_decoder.cpp so we
+    // only Detach if we actually attached the thread here. Without this
+    // balance, the thread leaks a reference to the VM and logs a warning
+    // at exit on some Android versions.
+    JavaVM* vm = app->activity->vm;
     JNIEnv* env = nullptr;
-    app->activity->vm->AttachCurrentThread(&env, nullptr);
-    m_videoDecoder.init(env, 1832, 1920); // Per-eye resolution from config
+    bool didAttach = false;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGE("AttachCurrentThread failed; skipping video decoder JNI init");
+            env = nullptr;
+        } else {
+            didAttach = true;
+        }
+    }
+    if (env) {
+        m_videoDecoder.init(env, 1832, 1920); // Per-eye resolution from config
+    }
+    if (didAttach) {
+        vm->DetachCurrentThread();
+    }
     LOGI("OpenXR app initialized successfully");
 }
 
