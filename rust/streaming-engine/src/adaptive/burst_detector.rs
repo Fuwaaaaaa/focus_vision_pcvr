@@ -34,6 +34,18 @@ impl BurstDetector {
         }
     }
 
+    /// Construct a detector with custom thresholds — intended for tests that
+    /// want short windows to avoid long `thread::sleep` calls.
+    #[cfg(test)]
+    pub fn new_with_thresholds(sustained: Duration, loss_rate: f64) -> Self {
+        Self {
+            pattern: LossPattern::None,
+            burst_start: None,
+            sustained_threshold: sustained,
+            loss_rate_threshold: loss_rate,
+        }
+    }
+
     /// Record a loss measurement. Call periodically (e.g., every heartbeat).
     /// `loss_rate` is 0.0-1.0 (fraction of packets lost in this interval).
     pub fn record(&mut self, loss_rate: f64) {
@@ -131,5 +143,24 @@ mod tests {
         assert_eq!(bd.pattern(), LossPattern::None);
         assert!(!bd.recommend_fec_boost());
         assert!(!bd.recommend_bitrate_reduction());
+    }
+
+    #[test]
+    fn test_new_with_thresholds_fast_sustained_detection() {
+        // Use a 10ms sustained window to keep the test snappy.
+        let mut bd = BurstDetector::new_with_thresholds(Duration::from_millis(10), 0.05);
+        bd.record(0.10);
+        assert_eq!(bd.pattern(), LossPattern::Burst);
+        thread::sleep(Duration::from_millis(20));
+        bd.record(0.10);
+        assert_eq!(bd.pattern(), LossPattern::Sustained);
+    }
+
+    #[test]
+    fn test_new_with_thresholds_custom_loss_rate() {
+        // Tighten loss threshold to 1%: 2% should now trigger burst.
+        let mut bd = BurstDetector::new_with_thresholds(Duration::from_millis(500), 0.01);
+        bd.record(0.02);
+        assert_eq!(bd.pattern(), LossPattern::Burst);
     }
 }
