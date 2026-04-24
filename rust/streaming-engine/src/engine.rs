@@ -313,6 +313,7 @@ pub(crate) enum DisconnectReason {
 /// Sends: HAPTIC_EVENT (outbound to HMD).
 /// When the connection closes or errors, cancels the provided token to stop streaming.
 /// Returns the disconnect reason so the caller can decide whether to hold state.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp_control(
     stream: Box<dyn crate::control::tcp_server::AsyncStream>,
     cancel: tokio_util::sync::CancellationToken,
@@ -634,6 +635,7 @@ fn spawn_audio_pipeline(target: SocketAddr, cancel: CancellationToken) {
 
 /// Check HMD-reported stats and adjust bitrate and FEC redundancy accordingly.
 /// Called once per second (every `framerate` frames).
+#[allow(clippy::too_many_arguments)]
 fn update_adaptive_bitrate(
     frame_count: u64,
     framerate: u64,
