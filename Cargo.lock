@@ -3185,6 +3185,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 name = "streaming-engine"
 version = "2.1.0"
 dependencies = [
+ "arbitrary",
  "audiopus",
  "bytes",
  "cbindgen",
@@ -3202,6 +3203,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
