@@ -124,53 +124,46 @@ impl TcpControlServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        // Step 1: Receive HELLO (with optional protocol version)
-        let msg = read_message_generic(&mut stream).await?;
-        if msg.0 != msg_type::HELLO {
-            return Err("Expected HELLO".into());
-        }
-        let client_version = fvp_common::protocol::parse_hello_version(&msg.1);
-        log::info!("Received HELLO from client (protocol v{})", client_version);
+        step_hello_exchange(&mut stream).await?;
+        self.step_pin_pairing(&mut stream).await?;
+        step_stream_config(&mut stream, &self.encode_stream_config()).await?;
+        step_stream_start(&mut stream).await?;
+        log::info!("Handshake complete, streaming ready");
+        Ok(stream)
+    }
 
-        // Step 2: Send HELLO_ACK with our protocol version
-        let version_payload = fvp_common::protocol::encode_version(fvp_common::protocol::PROTOCOL_VERSION);
-        send_message_generic(&mut stream, msg_type::HELLO_ACK, &version_payload).await?;
+    /// PIN request → response → verify. Separated from the free-fn steps because
+    /// it needs `self.pairing`.
+    async fn step_pin_pairing<S>(&self, stream: &mut S)
+        -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        log::debug!("handshake step: PIN_REQUEST");
+        send_message_generic(stream, msg_type::PIN_REQUEST, &[]).await
+            .map_err(|e| format!("step PIN_REQUEST send failed: {e}"))?;
 
-        // Step 3: Send PIN_REQUEST
-        send_message_generic(&mut stream, msg_type::PIN_REQUEST, &[]).await?;
-
-        // Step 4: Receive PIN_RESPONSE
-        let msg = read_message_generic(&mut stream).await?;
+        log::debug!("handshake step: PIN_RESPONSE (awaiting)");
+        let msg = read_message_generic(stream).await
+            .map_err(|e| format!("step PIN_RESPONSE read failed: {e}"))?;
         if msg.0 != msg_type::PIN_RESPONSE || msg.1.len() < 4 {
             return Err("Expected PIN_RESPONSE (4 bytes)".into());
         }
         let submitted_pin = u32::from_le_bytes([msg.1[0], msg.1[1], msg.1[2], msg.1[3]]);
 
-        // Step 5: Verify PIN
+        log::debug!("handshake step: PIN verify");
         let mut pairing = self.pairing.lock().await;
         match pairing.verify(submitted_pin) {
             Ok(()) => {
-                send_message_generic(&mut stream, msg_type::PIN_RESULT, &[0x01]).await?;
+                send_message_generic(stream, msg_type::PIN_RESULT, &[0x01]).await?;
+                log::info!("PIN accepted");
+                Ok(())
             }
             Err(_) => {
-                send_message_generic(&mut stream, msg_type::PIN_RESULT, &[0x00]).await?;
-                return Err("PIN verification failed".into());
+                send_message_generic(stream, msg_type::PIN_RESULT, &[0x00]).await?;
+                Err("PIN verification failed".into())
             }
         }
-        drop(pairing);
-
-        // Step 6: Send STREAM_CONFIG
-        let config_bytes = self.encode_stream_config();
-        send_message_generic(&mut stream, msg_type::STREAM_CONFIG, &config_bytes).await?;
-
-        // Step 7: Wait for STREAM_START
-        let msg = read_message_generic(&mut stream).await?;
-        if msg.0 != msg_type::STREAM_START {
-            return Err("Expected STREAM_START".into());
-        }
-
-        log::info!("Handshake complete, streaming ready");
-        Ok(stream)
     }
 
     fn encode_stream_config(&self) -> Vec<u8> {
@@ -190,6 +183,54 @@ impl TcpControlServer {
     pub fn is_connected(&self) -> Arc<Mutex<bool>> {
         self.connected.clone()
     }
+}
+
+/// Step 1-2: Receive HELLO and reply with HELLO_ACK carrying our protocol version.
+async fn step_hello_exchange<S>(stream: &mut S)
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    log::debug!("handshake step: HELLO (awaiting)");
+    let msg = read_message_generic(stream).await
+        .map_err(|e| format!("step HELLO read failed: {e}"))?;
+    if msg.0 != msg_type::HELLO {
+        return Err(format!("Expected HELLO, got msg_type {}", msg.0).into());
+    }
+    let client_version = fvp_common::protocol::parse_hello_version(&msg.1);
+    log::info!("Received HELLO from client (protocol v{})", client_version);
+
+    log::debug!("handshake step: HELLO_ACK");
+    let version_payload = fvp_common::protocol::encode_version(fvp_common::protocol::PROTOCOL_VERSION);
+    send_message_generic(stream, msg_type::HELLO_ACK, &version_payload).await
+        .map_err(|e| format!("step HELLO_ACK send failed: {e}"))?;
+    Ok(())
+}
+
+/// Step 6: Send STREAM_CONFIG with session-specific payload.
+async fn step_stream_config<S>(stream: &mut S, config_bytes: &[u8])
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    log::debug!("handshake step: STREAM_CONFIG ({} bytes)", config_bytes.len());
+    send_message_generic(stream, msg_type::STREAM_CONFIG, config_bytes).await
+        .map_err(|e| format!("step STREAM_CONFIG send failed: {e}").into())
+}
+
+/// Step 7: Wait for client STREAM_START.
+async fn step_stream_start<S>(stream: &mut S)
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    log::debug!("handshake step: STREAM_START (awaiting)");
+    let msg = read_message_generic(stream).await
+        .map_err(|e| format!("step STREAM_START read failed: {e}"))?;
+    if msg.0 != msg_type::STREAM_START {
+        return Err(format!("Expected STREAM_START, got msg_type {}", msg.0).into());
+    }
+    Ok(())
 }
 
 /// Read a framed message from any async stream.
