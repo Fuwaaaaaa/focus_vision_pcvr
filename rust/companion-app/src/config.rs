@@ -83,11 +83,32 @@ fn default_ft_smoothing() -> f32 { 0.6 }
 
 impl LocalConfig {
     /// Load from config/local.toml relative to the project root.
+    ///
+    /// A missing file is silently treated as "use defaults" (normal first-run
+    /// path). A present-but-malformed file is reported via `log::warn!` and
+    /// then falls back to defaults, so users editing local.toml by hand can
+    /// see syntax errors in the companion log without the app silently
+    /// discarding their changes.
     pub fn load() -> Self {
         let path = config_path();
-        match std::fs::read_to_string(&path) {
-            Ok(content) => toml::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                log::warn!("LocalConfig: cannot read {:?}: {} — using defaults", path, e);
+                return Self::default();
+            }
+        };
+        match toml::from_str(&content) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                log::warn!(
+                    "LocalConfig: failed to parse {:?}: {} — using defaults. \
+                     Fix the TOML syntax to preserve user overrides.",
+                    path, e
+                );
+                Self::default()
+            }
         }
     }
 
