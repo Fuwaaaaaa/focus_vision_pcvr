@@ -21,6 +21,21 @@ pub fn write_rtp_header(
     buf.extend_from_slice(&ssrc.to_be_bytes());
 }
 
+/// Append the 10-byte FVP header that follows the RTP header.
+/// Layout: frame_index u32 LE | shard_index u16 LE | shard_count u16 LE | flags u16 LE.
+pub fn write_fvp_header(
+    buf: &mut Vec<u8>,
+    frame_index: u32,
+    shard_index: u16,
+    shard_count: u16,
+    flags: u16,
+) {
+    buf.extend_from_slice(&frame_index.to_le_bytes());
+    buf.extend_from_slice(&shard_index.to_le_bytes());
+    buf.extend_from_slice(&shard_count.to_le_bytes());
+    buf.extend_from_slice(&flags.to_le_bytes());
+}
+
 /// A single RTP packet ready for transmission.
 #[derive(Debug, Clone)]
 pub struct RtpPacket {
@@ -93,11 +108,8 @@ impl RtpPacketizer {
             write_rtp_header(&mut buf, RTP_PT_H265, is_last, seq, timestamp_90khz, self.ssrc);
 
             // FVP header (10 bytes) — shard fields are u16 to support large keyframes
-            buf.extend_from_slice(&frame_index.to_le_bytes());
-            buf.extend_from_slice(&(i as u16).to_le_bytes());            // shard_index
-            buf.extend_from_slice(&(total_chunks as u16).to_le_bytes()); // shard_count
             let flags: u16 = if is_keyframe { 1 } else { 0 };
-            buf.extend_from_slice(&flags.to_le_bytes());
+            write_fvp_header(&mut buf, frame_index, i as u16, total_chunks as u16, flags);
 
             // Payload
             buf.extend_from_slice(chunk);
