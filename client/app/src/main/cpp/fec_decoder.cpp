@@ -285,25 +285,37 @@ void SlicedFecFrameDecoder::addShard(uint8_t sliceIndex, uint16_t shardIndex,
     if (!(m_sliceCompleted & (1 << sliceIndex)) && ctx.isComplete()) {
         auto decoded = ctx.tryDecode();
         if (decoded.has_value()) {
-            // Strip u32 length prefix from decoded data
+            // Strip u32 length prefix from decoded data.
+            //
+            // SECURITY: originalLen is attacker-influenced (UDP payload post-FEC).
+            // The earlier `originalLen + 4 <= data.size()` check was computed in
+            // uint32_t — with originalLen near UINT32_MAX the addition wrapped
+            // and the subsequent `data.begin() + 4 + originalLen` iterator was
+            // advanced past end, producing heap OOB read. We promote to size_t
+            // and cap at MAX_DECODED_SLICE_BYTES (16 MiB) so a malformed length
+            // prefix can never drive an out-of-bounds assign. On failure we
+            // leave the slice empty and let the existing SLICE_TIMEOUT path
+            // request an IDR (already rate-limited to 2/sec).
+            static constexpr size_t MAX_DECODED_SLICE_BYTES = 16 * 1024 * 1024;
             if (decoded->data.size() >= 4) {
-                uint32_t originalLen = (uint32_t)decoded->data[0]
-                    | ((uint32_t)decoded->data[1] << 8)
-                    | ((uint32_t)decoded->data[2] << 16)
-                    | ((uint32_t)decoded->data[3] << 24);
+                size_t originalLen =
+                      static_cast<size_t>(decoded->data[0])
+                    | (static_cast<size_t>(decoded->data[1]) << 8)
+                    | (static_cast<size_t>(decoded->data[2]) << 16)
+                    | (static_cast<size_t>(decoded->data[3]) << 24);
 
-                if (originalLen + 4 <= decoded->data.size()) {
-                    m_sliceData[sliceIndex].assign(
-                        decoded->data.begin() + 4,
-                        decoded->data.begin() + 4 + originalLen
-                    );
-                } else {
-                    // Length prefix exceeds data — use all data after prefix
-                    m_sliceData[sliceIndex].assign(
-                        decoded->data.begin() + 4,
-                        decoded->data.end()
-                    );
+                const size_t available = decoded->data.size() - 4;
+                if (originalLen > MAX_DECODED_SLICE_BYTES || originalLen > available) {
+                    LOGW("SlicedFecFrameDecoder: invalid length prefix %zu "
+                         "(available=%zu, cap=%zu) for slice %u — dropping",
+                         originalLen, available, MAX_DECODED_SLICE_BYTES,
+                         (unsigned)sliceIndex);
+                    return;
                 }
+                m_sliceData[sliceIndex].assign(
+                    decoded->data.begin() + 4,
+                    decoded->data.begin() + 4 + static_cast<ptrdiff_t>(originalLen)
+                );
             } else {
                 m_sliceData[sliceIndex] = std::move(decoded->data);
             }
