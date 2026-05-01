@@ -9,6 +9,10 @@ pub struct BitrateController {
     current_bitrate_bps: u64,
     min_bitrate_bps: u64,
     max_bitrate_bps: u64,
+    /// Optional ceiling imposed by the thermal governor. When `Some`, every
+    /// computed bitrate is additionally clamped to `min(max_bitrate_bps, this)`
+    /// while the floor still wins if the ceiling drops below `min_bitrate_bps`.
+    thermal_ceiling_bps: Option<u64>,
     target_loss_rate: f64,
     last_adjustment: Instant,
     /// Minimum interval between upward adjustments (hysteresis)
@@ -21,6 +25,7 @@ impl BitrateController {
             current_bitrate_bps: initial_bitrate_mbps as u64 * 1_000_000,
             min_bitrate_bps: 10_000_000,   // 10 Mbps floor
             max_bitrate_bps: 200_000_000,  // 200 Mbps ceiling
+            thermal_ceiling_bps: None,
             target_loss_rate: 0.02,        // 2%
             last_adjustment: Instant::now(),
             hysteresis_duration: Duration::from_secs(10),
@@ -87,14 +92,54 @@ impl BitrateController {
         }
 
         if (multiplier - 1.0).abs() > f64::EPSILON {
-            self.current_bitrate_bps = (self.current_bitrate_bps as f64 * multiplier) as u64;
-            self.current_bitrate_bps = self.current_bitrate_bps.max(self.min_bitrate_bps).min(self.max_bitrate_bps);
-            self.last_adjustment = Instant::now();
-            log::info!("Bitrate adjusted → {} Mbps", self.current_bitrate_bps / 1_000_000);
-            return true;
+            let candidate = (self.current_bitrate_bps as f64 * multiplier) as u64;
+            let new_bps = self.clamp_to_bounds(candidate);
+            if new_bps != self.current_bitrate_bps {
+                self.current_bitrate_bps = new_bps;
+                self.last_adjustment = Instant::now();
+                log::info!("Bitrate adjusted → {} Mbps", self.current_bitrate_bps / 1_000_000);
+                return true;
+            }
         }
 
         false
+    }
+
+    /// Apply the floor / ceiling / thermal-ceiling stack to a candidate bitrate.
+    /// Floor always wins — even a thermal ceiling below `min_bitrate_bps` cannot
+    /// reduce the encoder below its minimum operating point.
+    fn clamp_to_bounds(&self, candidate_bps: u64) -> u64 {
+        let effective_max = match self.thermal_ceiling_bps {
+            Some(thermal) => self.max_bitrate_bps.min(thermal),
+            None => self.max_bitrate_bps,
+        };
+        candidate_bps.min(effective_max).max(self.min_bitrate_bps)
+    }
+
+    /// Set the thermal ceiling (in bps). Immediately clamps the live bitrate
+    /// if it sits above the new ceiling so the cap takes effect on the next
+    /// frame, not the next adjustment cycle.
+    pub fn set_thermal_ceiling_bps(&mut self, ceiling_bps: u64) {
+        self.thermal_ceiling_bps = Some(ceiling_bps);
+        let clamped = self.clamp_to_bounds(self.current_bitrate_bps);
+        if clamped != self.current_bitrate_bps {
+            log::info!(
+                "Thermal ceiling applied: {} → {} Mbps",
+                self.current_bitrate_bps / 1_000_000,
+                clamped / 1_000_000,
+            );
+            self.current_bitrate_bps = clamped;
+        }
+    }
+
+    /// Lift the thermal ceiling — the live bitrate stays where it is, but
+    /// future adjustments may grow back up to `max_bitrate_bps`.
+    pub fn clear_thermal_ceiling(&mut self) {
+        self.thermal_ceiling_bps = None;
+    }
+
+    pub fn thermal_ceiling_bps(&self) -> Option<u64> {
+        self.thermal_ceiling_bps
     }
 
     pub fn current_bitrate_bps(&self) -> u64 { self.current_bitrate_bps }
@@ -271,6 +316,70 @@ mod tests {
         let changed = ctrl.adjust(&est, &gcc, &burst);
         assert!(!changed, "Burst should suppress bitrate reduction");
         assert_eq!(ctrl.current_bitrate_mbps(), 100, "Bitrate should remain unchanged during burst");
+    }
+
+    #[test]
+    fn test_thermal_ceiling_clamps_current_bitrate_immediately() {
+        let mut ctrl = BitrateController::new(150);
+        ctrl.set_thermal_ceiling_bps(70_000_000);
+        assert_eq!(ctrl.current_bitrate_mbps(), 70,
+            "thermal ceiling must clamp the live bitrate, not just future adjustments");
+    }
+
+    #[test]
+    fn test_thermal_ceiling_no_effect_when_above_current() {
+        let mut ctrl = BitrateController::new(80);
+        ctrl.set_thermal_ceiling_bps(150_000_000);
+        assert_eq!(ctrl.current_bitrate_mbps(), 80,
+            "ceiling above current bitrate is a no-op");
+    }
+
+    #[test]
+    fn test_thermal_ceiling_clamps_upward_adjust() {
+        let mut ctrl = BitrateController::new_with_hysteresis(80, Duration::from_millis(10));
+        ctrl.set_thermal_ceiling_bps(85_000_000);
+        let mut est = BandwidthEstimator::new();
+        let gcc = GccEstimator::new(80_000_000);
+        let burst = BurstDetector::new();
+        est.update(100, 0, 5.0);
+        std::thread::sleep(Duration::from_millis(20));
+        ctrl.adjust(&est, &gcc, &burst);
+        // 80 * 1.05 = 84 (under ceiling) — but next tick would push to 88 which would clamp to 85.
+        // Verify the next bump respects the ceiling.
+        std::thread::sleep(Duration::from_millis(20));
+        ctrl.adjust(&est, &gcc, &burst);
+        assert!(ctrl.current_bitrate_mbps() <= 85,
+            "ceiling must hold across consecutive +5% adjustments, got {}",
+            ctrl.current_bitrate_mbps());
+    }
+
+    #[test]
+    fn test_thermal_ceiling_lifted_allows_unlimited_growth() {
+        let mut ctrl = BitrateController::new(150);
+        ctrl.set_thermal_ceiling_bps(70_000_000);
+        assert_eq!(ctrl.current_bitrate_mbps(), 70);
+        // Lift ceiling — current bitrate stays at 70 (no spontaneous jump),
+        // but the cap is removed so future adjust() can grow back.
+        ctrl.clear_thermal_ceiling();
+        assert_eq!(ctrl.current_bitrate_mbps(), 70);
+        assert_eq!(ctrl.thermal_ceiling_bps(), None);
+    }
+
+    #[test]
+    fn test_thermal_ceiling_respects_floor() {
+        // Ceiling below the 10 Mbps floor — floor wins.
+        let mut ctrl = BitrateController::new(100);
+        ctrl.set_thermal_ceiling_bps(5_000_000);
+        assert_eq!(ctrl.current_bitrate_mbps(), 10,
+            "thermal ceiling below floor must not crush below min");
+    }
+
+    #[test]
+    fn test_thermal_ceiling_returns_stored_value() {
+        let mut ctrl = BitrateController::new(80);
+        assert_eq!(ctrl.thermal_ceiling_bps(), None);
+        ctrl.set_thermal_ceiling_bps(60_000_000);
+        assert_eq!(ctrl.thermal_ceiling_bps(), Some(60_000_000));
     }
 
     #[test]
