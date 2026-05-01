@@ -12,6 +12,29 @@
 pub mod audio;
 pub use audio::{AudioRecorder, default_audio_filename};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// CONFIG_UPDATE ACK status byte: update applied.
+pub const ACK_ACCEPTED: u8 = 0x01;
+/// CONFIG_UPDATE ACK status byte: update rejected (out of range / unknown).
+pub const ACK_REJECTED: u8 = 0x00;
+
+/// Pure handler for CONFIG_UPDATE key 0x03 (recording toggle).
+/// Accepts only `0` (disable) or `1` (enable); other values leave the state
+/// untouched and return `ACK_REJECTED` so an HMD with a wider value space
+/// cannot silently flip recording on/off.
+///
+/// The atomic write tap (`StreamingEngine::write_recording_nal`) must check
+/// the same `state` before touching the on-disk recorder for this toggle to
+/// take effect.
+pub fn apply_recording_config_update(value: u32, state: &AtomicBool) -> u8 {
+    match value {
+        0 => { state.store(false, Ordering::Relaxed); ACK_ACCEPTED }
+        1 => { state.store(true, Ordering::Relaxed); ACK_ACCEPTED }
+        _ => ACK_REJECTED,
+    }
+}
+
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -252,5 +275,34 @@ mod tests {
         assert_eq!(rec.nal_count(), 2);
         assert_eq!(rec.bytes_written(), 11);
         let _ = fs::remove_file(&p);
+    }
+
+    // -- Runtime toggle (CONFIG_UPDATE 0x03) --
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn test_apply_recording_config_disable_flips_atomic() {
+        let state = AtomicBool::new(true);
+        let ack = apply_recording_config_update(0, &state);
+        assert_eq!(ack, ACK_ACCEPTED);
+        assert!(!state.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_apply_recording_config_enable_flips_atomic() {
+        let state = AtomicBool::new(false);
+        let ack = apply_recording_config_update(1, &state);
+        assert_eq!(ack, ACK_ACCEPTED);
+        assert!(state.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_apply_recording_config_invalid_value_rejected_and_state_unchanged() {
+        let state = AtomicBool::new(true);
+        let ack = apply_recording_config_update(2, &state);
+        assert_eq!(ack, ACK_REJECTED);
+        assert!(state.load(Ordering::Relaxed),
+            "rejected update must leave the prior runtime state intact");
     }
 }

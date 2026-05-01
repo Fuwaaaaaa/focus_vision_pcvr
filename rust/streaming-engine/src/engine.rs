@@ -36,6 +36,19 @@ static HAPTIC_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// Whether audio capture is active (set by audio pipeline thread).
 static AUDIO_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Runtime recording flag. Initialised from `config.recording.enabled` at
+/// engine startup and toggleable mid-session via CONFIG_UPDATE key 0x03.
+/// `write_recording_nal` checks this before touching the on-disk recorder
+/// so an operator can stop a recording without restarting the engine.
+///
+/// Note: this gates *video* recording. Audio recording is bound to the
+/// audio task lifetime per session and remains driven by the boot config
+/// — runtime audio toggling needs the audio task to share an Arc handle,
+/// which is deferred to a follow-up because it requires real-device
+/// validation that "audio kept playing while toggling" actually works.
+pub(crate) static RECORDING_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Latest PC-side encode latency in microseconds (for HEARTBEAT_ACK waterfall).
 static PC_ENCODE_LATENCY_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Latest PC-side total latency in microseconds (present→send).
@@ -233,6 +246,12 @@ impl StreamingEngine {
         });
 
         let recorder = init_recorder(&config);
+        // Seed the runtime toggle from boot config so the first frames after
+        // startup honour the same on/off state the user configured.
+        RECORDING_ENABLED.store(
+            config.recording.enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         Ok(Self {
             runtime,
@@ -247,8 +266,12 @@ impl StreamingEngine {
     }
 
     /// Write a NAL to the active recording, if any. No-op when recording
-    /// is disabled or the recorder has been poisoned by a prior I/O error.
+    /// is disabled (statically or via runtime CONFIG_UPDATE 0x03) or the
+    /// recorder has been poisoned by a prior I/O error.
     pub fn write_recording_nal(&self, nal: &[u8]) {
+        if !RECORDING_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         if let Some(rec) = &self.recorder {
             if let Ok(mut r) = rec.try_lock() {
                 r.write_nal(nal);
@@ -505,6 +528,16 @@ async fn handle_tcp_control(
                                     log::info!("CONFIG_UPDATE: codec → {}", if value == 0 { "h264" } else { "h265" });
                                     // Codec change requires stream restart — acknowledged but deferred
                                     ack_status = 0x01;
+                                }
+                                0x03 => { // recording (0=off, 1=on)
+                                    ack_status = crate::recording::apply_recording_config_update(
+                                        value, &RECORDING_ENABLED,
+                                    );
+                                    log::info!(
+                                        "CONFIG_UPDATE: recording → {} (ack={})",
+                                        if value == 1 { "on" } else if value == 0 { "off" } else { "rejected" },
+                                        ack_status,
+                                    );
                                 }
                                 _ => {
                                     log::warn!("CONFIG_UPDATE: unknown key 0x{:02x}", key);
