@@ -6,6 +6,9 @@ All notable changes to Focus Vision PCVR will be documented in this file.
 
 ### Added
 - **Thermal Governor (ソフト骨格):** GPU 温度に応じて adaptive bitrate ceiling を段階的に絞る `thermal::ThermalGovernor`。`trait GpuThermalSource` 抽象 + `MockGpuThermalSource` (テスト用)。閾値 75/85/90°C (warn/limit/emergency)、limit で 70%、emergency で 50% にキャップ。`recovery_seconds` (デフォルト 30s) で線形ランプアップ。`[thermal]` config セクション追加。`BitrateController.set_thermal_ceiling_bps()` 統合 — floor (10 Mbps) は常に優先される。NVML 連携は Phase 4.3 (実機検証) まで stub (`try_create_nvml()` は `None`)。テスト 23 件追加 (config 4 + thermal 13 + bitrate ceiling 6)
+
+### Changed
+- **Bitrate Arbitration の明示化:** `BitrateController.adjust()` 内で多層に絡んでいた multiplier 連鎖を、純粋関数 `arbitrate(ArbitrationInputs) -> ArbitrationOutcome` に抽出。優先順位 (Sustained > 各 reduction > Increase > Floor / Thermal clamp) と勝者シグナルを `ArbDominant` enum で明示。`BitrateController.last_decision()` getter で「なぜ今のビットレートになったか」を runtime に問い合わせ可能 (status.json / log 用)。挙動は不変 (既存 18 件のテスト全 PASS)、新規 6 件追加 (合成シグナルでの floor/thermal/loss 優先順位検証)
 - **Session Recording MVP:** `[recording]` config セクションで有効化すると、VIDEO は Annex B raw (.h265/.h264)、AUDIO は WAV (16-bit PCM) として `%APPDATA%/FocusVisionPCVR/recordings/` に自動保存。`ffmpeg -i rec.h265 -i rec.wav -c:v copy rec.mp4` で mp4 化可能 (#25, #28, #31)
 - **RTP/FVP header helpers:** `transport::rtp::write_rtp_header` / `write_fvp_header` / `read_fvp_header` を導入。video・audio・pipeline (with_fec / sliced)・depacketizer の 4 箇所で別々に手書きしていた wire format を 1 箇所に集約 (#22, #29, #30)
 - **BurstDetector `new_with_thresholds`:** cfg(test) 専用コンストラクタで `thread::sleep` 依存テストを高速化可能に (#18)
