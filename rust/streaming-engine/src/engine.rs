@@ -922,18 +922,24 @@ async fn run_streaming(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Reconnect loop: when a session ends (TCP disconnect, Wi-Fi drop),
     // clean up and re-listen for a new HMD connection.
-    let mut accept_failures: u32 = 0;
-    let mut reconnect_attempts: u32 = 0;
-    const MAX_ACCEPT_FAILURES: u32 = 5;
-    const MAX_RECONNECT_ATTEMPTS: u32 = 10; // more lenient for Wi-Fi drops
-    let backoff_base = std::time::Duration::from_secs(1);
+    //
+    // Counter rules and exponential backoff live in `control::reconnect`
+    // so they are unit-testable without spinning up the full async loop.
+    // The 2-token (session_cancel + connection_cancel) split that keeps
+    // audio alive across the 5 s hold window is intentionally deferred
+    // to Phase 4.2 — it requires real Wi-Fi drop testing to validate.
+    let mut reconnect_state = crate::control::reconnect::ReconnectState::new();
 
     loop {
         if cancel.is_cancelled() { break; }
 
-        if accept_failures > 0 {
-            let delay = backoff_base * 2u32.pow((accept_failures - 1).min(4));
-            log::info!("Retrying accept in {:?} (failure {}/{})", delay, accept_failures, MAX_ACCEPT_FAILURES);
+        if let Some(delay) = reconnect_state.next_backoff() {
+            log::info!(
+                "Retrying accept in {:?} (failure {}/{})",
+                delay,
+                reconnect_state.accept_failures(),
+                crate::control::reconnect::MAX_ACCEPT_FAILURES,
+            );
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
                 _ = cancel.cancelled() => { break; }
@@ -951,9 +957,12 @@ async fn run_streaming(
             Ok(r) => r,
             Err(e) => {
                 log::error!("TCP accept failed: {}", e);
-                accept_failures += 1;
-                if accept_failures > MAX_ACCEPT_FAILURES {
-                    log::error!("Max accept failures reached ({}) — stopping engine", accept_failures);
+                reconnect_state.record_accept_failure();
+                if reconnect_state.should_stop_engine() {
+                    log::error!(
+                        "Max accept failures reached ({}) — stopping engine",
+                        reconnect_state.accept_failures(),
+                    );
                     break;
                 }
                 continue;
@@ -961,7 +970,7 @@ async fn run_streaming(
         };
 
         log::info!("HMD connected from {}, starting video stream", peer_addr);
-        accept_failures = 0; // Reset on successful accept
+        reconnect_state.record_accept_success();
 
         // Per-session cancel: fires when TCP drops or HMD disconnects
         let session_cancel = CancellationToken::new();
@@ -1039,7 +1048,7 @@ async fn run_streaming(
             Err(e) => {
                 log::error!("UDP sender failed: {}", e);
                 session_cancel.cancel();
-                accept_failures += 1;
+                reconnect_state.record_accept_failure();
                 continue;
             }
         };
@@ -1177,9 +1186,13 @@ async fn run_streaming(
         match reason {
             DisconnectReason::ConnectionLost => {
                 log::info!("Connection lost — listening for reconnection (5s hold)");
-                reconnect_attempts += 1;
-                if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
-                    log::warn!("Wi-Fi reconnect attempts: {}/{} — still accepting connections", reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                reconnect_state.record_connection_lost();
+                if reconnect_state.is_reconnect_warning_due() {
+                    log::warn!(
+                        "Wi-Fi reconnect attempts: {}/{} — still accepting connections",
+                        reconnect_state.reconnect_attempts(),
+                        crate::control::reconnect::MAX_RECONNECT_ATTEMPTS,
+                    );
                 }
 
                 // Re-create TCP server and listen during hold period
@@ -1200,12 +1213,12 @@ async fn run_streaming(
                         log::info!("HMD reconnected from {} during hold period", addr);
                         // HMD reconnected — loop will accept again immediately.
                         // The key improvement: listener was open, so HMD could find us.
-                        reconnect_attempts = 0;
+                        reconnect_state.record_clean_disconnect();
                         continue; // Skip backoff, go directly to new session
                     }
                     Some(Err(e)) => {
                         log::warn!("Accept failed during hold: {}", e);
-                        accept_failures += 1;
+                        reconnect_state.record_hold_accept_failure();
                     }
                     None => {
                         log::info!("Hold period expired — no reconnection");
@@ -1215,17 +1228,19 @@ async fn run_streaming(
             DisconnectReason::ClientRequested => {
                 // Clean disconnect — no hold needed
                 log::info!("Client requested disconnect — ready for new connection");
-                accept_failures = 0;
-                reconnect_attempts = 0;
+                reconnect_state.record_clean_disconnect();
             }
             DisconnectReason::ProtocolError => {
                 log::warn!("Protocol error — reconnecting");
-                reconnect_attempts += 1;
+                reconnect_state.record_protocol_error();
             }
         }
 
-        if accept_failures > MAX_ACCEPT_FAILURES {
-            log::error!("Max accept failures reached ({}) — stopping engine", accept_failures);
+        if reconnect_state.should_stop_engine() {
+            log::error!(
+                "Max accept failures reached ({}) — stopping engine",
+                reconnect_state.accept_failures(),
+            );
             break;
         }
     }

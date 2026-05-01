@@ -9,6 +9,7 @@ All notable changes to Focus Vision PCVR will be documented in this file.
 
 ### Changed
 - **Bitrate Arbitration の明示化:** `BitrateController.adjust()` 内で多層に絡んでいた multiplier 連鎖を、純粋関数 `arbitrate(ArbitrationInputs) -> ArbitrationOutcome` に抽出。優先順位 (Sustained > 各 reduction > Increase > Floor / Thermal clamp) と勝者シグナルを `ArbDominant` enum で明示。`BitrateController.last_decision()` getter で「なぜ今のビットレートになったか」を runtime に問い合わせ可能 (status.json / log 用)。挙動は不変 (既存 18 件のテスト全 PASS)、新規 6 件追加 (合成シグナルでの floor/thermal/loss 優先順位検証)
+- **Reconnect 状態機械抽出:** `engine.rs::run_streaming` に散在していた `accept_failures` / `reconnect_attempts` カウンタと exponential backoff (1→2→4→8→16s cap) を `control/reconnect.rs::ReconnectState` に集約。**accept failure (hard cap=5、エンジン停止) と reconnect attempt (soft cap=10、警告のみ) のカウンタ分離**を構造化 — 過去に Wi-Fi 長時間断でエンジン永久停止した不具合を再発防止。挙動不変、新規 10 件のユニットテスト追加 (counter 累積、reset 経路、backoff 上限、break/no-break 判定)。2-token 設計 (audio/recording を hold 中も生存) は実機 Wi-Fi 検証必要のため Phase 4.2 へ持ち越し (コメント明示)
 - **Session Recording MVP:** `[recording]` config セクションで有効化すると、VIDEO は Annex B raw (.h265/.h264)、AUDIO は WAV (16-bit PCM) として `%APPDATA%/FocusVisionPCVR/recordings/` に自動保存。`ffmpeg -i rec.h265 -i rec.wav -c:v copy rec.mp4` で mp4 化可能 (#25, #28, #31)
 - **RTP/FVP header helpers:** `transport::rtp::write_rtp_header` / `write_fvp_header` / `read_fvp_header` を導入。video・audio・pipeline (with_fec / sliced)・depacketizer の 4 箇所で別々に手書きしていた wire format を 1 箇所に集約 (#22, #29, #30)
 - **BurstDetector `new_with_thresholds`:** cfg(test) 専用コンストラクタで `thread::sleep` 依存テストを高速化可能に (#18)
