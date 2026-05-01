@@ -63,3 +63,15 @@ lockout_seconds = 300
 [recording]
 enabled = false
 output_dir = ""             # Empty = %APPDATA%/FocusVisionPCVR/recordings
+
+# Thermal governor. Caps adaptive bitrate ceiling when GPU temperature crosses
+# staged thresholds (warn -> limit -> emergency), then ramps back over
+# recovery_seconds once temperature drops below warn_celsius.
+# Disabled by default until NVML wiring is verified on real hardware (Phase 4.3).
+[thermal]
+enabled = false
+poll_interval_seconds = 5
+warn_celsius = 75           # log warning, no action
+limit_celsius = 85          # cap bitrate at 70%, resolution at 90%
+emergency_celsius = 90      # cap bitrate at 50%
+recovery_seconds = 30       # linear ramp back to 100% after temp < warn

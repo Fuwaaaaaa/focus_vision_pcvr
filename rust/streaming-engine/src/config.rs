@@ -37,6 +37,8 @@ pub struct AppConfig {
     pub memory_monitor: MemoryMonitorConfig,
     #[serde(default)]
     pub recording: RecordingConfig,
+    #[serde(default)]
+    pub thermal: ThermalConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +257,49 @@ fn default_sleep_timeout() -> u32 { 300 }
 fn default_sleep_motion_threshold() -> f32 { 0.002 }
 fn default_sleep_bitrate() -> u32 { 8 }
 
+/// Thermal governor settings. Caps the adaptive bitrate ceiling when GPU
+/// temperature crosses staged thresholds, then ramps back over `recovery_seconds`
+/// once temperature returns below `warn_celsius`.
+///
+/// `enabled` defaults to `false` until NVML wiring (Phase 4.3) is verified on
+/// real hardware — the software framework itself is exercised by unit tests
+/// against a `MockGpuThermalSource`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThermalConfig {
+    #[serde(default = "default_thermal_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_thermal_poll_seconds")]
+    pub poll_interval_seconds: u32,
+    #[serde(default = "default_thermal_warn_celsius")]
+    pub warn_celsius: u32,
+    #[serde(default = "default_thermal_limit_celsius")]
+    pub limit_celsius: u32,
+    #[serde(default = "default_thermal_emergency_celsius")]
+    pub emergency_celsius: u32,
+    #[serde(default = "default_thermal_recovery_seconds")]
+    pub recovery_seconds: u32,
+}
+
+impl Default for ThermalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_thermal_enabled(),
+            poll_interval_seconds: default_thermal_poll_seconds(),
+            warn_celsius: default_thermal_warn_celsius(),
+            limit_celsius: default_thermal_limit_celsius(),
+            emergency_celsius: default_thermal_emergency_celsius(),
+            recovery_seconds: default_thermal_recovery_seconds(),
+        }
+    }
+}
+
+fn default_thermal_enabled() -> bool { false }
+fn default_thermal_poll_seconds() -> u32 { 5 }
+fn default_thermal_warn_celsius() -> u32 { 75 }
+fn default_thermal_limit_celsius() -> u32 { 85 }
+fn default_thermal_emergency_celsius() -> u32 { 90 }
+fn default_thermal_recovery_seconds() -> u32 { 30 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryMonitorConfig {
     #[serde(default = "default_memory_monitor_enabled")]
@@ -453,6 +498,38 @@ impl AppConfig {
         }
         validate_range(&mut self.foveated.mid_qp_offset, 0, 51, 5, "foveated.mid_qp_offset", &mut errors);
         validate_range(&mut self.foveated.peripheral_qp_offset, 0, 51, 10, "foveated.peripheral_qp_offset", &mut errors);
+
+        // Thermal: per-threshold range checks first, then enforce monotonic
+        // ordering (warn < limit < emergency). Out-of-range bounds are clamped
+        // back to defaults so the ordering check can rely on plausible values.
+        validate_range(&mut self.thermal.warn_celsius, 50, 100, default_thermal_warn_celsius(), "thermal.warn_celsius", &mut errors);
+        validate_range(&mut self.thermal.limit_celsius, 50, 105, default_thermal_limit_celsius(), "thermal.limit_celsius", &mut errors);
+        validate_range(&mut self.thermal.emergency_celsius, 50, 110, default_thermal_emergency_celsius(), "thermal.emergency_celsius", &mut errors);
+        validate_range(&mut self.thermal.poll_interval_seconds, 1, 600, default_thermal_poll_seconds(), "thermal.poll_interval_seconds", &mut errors);
+        validate_range(&mut self.thermal.recovery_seconds, 1, 600, default_thermal_recovery_seconds(), "thermal.recovery_seconds", &mut errors);
+
+        if self.thermal.warn_celsius >= self.thermal.limit_celsius {
+            errors.push(ConfigError {
+                field: "thermal.limit_celsius",
+                message: format!(
+                    "limit ({}) must be > warn ({}), reset to defaults",
+                    self.thermal.limit_celsius, self.thermal.warn_celsius
+                ),
+            });
+            self.thermal.warn_celsius = default_thermal_warn_celsius();
+            self.thermal.limit_celsius = default_thermal_limit_celsius();
+        }
+        if self.thermal.limit_celsius >= self.thermal.emergency_celsius {
+            errors.push(ConfigError {
+                field: "thermal.emergency_celsius",
+                message: format!(
+                    "emergency ({}) must be > limit ({}), reset to defaults",
+                    self.thermal.emergency_celsius, self.thermal.limit_celsius
+                ),
+            });
+            self.thermal.limit_celsius = default_thermal_limit_celsius();
+            self.thermal.emergency_celsius = default_thermal_emergency_celsius();
+        }
 
         errors
     }
@@ -845,5 +922,56 @@ mod tests {
         assert_eq!(from_default.memory_monitor.enabled, from_serde.memory_monitor.enabled);
         assert_eq!(from_default.memory_monitor.poll_interval_seconds, from_serde.memory_monitor.poll_interval_seconds);
         assert_eq!(from_default.memory_monitor.growth_threshold_mb, from_serde.memory_monitor.growth_threshold_mb);
+        // thermal
+        assert_eq!(from_default.thermal.enabled, from_serde.thermal.enabled);
+        assert_eq!(from_default.thermal.poll_interval_seconds, from_serde.thermal.poll_interval_seconds);
+        assert_eq!(from_default.thermal.warn_celsius, from_serde.thermal.warn_celsius);
+        assert_eq!(from_default.thermal.limit_celsius, from_serde.thermal.limit_celsius);
+        assert_eq!(from_default.thermal.emergency_celsius, from_serde.thermal.emergency_celsius);
+    }
+
+    #[test]
+    fn test_thermal_config_defaults() {
+        let cfg = ThermalConfig::default();
+        assert!(!cfg.enabled, "thermal disabled by default until NVML wired");
+        assert_eq!(cfg.poll_interval_seconds, 5);
+        assert_eq!(cfg.warn_celsius, 75);
+        assert_eq!(cfg.limit_celsius, 85);
+        assert_eq!(cfg.emergency_celsius, 90);
+        assert_eq!(cfg.recovery_seconds, 30);
+    }
+
+    #[test]
+    fn test_validate_thermal_threshold_ordering_swapped() {
+        // warn >= limit: must be corrected.
+        let mut cfg = AppConfig::default();
+        cfg.thermal.warn_celsius = 90;
+        cfg.thermal.limit_celsius = 80;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "thermal.limit_celsius"
+            || e.field == "thermal.warn_celsius"));
+        // After validate, ordering must hold: warn < limit < emergency.
+        assert!(cfg.thermal.warn_celsius < cfg.thermal.limit_celsius);
+        assert!(cfg.thermal.limit_celsius < cfg.thermal.emergency_celsius);
+    }
+
+    #[test]
+    fn test_validate_thermal_emergency_above_limit() {
+        let mut cfg = AppConfig::default();
+        cfg.thermal.limit_celsius = 95;
+        cfg.thermal.emergency_celsius = 90;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "thermal.emergency_celsius"
+            || e.field == "thermal.limit_celsius"));
+        assert!(cfg.thermal.limit_celsius < cfg.thermal.emergency_celsius);
+    }
+
+    #[test]
+    fn test_validate_thermal_out_of_range_celsius() {
+        let mut cfg = AppConfig::default();
+        cfg.thermal.warn_celsius = 200; // physically implausible
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "thermal.warn_celsius"));
+        assert!(cfg.thermal.warn_celsius <= 100);
     }
 }
