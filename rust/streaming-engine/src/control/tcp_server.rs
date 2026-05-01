@@ -497,6 +497,207 @@ mod tests {
         server.await.unwrap();
     }
 
+    // -- Gap-filling tests (security boundaries + handshake error paths) --
+    //
+    // The above tests cover the happy path. These add regression coverage for
+    // the framing length cap, the handshake's error branches, and the
+    // protocol-version negotiation contract — paths that previously had no
+    // dedicated test even though they directly bound the trust boundary.
+
+    #[tokio::test]
+    async fn test_oversized_message_rejected_before_alloc() {
+        // Server side: declare a length prefix exceeding MAX_MSG_LEN. The
+        // contract is "InvalidData before allocation", not "OOM during read".
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_message(&mut stream).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let oversized_len = (fvp_common::MAX_MSG_LEN as u32) + 1;
+        client.write_all(&oversized_len.to_le_bytes()).await.unwrap();
+        // Don't bother sending payload — server should reject after reading
+        // the length prefix.
+        drop(client);
+
+        let result = server.await.unwrap();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                assert!(e.to_string().contains("too large"),
+                    "wrong error variant: {}", e);
+            }
+            other => panic!("expected InvalidData 'too large', got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_message_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_message(&mut stream).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&0u32.to_le_bytes()).await.unwrap();
+        drop(client);
+
+        let result = server.await.unwrap();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                assert!(e.to_string().contains("empty"));
+            }
+            other => panic!("expected InvalidData 'empty', got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hello_with_v3_payload_negotiated_against_protocol_version() {
+        // Client advertises protocol v3 in the HELLO payload; server must
+        // ack with PROTOCOL_VERSION (currently 3). Asserting against the
+        // constant rather than a literal so future bumps don't silently
+        // pass while skipping the handshake bytes.
+        let config = crate::config::AppConfig::default();
+        let server = TcpControlServer::new_without_tls(config);
+        let pin = server.pairing.lock().await.get_pin();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let test_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            server.handle_handshake_generic(stream).await
+        });
+
+        let mut client = TcpStream::connect(test_addr).await.unwrap();
+        // HELLO with v3 payload
+        let hello_payload = fvp_common::protocol::encode_version(3);
+        send_message(&mut client, msg_type::HELLO, &hello_payload).await.unwrap();
+
+        let (t, ack_payload) = read_message(&mut client).await.unwrap();
+        assert_eq!(t, msg_type::HELLO_ACK);
+        let server_version = fvp_common::protocol::parse_hello_version(&ack_payload);
+        assert_eq!(server_version, fvp_common::protocol::PROTOCOL_VERSION,
+            "HELLO_ACK must carry the canonical PROTOCOL_VERSION");
+
+        // Drive the rest of the handshake to keep the spawned task happy.
+        let _ = read_message(&mut client).await.unwrap(); // PIN_REQUEST
+        send_message(&mut client, msg_type::PIN_RESPONSE, &pin.to_le_bytes()).await.unwrap();
+        let _ = read_message(&mut client).await.unwrap(); // PIN_RESULT
+        let _ = read_message(&mut client).await.unwrap(); // STREAM_CONFIG
+        send_message(&mut client, msg_type::STREAM_START, &[]).await.unwrap();
+        assert!(server_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handshake_rejects_short_pin_response() {
+        // PIN_RESPONSE is supposed to carry 4 bytes (u32 LE). Anything shorter
+        // is a protocol violation and must abort the handshake instead of
+        // panicking on slice access.
+        let config = crate::config::AppConfig::default();
+        let server = TcpControlServer::new_without_tls(config);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let test_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            server.handle_handshake_generic(stream).await
+        });
+
+        let mut client = TcpStream::connect(test_addr).await.unwrap();
+        send_message(&mut client, msg_type::HELLO, &[]).await.unwrap();
+        let _ = read_message(&mut client).await.unwrap(); // HELLO_ACK
+        let _ = read_message(&mut client).await.unwrap(); // PIN_REQUEST
+        // Short payload — only 3 bytes.
+        send_message(&mut client, msg_type::PIN_RESPONSE, &[1, 2, 3]).await.unwrap();
+
+        let result = server_task.await.unwrap();
+        assert!(result.is_err(), "short PIN_RESPONSE must fail handshake");
+    }
+
+    #[tokio::test]
+    async fn test_handshake_rejects_unexpected_first_message() {
+        // Client sends STREAM_START as the first message. Server must reject
+        // because the HELLO step expects msg_type::HELLO.
+        let config = crate::config::AppConfig::default();
+        let server = TcpControlServer::new_without_tls(config);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let test_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            server.handle_handshake_generic(stream).await
+        });
+
+        let mut client = TcpStream::connect(test_addr).await.unwrap();
+        send_message(&mut client, msg_type::STREAM_START, &[]).await.unwrap();
+
+        let result = server_task.await.unwrap();
+        assert!(result.is_err(), "unexpected first msg must fail handshake");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Expected HELLO"), "wrong error text: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_handshake_rejects_unexpected_pin_step_message() {
+        // After HELLO_ACK, the server is awaiting PIN_RESPONSE. Sending a
+        // STREAM_START there must abort the handshake.
+        let config = crate::config::AppConfig::default();
+        let server = TcpControlServer::new_without_tls(config);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let test_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            server.handle_handshake_generic(stream).await
+        });
+
+        let mut client = TcpStream::connect(test_addr).await.unwrap();
+        send_message(&mut client, msg_type::HELLO, &[]).await.unwrap();
+        let _ = read_message(&mut client).await.unwrap(); // HELLO_ACK
+        let _ = read_message(&mut client).await.unwrap(); // PIN_REQUEST
+        // Wrong message type at PIN step.
+        send_message(&mut client, msg_type::STREAM_START, &[1, 2, 3, 4]).await.unwrap();
+
+        let result = server_task.await.unwrap();
+        assert!(result.is_err(), "wrong PIN-step msg must fail handshake");
+    }
+
+    #[tokio::test]
+    async fn test_cert_fingerprint_present_after_tls_init() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = crate::config::AppConfig::default();
+        let server = TcpControlServer::new(config);
+        let fp = server.cert_fingerprint();
+        assert!(!fp.is_empty(), "TLS-enabled server must expose cert fingerprint");
+        // SHA-256 hex is 64 chars; the format is 'AB:CD:...' (octets) per tls.rs.
+        // Just assert plausibility — exact format check belongs in tls.rs.
+        assert!(fp.len() >= 32, "cert fingerprint suspiciously short: {:?}", fp);
+    }
+
+    #[tokio::test]
+    async fn test_encode_stream_config_layout_matches_spec() {
+        // Wire format: res_x_le_u32 | res_y_le_u32 | bitrate_le_u32 |
+        //              framerate_le_u32 | codec_byte (0=h264, 1=h265).
+        // Total: 17 bytes.
+        let mut config = crate::config::AppConfig::default();
+        config.video.resolution_per_eye = [1920, 1080];
+        config.video.bitrate_mbps = 100;
+        config.video.framerate = 90;
+        config.video.codec = fvp_common::protocol::VideoCodec::H265;
+        let server = TcpControlServer::new_without_tls(config);
+        let bytes = server.encode_stream_config();
+
+        assert_eq!(bytes.len(), 17, "STREAM_CONFIG payload size shifted");
+        assert_eq!(&bytes[0..4], &1920u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &1080u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &100u32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &90u32.to_le_bytes());
+        assert_eq!(bytes[16], 1, "h265 codec byte");
+    }
+
     /// Test-only certificate verifier that accepts any server cert.
     #[derive(Debug)]
     struct NoVerifier;
