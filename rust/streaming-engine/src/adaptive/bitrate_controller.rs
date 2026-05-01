@@ -3,6 +3,146 @@ use crate::adaptive::bandwidth_estimator::BandwidthEstimator;
 use super::burst_detector::{BurstDetector, LossPattern};
 use super::gcc_estimator::GccEstimator;
 
+/// Reduced-form network signals fed into the arbitration step. Decoupled from
+/// the live BandwidthEstimator/GccEstimator/BurstDetector so the priority
+/// logic can be unit-tested with synthetic scalars.
+#[derive(Debug, Clone, Copy)]
+pub struct ArbitrationInputs {
+    pub current_bps: u64,
+    pub loss_rate: f64,
+    pub delay_gradient_ms: f64,
+    pub burst: LossPattern,
+    /// Whether the upward-adjustment cooldown has elapsed since the last
+    /// bitrate change (the controller's hysteresis gate).
+    pub hysteresis_elapsed: bool,
+    pub target_loss_rate: f64,
+    pub min_bps: u64,
+    pub hard_max_bps: u64,
+    pub thermal_ceiling_bps: Option<u64>,
+}
+
+/// Which signal forced the arbitrated decision. Useful for log/telemetry
+/// so operators can answer "why did the bitrate just drop?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbDominant {
+    /// No change requested — current bitrate is the target.
+    None,
+    /// Sustained-loss aggressive reduction (-20%).
+    Sustained,
+    /// Loss-based reduction picked over delay-based.
+    Loss,
+    /// Delay/GCC-based reduction (gradient overuse).
+    Delay,
+    /// Thermal ceiling clamped the network-derived target.
+    Thermal,
+    /// Hysteresis-gated upward step (+5%).
+    Increase,
+    /// Floor (min_bps) protected against an over-aggressive cap.
+    Floor,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ArbitrationOutcome {
+    pub target_bps: u64,
+    pub dominant: ArbDominant,
+}
+
+/// Pure arbitration: given current bitrate plus reduced network signals,
+/// decide the new target and the dominant signal. The network multiplier
+/// chain (sustained > delay+loss > increase) is computed first; the result
+/// is then clamped against the floor/hard_max/thermal stack with floor
+/// taking absolute priority.
+pub fn arbitrate(inputs: &ArbitrationInputs) -> ArbitrationOutcome {
+    let (mut multiplier, mut network_dom) = (1.0f64, ArbDominant::None);
+
+    // Burst pattern: skip changes entirely so FEC absorbs Wi-Fi interference.
+    if inputs.burst == LossPattern::Burst {
+        let target = clamp_with_thermal(
+            inputs.current_bps,
+            inputs.min_bps,
+            inputs.hard_max_bps,
+            inputs.thermal_ceiling_bps,
+        );
+        let dom = decide_clamp_dominant(inputs.current_bps, target,
+            inputs.thermal_ceiling_bps, ArbDominant::None);
+        return ArbitrationOutcome { target_bps: target, dominant: dom };
+    }
+
+    if inputs.burst == LossPattern::Sustained {
+        multiplier = 0.80;
+        network_dom = ArbDominant::Sustained;
+    } else {
+        if inputs.delay_gradient_ms > 2.0 {
+            let m = 0.90;
+            if m < multiplier {
+                multiplier = m;
+                network_dom = ArbDominant::Delay;
+            }
+        }
+        if inputs.loss_rate > 0.05 {
+            let m = 0.80;
+            if m < multiplier {
+                multiplier = m;
+                network_dom = ArbDominant::Loss;
+            }
+        } else if inputs.loss_rate > inputs.target_loss_rate {
+            let m = 0.95;
+            if m < multiplier {
+                multiplier = m;
+                network_dom = ArbDominant::Loss;
+            }
+        }
+    }
+
+    if multiplier >= 1.0 && inputs.hysteresis_elapsed && inputs.loss_rate < 0.01 {
+        multiplier = 1.05;
+        network_dom = ArbDominant::Increase;
+    }
+
+    let candidate = (inputs.current_bps as f64 * multiplier) as u64;
+    let target = clamp_with_thermal(
+        candidate,
+        inputs.min_bps,
+        inputs.hard_max_bps,
+        inputs.thermal_ceiling_bps,
+    );
+    let dom = decide_clamp_dominant(candidate, target,
+        inputs.thermal_ceiling_bps, network_dom);
+
+    ArbitrationOutcome { target_bps: target, dominant: dom }
+}
+
+/// Apply the floor / hard_max / thermal_ceiling stack. Floor wins absolutely:
+/// even a thermal ceiling below `min_bps` cannot crush the encoder below its
+/// minimum operating point.
+fn clamp_with_thermal(candidate: u64, min: u64, hard_max: u64, thermal: Option<u64>) -> u64 {
+    let effective_max = match thermal {
+        Some(t) => hard_max.min(t),
+        None => hard_max,
+    };
+    candidate.min(effective_max).max(min)
+}
+
+/// Decide which signal "won" after clamping. If the clamp moved the candidate
+/// downward, the cap that bit is the dominant signal; floor wins if it raised
+/// the candidate up.
+fn decide_clamp_dominant(
+    candidate: u64,
+    final_target: u64,
+    thermal: Option<u64>,
+    network_dom: ArbDominant,
+) -> ArbDominant {
+    if final_target > candidate {
+        return ArbDominant::Floor;
+    }
+    if let Some(t) = thermal {
+        if final_target == t && t < candidate {
+            return ArbDominant::Thermal;
+        }
+    }
+    network_dom
+}
+
 /// Adaptive bitrate controller.
 /// Adjusts encoding bitrate based on network quality estimates.
 pub struct BitrateController {
@@ -17,6 +157,11 @@ pub struct BitrateController {
     last_adjustment: Instant,
     /// Minimum interval between upward adjustments (hysteresis)
     hysteresis_duration: Duration,
+    /// Reason the most recent `adjust()` call resolved the way it did. Useful
+    /// for log lines and the `/status` JSON. `ArbDominant::None` until the
+    /// first call that produced a decision (including no-change cases once
+    /// data is available).
+    last_decision: ArbDominant,
 }
 
 impl BitrateController {
@@ -29,6 +174,7 @@ impl BitrateController {
             target_loss_rate: 0.02,        // 2%
             last_adjustment: Instant::now(),
             hysteresis_duration: Duration::from_secs(10),
+            last_decision: ArbDominant::None,
         }
     }
 
@@ -49,60 +195,39 @@ impl BitrateController {
             return false;
         }
 
-        // Burst loss (Wi-Fi interference): skip bitrate changes, let FEC absorb it
-        if burst.pattern() == LossPattern::Burst {
-            log::info!("Burst loss detected — skipping bitrate adjustment (FEC absorbs)");
-            return false;
-        }
+        let inputs = ArbitrationInputs {
+            current_bps: self.current_bitrate_bps,
+            loss_rate: estimator.loss_rate(),
+            delay_gradient_ms: gcc.delay_gradient_ms(),
+            burst: burst.pattern(),
+            hysteresis_elapsed: self.last_adjustment.elapsed() > self.hysteresis_duration,
+            target_loss_rate: self.target_loss_rate,
+            min_bps: self.min_bitrate_bps,
+            hard_max_bps: self.max_bitrate_bps,
+            thermal_ceiling_bps: self.thermal_ceiling_bps,
+        };
+        let outcome = arbitrate(&inputs);
+        self.last_decision = outcome.dominant;
 
-        let loss = estimator.loss_rate();
-        let gradient = gcc.delay_gradient_ms();
-        let mut multiplier = 1.0f64;
-
-        // Sustained loss: aggressive reduction regardless of delay signal
-        if burst.pattern() == LossPattern::Sustained {
-            multiplier = 0.80;
-            log::warn!("Sustained loss — aggressive bitrate reduction");
+        if outcome.target_bps != self.current_bitrate_bps {
+            log::info!(
+                "Bitrate {} → {} Mbps (signal: {:?})",
+                self.current_bitrate_bps / 1_000_000,
+                outcome.target_bps / 1_000_000,
+                outcome.dominant,
+            );
+            self.current_bitrate_bps = outcome.target_bps;
+            self.last_adjustment = Instant::now();
+            true
         } else {
-            // Delay-based detection: react to congestion before loss occurs
-            if gradient > 2.0 {
-                multiplier = multiplier.min(0.90);
-                log::warn!("Delay overuse (gradient {:.1}ms)", gradient);
-            }
-
-            // Loss-based detection: stronger reduction if packets are actually lost
-            if loss > 0.05 {
-                multiplier = multiplier.min(0.80);
-                log::warn!("High packet loss ({:.1}%)", loss * 100.0);
-            } else if loss > self.target_loss_rate {
-                multiplier = multiplier.min(0.95);
-                log::info!("Moderate packet loss ({:.1}%)", loss * 100.0);
-            }
+            false
         }
+    }
 
-        // Increase conditions (only if no reduction)
-        if multiplier >= 1.0 {
-            if loss < 0.01 && gradient < -1.0 && self.last_adjustment.elapsed() > self.hysteresis_duration {
-                multiplier = 1.05;
-                log::info!("Low loss + delay recovery (gradient {:.1}ms)", gradient);
-            } else if loss < 0.01 && self.last_adjustment.elapsed() > self.hysteresis_duration {
-                multiplier = 1.05;
-                log::info!("Low packet loss ({:.1}%)", loss * 100.0);
-            }
-        }
-
-        if (multiplier - 1.0).abs() > f64::EPSILON {
-            let candidate = (self.current_bitrate_bps as f64 * multiplier) as u64;
-            let new_bps = self.clamp_to_bounds(candidate);
-            if new_bps != self.current_bitrate_bps {
-                self.current_bitrate_bps = new_bps;
-                self.last_adjustment = Instant::now();
-                log::info!("Bitrate adjusted → {} Mbps", self.current_bitrate_bps / 1_000_000);
-                return true;
-            }
-        }
-
-        false
+    /// Which signal forced the most recent decision (or `None` before the
+    /// first `adjust()` call). Read by the status writer / log layer.
+    pub fn last_decision(&self) -> ArbDominant {
+        self.last_decision
     }
 
     /// Apply the floor / ceiling / thermal-ceiling stack to a candidate bitrate.
@@ -316,6 +441,128 @@ mod tests {
         let changed = ctrl.adjust(&est, &gcc, &burst);
         assert!(!changed, "Burst should suppress bitrate reduction");
         assert_eq!(ctrl.current_bitrate_mbps(), 100, "Bitrate should remain unchanged during burst");
+    }
+
+    // -- Pure arbitrate() function tests (no estimator/gcc/burst plumbing) --
+    //
+    // Inputs are network signals already reduced to scalars; outputs the
+    // arbitrated target bitrate plus the dominant signal name. This keeps
+    // the priority logic verifiable in isolation from the noise of the
+    // bandwidth/GCC/burst detector update paths.
+
+    #[test]
+    fn test_arbitrate_no_signal_holds_current() {
+        let inputs = ArbitrationInputs {
+            current_bps: 80_000_000,
+            loss_rate: 0.0,
+            delay_gradient_ms: 0.0,
+            burst: LossPattern::None,
+            hysteresis_elapsed: false,
+            target_loss_rate: 0.02,
+            min_bps: 10_000_000,
+            hard_max_bps: 200_000_000,
+            thermal_ceiling_bps: None,
+        };
+        let out = arbitrate(&inputs);
+        assert_eq!(out.target_bps, 80_000_000);
+        assert_eq!(out.dominant, ArbDominant::None);
+    }
+
+    #[test]
+    fn test_arbitrate_thermal_dominates_when_below_current() {
+        let inputs = ArbitrationInputs {
+            current_bps: 100_000_000,
+            loss_rate: 0.0,
+            delay_gradient_ms: 0.0,
+            burst: LossPattern::None,
+            hysteresis_elapsed: false,
+            target_loss_rate: 0.02,
+            min_bps: 10_000_000,
+            hard_max_bps: 200_000_000,
+            thermal_ceiling_bps: Some(60_000_000),
+        };
+        let out = arbitrate(&inputs);
+        assert_eq!(out.target_bps, 60_000_000, "thermal cap should clamp from 100 → 60 Mbps");
+        assert_eq!(out.dominant, ArbDominant::Thermal);
+    }
+
+    #[test]
+    fn test_arbitrate_loss_dominates_thermal_when_more_aggressive() {
+        // High loss → 80% of current = 80 Mbps. Thermal ceiling at 90 Mbps
+        // is more permissive. Loss wins.
+        let inputs = ArbitrationInputs {
+            current_bps: 100_000_000,
+            loss_rate: 0.10,
+            delay_gradient_ms: 0.0,
+            burst: LossPattern::None,
+            hysteresis_elapsed: false,
+            target_loss_rate: 0.02,
+            min_bps: 10_000_000,
+            hard_max_bps: 200_000_000,
+            thermal_ceiling_bps: Some(90_000_000),
+        };
+        let out = arbitrate(&inputs);
+        assert_eq!(out.target_bps, 80_000_000, "loss reduction (80) beats thermal (90)");
+        assert_eq!(out.dominant, ArbDominant::Loss);
+    }
+
+    #[test]
+    fn test_arbitrate_thermal_dominates_loss_when_more_aggressive() {
+        // Moderate loss → 95% of current = 95 Mbps. Thermal ceiling at 60 Mbps
+        // is much more aggressive. Thermal wins.
+        let inputs = ArbitrationInputs {
+            current_bps: 100_000_000,
+            loss_rate: 0.03, // moderate (above target 0.02)
+            delay_gradient_ms: 0.0,
+            burst: LossPattern::None,
+            hysteresis_elapsed: false,
+            target_loss_rate: 0.02,
+            min_bps: 10_000_000,
+            hard_max_bps: 200_000_000,
+            thermal_ceiling_bps: Some(60_000_000),
+        };
+        let out = arbitrate(&inputs);
+        assert_eq!(out.target_bps, 60_000_000, "thermal (60) beats loss reduction (95)");
+        assert_eq!(out.dominant, ArbDominant::Thermal);
+    }
+
+    #[test]
+    fn test_arbitrate_floor_respected_under_pathological_inputs() {
+        // Sustained burst (× 0.80) + thermal cap below floor — neither may
+        // crush the encoder below its minimum operating point.
+        let inputs = ArbitrationInputs {
+            current_bps: 12_000_000,
+            loss_rate: 0.50,
+            delay_gradient_ms: 100.0,
+            burst: LossPattern::Sustained,
+            hysteresis_elapsed: false,
+            target_loss_rate: 0.02,
+            min_bps: 10_000_000,
+            hard_max_bps: 200_000_000,
+            thermal_ceiling_bps: Some(2_000_000), // below floor
+        };
+        let out = arbitrate(&inputs);
+        assert_eq!(out.target_bps, 10_000_000, "floor must hold against thermal+sustained");
+    }
+
+    #[test]
+    fn test_arbitrate_thermal_blocks_increase_attempt() {
+        // All-clear signals + hysteresis elapsed would normally yield +5%,
+        // but a thermal cap below the +5% target must clamp the rise.
+        let inputs = ArbitrationInputs {
+            current_bps: 100_000_000,
+            loss_rate: 0.0,
+            delay_gradient_ms: -2.0, // recovery
+            burst: LossPattern::None,
+            hysteresis_elapsed: true,
+            target_loss_rate: 0.02,
+            min_bps: 10_000_000,
+            hard_max_bps: 200_000_000,
+            thermal_ceiling_bps: Some(100_000_000), // cap = current
+        };
+        let out = arbitrate(&inputs);
+        assert_eq!(out.target_bps, 100_000_000, "thermal cap blocks +5% rise from 100 → 105");
+        assert_eq!(out.dominant, ArbDominant::Thermal);
     }
 
     #[test]
