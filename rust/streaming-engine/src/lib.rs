@@ -12,6 +12,7 @@ pub mod codec_benchmark;
 pub mod face_tracking;
 pub mod sleep_mode;
 pub mod recording;
+pub mod thermal;
 
 use std::sync::{RwLock, Once};
 
