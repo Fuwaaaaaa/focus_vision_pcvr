@@ -7,6 +7,12 @@
 #include <stdlib.h>
 
 /**
+ * Minimum frame size for slice-based FEC to be beneficial.
+ * Below this threshold, RS encoding is already fast enough that slicing adds overhead.
+ */
+#define MIN_SLICE_SIZE 16384
+
+/**
  * Total blendshape count (37 lip + 14 eye).
  */
 #define TOTAL_BLENDSHAPES 51
@@ -121,7 +127,8 @@ void fvp_haptic_event(uint8_t controller_id,
  * Returns 0 on success, -1 on error.
  *
  * # Safety
- * `nal_data_ptr` must be valid for `nal_data_len` bytes.
+ * `nal_data_ptr` must be valid for `nal_data_len` bytes (and at most
+ * `MAX_NAL_DATA_LEN`; oversized inputs are rejected rather than trusted).
  */
 int32_t fvp_submit_encoded_nal(const uint8_t *nal_data_ptr,
                                uint32_t nal_data_len,
