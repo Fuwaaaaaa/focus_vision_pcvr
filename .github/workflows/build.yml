@@ -20,12 +20,21 @@ jobs:
           with:
             submodules: recursive
         - uses: dtolnay/rust-toolchain@stable
-        - name: Build
+        - name: Build (production)
           run: cargo build --release -p streaming-engine
-        - name: Test
+        - name: Test (production)
           run: cargo test --release --workspace
-        - name: Clippy
+        - name: Build (simulator)
+          run: cargo build --release -p streaming-engine --features simulator --bins
+        - name: Test (simulator)
+          # --test-threads=1 because the headless_e2e_test pair shares
+          # %APPDATA%/FocusVisionPCVR/status.json — running them in parallel
+          # would race the PIN reads/writes.
+          run: cargo test --release --workspace --features simulator -- --test-threads=1
+        - name: Clippy (production)
           run: cargo clippy --workspace -- -D warnings
+        - name: Clippy (simulator)
+          run: cargo clippy --workspace --features simulator -- -D warnings
         - name: Security audit
           continue-on-error: true
           run: |
@@ -35,6 +44,12 @@ jobs:
           with:
             name: streaming-engine-lib
             path: target/release/streaming_engine.lib
+        - uses: actions/upload-artifact@v4
+          with:
+            name: simulator-binaries
+            path: |
+              target/release/focus-vision-headless.exe
+              target/release/focus-vision-mock-client.exe
 
     companion-build:
       name: Companion App
