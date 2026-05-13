@@ -47,6 +47,23 @@ private:
     // Shard storage: index → data (empty = not received)
     std::vector<std::vector<uint8_t>> m_shards;
     std::vector<bool> m_received;
+
+    /// Cached encoding matrix `E = V × V_top^(-1)` of size [total × n].
+    /// Rebuilt only when (totalShards, dataShards) changes; reused
+    /// across frames of stable shard counts. Mirrors the FecEncoder
+    /// `cached_rs` pattern in transport/fec.rs (cache invalidates
+    /// on adaptive-FEC redundancy shifts that change parity_count).
+    struct EncodingMatrixCache {
+        uint16_t cachedTotal = 0;
+        uint16_t cachedN = 0;
+        std::vector<std::vector<uint8_t>> fullE; // [total][n]
+        bool valid() const { return cachedTotal != 0 && cachedN != 0; }
+    };
+    EncodingMatrixCache m_encodingCache;
+
+    /// (Re)build the cached encoding matrix for the current (total, n).
+    /// No-op when the cache already matches.
+    void ensureEncodingMatrix();
 };
 
 // --- fvp_flags bit layout (matches Rust protocol.rs) ---
