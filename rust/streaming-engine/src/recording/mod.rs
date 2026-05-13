@@ -164,6 +164,59 @@ pub fn default_filename(codec_ext: &str) -> String {
     format!("recording_{}.{}", ts, codec_ext)
 }
 
+/// Parse the `YYYY-MM-DDTHH-MM-SS` timestamp embedded in a filename produced
+/// by [`default_filename`] / [`audio::default_audio_filename`]. Returns `None`
+/// for names that don't match the convention so unrelated files in the same
+/// directory are left untouched by the purge.
+fn parse_recording_timestamp(file_name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let stem = file_name.strip_prefix("recording_")?;
+    // Strip the extension (`.h264|.h265|.wav` are the producers we ship).
+    let ts = stem
+        .strip_suffix(".h265")
+        .or_else(|| stem.strip_suffix(".h264"))
+        .or_else(|| stem.strip_suffix(".wav"))?;
+    let naive = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H-%M-%S").ok()?;
+    Some(naive.and_utc())
+}
+
+/// Delete recordings older than `retention_days` from `dir`. A
+/// `retention_days` of 0 disables purging (keep forever). Returns the number
+/// of files removed; missing directories and unparseable filenames are
+/// silently ignored so the function is safe to call on every engine start.
+pub fn purge_old_recordings(dir: &Path, retention_days: u32) -> u32 {
+    if retention_days == 0 {
+        return 0;
+    }
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days as i64);
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return 0, // directory does not exist yet — nothing to do
+    };
+    let mut removed = 0u32;
+    for entry in read_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let Some(ts) = parse_recording_timestamp(name_str) else { continue };
+        if ts < cutoff {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {
+                    log::info!("recording purge: removed {:?} (age > {} days)",
+                        entry.path(), retention_days);
+                    removed += 1;
+                }
+                Err(e) => {
+                    log::warn!("recording purge: failed to remove {:?}: {}",
+                        entry.path(), e);
+                }
+            }
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +357,82 @@ mod tests {
         assert_eq!(ack, ACK_REJECTED);
         assert!(state.load(Ordering::Relaxed),
             "rejected update must leave the prior runtime state intact");
+    }
+
+    // -- Retention / auto-rotation --
+
+    fn purge_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fvp_purge_test_{}", name));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_parse_recording_timestamp_h265() {
+        let ts = parse_recording_timestamp("recording_2026-01-15T10-30-45.h265").unwrap();
+        assert_eq!(ts.format("%Y-%m-%d").to_string(), "2026-01-15");
+    }
+
+    #[test]
+    fn test_parse_recording_timestamp_h264_and_wav() {
+        assert!(parse_recording_timestamp("recording_2026-01-15T10-30-45.h264").is_some());
+        assert!(parse_recording_timestamp("recording_2026-01-15T10-30-45.wav").is_some());
+    }
+
+    #[test]
+    fn test_parse_recording_timestamp_rejects_unrelated_files() {
+        assert!(parse_recording_timestamp("note.txt").is_none());
+        assert!(parse_recording_timestamp("recording_garbage.h265").is_none());
+        assert!(parse_recording_timestamp("session_2026-01-15T10-30-45.h265").is_none());
+    }
+
+    #[test]
+    fn test_purge_with_zero_retention_is_noop() {
+        let dir = purge_test_dir("zero");
+        let old = dir.join("recording_2000-01-01T00-00-00.h265");
+        fs::write(&old, b"x").unwrap();
+        let removed = purge_old_recordings(&dir, 0);
+        assert_eq!(removed, 0);
+        assert!(old.exists(), "retention=0 must keep everything");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_purge_removes_old_keeps_new() {
+        let dir = purge_test_dir("mixed");
+        let very_old = dir.join("recording_2000-01-01T00-00-00.h265");
+        let near_now = dir.join(default_filename("h265"));
+        fs::write(&very_old, b"x").unwrap();
+        fs::write(&near_now, b"y").unwrap();
+
+        let removed = purge_old_recordings(&dir, 30);
+        assert_eq!(removed, 1);
+        assert!(!very_old.exists(), "year-2000 recording must be purged at 30-day retention");
+        assert!(near_now.exists(), "today's recording must survive 30-day retention");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_purge_leaves_unrelated_files_alone() {
+        let dir = purge_test_dir("unrelated");
+        let notes = dir.join("readme.txt");
+        let old_recording = dir.join("recording_2000-01-01T00-00-00.h265");
+        fs::write(&notes, b"hello").unwrap();
+        fs::write(&old_recording, b"x").unwrap();
+
+        purge_old_recordings(&dir, 30);
+        assert!(notes.exists(), "non-recording files must never be touched");
+        assert!(!old_recording.exists(), "stale recording must be purged");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_purge_missing_directory_is_noop() {
+        let nonexistent = std::env::temp_dir().join("fvp_purge_definitely_not_there_xyz123");
+        let _ = fs::remove_dir_all(&nonexistent);
+        // Must not panic, must not error.
+        let removed = purge_old_recordings(&nonexistent, 30);
+        assert_eq!(removed, 0);
     }
 }

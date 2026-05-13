@@ -63,6 +63,7 @@ lockout_seconds = 300
 [recording]
 enabled = false
 output_dir = ""             # Empty = %APPDATA%/FocusVisionPCVR/recordings
+retention_days = 30         # Auto-purge recordings older than N days on startup. 0 = keep forever.
 
 # Thermal governor. Caps adaptive bitrate ceiling when GPU temperature crosses
 # staged thresholds (warn -> limit -> emergency), then ramps back over
