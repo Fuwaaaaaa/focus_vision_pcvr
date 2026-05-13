@@ -251,6 +251,21 @@ impl CompanionApp {
 
         if let Ok(contents) = std::fs::read_to_string(&path) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
+                // schema_version is absent in pre-v3.0 payloads; treat that as
+                // implicit schema 1 and proceed best-effort. A future-bumped
+                // schema_version is only logged so a stale companion doesn't
+                // refuse to render — extra/renamed fields are tolerated.
+                let observed = val
+                    .get("schema_version")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as u32;
+                if observed != fvp_common::STATUS_SCHEMA_VERSION {
+                    log::debug!(
+                        "status.json schema_version mismatch: companion expects {}, engine wrote {}",
+                        fvp_common::STATUS_SCHEMA_VERSION,
+                        observed
+                    );
+                }
                 let status = val["status"].as_str().unwrap_or("unknown");
                 match status {
                     "waiting" => {
