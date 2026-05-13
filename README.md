@@ -165,6 +165,16 @@ config/                 — TOML configuration
 
 ## Documentation
 
+### エンドユーザー向け
+
+| ドキュメント | 内容 |
+|-------------|------|
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | セットアップ手順 (非開発者向け、日本語) |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | トラブル症状別の対処マニュアル |
+| [docs/FAQ.md](docs/FAQ.md) | よくある質問 (ライセンス、互換性、仕様) |
+
+### 開発者・技術者向け
+
 | ドキュメント | 内容 |
 |-------------|------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | システム構成図・データフロー |
@@ -174,6 +184,7 @@ config/                 — TOML configuration
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 開発環境セットアップ・貢献ガイド |
 | [CLAUDE.md](CLAUDE.md) | AI開発ガイドライン |
 | [TODOS.md](TODOS.md) | ロードマップ・未完了タスク |
+| [docs/CONFIG.md](docs/CONFIG.md) | 全 config パラメータリファレンス |
 | [docs/TESTING.md](docs/TESTING.md) | 実機テスト手順書 |
 | [docs/E2E_TEST_GUIDE.md](docs/E2E_TEST_GUIDE.md) | E2Eテストガイド |
 
