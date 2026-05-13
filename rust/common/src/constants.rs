@@ -29,3 +29,15 @@ pub const RTP_PT_H265: u8 = 97;
 pub const RTP_PT_H264: u8 = 96;
 /// Maximum TCP control message length (64KB)
 pub const MAX_MSG_LEN: usize = 65536;
+
+/// Schema version of `%APPDATA%/FocusVisionPCVR/status.json`. Engine writers
+/// emit this in every status payload; companion readers compare on read to
+/// detect cross-version mismatches (a stale companion paired with a newer
+/// engine, or vice versa). Bump whenever a field is renamed or removed —
+/// adding new optional fields does not require a bump.
+///
+/// History:
+/// - implicit v1: pre-v3.0 payloads with no schema_version field.
+/// - v3: explicit schema_version + the v2.2.x field set (status, pin,
+///   latency_us, fps, bitrate_mbps, optional subsystem block).
+pub const STATUS_SCHEMA_VERSION: u32 = 3;

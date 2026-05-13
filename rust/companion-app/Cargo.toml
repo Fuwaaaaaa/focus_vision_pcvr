@@ -19,3 +19,4 @@ dirs-next = "2"
 serde_json = "1"
 egui_plot = "0.31"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+fvp-common = { path = "../common" }

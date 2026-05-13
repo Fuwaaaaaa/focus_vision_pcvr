@@ -91,6 +91,10 @@ fn build_status_json(
     let pin_str = pin.map(|p| format!("{:06}", p)).unwrap_or_else(|| "------".to_string());
 
     let mut obj = serde_json::Map::new();
+    obj.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(fvp_common::STATUS_SCHEMA_VERSION),
+    );
     obj.insert("status".to_string(), serde_json::Value::String(status.to_string()));
     obj.insert("pin".to_string(), serde_json::Value::String(pin_str));
     obj.insert("latency_us".to_string(), serde_json::Value::from(latency_us.unwrap_or(0)));
@@ -571,6 +575,16 @@ mod tests {
         assert_eq!(v["bitrate_mbps"], 120);
         assert!(v.get("ft_active").is_none());
         assert!(v.get("packet_loss_pct").is_none());
+    }
+
+    #[test]
+    fn test_build_status_json_includes_schema_version() {
+        // Every payload must carry schema_version so a stale companion can
+        // detect engine-version mismatch instead of silently parsing the
+        // wrong field shape.
+        let json = build_status_json("idle", None, None, None, None, None);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["schema_version"], fvp_common::STATUS_SCHEMA_VERSION);
     }
 
     #[test]
