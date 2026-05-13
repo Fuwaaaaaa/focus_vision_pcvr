@@ -12,3 +12,12 @@ thiserror = "2"
 
 [profile.release]
 panic = "abort"
+
+# Slim the dev profile's debug info to dodge Windows MSVC LNK1318 (PDB
+# unit-count limit hit by the simulator feature's larger object set —
+# adds hound + extra bins + tests). Line tables still give usable
+# backtraces; the lost detail is per-variable type info which dev
+# rarely needs interactively. Production driver linkage (release
+# profile) is unaffected.
+[profile.dev]
+debug = "line-tables-only"
