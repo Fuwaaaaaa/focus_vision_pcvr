@@ -185,6 +185,17 @@ pub struct StreamingEngine {
 
 impl StreamingEngine {
     pub fn new(config: AppConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // rustls 0.23 requires the process-default CryptoProvider to be
+        // installed exactly once before any TLS use. Tests and the C++
+        // driver path were both inheriting test-suite installs in earlier
+        // builds; the simulator headless binary surfaces the gap because
+        // it's the first standalone process to call `StreamingEngine::new`
+        // outside the test suite. Calling it here makes every engine
+        // instance correct by construction. install_default returns Err
+        // when an install already exists, which is the normal case when
+        // a parent test or the C++ driver pre-initialised it — discard.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         // Build tokio runtime with limited threads (eng review decision #1)
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
