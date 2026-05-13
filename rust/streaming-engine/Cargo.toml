@@ -45,5 +45,10 @@ tempfile = "3"
 name = "transport"
 harness = false
 
+[[bin]]
+name = "focus-vision-headless"
+path = "bin/headless.rs"
+required-features = ["simulator"]
+
 [build-dependencies]
 cbindgen = "0.27"
