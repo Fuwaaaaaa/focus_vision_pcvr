@@ -167,11 +167,11 @@
 - driver/CMakeLists.txt: GoogleTest v1.15.2 via FetchContent
 - driver/tests/test_qp_map.cpp: 7テスト（CTUグリッド、gaze、プリセット）
 
-### Foveated Transport (NVENC ROI) — 実機待ち
-- **What:** NVENC ROI encodeで視線領域ごとの解像度制御。帯域40%削減目標
-- **Why:** プリセット（aggressive +8/+25）で~30%まで改善済み。ROIでさらに40%目標
-- **Context:** NVENC SDK 12.x以降が必要。非対応時は現行プリセットにフォールバック
-- **Depends on:** 実機でNVENC ROI対応確認
+### ~~Foveated Transport (NVENC ROI)~~ — v3.0 で除外、post-v3.0 へ
+- **判断:** v3.0 RC 範囲外として明示的に除外。ROI 経路は実機で `nvEncGetEncodeCaps(NV_ENC_CAPS_SUPPORT_EMPHASIS_LEVEL_MAP)` を問い合わせ、対応 GPU + ドライバの組み合わせでしか有効化できない。シミュレータでは検証不能で、書いても確かめようがない
+- **現状:** QP delta map (aggressive +8/+25 プリセット) で ~30% 帯域削減を達成済み。実用上ROIなしでも十分機能している
+- **削除済み:** `queryRoiCapability()` (always false のスタブ) と `m_roiSupported` メンバ、`isRoiSupported()` getter、`foveatedModeStr()` の roi 分岐をコードから除去 (commit C2)
+- **再開条件:** Focus Vision 実機 + NVENC SDK 12.x 対応 GPU が同時に揃った時点で新規 issue で再着手
 
 ### FTミラーモード — 実機待ち
 - **What:** HMD内で自分の表情をリアルタイムプレビュー
