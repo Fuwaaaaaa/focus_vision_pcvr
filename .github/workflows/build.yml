@@ -74,6 +74,17 @@ jobs:
             curl -sL -o dist/fonts/GeistMono-Regular.ttf \
               "https://github.com/vercel/geist-font/raw/main/packages/geist-mono/fonts/geist-mono/GeistMono-Regular.ttf" || true
             ls -la dist/fonts/
+        - name: Sign focus-vision.exe (Authenticode)
+          # Skipped when secrets are not configured (PR builds, forks).
+          # When a maintainer adds WINDOWS_PFX_BASE64 + WINDOWS_PFX_PASSWORD
+          # to repo secrets, this signs the exe in-place before packaging
+          # so the user's first launch doesn't trip Windows SmartScreen.
+          if: ${{ secrets.WINDOWS_PFX_BASE64 != '' }}
+          shell: pwsh
+          env:
+            WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+            WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          run: ./scripts/sign-windows.ps1 -FilePath target/release/focus-vision.exe
         - name: Package companion app
           shell: bash
           run: |
@@ -124,13 +135,67 @@ jobs:
         - uses: gradle/actions/setup-gradle@v4
           with:
             gradle-version: '8.5'
-        - name: Build APK
+        - name: Stage release keystore
+          # Two paths:
+          #   1. ANDROID_KEYSTORE_BASE64 secret present → decode to a temp
+          #      file, point build.gradle.kts at it via ANDROID_KEYSTORE_PATH.
+          #      Produces a Play-Store-publishable APK.
+          #   2. Secret absent → generate an ephemeral keystore with keytool
+          #      so assembleRelease still runs (sideload-only APK; Play
+          #      Store rejection only matters when we actually publish there).
+          shell: bash
+          env:
+            ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+            ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+            ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+            ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          run: |
+            set -euo pipefail
+            KS_PATH="$RUNNER_TEMP/release.keystore"
+            if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+              echo "Real release keystore secret present — decoding"
+              echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KS_PATH"
+              echo "ANDROID_KEYSTORE_PATH=$KS_PATH"     >> "$GITHUB_ENV"
+              echo "ANDROID_KEYSTORE_PASSWORD=${ANDROID_KEYSTORE_PASSWORD:-}" >> "$GITHUB_ENV"
+              echo "ANDROID_KEY_ALIAS=${ANDROID_KEY_ALIAS:-focus_vision_pcvr}" >> "$GITHUB_ENV"
+              echo "ANDROID_KEY_PASSWORD=${ANDROID_KEY_PASSWORD:-${ANDROID_KEYSTORE_PASSWORD:-}}" >> "$GITHUB_ENV"
+            else
+              echo "No release keystore secret — generating ephemeral keystore"
+              # Generated keystore is per-build; the APK signed with it is
+              # sideloadable but not Play-Store-publishable (Play requires
+              # the same upload key every time).
+              EPHEMERAL_PASS="ephemeral$(date +%s)"
+              keytool -genkeypair -v \
+                -keystore "$KS_PATH" \
+                -storetype PKCS12 \
+                -storepass "$EPHEMERAL_PASS" \
+                -keypass "$EPHEMERAL_PASS" \
+                -alias focus_vision_pcvr \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Focus Vision PCVR CI, O=Fuwaaaaaa, C=JP"
+              echo "ANDROID_KEYSTORE_PATH=$KS_PATH"           >> "$GITHUB_ENV"
+              echo "ANDROID_KEYSTORE_PASSWORD=$EPHEMERAL_PASS" >> "$GITHUB_ENV"
+              echo "ANDROID_KEY_ALIAS=focus_vision_pcvr"      >> "$GITHUB_ENV"
+              echo "ANDROID_KEY_PASSWORD=$EPHEMERAL_PASS"     >> "$GITHUB_ENV"
+            fi
+        - name: Build release APK
           working-directory: client
-          run: gradle assembleDebug -Pandroid.ndkVersion=26.1.10909125
+          run: gradle assembleRelease -Pandroid.ndkVersion=26.1.10909125
+        - name: Verify APK signature
+          shell: bash
+          run: |
+            APK=$(ls client/app/build/outputs/apk/release/*.apk | head -1)
+            echo "Built: $APK"
+            # apksigner verify confirms the signing block is well-formed.
+            # If it ever fails the build is broken — signed-debug fallback
+            # would also fail here (the apksigner from build-tools is
+            # used; signtool isn't applicable here).
+            APKSIGNER=$(ls $ANDROID_HOME/build-tools/*/apksigner | sort -V | tail -1)
+            "$APKSIGNER" verify --verbose "$APK"
         - uses: actions/upload-artifact@v4
           with:
             name: android-client
-            path: client/app/build/outputs/apk/debug/*.apk
+            path: client/app/build/outputs/apk/release/*.apk
 
     version-lint:
       name: Version Consistency
@@ -211,14 +276,26 @@ jobs:
             New-Item -ItemType Directory -Force -Path out | Out-Null
             makensis installer/focus_vision.nsi
             Get-ChildItem out/
+        - name: Sign installer .exe (Authenticode)
+          # Same conditional + script as companion-build above. Signing
+          # the installer (in addition to the inner exe) is what builds
+          # SmartScreen reputation as downloads accumulate.
+          if: ${{ secrets.WINDOWS_PFX_BASE64 != '' }}
+          shell: pwsh
+          env:
+            WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+            WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          run: |
+            $exe = Get-ChildItem out/FocusVision-*-Setup.exe | Select-Object -First 1
+            ./scripts/sign-windows.ps1 -FilePath $exe.FullName
         - name: Smoke-verify the installer
           shell: pwsh
           run: |
             $exe = Get-ChildItem out/FocusVision-*-Setup.exe | Select-Object -First 1
             if (-not $exe) { throw "installer not produced" }
             Write-Host "Built: $($exe.FullName) ($([math]::Round($exe.Length / 1MB, 2)) MB)"
-            # Authenticode signature check (informational only — Phase D2
-            # adds real signing; until then this prints "Unsigned").
+            # Authenticode signature status — informational. "Valid" after
+            # D2 secrets are configured, "NotSigned" otherwise.
             Get-AuthenticodeSignature $exe.FullName | Format-List Status,StatusMessage
         - uses: actions/upload-artifact@v4
           with:
