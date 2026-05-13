@@ -1001,6 +1001,20 @@ async fn run_streaming(
 
         // Step 1: Wait for HMD to connect via TCP
         let tcp_server = TcpControlServer::new(config.clone());
+        // Publish the freshly-generated PIN to status.json so the companion
+        // app (or the simulator mock-client) can read it. Prior to this
+        // line the field was always "------" — companion app PIN display
+        // was a dead code path. The PIN rotates each time we re-enter this
+        // loop after a disconnect, so the write must repeat per iteration.
+        let pin_to_publish = tcp_server.current_pin().await;
+        crate::write_status_file(
+            "waiting",
+            Some(pin_to_publish),
+            None,
+            None,
+            None,
+            None,
+        );
         let accept_result = tokio::select! {
             r = tcp_server.listen_and_accept() => r,
             _ = cancel.cancelled() => { break; }
