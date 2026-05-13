@@ -2,6 +2,7 @@
 
 #include <d3d11.h>
 #include <wrl/client.h>
+#include <cstddef>  // offsetof (used by ABI static_asserts below)
 #include <cstdint>
 #include <vector>
 #include <atomic>
@@ -128,6 +129,41 @@ struct NV_ENC_CODEC_CONFIG {
         NV_ENC_CONFIG_H264 h264Config;
     };
 };
+
+// -----------------------------------------------------------------------------
+// Compile-time ABI assertions against NVENC SDK 12.x layout.
+//
+// The structs above are hand-mirrored from <nvEncodeAPI.h> because the engine
+// loads nvEncodeAPI64.dll at runtime and we don't ship the SDK headers. If
+// NVIDIA ever shifts a field, these asserts catch the drift at compile time —
+// far better than the silent VUI-bits-overwriting-RC-params crash that the
+// "実機検証待ち" TODO in TODOS.md was guarding against.
+//
+// Numbers come from NVENC SDK 12.2 header inspection: every NV_ENC_CONFIG_*
+// substruct is 256 × uint32_t = 1024 bytes. VUI block is 32 × uint32_t =
+// 128 bytes. videoFullRangeFlag is the 5th uint32_t (offset 16). The HEVC
+// codec config places hevcVUIParameters after `level`/`tier`/`minCUSize`/
+// `maxCUSize` + reserved1[4] = 8 × uint32_t = offset 32.
+// -----------------------------------------------------------------------------
+static_assert(sizeof(uint32_t) == 4, "Layout asserts assume 32-bit uint");
+static_assert(sizeof(NV_ENC_CONFIG_HEVC_VUI) == 128,
+    "NV_ENC_CONFIG_HEVC_VUI size drifted from SDK 12.x — check reserved[] padding");
+static_assert(offsetof(NV_ENC_CONFIG_HEVC_VUI, videoFullRangeFlag) == 16,
+    "videoFullRangeFlag offset drifted — full RGB color range setting would target the wrong bytes");
+static_assert(offsetof(NV_ENC_CONFIG_HEVC_VUI, colourPrimaries) == 24,
+    "VUI colour primaries offset drifted");
+static_assert(offsetof(NV_ENC_CONFIG_HEVC_VUI, matrixCoeffs) == 32,
+    "VUI matrix coefficients offset drifted");
+static_assert(sizeof(NV_ENC_CONFIG_HEVC) == 1024,
+    "NV_ENC_CONFIG_HEVC size drifted from SDK 12.x");
+static_assert(offsetof(NV_ENC_CONFIG_HEVC, hevcVUIParameters) == 32,
+    "hevcVUIParameters offset drifted — VUI writes would land in the wrong substruct");
+static_assert(sizeof(NV_ENC_CONFIG_H264) == 1024,
+    "NV_ENC_CONFIG_H264 size drifted from SDK 12.x");
+static_assert(offsetof(NV_ENC_CONFIG_H264, h264VUIParameters) == 32,
+    "h264VUIParameters offset drifted");
+static_assert(sizeof(NV_ENC_CODEC_CONFIG) == 1024,
+    "NV_ENC_CODEC_CONFIG (union of HEVC/H264 configs) size drifted");
 
 struct NV_ENC_CONFIG {
     uint32_t         version;
