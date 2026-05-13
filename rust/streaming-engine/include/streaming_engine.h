@@ -18,6 +18,16 @@
 #define TOTAL_BLENDSHAPES 51
 
 /**
+ * CONFIG_UPDATE ACK status byte: update applied.
+ */
+#define ACK_ACCEPTED 1
+
+/**
+ * CONFIG_UPDATE ACK status byte: update rejected (out of range / unknown).
+ */
+#define ACK_REJECTED 0
+
+/**
  * Tracking data sent from HMD to PC
  */
 typedef struct TrackingData {
