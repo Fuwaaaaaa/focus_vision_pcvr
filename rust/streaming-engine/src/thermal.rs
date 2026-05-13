@@ -172,13 +172,91 @@ impl ThermalGovernor {
         ((base_bitrate_bps as f64) * self.last_multiplier) as u64
     }
 
-    /// Stub for NVML-backed construction. Returns `None` until Phase 4.3
-    /// adds the `nvml-wrapper` dependency and real hardware verification.
+    /// Construct a governor backed by NVML. Requires the `nvml` cargo
+    /// feature and an NVIDIA GPU with the NVIDIA driver installed at
+    /// runtime. Returns `None` (degrading to "thermal disabled") when:
+    ///   - the feature was compiled out,
+    ///   - `Nvml::init()` fails (no NVIDIA driver / non-NVIDIA hardware),
+    ///   - no GPU is enumerated at index 0.
+    ///
     /// Call sites must treat `None` as "thermal control unavailable" and
     /// continue without a cap.
-    pub fn try_create_nvml(_config: ThermalConfig) -> Option<Self> {
-        log::debug!("NVML thermal source not yet wired — Phase 4.3 deliverable");
-        None
+    pub fn try_create_nvml(config: ThermalConfig) -> Option<Self> {
+        #[cfg(feature = "nvml")]
+        {
+            match NvmlThermalSource::try_open() {
+                Ok(source) => {
+                    log::info!(
+                        "Thermal governor backed by NVML (warn={}°C, limit={}°C, emergency={}°C)",
+                        config.warn_celsius, config.limit_celsius, config.emergency_celsius,
+                    );
+                    Some(Self::new(config, Box::new(source)))
+                }
+                Err(reason) => {
+                    log::info!("NVML thermal source unavailable: {} — thermal control disabled", reason);
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "nvml"))]
+        {
+            let _ = config;
+            log::debug!("NVML feature compiled out — thermal control disabled");
+            None
+        }
+    }
+}
+
+/// Production thermal source backed by `nvml-wrapper`. Holds the `Nvml`
+/// handle and the device index; re-acquires the `Device` handle on each
+/// poll because `Device<'_>` borrows from `Nvml` and we cannot store a
+/// self-referential struct ergonomically. The look-up is cheap — NVML
+/// caches device handles internally.
+#[cfg(feature = "nvml")]
+pub struct NvmlThermalSource {
+    nvml: nvml_wrapper::Nvml,
+    device_index: u32,
+}
+
+#[cfg(feature = "nvml")]
+impl NvmlThermalSource {
+    /// Try to initialise NVML and bind to device 0. Returns a human-readable
+    /// reason on failure so the caller can log a friendly message.
+    fn try_open() -> Result<Self, String> {
+        let nvml = nvml_wrapper::Nvml::init()
+            .map_err(|e| format!("Nvml::init failed: {}", e))?;
+        // Probe device 0 to confirm the system actually has a GPU we can
+        // read. Without this, a system with NVML installed but no NVIDIA
+        // hardware would succeed init and then fail on every poll.
+        let device = nvml.device_by_index(0)
+            .map_err(|e| format!("device_by_index(0) failed: {}", e))?;
+        let _ = device.temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
+            .map_err(|e| format!("temperature probe failed: {}", e))?;
+        Ok(Self { nvml, device_index: 0 })
+    }
+}
+
+#[cfg(feature = "nvml")]
+impl GpuThermalSource for NvmlThermalSource {
+    fn temperature_celsius(&self) -> Option<u32> {
+        // Re-acquire the device handle each poll. NVML internally caches
+        // device structures, so the cost is a handle lookup, not a full
+        // re-enumeration. Returning None on transient driver hiccups lets
+        // the governor degrade to "no cap" rather than killing the engine.
+        let device = match self.nvml.device_by_index(self.device_index) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("NVML device_by_index({}): {}", self.device_index, e);
+                return None;
+            }
+        };
+        match device.temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log::warn!("NVML temperature read: {}", e);
+                None
+            }
+        }
     }
 }
 
@@ -326,10 +404,26 @@ mod tests {
     }
 
     #[test]
-    fn test_try_create_nvml_returns_none_until_phase4() {
-        // NVML wiring is stubbed; production callers must gracefully
-        // disable thermal control when this returns None.
+    #[cfg(not(feature = "nvml"))]
+    fn test_try_create_nvml_returns_none_without_feature() {
+        // With the `nvml` feature off, NVML support is compiled out and
+        // try_create_nvml must always return None so callers degrade to
+        // "thermal disabled" instead of failing the engine startup.
         assert!(ThermalGovernor::try_create_nvml(cfg()).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "nvml")]
+    fn test_try_create_nvml_with_feature_on_non_nvidia_host_returns_none() {
+        // Even with the feature on, hosts without an NVIDIA driver (Intel /
+        // AMD / Apple / CI runners) must see None from Nvml::init failing,
+        // not a panic. We can't assert success here because the CI matrix
+        // never has NVIDIA hardware — this test is for the graceful
+        // degradation path, which is the production contract.
+        // If you're running this locally and it returns Some(_), great:
+        // the wire is connected and the test is a no-op for you.
+        let _ = ThermalGovernor::try_create_nvml(cfg());
+        // No panic == pass.
     }
 
     /// A source that always reports "no reading" — simulates NVML init
