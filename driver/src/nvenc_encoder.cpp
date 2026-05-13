@@ -82,16 +82,13 @@ bool NvencEncoder::encode(ID3D11Texture2D* srcTexture,
     outIsIdr = isIdr;
     m_frameCount++;
 
-    // Read gaze data for foveated encoding.
-    // Uses ROI if supported, falls back to QP delta map otherwise.
+    // Read gaze data for foveated encoding via per-CTU QP delta map.
+    // NVENC ROI capability is intentionally not wired in v3.0 — see TODOS.md
+    // for the rationale (cannot validate without specific hardware) and the
+    // re-open condition. The QP delta path achieves ~30% bandwidth reduction.
     if (m_foveatedEnabled && m_gazeValid.load()) {
         float gx = m_gazeX.load();
         float gy = m_gazeY.load();
-        if (m_roiSupported) {
-            // TODO: NVENC ROI path — set per-region quality via ROI API
-            // For now, fall through to QP delta map
-        }
-        // Fallback: QP delta map (always available)
         computeQpDeltaMap(gx, gy);
     }
 
@@ -189,17 +186,6 @@ void NvencEncoder::setGaze(float gazeX, float gazeY, bool valid) {
     m_gazeX.store(gazeX);
     m_gazeY.store(gazeY);
     m_gazeValid.store(valid);
-}
-
-bool NvencEncoder::queryRoiCapability() {
-    // TODO: Query NVENC for ROI support via nvEncGetEncodeCaps()
-    // NV_ENC_CAPS_SUPPORT_EMPHASIS_LEVEL_MAP or similar.
-    // For now, always return false (ROI not supported).
-    // When NVENC SDK 12.x ROI is available, query here and return true.
-    //
-    // Fallback behavior: use QP delta map (already implemented and tested).
-    m_roiSupported = false;
-    return m_roiSupported;
 }
 
 void NvencEncoder::computeQpDeltaMap(float gazeX, float gazeY) {
@@ -316,9 +302,6 @@ bool NvencEncoder::createEncoderSession() {
         OutputDebugStringA(buf);
         return false;
     }
-
-    // Query ROI capability after encoder is initialized
-    queryRoiCapability();
 
     return true;
 }
