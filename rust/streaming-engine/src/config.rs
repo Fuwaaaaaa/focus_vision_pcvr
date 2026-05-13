@@ -49,6 +49,10 @@ pub struct RecordingConfig {
     /// Output directory. Empty string = %APPDATA%/FocusVisionPCVR/recordings.
     #[serde(default)]
     pub output_dir: String,
+    /// Auto-purge recordings older than this many days on engine startup.
+    /// `0` disables purging — recordings accumulate indefinitely. Default 30.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
 }
 
 impl Default for RecordingConfig {
@@ -56,11 +60,13 @@ impl Default for RecordingConfig {
         Self {
             enabled: default_recording_enabled(),
             output_dir: String::new(),
+            retention_days: default_retention_days(),
         }
     }
 }
 
 fn default_recording_enabled() -> bool { false }
+fn default_retention_days() -> u32 { 30 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
