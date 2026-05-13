@@ -337,16 +337,11 @@ public:
     /// Enable/disable foveated encoding.
     void setFoveatedEnabled(bool enabled) { m_foveatedEnabled = enabled; }
 
-    /// Check if NVENC ROI (Region of Interest) encoding is supported.
-    /// ROI provides per-region quality control, superior to QP delta maps.
-    /// Falls back to QP delta map if ROI is not available.
-    bool isRoiSupported() const { return m_roiSupported; }
-
     /// Get the current foveated encoding mode description.
+    /// NVENC ROI is out-of-scope for v3.0 (see TODOS.md); the only active
+    /// path is the per-CTU QP delta map.
     const char* foveatedModeStr() const {
-        if (!m_foveatedEnabled) return "disabled";
-        if (m_roiSupported) return "roi";
-        return "qp_delta_map";
+        return m_foveatedEnabled ? "qp_delta_map" : "disabled";
     }
 
 private:
@@ -372,7 +367,6 @@ private:
 
     // Foveated encoding state
     bool m_foveatedEnabled = false;
-    bool m_roiSupported = false;  // Set by queryRoiCapability() during init
     std::atomic<float> m_gazeX{0.5f};
     std::atomic<float> m_gazeY{0.5f};
     std::atomic<bool> m_gazeValid{false};
@@ -381,7 +375,6 @@ private:
     uint32_t m_ctuRows = 0;
 
     void computeQpDeltaMap(float gazeX, float gazeY);
-    bool queryRoiCapability();
 
     bool loadNvencApi();
     bool createEncoderSession();
