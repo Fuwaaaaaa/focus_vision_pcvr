@@ -2,6 +2,49 @@
 #include "xr_utils.h"
 #include <mutex>
 
+// GF(2^8) arithmetic tables — primitive polynomial 0x11d
+// (x^8 + x^4 + x^3 + x^2 + 1), matching the reed-solomon-erasure crate's
+// default so encoder/decoder agree byte-for-byte.
+//
+// Hoisted to file scope (was inside tryDecode() as a static-local) so the
+// EncodingMatrixCache rebuild path can share the same tables without
+// reinitialising them.
+namespace {
+    static uint8_t s_gfExp[512];
+    static uint8_t s_gfLog[256];
+    static std::once_flag s_gfOnce;
+
+    void initGfTables() {
+        uint16_t x = 1;
+        for (int i = 0; i < 255; i++) {
+            s_gfExp[i] = (uint8_t)x;
+            s_gfLog[x] = (uint8_t)i;
+            x <<= 1;
+            if (x & 0x100) x ^= 0x11d;
+        }
+        for (int i = 255; i < 512; i++) s_gfExp[i] = s_gfExp[i - 255];
+        s_gfLog[0] = 0; // undefined; avoid garbage
+    }
+
+    inline void ensureGf() { std::call_once(s_gfOnce, initGfTables); }
+
+    inline uint8_t gfMul(uint8_t a, uint8_t b) {
+        if (a == 0 || b == 0) return 0;
+        return s_gfExp[s_gfLog[a] + s_gfLog[b]];
+    }
+    inline uint8_t gfInv(uint8_t a) {
+        if (a == 0) return 0;
+        return s_gfExp[255 - s_gfLog[a]];
+    }
+    inline uint8_t gfPow(uint8_t a, uint16_t n) {
+        if (n == 0) return 1;
+        if (a == 0) return 0;
+        uint16_t logA = s_gfLog[a];
+        uint16_t logResult = (uint16_t)(((uint32_t)logA * n) % 255);
+        return s_gfExp[logResult];
+    }
+} // namespace
+
 void FecFrameDecoder::beginFrame(uint32_t frameIndex, uint16_t totalShards,
                                   uint16_t dataShards, bool isKeyframe) {
     m_frameIndex = frameIndex;
@@ -12,6 +55,71 @@ void FecFrameDecoder::beginFrame(uint32_t frameIndex, uint16_t totalShards,
     m_receivedCount = 0;
     m_shards.assign(totalShards, std::vector<uint8_t>());
     m_received.assign(totalShards, false);
+}
+
+void FecFrameDecoder::ensureEncodingMatrix() {
+    if (m_encodingCache.cachedTotal == m_totalShards
+        && m_encodingCache.cachedN == m_dataShards
+        && m_encodingCache.valid()) {
+        return; // hit — same (total, n), nothing to rebuild
+    }
+
+    ensureGf();
+    const uint16_t total = m_totalShards;
+    const uint16_t n = m_dataShards;
+
+    // Step 1: full Vandermonde matrix V[total][n], V[i][j] = i^j in GF(2^8).
+    std::vector<std::vector<uint8_t>> vand(total, std::vector<uint8_t>(n, 0));
+    for (uint16_t i = 0; i < total; i++) {
+        for (uint16_t j = 0; j < n; j++) {
+            vand[i][j] = gfPow((uint8_t)(i & 0xFF), j);
+        }
+    }
+
+    // Step 2: invert V_top (first n rows of V) via Gaussian elimination,
+    // augmented with identity on the right so the inverse lands in cols [n..2n).
+    std::vector<std::vector<uint8_t>> topInv(n, std::vector<uint8_t>(2 * n, 0));
+    for (uint16_t r = 0; r < n; r++) {
+        for (uint16_t c = 0; c < n; c++) topInv[r][c] = vand[r][c];
+        topInv[r][n + r] = 1;
+    }
+    for (uint16_t col = 0; col < n; col++) {
+        uint16_t pivot = col;
+        while (pivot < n && topInv[pivot][col] == 0) pivot++;
+        if (pivot == n) {
+            // Singular — invalidate cache so a future build retries from scratch.
+            m_encodingCache.cachedTotal = 0;
+            m_encodingCache.cachedN = 0;
+            m_encodingCache.fullE.clear();
+            LOGW("FEC: V_top singular at col %u (total=%u n=%u)", col, total, n);
+            return;
+        }
+        if (pivot != col) std::swap(topInv[pivot], topInv[col]);
+        uint8_t inv = gfInv(topInv[col][col]);
+        for (uint16_t c = 0; c < 2 * n; c++) topInv[col][c] = gfMul(topInv[col][c], inv);
+        for (uint16_t r = 0; r < n; r++) {
+            if (r == col || topInv[r][col] == 0) continue;
+            uint8_t factor = topInv[r][col];
+            for (uint16_t c = 0; c < 2 * n; c++) topInv[r][c] ^= gfMul(factor, topInv[col][c]);
+        }
+    }
+
+    // Step 3: full encoding matrix E = V × V_top^(-1), size [total][n].
+    // Cached for reuse across frames; per-frame work shrinks from O(total*n²)
+    // to O(n²) (just row selection from this matrix).
+    m_encodingCache.fullE.assign(total, std::vector<uint8_t>(n, 0));
+    for (uint16_t i = 0; i < total; i++) {
+        for (uint16_t j = 0; j < n; j++) {
+            uint8_t val = 0;
+            for (uint16_t k = 0; k < n; k++) {
+                val ^= gfMul(vand[i][k], topInv[k][n + j]);
+            }
+            m_encodingCache.fullE[i][j] = val;
+        }
+    }
+
+    m_encodingCache.cachedTotal = total;
+    m_encodingCache.cachedN = n;
 }
 
 void FecFrameDecoder::addShard(uint16_t shardIndex, const uint8_t* data, int dataLen) {
@@ -84,108 +192,37 @@ std::optional<FecFrameDecoder::DecodedFrame> FecFrameDecoder::tryDecode() {
         return std::nullopt;
     }
 
-    // Reed-Solomon reconstruction via Vandermonde matrix inversion.
-    // We have m_dataShards unknowns and m_dataShards equations from
-    // the received data + parity shards.
-    //
-    // For each missing data shard, we substitute a parity shard equation.
-    // The RS code used on the Rust side (reed-solomon-erasure crate) uses
-    // a standard Vandermonde/Cauchy matrix over GF(2^8).
-    //
-    // This implementation uses the same GF(2^8) arithmetic with the
-    // primitive polynomial 0x11d (x^8 + x^4 + x^3 + x^2 + 1),
-    // matching reed-solomon-erasure's default.
+    // Reed-Solomon reconstruction via the cached encoding matrix
+    // E = V × V_top^(-1). The cache (m_encodingCache) holds E for the
+    // current (totalShards, dataShards) tuple; ensureEncodingMatrix
+    // rebuilds it only when the shard counts change (typical streaming
+    // keeps the same counts for many consecutive frames, so this is a
+    // big saving — the build cost is O(total*n²) and the per-frame cost
+    // drops to O(n²) selection + O(n³) inversion + O(n² * shardSize)
+    // reconstruction).
+    ensureEncodingMatrix();
+    if (!m_encodingCache.valid()) {
+        // Cache build failed (V_top singular for some pathological shard
+        // configuration). Logged inside ensureEncodingMatrix; bail.
+        return std::nullopt;
+    }
 
-    // Build GF(2^8) tables (thread-safe initialization)
-    static uint8_t gfExp[512];
-    static uint8_t gfLog[256];
-    static std::once_flag gfOnce;
-    std::call_once(gfOnce, []() {
-        // Primitive polynomial: x^8 + x^4 + x^3 + x^2 + 1 = 0x11d
-        uint16_t x = 1;
-        for (int i = 0; i < 255; i++) {
-            gfExp[i] = (uint8_t)x;
-            gfLog[x] = (uint8_t)i;
-            x <<= 1;
-            if (x & 0x100) x ^= 0x11d;
-        }
-        for (int i = 255; i < 512; i++) gfExp[i] = gfExp[i - 255];
-        gfLog[0] = 0; // undefined, but avoid garbage
-    });
-
-    auto gfMul = [&](uint8_t a, uint8_t b) -> uint8_t {
-        if (a == 0 || b == 0) return 0;
-        return gfExp[gfLog[a] + gfLog[b]];
-    };
-    auto gfInv = [&](uint8_t a) -> uint8_t {
-        if (a == 0) return 0; // shouldn't happen
-        return gfExp[255 - gfLog[a]];
-    };
-
-    // gf_pow: compute a^n in GF(2^8)
-    auto gfPow = [&](uint8_t a, uint16_t n) -> uint8_t {
-        if (n == 0) return 1;
-        if (a == 0) return 0;
-        uint16_t logA = gfLog[a];
-        uint16_t logResult = (uint16_t)((uint32_t)logA * n % 255);
-        return gfExp[logResult];
-    };
-
-    // Collect indices of received shards (data + parity, up to m_dataShards count)
+    // Collect the first m_dataShards received-shard indices. Order matches
+    // the row selection from the cached encoding matrix.
     std::vector<uint16_t> presentIdx;
+    presentIdx.reserve(m_dataShards);
     for (uint16_t i = 0; i < m_totalShards && presentIdx.size() < m_dataShards; i++) {
         if (m_received[i]) presentIdx.push_back(i);
     }
 
-    // Build the encoding matrix matching reed-solomon-erasure crate:
-    // 1. Vandermonde matrix V where V[i][j] = i^j in GF(2^8) (i = row index as field element)
-    // 2. Encoding matrix E = V × V_top^(-1), giving identity for data rows
-    // 3. For decoding: select rows of E for received shards, invert, multiply
-    uint16_t n = m_dataShards;
-    uint16_t total = m_totalShards;
+    const uint16_t n = m_dataShards;
 
-    // Step 1: Build full Vandermonde matrix (total × n)
-    std::vector<std::vector<uint8_t>> vand(total, std::vector<uint8_t>(n, 0));
-    for (uint16_t i = 0; i < total; i++) {
-        for (uint16_t j = 0; j < n; j++) {
-            vand[i][j] = gfPow((uint8_t)(i & 0xFF), j);
-        }
-    }
-
-    // Step 2: Compute V_top^(-1) via Gaussian elimination on top n×n
-    std::vector<std::vector<uint8_t>> topInv(n, std::vector<uint8_t>(2 * n, 0));
-    for (uint16_t r = 0; r < n; r++) {
-        for (uint16_t c = 0; c < n; c++) topInv[r][c] = vand[r][c];
-        topInv[r][n + r] = 1;
-    }
-    for (uint16_t col = 0; col < n; col++) {
-        uint16_t pivot = col;
-        while (pivot < n && topInv[pivot][col] == 0) pivot++;
-        if (pivot == n) {
-            LOGW("FEC: V_top singular at col %u", col);
-            return std::nullopt;
-        }
-        if (pivot != col) std::swap(topInv[pivot], topInv[col]);
-        uint8_t inv = gfInv(topInv[col][col]);
-        for (uint16_t c = 0; c < 2 * n; c++) topInv[col][c] = gfMul(topInv[col][c], inv);
-        for (uint16_t r = 0; r < n; r++) {
-            if (r == col || topInv[r][col] == 0) continue;
-            uint8_t factor = topInv[r][col];
-            for (uint16_t c = 0; c < 2 * n; c++) topInv[r][c] ^= gfMul(factor, topInv[col][c]);
-        }
-    }
-
-    // Step 3: Build encoding matrix E = V × V_top^(-1)
-    // We only need the rows corresponding to received shards
+    // Select rows of the cached encoding matrix for the received shards.
     std::vector<std::vector<uint8_t>> matrix(n, std::vector<uint8_t>(n, 0));
     for (uint16_t row = 0; row < n; row++) {
-        uint16_t s = presentIdx[row];
+        const uint16_t s = presentIdx[row];
         for (uint16_t col = 0; col < n; col++) {
-            uint8_t val = 0;
-            for (uint16_t k = 0; k < n; k++) {
-                val ^= gfMul(vand[s][k], topInv[k][n + col]);
-            }
-            matrix[row][col] = val;
+            matrix[row][col] = m_encodingCache.fullE[s][col];
         }
     }
 
