@@ -245,6 +245,15 @@ impl StreamingEngine {
             }
         });
 
+        // Purge old recordings before opening today's file. Runs even when
+        // recording is disabled this session so retention is honoured
+        // regardless of the current on/off toggle.
+        let purge_dir = recording_output_dir(&config);
+        let _ = crate::recording::purge_old_recordings(
+            &purge_dir,
+            config.recording.retention_days,
+        );
+
         let recorder = init_recorder(&config);
         // Seed the runtime toggle from boot config so the first frames after
         // startup honour the same on/off state the user configured.
