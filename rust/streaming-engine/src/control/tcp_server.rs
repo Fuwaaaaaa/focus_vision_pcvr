@@ -65,6 +65,14 @@ impl TcpControlServer {
         &self.cert_fingerprint
     }
 
+    /// Current 6-digit pairing PIN. Surfaces the value the engine should
+    /// publish via status.json so the companion app can render it. The PIN
+    /// rotates every `TcpControlServer::new()` (each accept loop creates
+    /// fresh `PairingState`), so callers should re-read after a reconnect.
+    pub async fn current_pin(&self) -> u32 {
+        self.pairing.lock().await.get_pin()
+    }
+
     /// Start listening. Accepts TLS connection, then runs protocol handshake.
     /// Returns the authenticated stream (TLS-wrapped or plaintext) for post-handshake control.
     pub async fn listen_and_accept(&self) -> std::io::Result<(Box<dyn AsyncStream>, SocketAddr)> {

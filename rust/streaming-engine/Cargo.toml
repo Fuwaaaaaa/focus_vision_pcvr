@@ -50,5 +50,10 @@ name = "focus-vision-headless"
 path = "bin/headless.rs"
 required-features = ["simulator"]
 
+[[bin]]
+name = "focus-vision-mock-client"
+path = "bin/mock_client.rs"
+required-features = ["simulator"]
+
 [build-dependencies]
 cbindgen = "0.27"

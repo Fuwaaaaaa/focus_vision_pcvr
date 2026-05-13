@@ -14,6 +14,9 @@ pub mod sleep_mode;
 pub mod recording;
 pub mod thermal;
 
+#[cfg(feature = "simulator")]
+pub mod simulator;
+
 use std::sync::{RwLock, Once};
 
 use engine::{StreamingEngine, EncodedFrame};
