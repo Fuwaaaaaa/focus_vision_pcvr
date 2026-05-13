@@ -1178,13 +1178,14 @@ dependencies = [
 
 [[package]]
 name = "focus-vision-companion"
-version = "2.1.0"
+version = "3.0.0"
 dependencies = [
  "dirs-next",
  "eframe",
  "egui",
  "egui_plot",
  "env_logger",
+ "fvp-common",
  "log",
  "serde",
  "serde_json",
@@ -1284,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "fvp-common"
-version = "2.1.0"
+version = "3.0.0"
 dependencies = [
  "serde",
 ]
@@ -3183,7 +3184,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streaming-engine"
-version = "2.1.0"
+version = "3.0.0"
 dependencies = [
  "arbitrary",
  "audiopus",

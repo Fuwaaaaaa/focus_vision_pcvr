@@ -10,8 +10,8 @@ android {
         applicationId = "com.focusvision.pcvr"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "3.0.0"
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake { arguments += listOf("-DANDROID_STL=c++_shared", "-DANDROID_PLATFORM=android-29") }
