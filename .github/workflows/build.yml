@@ -6,6 +6,10 @@ on:
       tags: ['v*']
     pull_request:
       branches: [main]
+    schedule:
+      # Nightly at 03:00 UTC: runs fuzz-nightly. Other jobs still gate on
+      # push/PR so this schedule is effectively fuzz-only.
+      - cron: '0 3 * * *'
 
 jobs:
     rust-build:
@@ -112,6 +116,44 @@ jobs:
           with:
             name: android-client
             path: client/app/build/outputs/apk/debug/*.apk
+
+    version-lint:
+      name: Version Consistency
+      runs-on: windows-latest
+      steps:
+        - uses: actions/checkout@v4
+        - name: Check all version sources agree
+          shell: pwsh
+          run: ./scripts/check-versions.ps1
+
+    fuzz-nightly:
+      name: Fuzz (nightly)
+      # Skip on PRs to keep PR latency low; runs on every push to main
+      # plus the cron schedule. Cron is wired at the workflow level so this
+      # block stays close to the targets it owns.
+      if: github.event_name != 'pull_request'
+      runs-on: ubuntu-latest
+      continue-on-error: true
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            submodules: recursive
+        - uses: dtolnay/rust-toolchain@nightly
+        - name: Install cargo-fuzz
+          run: cargo install cargo-fuzz --locked
+        - name: Smoke-fuzz each target (30 s budget)
+          working-directory: rust/streaming-engine
+          run: |
+            for target in fuzz_rtp fuzz_fec fuzz_protocol fuzz_config fuzz_slice fuzz_recording; do
+              echo "=== $target ==="
+              cargo +nightly fuzz run "$target" -- -max_total_time=30 -print_final_stats=1
+            done
+        - name: Upload fuzz artifacts on failure
+          if: failure()
+          uses: actions/upload-artifact@v4
+          with:
+            name: fuzz-artifacts
+            path: rust/streaming-engine/fuzz/artifacts/
 
     release:
       name: Create Release
