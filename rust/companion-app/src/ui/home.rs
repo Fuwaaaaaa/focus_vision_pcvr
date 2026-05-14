@@ -138,6 +138,32 @@ impl CompanionApp {
 
             if self.connection_status == ConnectionStatus::WaitingForPin {
                 ui.label(egui::RichText::new("Enter this PIN on your headset").size(12.0).color(text_muted));
+
+                // Live countdown — locally derived so we don't depend on
+                // the engine rewriting status.json every second. Only
+                // renders when the engine actually emitted an expiry
+                // value (None = old engine = no countdown).
+                if let (Some(baseline), Some(observed)) =
+                    (self.pin_expires_in_seconds, self.pin_expires_observed_at)
+                {
+                    let elapsed = observed.elapsed().as_secs() as u32;
+                    let remaining = baseline.saturating_sub(elapsed);
+                    let mins = remaining / 60;
+                    let secs = remaining % 60;
+                    let countdown_color = if remaining < 30 {
+                        egui::Color32::from_rgb(248, 113, 113) // urgency red
+                    } else if remaining < 60 {
+                        egui::Color32::from_rgb(251, 191, 36) // warning yellow
+                    } else {
+                        text_muted
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("Expires in {}:{:02}", mins, secs))
+                            .size(12.0)
+                            .color(countdown_color)
+                            .monospace(),
+                    );
+                }
             }
         });
 
@@ -250,5 +276,38 @@ impl CompanionApp {
                 });
             });
         }
+
+        // Recent activity log tail. Collapsed by default so the Home tab
+        // stays calm — when something needs explaining, the user can pop
+        // it open. Last 10 lines fits one screen on the default 480x640
+        // window with the log's tendency to one-line entries.
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Recent activity").size(12.0).color(text_muted),
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            let entries: Vec<String> = self
+                .status_log
+                .lock()
+                .map(|log| log.iter().rev().take(10).rev().cloned().collect())
+                .unwrap_or_default();
+            if entries.is_empty() {
+                ui.label(
+                    egui::RichText::new("(no events yet)")
+                        .size(11.0)
+                        .color(text_muted)
+                        .italics(),
+                );
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        for entry in entries.iter() {
+                            ui.label(egui::RichText::new(entry).size(11.0).monospace());
+                        }
+                    });
+            }
+        });
     }
 }

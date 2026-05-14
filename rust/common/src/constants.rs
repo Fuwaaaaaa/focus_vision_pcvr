@@ -16,6 +16,13 @@ pub const HEARTBEAT_MAX_MISSES: u32 = 3;
 pub const MAX_PIN_ATTEMPTS: u8 = 5;
 /// PIN lockout duration in seconds
 pub const PIN_LOCKOUT_SECONDS: u64 = 300;
+/// Lifetime of a pairing PIN. Engine rotates the PIN once this elapses
+/// without a successful pair, so the companion's countdown to PIN refresh
+/// derives from this constant. Matches PIN_LOCKOUT_SECONDS by design:
+/// a brute-force attacker hitting MAX_PIN_ATTEMPTS sees the same wait
+/// regardless of whether they tripped lockout or merely waited for the
+/// next PIN window.
+pub const PIN_LIFETIME_SECONDS: u32 = 300;
 /// UDP port offsets from DEFAULT_UDP_PORT (9945)
 /// Video: 9946, Tracking: 9947, Audio: 9948
 pub const VIDEO_PORT_OFFSET: u16 = 1;

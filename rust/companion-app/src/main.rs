@@ -1,9 +1,11 @@
 mod adb;
 mod config;
+mod demo;
 mod driver;
 mod export;
 mod stats_history;
 mod status_parser;
+mod svg_export;
 mod ui;
 
 use status_parser::{parse_status_json, ConnectionStatus};
@@ -16,18 +18,26 @@ use std::time::{Duration, Instant};
 fn main() -> eframe::Result {
     env_logger::init();
 
+    let demo_mode = std::env::args().any(|a| a == "--demo");
+
+    let title = if demo_mode {
+        "Focus Vision PCVR — DEMO MODE"
+    } else {
+        "Focus Vision PCVR"
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([480.0, 640.0])
             .with_min_inner_size([400.0, 500.0])
-            .with_title("Focus Vision PCVR"),
+            .with_title(title),
         ..Default::default()
     };
 
     eframe::run_native(
         "Focus Vision PCVR",
         options,
-        Box::new(|cc| Ok(Box::new(CompanionApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(CompanionApp::new(cc, demo_mode)))),
     )
 }
 
@@ -106,6 +116,26 @@ pub(crate) struct CompanionApp {
     // reverts on the next paint. Keeps an irreversible action one tap away
     // from a misclick.
     pub(crate) reset_confirm_until: Option<Instant>,
+
+    // Demo mode: when true, the companion synthesizes `ParsedStatus`
+    // from elapsed wall-clock time instead of reading `status.json`. ADB
+    // scans and driver installs are also disabled so a screen-recording
+    // session doesn't accidentally poke the user's real environment.
+    // Selected via `--demo` on the command line; defaults to false.
+    pub(crate) demo_mode: bool,
+    pub(crate) demo_start: Instant,
+
+    // PIN expiry countdown — populated from `status.json` (or by the demo
+    // synthesizer). `None` means the engine isn't emitting the field yet,
+    // which is also the v2-era payload shape; the UI gates the display
+    // on Some(_) so old engines don't show a stuck "Expires in: 0:00".
+    //
+    // We additionally track when we last observed a new value, so the
+    // Home tab can render a live local countdown even when the engine
+    // only emits the field once per PIN issuance (which is the case
+    // today — the engine doesn't repaint status.json once a second).
+    pub(crate) pin_expires_in_seconds: Option<u32>,
+    pub(crate) pin_expires_observed_at: Option<Instant>,
 }
 
 /// status.json is considered stale (engine probably died) once its mtime
@@ -123,7 +153,7 @@ pub(crate) enum Tab {
 }
 
 impl CompanionApp {
-    fn new(cc: &eframe::CreationContext) -> Self {
+    fn new(cc: &eframe::CreationContext, demo_mode: bool) -> Self {
         // Load custom fonts from DESIGN.md: Instrument Serif (brand) + Geist (UI)
         let mut fonts = egui::FontDefinitions::default();
 
@@ -222,6 +252,10 @@ impl CompanionApp {
             // if SteamVR is running and the engine is healthy.
             engine_alive: false,
             reset_confirm_until: None,
+            demo_mode,
+            demo_start: Instant::now(),
+            pin_expires_in_seconds: None,
+            pin_expires_observed_at: None,
             local_config: cfg,
         }
     }
@@ -239,6 +273,14 @@ impl CompanionApp {
         }
         self.last_device_scan = Instant::now();
 
+        // Demo mode never touches the user's real ADB devices — scanning
+        // would surface real hardware in the picker, which is misleading
+        // when the rest of the UI is synthetic.
+        if self.demo_mode {
+            self.devices.clear();
+            return;
+        }
+
         if let Some(ref adb) = self.adb_path {
             self.devices = adb::list_devices(adb);
         }
@@ -249,6 +291,18 @@ impl CompanionApp {
             return;
         }
         self.last_status_read = Instant::now();
+
+        if self.demo_mode {
+            // Bypass the filesystem: the synthesizer produces a fresh
+            // ParsedStatus from elapsed time. We force engine_alive=true
+            // so the red "engine stopped" banner stays hidden — the
+            // yellow DEMO banner on top tells the user what's actually
+            // happening.
+            let parsed = demo::synthesize(self.demo_start.elapsed());
+            self.engine_alive = true;
+            self.apply_parsed_status(parsed);
+            return;
+        }
 
         let path = match dirs_next::data_dir() {
             Some(d) => d.join("FocusVisionPCVR").join("status.json"),
@@ -299,6 +353,25 @@ impl CompanionApp {
     fn apply_parsed_status(&mut self, parsed: status_parser::ParsedStatus) {
         use status_parser::ConnectionStatus as CS;
         self.connection_status = parsed.connection;
+        // Pin expiry: when the engine emits a fresh value, snapshot it
+        // along with the wall-clock time we received it, so the UI can
+        // count down locally even though status.json isn't rewritten
+        // every second. A change of more than 1s OR moving from None
+        // counts as "fresh" — without this we'd reset the countdown
+        // every poll cycle.
+        match (parsed.pin_expires_in_seconds, self.pin_expires_in_seconds) {
+            (Some(new), Some(old)) if (new as i64 - old as i64).abs() <= 1 => {
+                // No-op: engine re-emitted same value, keep our running countdown.
+            }
+            (Some(new), _) => {
+                self.pin_expires_in_seconds = Some(new);
+                self.pin_expires_observed_at = Some(Instant::now());
+            }
+            (None, _) => {
+                self.pin_expires_in_seconds = None;
+                self.pin_expires_observed_at = None;
+            }
+        }
 
         match parsed.connection {
             CS::Disconnected => {
@@ -364,6 +437,33 @@ impl eframe::App for CompanionApp {
         let accent = egui::Color32::from_rgb(52, 211, 153); // #34D399
         let text_muted = egui::Color32::from_rgb(152, 152, 164);
 
+        if self.demo_mode {
+            // Warning yellow banner pinned above the tab bar. Uses #FBBF24
+            // on a darker fill so it reads as "informational" rather than
+            // "error" — the red engine-stopped banner uses #F87171 instead.
+            egui::TopBottomPanel::top("demo_banner")
+                .frame(
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(38, 30, 8))
+                        .inner_margin(egui::Margin::symmetric(12, 6)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("●")
+                                .color(egui::Color32::from_rgb(251, 191, 36)),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "DEMO MODE — シミュレーション中（実エンジンは起動していません）",
+                            )
+                            .color(egui::Color32::from_rgb(251, 191, 36))
+                            .strong(),
+                        );
+                    });
+                });
+        }
+
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::Home, "Home");
@@ -405,6 +505,56 @@ pub(crate) fn rfd_pick_file() -> Option<String> {
 
     #[cfg(not(target_os = "windows"))]
     {
+        None
+    }
+}
+
+/// File-save dialog companion to `rfd_pick_file()`. Returns `None` if the
+/// user cancelled, no dialog backend is available, or the call failed.
+/// `default_stem` becomes the suggested filename (no extension); `ext`
+/// is the file extension without a dot. Used by the SVG export button
+/// in the Settings tab.
+pub(crate) fn pick_save_path(default_stem: &str, ext: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        // Inject the values via env vars rather than concatenating into the
+        // script body — that way a user-supplied stem with quotes or
+        // backticks can't break the PowerShell quoting.
+        let output = Command::new("powershell")
+            .env("FVP_SAVE_STEM", default_stem)
+            .env("FVP_SAVE_EXT", ext)
+            .args([
+                "-Command",
+                r#"
+                Add-Type -AssemblyName System.Windows.Forms
+                $stem = $env:FVP_SAVE_STEM
+                $ext = $env:FVP_SAVE_EXT
+                $dialog = New-Object System.Windows.Forms.SaveFileDialog
+                $dialog.Filter = "$ext files (*.$ext)|*.$ext|All files (*.*)|*.*"
+                $dialog.Title = 'Save'
+                $dialog.FileName = "$stem.$ext"
+                $dialog.DefaultExt = $ext
+                $dialog.AddExtension = $true
+                if ($dialog.ShowDialog() -eq 'OK') { $dialog.FileName }
+                "#,
+            ])
+            .output()
+            .ok()?;
+
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path))
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No native dialog on non-Windows targets — drop the SVG next to
+        // the user's data dir so they can still find it from a script.
+        let _ = (default_stem, ext);
         None
     }
 }

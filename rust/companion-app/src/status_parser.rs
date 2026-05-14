@@ -48,6 +48,11 @@ pub struct ParsedStatus {
     pub fps: u32,
     pub bitrate_mbps: f32,
     pub subsystems: Subsystems,
+    /// Seconds remaining until the current PIN expires and a fresh one
+    /// will be minted. `None` when the engine doesn't emit the field
+    /// (pre-v3 payloads, or status types where the PIN isn't active).
+    /// The Home tab uses this to render an `Expires in: M:SS` countdown.
+    pub pin_expires_in_seconds: Option<u32>,
 }
 
 impl Default for ParsedStatus {
@@ -60,6 +65,7 @@ impl Default for ParsedStatus {
             fps: 0,
             bitrate_mbps: 0.0,
             subsystems: Subsystems::default(),
+            pin_expires_in_seconds: None,
         }
     }
 }
@@ -112,6 +118,11 @@ pub fn parse_status_json(content: &str) -> Option<ParsedStatus> {
             .map(|v| v as f32),
     };
 
+    let pin_expires_in_seconds = val
+        .get("pin_expires_in_seconds")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
     Some(ParsedStatus {
         schema_version,
         connection,
@@ -120,6 +131,7 @@ pub fn parse_status_json(content: &str) -> Option<ParsedStatus> {
         fps,
         bitrate_mbps,
         subsystems,
+        pin_expires_in_seconds,
     })
 }
 
@@ -290,6 +302,30 @@ mod tests {
         let json = r#"{"status": "streaming", "pin": "111111", "latency_us": 12500}"#;
         let parsed = parse_status_json(json).unwrap();
         assert!((parsed.latency_ms - 12.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn pin_expires_in_seconds_parses_when_present() {
+        let json = r#"{
+            "schema_version": 3,
+            "status": "waiting",
+            "pin": "742103",
+            "pin_expires_in_seconds": 247
+        }"#;
+        let parsed = parse_status_json(json).unwrap();
+        assert_eq!(parsed.connection, ConnectionStatus::WaitingForPin);
+        assert_eq!(parsed.pin_expires_in_seconds, Some(247));
+    }
+
+    #[test]
+    fn pin_expires_in_seconds_absent_yields_none() {
+        let json = r#"{
+            "schema_version": 3,
+            "status": "waiting",
+            "pin": "742103"
+        }"#;
+        let parsed = parse_status_json(json).unwrap();
+        assert_eq!(parsed.pin_expires_in_seconds, None);
     }
 
     #[test]
