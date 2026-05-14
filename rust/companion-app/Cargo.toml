@@ -20,3 +20,9 @@ serde_json = "1"
 egui_plot = "0.31"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 fvp-common = { path = "../common" }
+
+# Windows-only: registry access for finding Steam's actual install path
+# (more reliable than guessing common drive letters or parsing
+# libraryfolders.vdf, especially when Steam lives on a non-default drive).
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
