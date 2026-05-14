@@ -97,6 +97,13 @@ struct CompanionApp {
     // status.json read) shows "engine stopped" instead of misleading
     // "everything's fine".
     engine_alive: bool,
+
+    // Two-stage confirmation for "Reset to defaults". `Some(deadline)` puts
+    // the button into "click again to confirm" mode until the deadline; a
+    // second click before then performs the reset, otherwise the prompt
+    // reverts on the next paint. Keeps an irreversible action one tap away
+    // from a misclick.
+    reset_confirm_until: Option<Instant>,
 }
 
 /// status.json is considered stale (engine probably died) once its mtime
@@ -180,7 +187,10 @@ impl CompanionApp {
             driver_status,
             adb_path,
             devices: Vec::new(),
-            apk_path: String::new(),
+            apk_path: {
+                let cfg = config::LocalConfig::load();
+                cfg.deploy.apk_path.clone()
+            },
             deploy_status: String::new(),
             last_device_scan: Instant::now() - Duration::from_secs(10),
             pin_code: "----".to_string(),
@@ -188,8 +198,14 @@ impl CompanionApp {
             latency_ms: 0.0,
             fps: 0,
             bitrate_mbps: 0.0,
-            audio_enabled: true,
-            audio_bitrate_kbps: 128,
+            audio_enabled: {
+                let cfg = config::LocalConfig::load();
+                cfg.audio.enabled
+            },
+            audio_bitrate_kbps: {
+                let cfg = config::LocalConfig::load();
+                cfg.audio.bitrate_kbps
+            },
             deploy_in_progress: false,
             deploy_result: Arc::new(Mutex::new(None)),
             last_status_read: Instant::now() - Duration::from_secs(10),
@@ -236,6 +252,7 @@ impl CompanionApp {
             // read_engine_status() tick (within 1 s) will flip this to true
             // if SteamVR is running and the engine is healthy.
             engine_alive: false,
+            reset_confirm_until: None,
         }
     }
 
@@ -694,6 +711,7 @@ impl CompanionApp {
         // APK path
         ui.group(|ui| {
             ui.label(egui::RichText::new("APK File").size(13.0).color(text_muted));
+            let prev_apk = self.apk_path.clone();
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut self.apk_path);
                 if ui.button("Browse...").clicked() {
@@ -702,6 +720,13 @@ impl CompanionApp {
                     }
                 }
             });
+
+            if self.apk_path != prev_apk {
+                self.local_config.deploy.apk_path = self.apk_path.clone();
+                if let Err(e) = self.local_config.save() {
+                    self.log(&format!("Failed to save APK path: {e}"));
+                }
+            }
         });
 
         ui.add_space(8.0);
@@ -795,6 +820,8 @@ impl CompanionApp {
         ui.group(|ui| {
             ui.label(egui::RichText::new("Audio").size(13.0).color(text_muted));
 
+            let prev_audio_enabled = self.audio_enabled;
+            let prev_audio_bitrate = self.audio_bitrate_kbps;
             ui.checkbox(&mut self.audio_enabled, "Audio streaming enabled");
 
             if self.audio_enabled {
@@ -803,6 +830,20 @@ impl CompanionApp {
                     ui.add(egui::Slider::new(&mut self.audio_bitrate_kbps, 64..=256).suffix(" kbps"));
                 });
                 ui.label(egui::RichText::new("WASAPI loopback — no virtual device needed").size(11.0).color(text_muted));
+            }
+
+            // Persist on change. Engine reads bitrate at startup, so a manual
+            // engine restart is needed to pick up new values — the hint below
+            // makes that explicit instead of leaving the user guessing why
+            // the slider movement seems to do nothing in real time.
+            if self.audio_enabled != prev_audio_enabled || self.audio_bitrate_kbps != prev_audio_bitrate {
+                self.local_config.audio.enabled = self.audio_enabled;
+                self.local_config.audio.bitrate_kbps = self.audio_bitrate_kbps;
+                match self.local_config.save() {
+                    Ok(()) => self.log(&format!("Audio: {} ({} kbps) — restart engine to apply",
+                        if self.audio_enabled { "enabled" } else { "disabled" }, self.audio_bitrate_kbps)),
+                    Err(e) => self.log(&format!("Failed to save audio config: {e}")),
+                }
             }
         });
 
@@ -884,6 +925,20 @@ impl CompanionApp {
                             .desired_width(320.0),
                     );
                 });
+
+                // Inline directory validation. Blank is OK (engine falls back
+                // to the default path). A typed path that doesn't exist yet
+                // gets a yellow warning rather than a hard error, because
+                // the engine creates missing dirs at startup — we just want
+                // the user to catch typos before they record.
+                if let Some(diag) = recording_dir_diagnostic(&self.recording_output_dir) {
+                    let color = match diag.severity {
+                        DirSeverity::Warning => egui::Color32::from_rgb(251, 191, 36),
+                        DirSeverity::Error => egui::Color32::from_rgb(248, 113, 113),
+                    };
+                    ui.label(egui::RichText::new(diag.message).size(11.0).color(color));
+                }
+
                 ui.label(
                     egui::RichText::new("Video: raw Annex B (.h265/.h264) / Audio: 16-bit PCM (.wav). ffmpeg -i rec.h265 -i rec.wav -c:v copy rec.mp4")
                         .size(11.0).color(text_muted),
@@ -972,7 +1027,118 @@ impl CompanionApp {
 
         ui.add_space(16.0);
 
+        // Reset to defaults — wipes every UI-side override (codec, audio,
+        // sleep, FT, recording, deploy.apk_path) back to factory settings.
+        // Two-stage confirm avoids misclicks: the button flips to "Confirm
+        // reset" for 3 s, then reverts. Engine-side settings only re-apply
+        // after the next engine restart, mirrored elsewhere in this tab.
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Maintenance").size(13.0).color(text_muted));
+            let now = Instant::now();
+            let confirming = self
+                .reset_confirm_until
+                .map(|t| t > now)
+                .unwrap_or(false);
+
+            let (label, btn_color) = if confirming {
+                ("Confirm reset", egui::Color32::from_rgb(248, 113, 113))
+            } else {
+                ("Reset to defaults", egui::Color32::from_rgb(232, 232, 236))
+            };
+
+            if ui
+                .button(egui::RichText::new(label).color(btn_color))
+                .clicked()
+            {
+                if confirming {
+                    self.reset_to_defaults();
+                    self.reset_confirm_until = None;
+                } else {
+                    self.reset_confirm_until = Some(now + Duration::from_secs(3));
+                }
+            }
+
+            ui.label(
+                egui::RichText::new(
+                    "All companion-side overrides (codec, audio, sleep, FT, recording, APK path) revert to defaults. Engine restart required for engine-side changes.",
+                )
+                .size(11.0)
+                .color(text_muted),
+            );
+        });
+
+        ui.add_space(16.0);
+
         ui.label(egui::RichText::new(format!("Focus Vision PCVR v{}", env!("CARGO_PKG_VERSION"))).size(11.0).color(text_muted));
+    }
+
+    /// Wipe LocalConfig back to defaults, persist, and re-sync every UI
+    /// shadow field so the on-screen sliders/toggles match what was saved.
+    /// Failure to save is non-fatal: we log it but still apply the in-memory
+    /// reset, so the user at least gets immediate visual feedback.
+    fn reset_to_defaults(&mut self) {
+        self.local_config = config::LocalConfig::default();
+
+        self.selected_codec = self.local_config.video.codec.clone();
+        self.sleep_enabled = self.local_config.sleep_mode.enabled;
+        self.sleep_timeout = self.local_config.sleep_mode.timeout_seconds;
+        self.ft_enabled = self.local_config.face_tracking.enabled;
+        self.ft_smoothing = self.local_config.face_tracking.smoothing;
+        self.recording_enabled = self.local_config.recording.enabled;
+        self.recording_output_dir = self.local_config.recording.output_dir.clone();
+        self.audio_enabled = self.local_config.audio.enabled;
+        self.audio_bitrate_kbps = self.local_config.audio.bitrate_kbps;
+        self.apk_path = self.local_config.deploy.apk_path.clone();
+
+        match self.local_config.save() {
+            Ok(()) => self.log("Settings reset to defaults"),
+            Err(e) => self.log(&format!("Reset applied in-memory but save failed: {e}")),
+        }
+    }
+}
+
+/// Severity tier for the inline recording-dir diagnostic. Two levels keeps
+/// the visual language simple — yellow for "you typed something the engine
+/// will tolerate but might not be what you meant", red for "this can't work".
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum DirSeverity {
+    Warning,
+    Error,
+}
+
+/// Result of validating a user-typed recording output dir. None means the
+/// input is fine (either blank → use default, or an existing directory).
+#[derive(Debug)]
+struct DirDiagnostic {
+    severity: DirSeverity,
+    message: &'static str,
+}
+
+/// Validate the recording output dir string the user typed into Settings.
+///
+/// Returns `None` when the input is acceptable:
+/// - blank/whitespace: engine falls back to `%APPDATA%/FocusVisionPCVR/recordings`
+/// - an existing directory
+///
+/// Returns `Some(...)` with a user-facing hint when:
+/// - the path exists but is not a directory (Error)
+/// - the path doesn't exist (Warning — engine creates it on startup)
+fn recording_dir_diagnostic(path_str: &str) -> Option<DirDiagnostic> {
+    let trimmed = path_str.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(trimmed);
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => None,
+        Ok(_) => Some(DirDiagnostic {
+            severity: DirSeverity::Error,
+            message: "Path exists but is not a directory",
+        }),
+        Err(_) => Some(DirDiagnostic {
+            severity: DirSeverity::Warning,
+            message: "Directory does not exist yet (engine will create it on startup)",
+        }),
     }
 }
 
@@ -999,5 +1165,47 @@ fn rfd_pick_file() -> Option<String> {
     #[cfg(not(target_os = "windows"))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_recording_dir_is_accepted() {
+        assert!(recording_dir_diagnostic("").is_none());
+        assert!(recording_dir_diagnostic("   ").is_none());
+        assert!(recording_dir_diagnostic("\t \n").is_none());
+    }
+
+    #[test]
+    fn existing_directory_returns_no_diagnostic() {
+        // The cargo target dir is guaranteed to exist during `cargo test`,
+        // so we use the project root (CARGO_MANIFEST_DIR points at the
+        // package, which is always a real dir).
+        let dir = env!("CARGO_MANIFEST_DIR");
+        assert!(recording_dir_diagnostic(dir).is_none());
+    }
+
+    #[test]
+    fn nonexistent_path_yields_warning() {
+        let diag = recording_dir_diagnostic(r"C:\definitely-not-a-real-path-12345\nope")
+            .expect("should warn about missing dir");
+        assert_eq!(diag.severity, DirSeverity::Warning);
+        assert!(diag.message.contains("does not exist"));
+    }
+
+    #[test]
+    fn file_instead_of_dir_yields_error() {
+        // The companion-app's own Cargo.toml is a file, not a dir. If a user
+        // points the recording dir at a file (e.g. by mistake selecting an
+        // existing config file), we surface an error.
+        let cargo_toml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let cargo_toml_str = cargo_toml.to_string_lossy();
+        let diag = recording_dir_diagnostic(&cargo_toml_str)
+            .expect("should error on file-as-dir");
+        assert_eq!(diag.severity, DirSeverity::Error);
+        assert!(diag.message.contains("not a directory"));
     }
 }
