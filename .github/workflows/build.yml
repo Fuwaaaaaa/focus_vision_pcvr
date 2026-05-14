@@ -170,6 +170,36 @@ jobs:
             name: fuzz-artifacts
             path: rust/streaming-engine/fuzz/artifacts/
 
+    coverage:
+      name: Coverage (nightly)
+      # Coverage instrumentation roughly doubles compile time and the LLVM
+      # profile collection isn't free either — skip on PRs to keep CI fast,
+      # run on push to main and the nightly cron so we still catch regression.
+      if: github.event_name != 'pull_request'
+      runs-on: windows-latest
+      continue-on-error: true
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            submodules: recursive
+        - uses: dtolnay/rust-toolchain@stable
+          with:
+            components: llvm-tools-preview
+        - name: Install cargo-llvm-cov
+          uses: taiki-e/install-action@cargo-llvm-cov
+        - name: Generate coverage (workspace + simulator)
+          # --test-threads=1 mirrors the rust-build job: the headless_e2e_test
+          # pair shares status.json. Cobertura output for downstream tooling,
+          # plus a human-readable summary line for the action log.
+          run: |
+            cargo llvm-cov --workspace --features simulator --cobertura --output-path coverage.xml -- --test-threads=1
+            cargo llvm-cov report --features simulator --summary-only
+        - name: Upload coverage XML
+          uses: actions/upload-artifact@v4
+          with:
+            name: coverage-cobertura
+            path: coverage.xml
+
     release:
       name: Create Release
       if: startsWith(github.ref, 'refs/tags/v')
