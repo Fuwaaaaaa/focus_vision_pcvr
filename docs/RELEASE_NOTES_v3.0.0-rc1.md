@@ -16,6 +16,23 @@ final 版 (v3.0.0) で正式リリースします。
 ## ハイライト
 
 ### コンパニオンアプリ
+- **`--demo` フラグ**: `cargo run -p focus-vision-companion -- --demo`
+  で「実機なし」のデモモード起動。60 秒スクリプト
+  （Disconnected → WaitingForPin "847251" → Connected with アニメ統計）
+  で全タブを体験できます。`status.json` をバイパス、ADB スキャンも
+  無効化、黄色 "DEMO MODE — シミュレーション中" バナーで実エンジン
+  との混同を防ぎます。
+- **Home タブ ログ末尾ビュー**: 最近のイベント 10 件を折りたたみ
+  「Recent activity」セクションでモノスペース表示。デフォルト閉じ。
+- **PIN 期限カウントダウン**: PIN 表示中に `Expires in 4:58` を
+  カラー閾値付き（60 秒以下で黄、30 秒以下で赤）で表示。
+  status.json に `pin_expires_in_seconds` フィールドを追加し、
+  受信時刻からローカルでカウントダウンするためエンジン側は
+  PIN 発行時に 1 回エミットするだけで十分。
+- **統計の SVG エクスポート**: Settings タブの "Export Stats Graph
+  (.svg)" ボタン。直近 30 秒の latency / FPS / packet loss を
+  自己完結 SVG として保存。NaN/inf ガードあり、egui 非依存の
+  純関数で実装されているため単体テスト可能。
 - **Audio / APK / Window の persistence**: 設定したオーディオビットレート、
   APK パス、ウィンドウ位置がアプリ再起動後も保持されます。以前はビットレート
   スライダーを動かしても保存されない不具合がありました。
@@ -62,9 +79,11 @@ final 版 (v3.0.0) で正式リリースします。
   カバレッジを集計し、Cobertura XML をアーティファクト保存。
 
 ### テスト・CI
-- **ワークスペーステスト**: 313 → 345（+32）
-- **Companion**: 25 → 47（+22）
-- **Driver C++ (gtest)**: 13 → 30（+17）
+- **ワークスペーステスト**: 313 → 450（+137）
+- **Companion**: 25 → 60（+35; demo synthesizer 6 / svg_export 5 / pin_expires_in 2 など）
+- **Driver C++ (gtest)**: 13 → 36（+23; +6 NVENC VUI full-range検証）
+- **OSC loopback 統合テスト**: 4 件追加。`127.0.0.1:0` ループバック
+  レシーバ経由で blendshape → OSC バイト列まで end-to-end 検証
 - **CI clippy `-D warnings`** 既存ゲートを維持、coverage ジョブ追加
 
 ### ドキュメント

@@ -10,7 +10,31 @@ ships without requiring real hardware to validate; items that need a
 NVIDIA GPU or Focus Vision headset are explicitly tagged as
 "hardware-pending" in the Out-of-Scope section at the bottom.
 
-### Companion App (UX)
+### Companion App (Demo + UX)
+- **`--demo` flag:** new `demo` module synthesizes a 60 s scripted
+  state cycle (Disconnected → WaitingForPin "847251" → Connected with
+  sine-animated latency / bitrate). Bypasses `status.json`, disables
+  ADB scans, and shows a yellow "DEMO MODE — シミュレーション中"
+  banner above the tab bar so reviewers / onboarding can exercise the
+  whole UI without a VR rig. Title bar also flips to "Focus Vision
+  PCVR — DEMO MODE" for visual unambiguity.
+- **Home tab — recent activity tail:** collapsing "Recent activity"
+  panel at the bottom of Home renders the last 10 lines of
+  `status_log` in monospace. Default-collapsed so the tab stays calm;
+  pops open when something needs explaining.
+- **PIN expires-in countdown:** when the engine emits the new
+  `pin_expires_in_seconds` field (and on demo's PIN-waiting phase),
+  the Home tab renders `Expires in 4:58` beside the PIN, with yellow
+  ≤60 s and red ≤30 s. Countdown is derived locally from the moment
+  of receipt so the engine doesn't need to rewrite `status.json`
+  every second to keep the timer alive.
+- **Stats SVG export:** Settings tab gains an "Export Stats Graph
+  (.svg)" button next to "Export Logs (zip)". Renders the last 30 s
+  of latency / FPS / packet loss as a self-contained SVG via a pure
+  function (egui-independent), with NaN/inf guards and BT.709-style
+  axis labeling. SaveFileDialog via PowerShell.
+
+### Companion App (UX, from prior commits)
 - **Audio + APK + Window persistence:** the audio enable/bitrate
   toggle, last-used APK path, and (via eframe default) window position
   now survive a relaunch — `[audio]` and `[deploy]` sections joined
@@ -41,6 +65,22 @@ NVIDIA GPU or Focus Vision headset are explicitly tagged as
   `impl` blocks. Public/binary API unchanged.
 
 ### Streaming Engine
+- **`status.json` schema +`pin_expires_in_seconds`:** new optional
+  field carries `PIN_LIFETIME_SECONDS` (300 s, added to
+  `fvp-common::constants`) so the companion can render a live
+  countdown beside the PIN. Engine emits the value on PIN issue;
+  the schema is forward-compatible (parser treats `None` as "old
+  engine, no countdown").
+- **`OscBridge::set_target`:** OSC destination is now configurable
+  rather than const "127.0.0.1:9000". Production still defaults to
+  the VRChat listener; the new integration test routes to a
+  127.0.0.1:0 loopback receiver so the wire format is verified end-
+  to-end without poking the user's real VRChat session.
+- **NVENC VUI `applyVuiFromConfig` helper extracted:** the H.264 and
+  HEVC VUI setup blocks in `nvenc_encoder.cpp::init` now share a
+  template helper in the header. Same bits go out — but the helper
+  is gtest-callable without spinning up a real encoder, so the
+  full_range / BT.709 wiring is now covered by 6 unit tests.
 - **`status.json` parser extracted:** `companion-app::status_parser`
   now owns the JSON → struct mapping with typed `ParsedStatus` /
   `ConnectionStatus` / `Subsystems`. `apply_parsed_status` is the
@@ -78,8 +118,20 @@ NVIDIA GPU or Focus Vision headset are explicitly tagged as
   attempts pile up.
 
 ### Tests
-- **Workspace:** 313 → 345 (`+32`). Companion: 25 → 47 (`+22`).
-  Driver C++ (gtest): 13 → 30 (`+17`).
+- **Workspace:** 313 → 450 (`+137`). Companion: 25 → 60 (`+35`).
+  Driver C++ (gtest): 13 → 36 (`+23`).
+- **Demo synthesizer:** 6 cases — phase transitions, PIN format,
+  schema version, stats bounds, cycle wraparound.
+- **PIN expires-in:** 4 cases — parser presence/absence,
+  build_status_json emission/omission, demo countdown shape.
+- **SVG export:** 5 cases — empty / partial / full history, NaN/inf
+  guards, brand header.
+- **OSC loopback (integration):** 4 cases — full UDP roundtrip with
+  blendshapes → OSC wire bytes, separate lip/eye name tables, EMA
+  attenuation on first frame, sub-threshold drop.
+- **NVENC VUI:** 6 gtest cases — full-range true/false flag bits,
+  videoSignalTypePresentFlag always-on, BT.709 metadata,
+  videoFormat=Unspecified, H.264 alias parity.
 - **status.json parser:** 12 cases — idle, waiting/real PIN,
   sentinel PIN, streaming with/without subsystems, pre-v3 payload,
   future schema_version, unknown status, malformed JSON, partial
@@ -124,14 +176,23 @@ NVIDIA GPU or Focus Vision headset are explicitly tagged as
   `feat/v3-phase-f-docs`).
 
 ### Deferred to post-RC1
-- DRS (Dynamic Resolution Scaling), NVENC VUI fullrange wiring,
-  Hand-tracking — all need NVIDIA GPU + Focus Vision headset to
-  verify and are out of scope for an "implement & validate" pass.
+- DRS (Dynamic Resolution Scaling) and Hand-tracking — both need
+  NVIDIA GPU + Focus Vision headset to verify and are out of scope
+  for an "implement & validate" pass. (VUI full-range wiring was
+  previously listed here; the bits land via the new
+  `applyVuiFromConfig` helper, now covered by gtest. Real-encoder
+  bitstream verification remains hardware-pending.)
 - `engine.rs::run_streaming` split into session/frame/reconnection
   modules and FFI type unification (`TrackingData` /
   `ControllerState` into `fvp-common`). Both refactors are
   test-net-ready on this branch; deferred to keep the rc1 window
   short.
+- Clippy regressions from Rust 1.94+ — newer lint rules
+  (`manual_div_ceil`, `useless_vec` on test-only constants,
+  `manual_is_multiple_of`) fire on pre-existing test code in
+  `streaming-engine` lib tests, fuzz_tests, and video_pipeline_test.
+  All new code added in this RC is clippy-clean; the existing
+  warnings will be cleaned up in a follow-up.
 
 ## [Unreleased]
 
