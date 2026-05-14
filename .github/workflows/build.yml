@@ -88,11 +88,13 @@ jobs:
           # When a maintainer adds WINDOWS_PFX_BASE64 + WINDOWS_PFX_PASSWORD
           # to repo secrets, this signs the exe in-place before packaging
           # so the user's first launch doesn't trip Windows SmartScreen.
-          if: ${{ secrets.WINDOWS_PFX_BASE64 != '' }}
-          shell: pwsh
+          # NOTE: GH Actions rejects `secrets.*` in `if:` expressions, so
+          # we hoist the secret into `env` and gate on the env var instead.
           env:
             WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
             WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          if: env.WINDOWS_PFX_BASE64 != ''
+          shell: pwsh
           run: ./scripts/sign-windows.ps1 -FilePath target/release/focus-vision.exe
         - name: Package companion app
           shell: bash
@@ -318,12 +320,13 @@ jobs:
         - name: Sign installer .exe (Authenticode)
           # Same conditional + script as companion-build above. Signing
           # the installer (in addition to the inner exe) is what builds
-          # SmartScreen reputation as downloads accumulate.
-          if: ${{ secrets.WINDOWS_PFX_BASE64 != '' }}
-          shell: pwsh
+          # SmartScreen reputation as downloads accumulate. Env-hoist
+          # workaround for the same `secrets.*` in `if:` restriction.
           env:
             WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
             WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          if: env.WINDOWS_PFX_BASE64 != ''
+          shell: pwsh
           run: |
             $exe = Get-ChildItem out/FocusVision-*-Setup.exe | Select-Object -First 1
             ./scripts/sign-windows.ps1 -FilePath $exe.FullName
