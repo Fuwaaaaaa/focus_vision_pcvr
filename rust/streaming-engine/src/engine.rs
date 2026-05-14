@@ -41,12 +41,22 @@ static AUDIO_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// `write_recording_nal` checks this before touching the on-disk recorder
 /// so an operator can stop a recording without restarting the engine.
 ///
-/// Note: this gates *video* recording. Audio recording is bound to the
-/// audio task lifetime per session and remains driven by the boot config
-/// — runtime audio toggling needs the audio task to share an Arc handle,
-/// which is deferred to a follow-up because it requires real-device
-/// validation that "audio kept playing while toggling" actually works.
+/// Note: this gates *video* recording. The audio side has its own gate
+/// (`AUDIO_RECORDING_ENABLED`, toggled via CONFIG_UPDATE 0x05) so audio
+/// can be toggled independently of video at runtime — useful when an
+/// avatar capture needs video but the operator wants to omit ambient
+/// audio mid-session.
 pub(crate) static RECORDING_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Runtime gate for *audio* recording. Mirrors `RECORDING_ENABLED` —
+/// see CONFIG_UPDATE 0x05 / `apply_audio_recording_config_update`.
+///
+/// Limitation: when `recording.enabled = false` at boot, the audio
+/// pipeline does not open an `AudioRecorder`, so flipping this atomic
+/// on at runtime is a no-op until the next session. Matches the same
+/// limitation video has (init_recorder returns None when disabled).
+pub(crate) static AUDIO_RECORDING_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Latest PC-side encode latency in microseconds (for HEARTBEAT_ACK waterfall).
@@ -267,8 +277,14 @@ impl StreamingEngine {
 
         let recorder = init_recorder(&config);
         // Seed the runtime toggle from boot config so the first frames after
-        // startup honour the same on/off state the user configured.
+        // startup honour the same on/off state the user configured. Audio
+        // mirrors the same seed; it can be flipped independently at runtime
+        // via CONFIG_UPDATE 0x05 once the session is up.
         RECORDING_ENABLED.store(
+            config.recording.enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        AUDIO_RECORDING_ENABLED.store(
             config.recording.enabled,
             std::sync::atomic::Ordering::Relaxed,
         );
@@ -559,6 +575,16 @@ async fn handle_tcp_control(
                                         ack_status,
                                     );
                                 }
+                                0x05 => { // audio recording (0=off, 1=on)
+                                    ack_status = crate::recording::apply_audio_recording_config_update(
+                                        value, &AUDIO_RECORDING_ENABLED,
+                                    );
+                                    log::info!(
+                                        "CONFIG_UPDATE: audio recording → {} (ack={})",
+                                        if value == 1 { "on" } else if value == 0 { "off" } else { "rejected" },
+                                        ack_status,
+                                    );
+                                }
                                 _ => {
                                     log::warn!("CONFIG_UPDATE: unknown key 0x{:02x}", key);
                                 }
@@ -683,9 +709,14 @@ fn spawn_audio_pipeline(
                         let pcm_frame: Vec<f32> = accum.drain(..STEREO_FRAME_SIZE).collect();
 
                         // Tap PCM for session recording (before encode) so the WAV
-                        // is lossless and aligned with the captured samples.
-                        if let Some(rec) = audio_recorder.as_mut() {
-                            rec.write_pcm_f32(&pcm_frame);
+                        // is lossless and aligned with the captured samples. The
+                        // runtime gate (CONFIG_UPDATE 0x05) lets the operator
+                        // pause audio recording mid-session without restarting
+                        // the engine, while video keeps recording independently.
+                        if AUDIO_RECORDING_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                            if let Some(rec) = audio_recorder.as_mut() {
+                                rec.write_pcm_f32(&pcm_frame);
+                            }
                         }
 
                         let opus_data = match encoder.encode(&pcm_frame) {
