@@ -260,24 +260,14 @@ bool NvencEncoder::createEncoderSession() {
 
     // Set VUI (Video Usability Information) parameters for color space signaling.
     // This tells the decoder whether the stream is full range (0-255) or limited (16-235).
+    // Body extracted to `applyVuiFromConfig` so the unit tests can drive
+    // it directly without spinning up a real NVENC encoder.
     if (m_config.use_hevc) {
-        auto& vui = encConfig.encodeCodecConfig.hevcConfig.hevcVUIParameters;
-        vui.videoSignalTypePresentFlag = 1;
-        vui.videoFormat = 5; // Unspecified
-        vui.videoFullRangeFlag = m_config.full_range ? 1 : 0;
-        vui.colourDescriptionPresentFlag = 1;
-        vui.colourPrimaries = 1;            // BT.709
-        vui.transferCharacteristics = 1;    // BT.709
-        vui.matrixCoeffs = 1;               // BT.709
+        applyVuiFromConfig(encConfig.encodeCodecConfig.hevcConfig.hevcVUIParameters,
+                           m_config.full_range);
     } else {
-        auto& vui = encConfig.encodeCodecConfig.h264Config.h264VUIParameters;
-        vui.videoSignalTypePresentFlag = 1;
-        vui.videoFormat = 5;
-        vui.videoFullRangeFlag = m_config.full_range ? 1 : 0;
-        vui.colourDescriptionPresentFlag = 1;
-        vui.colourPrimaries = 1;
-        vui.transferCharacteristics = 1;
-        vui.matrixCoeffs = 1;
+        applyVuiFromConfig(encConfig.encodeCodecConfig.h264Config.h264VUIParameters,
+                           m_config.full_range);
     }
 
     NV_ENC_INITIALIZE_PARAMS initParams = {};
