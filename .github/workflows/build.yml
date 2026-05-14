@@ -6,6 +6,15 @@ on:
       tags: ['v*']
     pull_request:
       branches: [main]
+      # Default activity types are opened/synchronize/reopened. Adding
+      # ready_for_review means a draft PR transitioned to ready also
+      # triggers a build — otherwise the PR sits without any CI signal
+      # until the next push, which is easy to miss.
+      types: [opened, synchronize, reopened, ready_for_review]
+    # Manual trigger for one-off rebuilds (e.g. after a transient
+    # CI infra issue or a flaky third-party action). Falls back to the
+    # currently-checked-out ref of the workflow file.
+    workflow_dispatch:
     schedule:
       # Nightly at 03:00 UTC: runs fuzz-nightly. Other jobs still gate on
       # push/PR so this schedule is effectively fuzz-only.
