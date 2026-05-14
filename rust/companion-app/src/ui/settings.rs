@@ -295,6 +295,27 @@ impl CompanionApp {
                 }
             });
             ui.label(egui::RichText::new("PC logs + HMD logcat + system info → zip").size(11.0).color(text_muted));
+
+            // Stats SVG export — same group as log export because both
+            // produce shareable diagnostic artifacts. Runs synchronously:
+            // the SVG render is just a string format over 30 samples,
+            // which finishes well within one paint tick.
+            ui.add_space(8.0);
+            if ui.button("Export Stats Graph (.svg)").clicked() {
+                let svg = crate::svg_export::render(&self.stats_history);
+                match crate::pick_save_path("focus-vision-stats", "svg") {
+                    Some(path) => match std::fs::write(&path, svg) {
+                        Ok(()) => self.log(&format!("Stats SVG saved: {}", path.display())),
+                        Err(e) => self.log(&format!("Stats SVG save failed: {e}")),
+                    },
+                    None => {
+                        // User cancelled the dialog (or no dialog backend on
+                        // this platform). No log line — cancellation is
+                        // expected, not an error worth surfacing.
+                    }
+                }
+            }
+            ui.label(egui::RichText::new("Last 30 s of latency / FPS / packet loss → SVG").size(11.0).color(text_muted));
         });
 
         ui.add_space(16.0);

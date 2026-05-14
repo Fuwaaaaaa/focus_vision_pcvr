@@ -1058,6 +1058,11 @@ async fn run_streaming(
         // line the field was always "------" — companion app PIN display
         // was a dead code path. The PIN rotates each time we re-enter this
         // loop after a disconnect, so the write must repeat per iteration.
+        //
+        // We also publish PIN_LIFETIME_SECONDS so the companion can render
+        // a live "Expires in: M:SS" countdown. The companion counts down
+        // locally from the moment it observes the value — the engine
+        // doesn't need to re-emit the file every second.
         let pin_to_publish = tcp_server.current_pin().await;
         crate::write_status_file(
             "waiting",
@@ -1066,6 +1071,7 @@ async fn run_streaming(
             None,
             None,
             None,
+            Some(fvp_common::PIN_LIFETIME_SECONDS),
         );
         let accept_result = tokio::select! {
             r = tcp_server.listen_and_accept() => r,
