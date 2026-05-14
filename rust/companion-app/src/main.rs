@@ -1,113 +1,159 @@
 mod adb;
 mod config;
+mod demo;
 mod driver;
 mod export;
 mod stats_history;
+mod status_parser;
+mod svg_export;
+mod ui;
+
+use status_parser::{parse_status_json, ConnectionStatus};
 
 use eframe::egui;
-use egui_plot::{Line, PlotPoints, Plot};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::thread;
 
 fn main() -> eframe::Result {
     env_logger::init();
+
+    let demo_mode = std::env::args().any(|a| a == "--demo");
+
+    let title = if demo_mode {
+        "Focus Vision PCVR — DEMO MODE"
+    } else {
+        "Focus Vision PCVR"
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([480.0, 640.0])
             .with_min_inner_size([400.0, 500.0])
-            .with_title("Focus Vision PCVR"),
+            .with_title(title),
         ..Default::default()
     };
 
     eframe::run_native(
         "Focus Vision PCVR",
         options,
-        Box::new(|cc| Ok(Box::new(CompanionApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(CompanionApp::new(cc, demo_mode)))),
     )
 }
 
-struct CompanionApp {
+pub(crate) struct CompanionApp {
     // Driver state
-    steamvr_dir: Option<PathBuf>,
-    driver_installed: bool,
-    driver_status: String,
+    pub(crate) steamvr_dir: Option<PathBuf>,
+    pub(crate) driver_installed: bool,
+    pub(crate) driver_status: String,
 
     // ADB state
-    adb_path: Option<String>,
-    devices: Vec<adb::AdbDevice>,
-    apk_path: String,
-    deploy_status: String,
-    last_device_scan: Instant,
+    pub(crate) adb_path: Option<String>,
+    pub(crate) devices: Vec<adb::AdbDevice>,
+    pub(crate) apk_path: String,
+    pub(crate) deploy_status: String,
+    pub(crate) last_device_scan: Instant,
 
     // Streaming state
-    pin_code: String,
-    connection_status: ConnectionStatus,
-    latency_ms: f32,
-    fps: u32,
-    bitrate_mbps: f32,
+    pub(crate) pin_code: String,
+    pub(crate) connection_status: ConnectionStatus,
+    pub(crate) latency_ms: f32,
+    pub(crate) fps: u32,
+    pub(crate) bitrate_mbps: f32,
 
     // Audio settings
-    audio_enabled: bool,
-    audio_bitrate_kbps: u32,
+    pub(crate) audio_enabled: bool,
+    pub(crate) audio_bitrate_kbps: u32,
 
     // Deploy async state
-    deploy_in_progress: bool,
-    deploy_result: Arc<Mutex<Option<String>>>,
+    pub(crate) deploy_in_progress: bool,
+    pub(crate) deploy_result: Arc<Mutex<Option<String>>>,
 
     // Engine status (read from status.json)
     last_status_read: Instant,
 
     // UI state
-    active_tab: Tab,
-    status_log: Arc<Mutex<Vec<String>>>,
+    pub(crate) active_tab: Tab,
+    pub(crate) status_log: Arc<Mutex<Vec<String>>>,
 
     // v1.1: Codec selection
-    selected_codec: String,
-    local_config: config::LocalConfig,
+    pub(crate) selected_codec: String,
+    pub(crate) local_config: config::LocalConfig,
 
     // v1.1: Stats history for sparkline graphs
-    stats_history: stats_history::StatsHistory,
+    pub(crate) stats_history: stats_history::StatsHistory,
 
     // v1.1: Log export
-    export_in_progress: bool,
-    export_result: Arc<Mutex<Option<String>>>,
+    pub(crate) export_in_progress: bool,
+    pub(crate) export_result: Arc<Mutex<Option<String>>>,
 
     // v1.2: Subsystem status (read from status.json)
-    sub_ft_active: bool,
-    sub_sleep_active: bool,
-    sub_audio_enabled: bool,
-    sub_packet_loss: f32,
+    pub(crate) sub_ft_active: bool,
+    pub(crate) sub_sleep_active: bool,
+    pub(crate) sub_audio_enabled: bool,
+    pub(crate) sub_packet_loss: f32,
 
     // v1.2: Sleep mode + face tracking settings
-    sleep_enabled: bool,
-    sleep_timeout: u32,
-    ft_enabled: bool,
-    ft_smoothing: f32,
+    pub(crate) sleep_enabled: bool,
+    pub(crate) sleep_timeout: u32,
+    pub(crate) ft_enabled: bool,
+    pub(crate) ft_smoothing: f32,
 
     // Session Recording settings
-    recording_enabled: bool,
-    recording_output_dir: String,
+    pub(crate) recording_enabled: bool,
+    pub(crate) recording_output_dir: String,
+
+    // Engine liveness — `false` when status.json is missing or its mtime is
+    // older than ENGINE_STALE_THRESHOLD. Used by the Home tab banner.
+    // Defaults to false so a freshly-launched companion (before the first
+    // status.json read) shows "engine stopped" instead of misleading
+    // "everything's fine".
+    pub(crate) engine_alive: bool,
+
+    // Two-stage confirmation for "Reset to defaults". `Some(deadline)` puts
+    // the button into "click again to confirm" mode until the deadline; a
+    // second click before then performs the reset, otherwise the prompt
+    // reverts on the next paint. Keeps an irreversible action one tap away
+    // from a misclick.
+    pub(crate) reset_confirm_until: Option<Instant>,
+
+    // Demo mode: when true, the companion synthesizes `ParsedStatus`
+    // from elapsed wall-clock time instead of reading `status.json`. ADB
+    // scans and driver installs are also disabled so a screen-recording
+    // session doesn't accidentally poke the user's real environment.
+    // Selected via `--demo` on the command line; defaults to false.
+    pub(crate) demo_mode: bool,
+    pub(crate) demo_start: Instant,
+
+    // PIN expiry countdown — populated from `status.json` (or by the demo
+    // synthesizer). `None` means the engine isn't emitting the field yet,
+    // which is also the v2-era payload shape; the UI gates the display
+    // on Some(_) so old engines don't show a stuck "Expires in: 0:00".
+    //
+    // We additionally track when we last observed a new value, so the
+    // Home tab can render a live local countdown even when the engine
+    // only emits the field once per PIN issuance (which is the case
+    // today — the engine doesn't repaint status.json once a second).
+    pub(crate) pin_expires_in_seconds: Option<u32>,
+    pub(crate) pin_expires_observed_at: Option<Instant>,
 }
 
+/// status.json is considered stale (engine probably died) once its mtime
+/// is older than this. The engine rewrites the file on every meaningful
+/// event (PIN issued, session started, frame stats updated). 5 s is
+/// generous enough to avoid false positives on a busy host but short
+/// enough that a real crash is surfaced quickly.
+const ENGINE_STALE_THRESHOLD: Duration = Duration::from_secs(5);
+
 #[derive(PartialEq, Clone, Copy)]
-enum Tab {
+pub(crate) enum Tab {
     Home,
     Deploy,
     Settings,
 }
 
-#[derive(PartialEq, Clone, Copy)]
-enum ConnectionStatus {
-    Disconnected,
-    WaitingForPin,
-    Connected,
-}
-
 impl CompanionApp {
-    fn new(cc: &eframe::CreationContext) -> Self {
+    fn new(cc: &eframe::CreationContext, demo_mode: bool) -> Self {
         // Load custom fonts from DESIGN.md: Instrument Serif (brand) + Geist (UI)
         let mut fonts = egui::FontDefinitions::default();
 
@@ -160,13 +206,18 @@ impl CompanionApp {
             "Driver not installed".to_string()
         };
 
+        // Load the persisted config once and hand its fields out to the
+        // shadow UI state. Holding `local_config` last means the move into
+        // the struct ends the load() lifetimes cleanly.
+        let cfg = config::LocalConfig::load();
+
         Self {
             steamvr_dir,
             driver_installed,
             driver_status,
             adb_path,
             devices: Vec::new(),
-            apk_path: String::new(),
+            apk_path: cfg.deploy.apk_path.clone(),
             deploy_status: String::new(),
             last_device_scan: Instant::now() - Duration::from_secs(10),
             pin_code: "----".to_string(),
@@ -174,18 +225,14 @@ impl CompanionApp {
             latency_ms: 0.0,
             fps: 0,
             bitrate_mbps: 0.0,
-            audio_enabled: true,
-            audio_bitrate_kbps: 128,
+            audio_enabled: cfg.audio.enabled,
+            audio_bitrate_kbps: cfg.audio.bitrate_kbps,
             deploy_in_progress: false,
             deploy_result: Arc::new(Mutex::new(None)),
             last_status_read: Instant::now() - Duration::from_secs(10),
             active_tab: Tab::Home,
             status_log: Arc::new(Mutex::new(Vec::new())),
-            selected_codec: {
-                let cfg = config::LocalConfig::load();
-                cfg.video.codec.clone()
-            },
-            local_config: config::LocalConfig::load(),
+            selected_codec: cfg.video.codec.clone(),
             stats_history: stats_history::StatsHistory::new(),
             export_in_progress: false,
             export_result: Arc::new(Mutex::new(None)),
@@ -193,45 +240,46 @@ impl CompanionApp {
             sub_sleep_active: false,
             sub_audio_enabled: true,
             sub_packet_loss: 0.0,
-            sleep_enabled: {
-                let cfg = config::LocalConfig::load();
-                cfg.sleep_mode.enabled
-            },
-            sleep_timeout: {
-                let cfg = config::LocalConfig::load();
-                cfg.sleep_mode.timeout_seconds
-            },
-            ft_enabled: {
-                let cfg = config::LocalConfig::load();
-                cfg.face_tracking.enabled
-            },
-            ft_smoothing: {
-                let cfg = config::LocalConfig::load();
-                cfg.face_tracking.smoothing
-            },
-            recording_enabled: {
-                let cfg = config::LocalConfig::load();
-                cfg.recording.enabled
-            },
-            recording_output_dir: {
-                let cfg = config::LocalConfig::load();
-                cfg.recording.output_dir
-            },
+            sleep_enabled: cfg.sleep_mode.enabled,
+            sleep_timeout: cfg.sleep_mode.timeout_seconds,
+            ft_enabled: cfg.face_tracking.enabled,
+            ft_smoothing: cfg.face_tracking.smoothing,
+            recording_enabled: cfg.recording.enabled,
+            recording_output_dir: cfg.recording.output_dir.clone(),
+            // Starts false: we haven't seen a fresh status.json yet, so we
+            // assume the engine is down until proven otherwise. The first
+            // read_engine_status() tick (within 1 s) will flip this to true
+            // if SteamVR is running and the engine is healthy.
+            engine_alive: false,
+            reset_confirm_until: None,
+            demo_mode,
+            demo_start: Instant::now(),
+            pin_expires_in_seconds: None,
+            pin_expires_observed_at: None,
+            local_config: cfg,
         }
     }
 
-    fn log(&self, msg: &str) {
+    pub(crate) fn log(&self, msg: &str) {
         if let Ok(mut log) = self.status_log.lock() {
             log.push(msg.to_string());
             if log.len() > 100 { log.remove(0); }
         }
     }
 
-    fn scan_devices(&mut self) {
+    pub(crate) fn scan_devices(&mut self) {
         if self.last_device_scan.elapsed() < Duration::from_secs(3) {
             return;
         }
         self.last_device_scan = Instant::now();
+
+        // Demo mode never touches the user's real ADB devices — scanning
+        // would surface real hardware in the picker, which is misleading
+        // when the rest of the UI is synthetic.
+        if self.demo_mode {
+            self.devices.clear();
+            return;
+        }
 
         if let Some(ref adb) = self.adb_path {
             self.devices = adb::list_devices(adb);
@@ -244,58 +292,105 @@ impl CompanionApp {
         }
         self.last_status_read = Instant::now();
 
+        if self.demo_mode {
+            // Bypass the filesystem: the synthesizer produces a fresh
+            // ParsedStatus from elapsed time. We force engine_alive=true
+            // so the red "engine stopped" banner stays hidden — the
+            // yellow DEMO banner on top tells the user what's actually
+            // happening.
+            let parsed = demo::synthesize(self.demo_start.elapsed());
+            self.engine_alive = true;
+            self.apply_parsed_status(parsed);
+            return;
+        }
+
         let path = match dirs_next::data_dir() {
             Some(d) => d.join("FocusVisionPCVR").join("status.json"),
             None => return,
         };
 
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
-                // schema_version is absent in pre-v3.0 payloads; treat that as
-                // implicit schema 1 and proceed best-effort. A future-bumped
-                // schema_version is only logged so a stale companion doesn't
-                // refuse to render — extra/renamed fields are tolerated.
-                let observed = val
-                    .get("schema_version")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as u32;
-                if observed != fvp_common::STATUS_SCHEMA_VERSION {
-                    log::debug!(
-                        "status.json schema_version mismatch: companion expects {}, engine wrote {}",
-                        fvp_common::STATUS_SCHEMA_VERSION,
-                        observed
-                    );
-                }
-                let status = val["status"].as_str().unwrap_or("unknown");
-                match status {
-                    "waiting" => {
-                        if let Some(pin) = val["pin"].as_str() {
-                            if pin != "----" {
-                                self.pin_code = pin.to_string();
-                                self.connection_status = ConnectionStatus::WaitingForPin;
-                            } else {
-                                self.connection_status = ConnectionStatus::Disconnected;
-                            }
-                        }
-                    }
-                    "streaming" => {
-                        self.connection_status = ConnectionStatus::Connected;
-                        if let Some(pin) = val["pin"].as_str() {
-                            self.pin_code = pin.to_string();
-                        }
-                        self.latency_ms = val["latency_us"].as_u64().unwrap_or(0) as f32 / 1000.0;
-                        self.fps = val["fps"].as_u64().unwrap_or(0) as u32;
-                        self.bitrate_mbps = val["bitrate_mbps"].as_u64().unwrap_or(0) as f32;
-                        self.sub_ft_active = val["ft_active"].as_bool().unwrap_or(false);
-                        self.sub_sleep_active = val["sleep_active"].as_bool().unwrap_or(false);
-                        self.sub_audio_enabled = val["audio_enabled"].as_bool().unwrap_or(true);
-                        self.sub_packet_loss = val["packet_loss_pct"].as_f64().unwrap_or(0.0) as f32;
-                        self.stats_history.push(self.latency_ms, self.fps as f32, self.sub_packet_loss);
-                    }
-                    _ => {
-                        self.connection_status = ConnectionStatus::Disconnected;
-                    }
-                }
+        // Engine liveness from file mtime. If the file is missing or older
+        // than ENGINE_STALE_THRESHOLD, the engine has either not started or
+        // died. Read this BEFORE parsing so a stale-but-readable payload
+        // doesn't accidentally show "connected".
+        self.engine_alive = match std::fs::metadata(&path) {
+            Ok(meta) => meta
+                .modified()
+                .ok()
+                .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
+                .map(|age| age < ENGINE_STALE_THRESHOLD)
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let parsed = match parse_status_json(&contents) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Forward-compat: a schema bump only logs — the parser already
+        // tolerates extra fields and missing optional ones.
+        if let Some(observed) = parsed.schema_version {
+            if observed != fvp_common::STATUS_SCHEMA_VERSION {
+                log::debug!(
+                    "status.json schema_version mismatch: companion expects {}, engine wrote {}",
+                    fvp_common::STATUS_SCHEMA_VERSION,
+                    observed
+                );
+            }
+        }
+
+        self.apply_parsed_status(parsed);
+    }
+
+    /// Apply a parsed status payload to the live UI state. Split out from
+    /// `read_engine_status` so unit tests can drive the state machine
+    /// without touching the filesystem.
+    fn apply_parsed_status(&mut self, parsed: status_parser::ParsedStatus) {
+        use status_parser::ConnectionStatus as CS;
+        self.connection_status = parsed.connection;
+        // Pin expiry: when the engine emits a fresh value, snapshot it
+        // along with the wall-clock time we received it, so the UI can
+        // count down locally even though status.json isn't rewritten
+        // every second. A change of more than 1s OR moving from None
+        // counts as "fresh" — without this we'd reset the countdown
+        // every poll cycle.
+        match (parsed.pin_expires_in_seconds, self.pin_expires_in_seconds) {
+            (Some(new), Some(old)) if (new as i64 - old as i64).abs() <= 1 => {
+                // No-op: engine re-emitted same value, keep our running countdown.
+            }
+            (Some(new), _) => {
+                self.pin_expires_in_seconds = Some(new);
+                self.pin_expires_observed_at = Some(Instant::now());
+            }
+            (None, _) => {
+                self.pin_expires_in_seconds = None;
+                self.pin_expires_observed_at = None;
+            }
+        }
+
+        match parsed.connection {
+            CS::Disconnected => {
+                // Leave stats alone on transient disconnects so the sparkline
+                // doesn't snap to zero between status writes.
+            }
+            CS::WaitingForPin => {
+                self.pin_code = parsed.pin;
+            }
+            CS::Connected => {
+                self.pin_code = parsed.pin;
+                self.latency_ms = parsed.latency_ms;
+                self.fps = parsed.fps;
+                self.bitrate_mbps = parsed.bitrate_mbps;
+                self.sub_ft_active = parsed.subsystems.ft_active.unwrap_or(false);
+                self.sub_sleep_active = parsed.subsystems.sleep_active.unwrap_or(false);
+                self.sub_audio_enabled = parsed.subsystems.audio_enabled.unwrap_or(true);
+                self.sub_packet_loss = parsed.subsystems.packet_loss_pct.unwrap_or(0.0);
+                self.stats_history.push(self.latency_ms, self.fps as f32, self.sub_packet_loss);
             }
         }
     }
@@ -342,6 +437,33 @@ impl eframe::App for CompanionApp {
         let accent = egui::Color32::from_rgb(52, 211, 153); // #34D399
         let text_muted = egui::Color32::from_rgb(152, 152, 164);
 
+        if self.demo_mode {
+            // Warning yellow banner pinned above the tab bar. Uses #FBBF24
+            // on a darker fill so it reads as "informational" rather than
+            // "error" — the red engine-stopped banner uses #F87171 instead.
+            egui::TopBottomPanel::top("demo_banner")
+                .frame(
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(38, 30, 8))
+                        .inner_margin(egui::Margin::symmetric(12, 6)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("●")
+                                .color(egui::Color32::from_rgb(251, 191, 36)),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "DEMO MODE — シミュレーション中（実エンジンは起動していません）",
+                            )
+                            .color(egui::Color32::from_rgb(251, 191, 36))
+                            .strong(),
+                        );
+                    });
+                });
+        }
+
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::Home, "Home");
@@ -360,557 +482,9 @@ impl eframe::App for CompanionApp {
     }
 }
 
-impl CompanionApp {
-    fn render_home(&mut self, ui: &mut egui::Ui, accent: egui::Color32, text_muted: egui::Color32) {
-        ui.add_space(16.0);
-
-        // Brand
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Focus").size(32.0));
-            ui.label(egui::RichText::new("Vision").size(32.0).color(accent).italics());
-        });
-        ui.label(egui::RichText::new("PCVR Streaming").size(14.0).color(text_muted));
-
-        ui.add_space(24.0);
-
-        // Driver status
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("SteamVR Driver").size(13.0).color(text_muted));
-            ui.horizontal(|ui| {
-                let (dot_color, status_text) = if self.driver_installed {
-                    (accent, "Installed")
-                } else if self.steamvr_dir.is_some() {
-                    (egui::Color32::from_rgb(251, 191, 36), "Not installed")
-                } else {
-                    (egui::Color32::from_rgb(248, 113, 113), "SteamVR not found")
-                };
-                ui.label(egui::RichText::new("●").color(dot_color));
-                ui.label(status_text);
-            });
-
-            if !self.driver_installed {
-                if let Some(ref _dir) = self.steamvr_dir {
-                    if ui.button("Install Driver").clicked() {
-                        // Look for built driver in the project's build output
-                        let driver_source = PathBuf::from("driver/build/focus_vision_pcvr");
-                        match driver::install_driver(self.steamvr_dir.as_ref().unwrap(), &driver_source) {
-                            Ok(()) => {
-                                self.driver_installed = true;
-                                self.driver_status = "Driver installed".to_string();
-                                self.log("Driver installed successfully");
-                            }
-                            Err(e) => {
-                                self.driver_status = format!("Install failed: {e}");
-                                self.log(&format!("Driver install failed: {e}"));
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        ui.add_space(16.0);
-
-        // Contextual setup hint — shows the next step based on current state
-        let hint = if !self.driver_installed {
-            Some("Next: Install the SteamVR driver above")
-        } else if self.connection_status == ConnectionStatus::Disconnected {
-            if self.devices.is_empty() {
-                Some("Next: Connect Focus Vision via USB and deploy the APK (Deploy tab)")
-            } else {
-                Some("Next: Start SteamVR, then enter the PIN on your headset")
-            }
-        } else {
-            None
-        };
-        if let Some(hint_text) = hint {
-            ui.label(egui::RichText::new(hint_text).size(12.0).color(accent).italics());
-            ui.add_space(8.0);
-        }
-
-        // PIN display
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Pairing PIN").size(13.0).color(text_muted));
-            ui.add_space(8.0);
-
-            let pin_text = if self.connection_status == ConnectionStatus::WaitingForPin {
-                &self.pin_code
-            } else if self.connection_status == ConnectionStatus::Connected {
-                "Connected"
-            } else {
-                "----"
-            };
-
-            ui.label(
-                egui::RichText::new(pin_text)
-                    .size(48.0)
-                    .monospace()
-                    .color(if self.connection_status == ConnectionStatus::Connected {
-                        accent
-                    } else {
-                        egui::Color32::from_rgb(232, 232, 236)
-                    }),
-            );
-
-            if self.connection_status == ConnectionStatus::WaitingForPin {
-                ui.label(egui::RichText::new("Enter this PIN on your headset").size(12.0).color(text_muted));
-            }
-        });
-
-        ui.add_space(16.0);
-
-        // Connection stats
-        if self.connection_status == ConnectionStatus::Connected {
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Streaming").size(13.0).color(text_muted));
-                ui.add_space(8.0);
-
-                ui.columns(3, |cols| {
-                    cols[0].vertical_centered(|ui| {
-                        ui.label(egui::RichText::new(format!("{:.1}", self.latency_ms))
-                            .size(24.0).monospace());
-                        ui.label(egui::RichText::new("ms").size(11.0).color(text_muted));
-                    });
-                    cols[1].vertical_centered(|ui| {
-                        ui.label(egui::RichText::new(format!("{}", self.fps))
-                            .size(24.0).monospace());
-                        ui.label(egui::RichText::new("fps").size(11.0).color(text_muted));
-                    });
-                    cols[2].vertical_centered(|ui| {
-                        ui.label(egui::RichText::new(format!("{:.1}", self.bitrate_mbps))
-                            .size(24.0).monospace());
-                        ui.label(egui::RichText::new("Mbps").size(11.0).color(text_muted));
-                    });
-                });
-            });
-
-            // Sparkline graphs (30s history)
-            ui.add_space(8.0);
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Latency (30s)").size(11.0).color(text_muted));
-                let points = stats_history::StatsHistory::as_plot_points(&self.stats_history.latency_ms);
-                Plot::new("latency_spark")
-                    .height(50.0)
-                    .show_axes(false)
-                    .show_grid(false)
-                    .allow_drag(false)
-                    .allow_zoom(false)
-                    .allow_scroll(false)
-                    .show(ui, |plot_ui| {
-                        plot_ui.line(Line::new(PlotPoints::new(points)).color(accent));
-                    });
-
-                ui.label(egui::RichText::new("FPS (30s)").size(11.0).color(text_muted));
-                let fps_points = stats_history::StatsHistory::as_plot_points(&self.stats_history.fps);
-                Plot::new("fps_spark")
-                    .height(50.0)
-                    .show_axes(false)
-                    .show_grid(false)
-                    .allow_drag(false)
-                    .allow_zoom(false)
-                    .allow_scroll(false)
-                    .show(ui, |plot_ui| {
-                        plot_ui.line(Line::new(PlotPoints::new(fps_points)).color(accent));
-                    });
-            });
-
-            // Subsystem status indicators
-            ui.add_space(8.0);
-            ui.group(|ui| {
-                ui.label(egui::RichText::new("Subsystems").size(13.0).color(text_muted));
-                ui.add_space(4.0);
-
-                let active_color = accent;
-                let idle_color = text_muted;
-
-                ui.horizontal(|ui| {
-                    let (ft_color, ft_label) = if self.sub_ft_active {
-                        (active_color, "FT Active")
-                    } else {
-                        (idle_color, "FT Idle")
-                    };
-                    ui.label(egui::RichText::new("●").size(11.0).color(ft_color));
-                    ui.label(egui::RichText::new(ft_label).size(11.0).color(ft_color));
-
-                    ui.add_space(16.0);
-
-                    let (sleep_color, sleep_label) = if self.sub_sleep_active {
-                        (idle_color, "Sleep")
-                    } else {
-                        (active_color, "Awake")
-                    };
-                    ui.label(egui::RichText::new("●").size(11.0).color(sleep_color));
-                    ui.label(egui::RichText::new(sleep_label).size(11.0).color(sleep_color));
-
-                    ui.add_space(16.0);
-
-                    let (audio_color, audio_label) = if self.sub_audio_enabled {
-                        (active_color, "Audio OK")
-                    } else {
-                        (idle_color, "Audio Off")
-                    };
-                    ui.label(egui::RichText::new("●").size(11.0).color(audio_color));
-                    ui.label(egui::RichText::new(audio_label).size(11.0).color(audio_color));
-
-                    ui.add_space(16.0);
-
-                    let loss_color = if self.sub_packet_loss > 5.0 {
-                        egui::Color32::from_rgb(248, 113, 113) // error red
-                    } else if self.sub_packet_loss > 2.0 {
-                        egui::Color32::from_rgb(251, 191, 36) // warning yellow
-                    } else {
-                        text_muted
-                    };
-                    ui.label(egui::RichText::new(format!("Loss {:.1}%", self.sub_packet_loss))
-                        .size(11.0).color(loss_color));
-                });
-            });
-        }
-    }
-
-    fn render_deploy(&mut self, ui: &mut egui::Ui, accent: egui::Color32, text_muted: egui::Color32) {
-        ui.add_space(16.0);
-        ui.label(egui::RichText::new("Deploy to Headset").size(20.0));
-        ui.label(egui::RichText::new("ADB経由でFocus VisionにAPKをインストール").size(13.0).color(text_muted));
-
-        ui.add_space(16.0);
-
-        // ADB status
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("ADB").size(13.0).color(text_muted));
-            match &self.adb_path {
-                Some(path) => {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("●").color(accent));
-                        ui.label(format!("Found: {path}"));
-                    });
-                }
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(248, 113, 113)));
-                        ui.label("ADB not found. Install Android SDK Platform Tools.");
-                    });
-                }
-            }
-        });
-
-        ui.add_space(8.0);
-
-        // Connected devices
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Devices").size(13.0).color(text_muted));
-                if ui.button("Refresh").clicked() {
-                    self.last_device_scan = Instant::now() - Duration::from_secs(10);
-                    self.scan_devices();
-                }
-            });
-
-            if self.devices.is_empty() {
-                ui.label(egui::RichText::new("No devices connected. Connect Focus Vision via USB and enable developer mode.").color(text_muted));
-            } else {
-                for device in &self.devices {
-                    ui.horizontal(|ui| {
-                        let color = if device.is_focus_vision { accent } else { text_muted };
-                        ui.label(egui::RichText::new("●").color(color));
-                        ui.label(format!("{} ({})", device.model, device.serial));
-                        if device.is_focus_vision {
-                            ui.label(egui::RichText::new("Focus Vision").color(accent).size(11.0));
-                        }
-                    });
-                }
-            }
-        });
-
-        ui.add_space(8.0);
-
-        // APK path
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("APK File").size(13.0).color(text_muted));
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.apk_path);
-                if ui.button("Browse...").clicked() {
-                    if let Some(path) = rfd_pick_file() {
-                        self.apk_path = path;
-                    }
-                }
-            });
-        });
-
-        ui.add_space(8.0);
-
-        // Deploy button
-        let can_deploy = self.adb_path.is_some()
-            && !self.devices.is_empty()
-            && !self.apk_path.is_empty()
-            && std::path::Path::new(&self.apk_path).exists();
-
-        let deploy_enabled = can_deploy && !self.deploy_in_progress;
-        ui.add_enabled_ui(deploy_enabled, |ui| {
-            let label = if self.deploy_in_progress {
-                "Installing..."
-            } else {
-                "Install APK on All Devices"
-            };
-            if ui.button(
-                egui::RichText::new(label).size(16.0)
-            ).clicked() {
-                self.deploy_in_progress = true;
-                self.deploy_status = "Installing...".to_string();
-
-                let adb = self.adb_path.clone().unwrap();
-                let apk = self.apk_path.clone();
-                let devices: Vec<_> = self.devices.iter().map(|d| d.serial.clone()).collect();
-                let result = self.deploy_result.clone();
-
-                thread::Builder::new()
-                    .name("fvp-deploy".into())
-                    .spawn(move || {
-                        let mut outcomes = Vec::new();
-                        for serial in &devices {
-                            match adb::install_apk(&adb, serial, &apk) {
-                                Ok(_) => {
-                                    let _ = adb::launch_app(&adb, serial, "com.focusvision.pcvr");
-                                    outcomes.push(format!("OK: {}", serial));
-                                }
-                                Err(e) => {
-                                    outcomes.push(format!("FAIL {}: {}", serial, e));
-                                }
-                            }
-                        }
-                        let msg = outcomes.join(", ");
-                        if let Ok(mut guard) = result.lock() {
-                            *guard = Some(msg);
-                        }
-                    })
-                    .expect("spawn deploy thread");
-            }
-        });
-
-        if !self.deploy_status.is_empty() {
-            ui.add_space(8.0);
-            ui.label(&self.deploy_status);
-        }
-    }
-
-    fn render_settings(&mut self, ui: &mut egui::Ui, _accent: egui::Color32, text_muted: egui::Color32) {
-        ui.add_space(16.0);
-        ui.label(egui::RichText::new("Settings").size(20.0));
-
-        ui.add_space(16.0);
-
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Driver").size(13.0).color(text_muted));
-
-            if self.driver_installed
-                && ui.button("Uninstall Driver").clicked() {
-                    if let Some(ref dir) = self.steamvr_dir {
-                        match driver::uninstall_driver(dir) {
-                            Ok(()) => {
-                                self.driver_installed = false;
-                                self.log("Driver uninstalled");
-                            }
-                            Err(e) => {
-                                self.log(&format!("Uninstall failed: {e}"));
-                            }
-                        }
-                    }
-                }
-
-            if let Some(ref dir) = self.steamvr_dir {
-                ui.label(egui::RichText::new(format!("SteamVR: {}", dir.display())).size(11.0).color(text_muted));
-            }
-        });
-
-        ui.add_space(16.0);
-
-        // Audio settings
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Audio").size(13.0).color(text_muted));
-
-            ui.checkbox(&mut self.audio_enabled, "Audio streaming enabled");
-
-            if self.audio_enabled {
-                ui.horizontal(|ui| {
-                    ui.label("Bitrate:");
-                    ui.add(egui::Slider::new(&mut self.audio_bitrate_kbps, 64..=256).suffix(" kbps"));
-                });
-                ui.label(egui::RichText::new("WASAPI loopback — no virtual device needed").size(11.0).color(text_muted));
-            }
-        });
-
-        ui.add_space(16.0);
-
-        // Sleep Mode settings (v1.2)
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Sleep Mode").size(13.0).color(text_muted));
-
-            let prev_enabled = self.sleep_enabled;
-            let prev_timeout = self.sleep_timeout;
-            ui.checkbox(&mut self.sleep_enabled, "Auto-sleep on inactivity");
-
-            if self.sleep_enabled {
-                ui.horizontal(|ui| {
-                    ui.label("Timeout:");
-                    ui.add(egui::Slider::new(&mut self.sleep_timeout, 30..=900).suffix("s"));
-                });
-                ui.label(egui::RichText::new(format!("{}m {}s — bitrate drops to 8 Mbps during sleep",
-                    self.sleep_timeout / 60, self.sleep_timeout % 60)).size(11.0).color(text_muted));
-            }
-
-            if self.sleep_enabled != prev_enabled || self.sleep_timeout != prev_timeout {
-                self.local_config.sleep_mode.enabled = self.sleep_enabled;
-                self.local_config.sleep_mode.timeout_seconds = self.sleep_timeout;
-                match self.local_config.save() {
-                    Ok(()) => self.log(&format!("Sleep mode: {} (timeout {}s)",
-                        if self.sleep_enabled { "enabled" } else { "disabled" }, self.sleep_timeout)),
-                    Err(e) => self.log(&format!("Failed to save config: {e}")),
-                }
-            }
-        });
-
-        ui.add_space(16.0);
-
-        // Face Tracking settings (v1.2)
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Face Tracking").size(13.0).color(text_muted));
-
-            let prev_enabled = self.ft_enabled;
-            let prev_smoothing = self.ft_smoothing;
-            ui.checkbox(&mut self.ft_enabled, "Face tracking → VRChat OSC");
-
-            if self.ft_enabled {
-                ui.horizontal(|ui| {
-                    ui.label("Smoothing:");
-                    ui.add(egui::Slider::new(&mut self.ft_smoothing, 0.0..=0.95).fixed_decimals(2));
-                });
-                ui.label(egui::RichText::new("0.0 = raw, higher = smoother (reduces jitter)").size(11.0).color(text_muted));
-            }
-
-            if self.ft_enabled != prev_enabled || (self.ft_smoothing - prev_smoothing).abs() > 0.001 {
-                self.local_config.face_tracking.enabled = self.ft_enabled;
-                self.local_config.face_tracking.smoothing = self.ft_smoothing;
-                match self.local_config.save() {
-                    Ok(()) => self.log(&format!("Face tracking: {} (smoothing {:.2})",
-                        if self.ft_enabled { "enabled" } else { "disabled" }, self.ft_smoothing)),
-                    Err(e) => self.log(&format!("Failed to save config: {e}")),
-                }
-            }
-        });
-
-        ui.add_space(16.0);
-
-        // Session Recording
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Session Recording").size(13.0).color(text_muted));
-
-            let prev_rec_enabled = self.recording_enabled;
-            let prev_rec_dir = self.recording_output_dir.clone();
-            ui.checkbox(&mut self.recording_enabled, "Record sessions to disk (video + audio)");
-
-            if self.recording_enabled {
-                ui.horizontal(|ui| {
-                    ui.label("Output dir:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.recording_output_dir)
-                            .hint_text("(blank = %APPDATA%/FocusVisionPCVR/recordings)")
-                            .desired_width(320.0),
-                    );
-                });
-                ui.label(
-                    egui::RichText::new("Video: raw Annex B (.h265/.h264) / Audio: 16-bit PCM (.wav). ffmpeg -i rec.h265 -i rec.wav -c:v copy rec.mp4")
-                        .size(11.0).color(text_muted),
-                );
-                ui.label(
-                    egui::RichText::new("Engine restart required for changes to take effect.")
-                        .size(11.0).color(text_muted),
-                );
-            }
-
-            if self.recording_enabled != prev_rec_enabled || self.recording_output_dir != prev_rec_dir {
-                self.local_config.recording.enabled = self.recording_enabled;
-                self.local_config.recording.output_dir = self.recording_output_dir.clone();
-                match self.local_config.save() {
-                    Ok(()) => self.log(&format!("Recording: {} (dir: {})",
-                        if self.recording_enabled { "enabled" } else { "disabled" },
-                        if self.recording_output_dir.is_empty() { "<default>" } else { &self.recording_output_dir })),
-                    Err(e) => self.log(&format!("Failed to save config: {e}")),
-                }
-            }
-        });
-
-        ui.add_space(16.0);
-
-        // Log
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Log").size(13.0).color(text_muted));
-            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                if let Ok(log) = self.status_log.lock() {
-                    for entry in log.iter().rev() {
-                        ui.label(egui::RichText::new(entry).size(11.0).monospace().color(text_muted));
-                    }
-                }
-            });
-        });
-
-        ui.add_space(16.0);
-
-        // Codec selection (v1.1)
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Video Codec").size(13.0).color(text_muted));
-            let prev = self.selected_codec.clone();
-            ui.radio_value(&mut self.selected_codec, "h265".to_string(), "H.265 (HEVC) — higher quality");
-            ui.radio_value(&mut self.selected_codec, "h264".to_string(), "H.264 — lower latency (2-5ms)");
-            if self.selected_codec != prev {
-                self.local_config.video.codec = self.selected_codec.clone();
-                match self.local_config.save() {
-                    Ok(()) => self.log(&format!("Codec set to {}. Restart engine to apply.", self.selected_codec)),
-                    Err(e) => self.log(&format!("Failed to save config: {e}")),
-                }
-            }
-        });
-
-        ui.add_space(16.0);
-
-        // Log export (v1.1)
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Diagnostics").size(13.0).color(text_muted));
-            let export_enabled = !self.export_in_progress;
-            ui.add_enabled_ui(export_enabled, |ui| {
-                let label = if self.export_in_progress { "Exporting..." } else { "Export Logs (zip)" };
-                if ui.button(label).clicked() {
-                    self.export_in_progress = true;
-                    let adb = self.adb_path.clone();
-                    let serial = self.devices.first().map(|d| d.serial.clone());
-                    let result = self.export_result.clone();
-                    thread::Builder::new()
-                        .name("fvp-export".into())
-                        .spawn(move || {
-                            let msg = match export::export_logs(
-                                adb.as_deref(),
-                                serial.as_deref(),
-                            ) {
-                                Ok(path) => format!("Logs exported: {}", path.display()),
-                                Err(e) => format!("Export failed: {e}"),
-                            };
-                            if let Ok(mut guard) = result.lock() {
-                                *guard = Some(msg);
-                            }
-                        })
-                        .expect("spawn export thread");
-                }
-            });
-            ui.label(egui::RichText::new("PC logs + HMD logcat + system info → zip").size(11.0).color(text_muted));
-        });
-
-        ui.add_space(16.0);
-
-        ui.label(egui::RichText::new(format!("Focus Vision PCVR v{}", env!("CARGO_PKG_VERSION"))).size(11.0).color(text_muted));
-    }
-}
-
-/// Simple file picker fallback (no rfd crate — uses Windows common dialog via command)
-fn rfd_pick_file() -> Option<String> {
+/// Simple file picker fallback (no rfd crate — uses Windows common dialog via command).
+/// `pub(crate)` so the Deploy tab can invoke it from `ui::deploy`.
+pub(crate) fn rfd_pick_file() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
@@ -931,6 +505,56 @@ fn rfd_pick_file() -> Option<String> {
 
     #[cfg(not(target_os = "windows"))]
     {
+        None
+    }
+}
+
+/// File-save dialog companion to `rfd_pick_file()`. Returns `None` if the
+/// user cancelled, no dialog backend is available, or the call failed.
+/// `default_stem` becomes the suggested filename (no extension); `ext`
+/// is the file extension without a dot. Used by the SVG export button
+/// in the Settings tab.
+pub(crate) fn pick_save_path(default_stem: &str, ext: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        // Inject the values via env vars rather than concatenating into the
+        // script body — that way a user-supplied stem with quotes or
+        // backticks can't break the PowerShell quoting.
+        let output = Command::new("powershell")
+            .env("FVP_SAVE_STEM", default_stem)
+            .env("FVP_SAVE_EXT", ext)
+            .args([
+                "-Command",
+                r#"
+                Add-Type -AssemblyName System.Windows.Forms
+                $stem = $env:FVP_SAVE_STEM
+                $ext = $env:FVP_SAVE_EXT
+                $dialog = New-Object System.Windows.Forms.SaveFileDialog
+                $dialog.Filter = "$ext files (*.$ext)|*.$ext|All files (*.*)|*.*"
+                $dialog.Title = 'Save'
+                $dialog.FileName = "$stem.$ext"
+                $dialog.DefaultExt = $ext
+                $dialog.AddExtension = $true
+                if ($dialog.ShowDialog() -eq 'OK') { $dialog.FileName }
+                "#,
+            ])
+            .output()
+            .ok()?;
+
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path))
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No native dialog on non-Windows targets — drop the SVG next to
+        // the user's data dir so they can still find it from a script.
+        let _ = (default_stem, ext);
         None
     }
 }
