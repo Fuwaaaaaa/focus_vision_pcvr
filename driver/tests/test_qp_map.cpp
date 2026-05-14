@@ -212,3 +212,194 @@ TEST(VuiConfig, NvencConfigFullRangePropagation) {
     vui2.videoFullRangeFlag = appConfig.full_range ? 1 : 0;
     EXPECT_EQ(vui2.videoFullRangeFlag, 0u);
 }
+
+// ============================================================
+// Boundary tests — gaze coordinates outside the [0,1] range
+// ============================================================
+
+TEST(QpMap, NegativeGazeStaysCoherent) {
+    // A miscalibrated eye tracker can briefly report negative or > 1 gaze
+    // coordinates. The QP map must still produce a sane output (every CTU
+    // valid, no NaN, no out-of-bounds writes) — we treat off-screen gaze as
+    // "centre is far away, so almost everything is peripheral".
+    uint32_t cols, rows;
+    computeCtuGrid(FRAME_W, FRAME_H, CTU_HEVC, cols, rows);
+
+    std::vector<int8_t> map;
+    computeQpDeltaMap(-0.5f, -0.5f, cols, rows, 0.15f, 0.35f, 5, 15, map);
+    ASSERT_EQ(map.size(), cols * rows);
+    // Every CTU is far from the off-screen gaze, so the entire map is peripheral.
+    for (auto v : map) {
+        EXPECT_EQ(v, 15);
+    }
+}
+
+TEST(QpMap, OverOneGazeStaysCoherent) {
+    uint32_t cols, rows;
+    computeCtuGrid(FRAME_W, FRAME_H, CTU_HEVC, cols, rows);
+
+    std::vector<int8_t> map;
+    computeQpDeltaMap(1.5f, 1.5f, cols, rows, 0.15f, 0.35f, 5, 15, map);
+    ASSERT_EQ(map.size(), cols * rows);
+    for (auto v : map) {
+        EXPECT_EQ(v, 15);
+    }
+}
+
+TEST(QpMap, MidZoneCtusReceiveMidDelta) {
+    // With gaze at centre, the annulus between fovea_r and mid_r must
+    // be populated with `midQpDelta`. Without this test the existing
+    // suite only validates the fovea (=0) and peripheral (=15) zones —
+    // a regression that collapsed mid into peripheral would go unnoticed.
+    uint32_t cols, rows;
+    computeCtuGrid(FRAME_W, FRAME_H, CTU_HEVC, cols, rows);
+
+    std::vector<int8_t> map;
+    computeQpDeltaMap(0.5f, 0.5f, cols, rows, 0.05f, 0.40f, 5, 15, map);
+
+    bool sawMid = false;
+    for (auto v : map) {
+        if (v == 5) { sawMid = true; break; }
+    }
+    EXPECT_TRUE(sawMid) << "expected at least one CTU in the mid zone";
+}
+
+TEST(QpMap, ZeroFoveaRadiusCollapsesToMidOrPeripheral) {
+    // fovea_r == 0 means there is no fovea zone at all — the centre CTU
+    // is at exactly distance 0, which is <= 0 so still classified as fovea.
+    // Everything else gets mid or peripheral.
+    uint32_t cols, rows;
+    computeCtuGrid(FRAME_W, FRAME_H, CTU_HEVC, cols, rows);
+    std::vector<int8_t> map;
+    computeQpDeltaMap(0.5f, 0.5f, cols, rows, 0.0f, 0.35f, 5, 15, map);
+    ASSERT_EQ(map.size(), cols * rows);
+    // Nearly all of the map should be non-zero.
+    int zeros = 0;
+    for (auto v : map) if (v == 0) zeros++;
+    EXPECT_LE(zeros, 4) << "fovea_r=0 should produce very few zero CTUs";
+}
+
+TEST(QpMap, MidRadiusBeyondOneEliminatesPeripheral) {
+    // mid_r >= sqrt(2) ≈ 1.42 in CTU units guarantees the whole grid sits
+    // inside the mid zone — no peripheral CTUs.
+    uint32_t cols, rows;
+    computeCtuGrid(FRAME_W, FRAME_H, CTU_HEVC, cols, rows);
+    std::vector<int8_t> map;
+    computeQpDeltaMap(0.5f, 0.5f, cols, rows, 0.0f, 2.0f, 5, 15, map);
+    for (auto v : map) {
+        EXPECT_NE(v, 15) << "no CTU should be peripheral when mid_r is huge";
+    }
+}
+
+// ============================================================
+// Degenerate grid sizes
+// ============================================================
+
+TEST(QpMap, OneByOneGridIsFovea) {
+    std::vector<int8_t> map;
+    computeQpDeltaMap(0.5f, 0.5f, 1, 1, 0.15f, 0.35f, 5, 15, map);
+    ASSERT_EQ(map.size(), 1u);
+    EXPECT_EQ(map[0], 0) << "a 1x1 grid puts the gaze inside the only CTU";
+}
+
+TEST(QpMap, ZeroSizedGridYieldsEmptyMap) {
+    std::vector<int8_t> map;
+    computeQpDeltaMap(0.5f, 0.5f, 0, 0, 0.15f, 0.35f, 5, 15, map);
+    EXPECT_TRUE(map.empty());
+}
+
+TEST(QpMap, TinyFrameCtuGridRoundsUp) {
+    // 1px frame still needs one CTU; CTU=16 → 1 col, 1 row.
+    uint32_t cols, rows;
+    computeCtuGrid(1, 1, 16, cols, rows);
+    EXPECT_EQ(cols, 1u);
+    EXPECT_EQ(rows, 1u);
+}
+
+TEST(QpMap, FrameNotDivisibleByCtuRoundsUp) {
+    // 1833x1921 with CTU=64 yields ceil(1833/64)=29, ceil(1921/64)=31
+    uint32_t cols, rows;
+    computeCtuGrid(1833, 1921, 64, cols, rows);
+    EXPECT_EQ(cols, 29u);
+    EXPECT_EQ(rows, 31u);
+}
+
+// ============================================================
+// Foveated preset exhaustive cases
+// ============================================================
+
+TEST(FoveatedPreset, SubtlePresetValues) {
+    auto* subtle = findFoveatedPreset("subtle");
+    ASSERT_NE(subtle, nullptr);
+    EXPECT_EQ(subtle->mid_qp_offset, 3);
+    EXPECT_EQ(subtle->peripheral_qp_offset, 8);
+}
+
+TEST(FoveatedPreset, AllPresetsOrderedByAggressiveness) {
+    // The presets should monotonically increase in QP offset values:
+    // subtle (3,8) < balanced (5,15) < aggressive (8,25). A future
+    // re-ordering bug would silently apply the wrong intensity.
+    auto* subtle = findFoveatedPreset("subtle");
+    auto* balanced = findFoveatedPreset("balanced");
+    auto* aggressive = findFoveatedPreset("aggressive");
+    ASSERT_NE(subtle, nullptr);
+    ASSERT_NE(balanced, nullptr);
+    ASSERT_NE(aggressive, nullptr);
+    EXPECT_LT(subtle->mid_qp_offset, balanced->mid_qp_offset);
+    EXPECT_LT(balanced->mid_qp_offset, aggressive->mid_qp_offset);
+    EXPECT_LT(subtle->peripheral_qp_offset, balanced->peripheral_qp_offset);
+    EXPECT_LT(balanced->peripheral_qp_offset, aggressive->peripheral_qp_offset);
+}
+
+TEST(FoveatedPreset, CaseSensitiveMatching) {
+    // The lookup is intentionally case-sensitive — "Balanced" won't match
+    // "balanced". Documenting that contract here prevents a future
+    // case-insensitive change from breaking config files in the wild.
+    EXPECT_EQ(findFoveatedPreset("Balanced"), nullptr);
+    EXPECT_EQ(findFoveatedPreset("BALANCED"), nullptr);
+    EXPECT_NE(findFoveatedPreset("balanced"), nullptr);
+}
+
+TEST(FoveatedPreset, EmptyStringReturnsNull) {
+    EXPECT_EQ(findFoveatedPreset(""), nullptr);
+}
+
+TEST(FoveatedPreset, PartialMatchReturnsNull) {
+    // Prefix collisions ("balance" is a prefix of "balanced") must not
+    // accidentally match — the comparator checks both null terminators.
+    EXPECT_EQ(findFoveatedPreset("balance"), nullptr);
+    EXPECT_EQ(findFoveatedPreset("balancedXY"), nullptr);
+}
+
+// ============================================================
+// NVENC ABI / struct layout assertions
+// ============================================================
+
+TEST(NvencAbi, HevcAndH264ConfigsShareUnionSize) {
+    // The NV_ENC_CODEC_CONFIG union is the largest of its members.
+    // If the SDK changes one struct without updating the union footprint,
+    // we want to know at test time, not at runtime. Bind to locals because
+    // EXPECT_EQ takes a macro-comma-separated arg list and the comma in
+    // std::max<…>(…, …) confuses the preprocessor.
+    const size_t unionSize = sizeof(NV_ENC_CODEC_CONFIG);
+    const size_t hevcSize = sizeof(NV_ENC_CONFIG_HEVC);
+    const size_t h264Size = sizeof(NV_ENC_CONFIG_H264);
+    // `(std::max)(...)` — extra parens prevent Windows.h's `max` macro
+    // from clobbering the std:: name when the test transitively pulls
+    // <windows.h> via nvenc_encoder.h.
+    const size_t maxMemberSize = (hevcSize > h264Size) ? hevcSize : h264Size;
+    EXPECT_EQ(unionSize, maxMemberSize);
+}
+
+TEST(NvencAbi, StructVersionMacroProducesNonZero) {
+    // NVENCAPI_STRUCT_VERSION encodes (sizeof | ver_idx<<16 | apiVersion<<24)
+    // into a u32 that nvEncInitializeEncoder validates at runtime. A version
+    // of 0 would silently fail with NV_ENC_ERR_INVALID_VERSION — guard
+    // against the inline type definitions regressing.
+    constexpr uint32_t hevcConfigVer = NVENCAPI_STRUCT_VERSION(NV_ENC_CONFIG_HEVC, 1);
+    constexpr uint32_t h264ConfigVer = NVENCAPI_STRUCT_VERSION(NV_ENC_CONFIG_H264, 1);
+    EXPECT_GT(hevcConfigVer, 0u);
+    EXPECT_GT(h264ConfigVer, 0u);
+    // Major version (low byte of the apiVersion field) must be 12.
+    EXPECT_EQ(NVENCAPI_MAJOR_VERSION, 12);
+}
