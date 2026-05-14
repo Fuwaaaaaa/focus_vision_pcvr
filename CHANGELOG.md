@@ -2,42 +2,141 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
-## [Unreleased]
+## [3.0.0-rc1] - 2026-05-14
 
-### Added
-- **Thermal Governor (ソフト骨格):** GPU 温度に応じて adaptive bitrate ceiling を段階的に絞る `thermal::ThermalGovernor`。`trait GpuThermalSource` 抽象 + `MockGpuThermalSource` (テスト用)。閾値 75/85/90°C (warn/limit/emergency)、limit で 70%、emergency で 50% にキャップ。`recovery_seconds` (デフォルト 30s) で線形ランプアップ。`[thermal]` config セクション追加。`BitrateController.set_thermal_ceiling_bps()` 統合 — floor (10 Mbps) は常に優先される。NVML 連携は Phase 4.3 (実機検証) まで stub (`try_create_nvml()` は `None`)。テスト 23 件追加 (config 4 + thermal 13 + bitrate ceiling 6)
+First release candidate for v3.0.0. Focuses on completion-grade UX,
+test coverage, and release infrastructure. Every change in this entry
+ships without requiring real hardware to validate; items that need a
+NVIDIA GPU or Focus Vision headset are explicitly tagged as
+"hardware-pending" in the Out-of-Scope section at the bottom.
 
-### Changed
-- **Bitrate Arbitration の明示化:** `BitrateController.adjust()` 内で多層に絡んでいた multiplier 連鎖を、純粋関数 `arbitrate(ArbitrationInputs) -> ArbitrationOutcome` に抽出。優先順位 (Sustained > 各 reduction > Increase > Floor / Thermal clamp) と勝者シグナルを `ArbDominant` enum で明示。`BitrateController.last_decision()` getter で「なぜ今のビットレートになったか」を runtime に問い合わせ可能 (status.json / log 用)。挙動は不変 (既存 18 件のテスト全 PASS)、新規 6 件追加 (合成シグナルでの floor/thermal/loss 優先順位検証)
-- **Reconnect 状態機械抽出:** `engine.rs::run_streaming` に散在していた `accept_failures` / `reconnect_attempts` カウンタと exponential backoff (1→2→4→8→16s cap) を `control/reconnect.rs::ReconnectState` に集約。**accept failure (hard cap=5、エンジン停止) と reconnect attempt (soft cap=10、警告のみ) のカウンタ分離**を構造化 — 過去に Wi-Fi 長時間断でエンジン永久停止した不具合を再発防止。挙動不変、新規 10 件のユニットテスト追加 (counter 累積、reset 経路、backoff 上限、break/no-break 判定)。2-token 設計 (audio/recording を hold 中も生存) は実機 Wi-Fi 検証必要のため Phase 4.2 へ持ち越し (コメント明示)
+### Companion App (UX)
+- **Audio + APK + Window persistence:** the audio enable/bitrate
+  toggle, last-used APK path, and (via eframe default) window position
+  now survive a relaunch — `[audio]` and `[deploy]` sections joined
+  `[video]` / `[sleep_mode]` / `[face_tracking]` / `[recording]` in
+  `local.toml`. Sliding the audio bitrate slider previously did
+  nothing; it now writes to disk and the engine reads it on next
+  start.
+- **Reset to defaults:** Settings tab gains a Maintenance group with a
+  two-stage confirm button (`Reset to defaults` → `Confirm reset`
+  for 3 s). Wipes every companion-side override and re-syncs the
+  in-memory shadow state so the visible sliders match what was saved.
+- **Recording dir validation:** inline diagnostic next to the output-
+  dir input. Blank stays a no-op (engine falls back to
+  `%APPDATA%/FocusVisionPCVR/recordings`); missing paths warn yellow
+  (engine creates them at startup); a file-instead-of-dir errors red.
+- **Engine-stopped banner:** Home tab shows a red banner when
+  `status.json` is missing or its mtime is older than 5 s. Surfaces
+  engine crashes or SteamVR not running. The banner can't restart the
+  engine (it lives inside `vrserver.exe`); it directs the user to
+  SteamVR's process-lifecycle instead.
+- **SteamVR drivers dir via registry:** resolves the SteamVR install
+  via the Windows registry (HKLM\SOFTWARE\Valve\Steam +
+  WOW6432Node fallback), so the driver Install/Uninstall buttons
+  work even when SteamVR isn't on the standard library path.
+- **`CompanionApp` split into `ui/{home, deploy, settings}.rs`:**
+  `main.rs` shrinks from 1209 LoC to 410, each tab is its own file.
+  The render methods stay attached to `CompanionApp` via per-file
+  `impl` blocks. Public/binary API unchanged.
 
-### Added (continued)
-- **Recording の実行時 toggle (CONFIG_UPDATE 0x03):** HMD ダッシュボードから録画 on/off をエンジン再起動なしで切替可能に。CONFIG_UPDATE key=0x03, value=0/1 で `RECORDING_ENABLED` AtomicBool を flip。`StreamingEngine::write_recording_nal` が atomic を early-return チェックするため、無効化した瞬間に video NAL の disk 書込みが停止 (poisoned 経路ではなく明示的 gate)。エンジン起動時は `config.recording.enabled` で seed され、boot 設定と挙動一致。純粋関数 `recording::apply_recording_config_update(value, &AtomicBool) -> u8 ack_status` に切出し、3 件のユニットテストで `value=2` のような不正値は ACK_REJECTED で state を変更しないことを保証。**注:** audio recording の runtime toggle は session の audio task と Arc<Mutex<Option<>>> を共有する必要があり、「toggle しても audio が止まらない」ことの検証に実機が必要なため follow-up へ持ち越し
+### Streaming Engine
+- **`status.json` parser extracted:** `companion-app::status_parser`
+  now owns the JSON → struct mapping with typed `ParsedStatus` /
+  `ConnectionStatus` / `Subsystems`. `apply_parsed_status` is the
+  new write-side seam — tests don't need egui to validate the state
+  machine. Fixed a latent bug where the engine's 6-dash sentinel
+  PIN briefly displayed as if it were a real code.
+- **Audio recording runtime toggle (CONFIG_UPDATE 0x05):** mirrors
+  the existing video toggle (0x03). Audio gating is independent of
+  video, so an operator can pause audio recording mid-session while
+  video keeps writing. The boot config (`recording.enabled`) still
+  seeds both gates.
+- **Thermal governor wired to engine:** `ThermalGovernor` +
+  `NvmlThermalSource` were complete since Phase 1 but sat idle. The
+  engine now constructs the governor once before the reconnect loop
+  and calls `tick()` on each bitrate-adjust tick, applying the
+  multiplier to `bitrate_ctrl.set_thermal_ceiling_bps`. On non-NVIDIA
+  hosts or without the `nvml` cargo feature the governor is `None`
+  and the block is a no-op. Threshold tuning remains a hardware
+  follow-up.
+
+### Thermal Governor (soft-skeleton, merged from earlier work)
+- **`thermal::ThermalGovernor`:** GPU-temperature-driven cap on
+  adaptive-bitrate ceiling. 75/85/90 °C (warn/limit/emergency),
+  70 % at limit, 50 % at emergency, linear ramp back over
+  `recovery_seconds` (default 30 s). `[thermal]` config section.
+- **Bitrate arbitration explicit:** `arbitrate(ArbitrationInputs)
+  -> ArbitrationOutcome` pure function exposes the multiplier
+  priority order (Sustained > each reduction > Increase >
+  Floor / Thermal clamp) and a winner-signal enum. Behaviour
+  unchanged.
+- **Reconnect state machine extracted:** `control::reconnect::ReconnectState`
+  owns the accept-failure / reconnect-attempt counters and
+  exponential backoff (1 → 16 s cap). Splits the two counters so a
+  long Wi-Fi drop can't stop the engine just because reconnect
+  attempts pile up.
 
 ### Tests
-- **`tcp_server.rs` ギャップ補完 (+8 件):** トラスト境界とハンドシェイクのエラー経路に回帰テスト追加。`MAX_MSG_LEN` (64KB) を超える length prefix が allocation 前に拒否されること、空メッセージ (len=0) 拒否、HELLO_ACK が `PROTOCOL_VERSION` 定数 (現在 v3) を ack すること、PIN_RESPONSE が < 4 byte のとき handshake が abort すること、HELLO 期待ステップで STREAM_START を送ると拒否されること、PIN ステップで誤メッセージ型を送ると拒否されること、TLS 初期化後に cert fingerprint が空でないこと、`encode_stream_config()` のワイヤフォーマット (17 byte レイアウト) を locked-in
-- **Session Recording MVP:** `[recording]` config セクションで有効化すると、VIDEO は Annex B raw (.h265/.h264)、AUDIO は WAV (16-bit PCM) として `%APPDATA%/FocusVisionPCVR/recordings/` に自動保存。`ffmpeg -i rec.h265 -i rec.wav -c:v copy rec.mp4` で mp4 化可能 (#25, #28, #31)
-- **RTP/FVP header helpers:** `transport::rtp::write_rtp_header` / `write_fvp_header` / `read_fvp_header` を導入。video・audio・pipeline (with_fec / sliced)・depacketizer の 4 箇所で別々に手書きしていた wire format を 1 箇所に集約 (#22, #29, #30)
-- **BurstDetector `new_with_thresholds`:** cfg(test) 専用コンストラクタで `thread::sleep` 依存テストを高速化可能に (#18)
+- **Workspace:** 313 → 345 (`+32`). Companion: 25 → 47 (`+22`).
+  Driver C++ (gtest): 13 → 30 (`+17`).
+- **status.json parser:** 12 cases — idle, waiting/real PIN,
+  sentinel PIN, streaming with/without subsystems, pre-v3 payload,
+  future schema_version, unknown status, malformed JSON, partial
+  writes, latency-µs → ms, engine-format round-trip.
+- **Audio recording toggle:** 4 cases — disable, enable, invalid
+  value rejected, independence between audio and video gates.
+- **Recording dir diagnostic:** 4 cases — blank accepted, existing
+  dir, nonexistent (warning), file-not-dir (error).
+- **Audio / APK config roundtrip:** 4 cases for the new
+  `[audio]` and `[deploy]` sections (defaults, roundtrip, missing-
+  section fallback, APK-path roundtrip).
+- **Driver QP map + NVENC ABI:** 17 cases — off-screen gaze, mid-
+  zone CTUs, zero-fovea-radius, huge-mid-radius, 1×1 / 0-sized /
+  uneven CTU grids, all three foveated presets, case-sensitive
+  preset lookup, NV_ENC_CODEC_CONFIG union sizing,
+  `NVENCAPI_STRUCT_VERSION` non-zero.
 
-### Changed
-- **osc_bridge EMA:** lip (37) / eye (14) の EMA + profile weight + OSC 送信ループを `apply_smoothing_and_send` ヘルパーに統合。挙動不変 (#14)
-- **FtProfile::validate():** `normalize()` + `sanitize_weights()` の 2 パスを統合。公開 API は温存 (#15)
-- **status.json:** 手書き JSON を `serde_json` に置換。エスケープ必要な文字が混入しても壊れない (#16)
-- **session_log flush:** `writeln!` ループを `write_all` 一回に統合、syscall 数を削減 (#17)
-- **config::validate():** 繰り返しの check→push→clamp パターンを `validate_range` / `validate_f32_range` ヘルパーに統合 (#19)
-- **sent_packet_log pruning:** 毎フレームの sort+truncate を 300 フレーム周期 (~3.3s@90fps) にバッチ化 (#23)
-- **TCP handshake:** 69 LoC のモノリシックな関数を `step_hello_exchange` / `step_pin_pairing` / `step_stream_config` / `step_stream_start` に分解、各ステップに `log::debug!` 追加 (#24)
-
-### Tests
-- 新規テスト合計 **20+** 件追加（FtProfile::validate、status.json round-trip、BurstDetector thresholds、write_rtp_header、write_fvp_header、read_fvp_header、AudioRecorder WAV layout、Recorder start-code handling、config Default consistency、他）
-- **合計テスト数: 313 → 272+ (lib) + 4 (fuzz) + 7 (pipeline)**
-
-### Fixed
-- **CI clippy:** pre-existing な `handle_tcp_control` / `update_adaptive_bitrate` の `too_many_arguments` warning で Rust Streaming Engine ジョブが恒常的に FAIL していたのを修正 (#21)
+### CI
+- **Coverage (nightly):** `cargo-llvm-cov` via taiki-e/install-action
+  produces Cobertura XML on `windows-latest`, uploaded as
+  `coverage-cobertura` artifact. `continue-on-error: true` while
+  baselines establish; threshold can be set once a few nights of
+  data are in.
+- **Installer build + Authenticode signing (merged from Phase D):**
+  `installer-build` job assembles the NSIS installer from
+  companion-app + driver artifacts; an Authenticode signing step
+  fires when `WINDOWS_PFX_BASE64` / `WINDOWS_PFX_PASSWORD` repo
+  secrets are present (PR builds skip it). Same pattern on the
+  companion exe. `Get-AuthenticodeSignature` reports
+  Valid / NotSigned in the action log.
+- **Android release keystore:** `client/app/build.gradle.kts`
+  wires `ANDROID_KEYSTORE_BASE64` + alias / password env vars,
+  with an ephemeral-keystore fallback so `assembleRelease`
+  succeeds even on forks / PRs.
 
 ### Docs
-- README / ARCHITECTURE / TODOS / CHANGELOG を一連のリファクタ/機能追加に合わせて同期
+- **`docs/SIGNING.md`:** operator-side guide — cert acquisition,
+  base-64 encoding for GitHub secrets, signtool wrapper invocation,
+  timestamping URL choice, verification.
+- **`docs/USER_GUIDE.md` / `TROUBLESHOOTING.md` / `FAQ.md`:**
+  Japanese user-facing manuals (cherry-picked from
+  `feat/v3-phase-f-docs`).
+
+### Deferred to post-RC1
+- DRS (Dynamic Resolution Scaling), NVENC VUI fullrange wiring,
+  Hand-tracking — all need NVIDIA GPU + Focus Vision headset to
+  verify and are out of scope for an "implement & validate" pass.
+- `engine.rs::run_streaming` split into session/frame/reconnection
+  modules and FFI type unification (`TrackingData` /
+  `ControllerState` into `fvp-common`). Both refactors are
+  test-net-ready on this branch; deferred to keep the rc1 window
+  short.
+
+## [Unreleased]
+
+(All entries previously listed here moved into [3.0.0-rc1] above on the
+release cut. Add new post-rc1 work below this header.)
 
 ## [2.2.1] - 2026-04-15
 
