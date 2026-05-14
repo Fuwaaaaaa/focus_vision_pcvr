@@ -90,7 +90,21 @@ struct CompanionApp {
     // Session Recording settings
     recording_enabled: bool,
     recording_output_dir: String,
+
+    // Engine liveness — `false` when status.json is missing or its mtime is
+    // older than ENGINE_STALE_THRESHOLD. Used by the Home tab banner.
+    // Defaults to false so a freshly-launched companion (before the first
+    // status.json read) shows "engine stopped" instead of misleading
+    // "everything's fine".
+    engine_alive: bool,
 }
+
+/// status.json is considered stale (engine probably died) once its mtime
+/// is older than this. The engine rewrites the file on every meaningful
+/// event (PIN issued, session started, frame stats updated). 5 s is
+/// generous enough to avoid false positives on a busy host but short
+/// enough that a real crash is surfaced quickly.
+const ENGINE_STALE_THRESHOLD: Duration = Duration::from_secs(5);
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -217,6 +231,11 @@ impl CompanionApp {
                 let cfg = config::LocalConfig::load();
                 cfg.recording.output_dir
             },
+            // Starts false: we haven't seen a fresh status.json yet, so we
+            // assume the engine is down until proven otherwise. The first
+            // read_engine_status() tick (within 1 s) will flip this to true
+            // if SteamVR is running and the engine is healthy.
+            engine_alive: false,
         }
     }
 
@@ -247,6 +266,20 @@ impl CompanionApp {
         let path = match dirs_next::data_dir() {
             Some(d) => d.join("FocusVisionPCVR").join("status.json"),
             None => return,
+        };
+
+        // Engine liveness from file mtime. If the file is missing or older
+        // than ENGINE_STALE_THRESHOLD, the engine has either not started or
+        // died. Read this BEFORE parsing so a stale-but-readable payload
+        // doesn't accidentally show "connected".
+        self.engine_alive = match std::fs::metadata(&path) {
+            Ok(meta) => meta
+                .modified()
+                .ok()
+                .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
+                .map(|age| age < ENGINE_STALE_THRESHOLD)
+                .unwrap_or(false),
+            Err(_) => false,
         };
 
         if let Ok(contents) = std::fs::read_to_string(&path) {
@@ -371,7 +404,41 @@ impl CompanionApp {
         });
         ui.label(egui::RichText::new("PCVR Streaming").size(14.0).color(text_muted));
 
-        ui.add_space(24.0);
+        ui.add_space(16.0);
+
+        // Engine-died banner. Surfaced when status.json is missing or its
+        // mtime is older than ENGINE_STALE_THRESHOLD — the engine has
+        // either not started, was killed, or SteamVR crashed.
+        //
+        // Note: the companion app CANNOT restart the engine itself because
+        // the engine lives inside vrserver.exe (loaded as a SteamVR driver
+        // staticlib). Only SteamVR's process-lifecycle restart works, so
+        // the banner directs the user there instead of offering a button.
+        if !self.engine_alive {
+            let red = egui::Color32::from_rgb(248, 113, 113);
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("●").color(red).size(16.0));
+                    ui.label(
+                        egui::RichText::new("ストリーミングエンジンが停止しています")
+                            .color(red)
+                            .strong(),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "SteamVR を起動 (または再起動) するとエンジンが立ち上がります。\
+                         SteamVR が動作中でもこの表示が消えない場合は、Settings タブの\
+                         Export Logs から診断情報を収集してください。",
+                    )
+                    .size(12.0)
+                    .color(text_muted),
+                );
+            });
+            ui.add_space(8.0);
+        }
+
+        ui.add_space(8.0);
 
         // Driver status
         ui.group(|ui| {
