@@ -39,17 +39,17 @@ See `ARCHITECTURE.md` for detailed system diagrams and data flow.
 cargo build --release -p streaming-engine          # Rust streaming engine
 cargo build --release -p focus-vision-companion    # PC companion app
 cargo build --release -p streaming-engine --features simulator --bins   # E2E binaries
-cargo test --workspace                              # 345+ tests
+cargo test --workspace                              # 450+ tests
 ```
 
 ## Testing
 ```bash
-cargo test --workspace                              # All tests (345+)
-cargo test -p streaming-engine                      # Engine: 280+ tests
-cargo test -p focus-vision-companion --bins         # Companion: 47 tests (config, ADB, export, status_parser, ui/settings validator)
+cargo test --workspace                              # All tests (450+)
+cargo test -p streaming-engine                      # Engine: 340+ tests + integration
+cargo test -p focus-vision-companion --bins         # Companion: 60 tests (config, ADB, export, status_parser, demo, svg_export, ui/settings validator)
 cargo test -p fvp-common                            # Common: protocol structs / flags / versioning
 cargo bench -p streaming-engine                     # Criterion benchmarks
-cargo clippy --workspace -- -D warnings             # CI clippy gate
+cargo clippy --workspace -- -D warnings             # CI clippy gate (some pre-existing toolchain regressions; new RC code is clean)
 # Fuzz targets (Linux CI / cargo-fuzz):
 cd rust/streaming-engine && cargo fuzz list         # fuzz_rtp, fuzz_fec, fuzz_protocol, fuzz_config, fuzz_slice, fuzz_recording
 # Headless E2E (simulator feature, runs full TCP+TLS+RTP+FEC+UDP loop in-process):
@@ -57,18 +57,24 @@ cargo run -p streaming-engine --bin focus-vision-headless --features simulator
 cargo test --workspace --features simulator -- --test-threads=1  # includes headless_e2e_test
 # C++ tests (requires CMake build):
 cd driver/build && cmake --build . --config Release
-ctest --test-dir driver/build --build-config Release --output-on-failure  # 30 gtest cases
+ctest --test-dir driver/build --build-config Release --output-on-failure  # 36 gtest cases
 ```
 
 ## Companion App
 ```bash
-cargo run -p focus-vision-companion  # Run the PC companion app
+cargo run -p focus-vision-companion          # Run the PC companion app
+cargo run -p focus-vision-companion -- --demo  # Demo mode — synthesizes status without engine
 ```
 
+`--demo` runs a 60 s scripted cycle (Disconnected → WaitingForPin
+"847251" → Connected with animated stats). Bypasses `status.json`,
+disables ADB scans, and shows a yellow "DEMO MODE" banner so the UI
+can be exercised without a VR rig.
+
 Tabs (file-per-tab under `rust/companion-app/src/ui/`):
-- **Home** — engine-stopped banner, driver status, contextual setup hint, PIN display, live stats sparklines, subsystem indicators
+- **Home** — engine-stopped banner, driver status, contextual setup hint, PIN display (with `Expires in` countdown when active), live stats sparklines, subsystem indicators, "Recent activity" log tail (collapsing)
 - **Deploy** — ADB device list, APK picker (path persists), install button
-- **Settings** — driver, audio (persists), sleep mode, face tracking, session recording with inline dir validation, codec radio, diagnostics zip export, reset-to-defaults (2-stage confirm)
+- **Settings** — driver, audio (persists), sleep mode, face tracking, session recording with inline dir validation, codec radio, diagnostics zip export, **stats SVG export**, reset-to-defaults (2-stage confirm)
 
 ## Config
 `config/default.toml` — override with `config/local.toml` (gitignored).
