@@ -1014,6 +1014,27 @@ async fn run_streaming(
     // to Phase 4.2 — it requires real Wi-Fi drop testing to validate.
     let mut reconnect_state = crate::control::reconnect::ReconnectState::new();
 
+    // Thermal governor lives for the whole engine — NVML init is non-trivial
+    // (~tens of ms) so we pay it once. `try_create_nvml` returns `None` on
+    // non-NVIDIA hosts and when the `nvml` cargo feature is compiled out,
+    // so every call site treats the governor as opt-in: present → cap by
+    // multiplier, absent → no cap. The base ceiling re-applies each session
+    // because `bitrate_ctrl` is per-session.
+    let mut thermal_gov: Option<crate::thermal::ThermalGovernor> =
+        if config.thermal.enabled {
+            crate::thermal::ThermalGovernor::try_create_nvml(config.thermal.clone())
+        } else {
+            None
+        };
+    if thermal_gov.is_some() {
+        log::info!(
+            "Thermal governor armed (warn={}°C / limit={}°C / emergency={}°C)",
+            config.thermal.warn_celsius,
+            config.thermal.limit_celsius,
+            config.thermal.emergency_celsius,
+        );
+    }
+
     loop {
         if cancel.is_cancelled() { break; }
 
@@ -1247,6 +1268,20 @@ async fn run_streaming(
                         &burst_detector,
                         gcc_enabled,
                     );
+
+                    // Thermal feedback. The governor internally rate-limits to
+                    // `config.thermal.poll_interval_seconds`; calling every
+                    // bitrate-adjust tick (~1 s) just skips early on most
+                    // ticks. `multiplier < 1.0` lowers the bitrate ceiling
+                    // until the GPU cools; on non-NVIDIA hosts the governor
+                    // is None and the whole block is a no-op.
+                    if let Some(ref mut gov) = thermal_gov {
+                        if let Some(multiplier) = gov.tick() {
+                            let base_max_bps = (config.video.bitrate_mbps as u64) * 1_000_000;
+                            let ceiling = (base_max_bps as f64 * multiplier) as u64;
+                            bitrate_ctrl.set_thermal_ceiling_bps(ceiling);
+                        }
+                    }
 
                     // Sync slice FEC encoders with current redundancy
                     if slice_fec_enabled {

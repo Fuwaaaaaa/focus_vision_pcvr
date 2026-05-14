@@ -3,9 +3,12 @@
 //!
 //! The governor is source-agnostic: production builds wrap NVML behind
 //! `GpuThermalSource`, tests use `MockGpuThermalSource`. NVML wiring is
-//! intentionally a stub until Phase 4.3 (real-hardware verification);
-//! `try_create_nvml()` always returns `None` for now so call sites cleanly
-//! degrade to "thermal disabled" without a hard build dependency.
+//! compiled out by default — enable the `nvml` cargo feature to pull in
+//! `nvml-wrapper` and let `try_create_nvml()` return a live source on
+//! NVIDIA hosts. On non-NVIDIA hardware (Intel/AMD/Apple/CI) the
+//! function returns `None` and call sites cleanly degrade to "thermal
+//! disabled", so always-on integration is safe even when the feature
+//! is compiled in.
 
 use std::sync::{atomic::{AtomicU32, Ordering}, Arc};
 use std::time::{Duration, Instant};
