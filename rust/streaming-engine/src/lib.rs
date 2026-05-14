@@ -66,13 +66,22 @@ pub fn write_status_file(
     fps: Option<u16>,
     bitrate_mbps: Option<u32>,
     subsystems: Option<&SubsystemStatus>,
+    pin_expires_in_seconds: Option<u32>,
 ) {
     let dir = match dirs_next::data_dir() {
         Some(d) => d.join("FocusVisionPCVR"),
         None => return,
     };
     let _ = std::fs::create_dir_all(&dir);
-    let json = build_status_json(status, pin, latency_us, fps, bitrate_mbps, subsystems);
+    let json = build_status_json(
+        status,
+        pin,
+        latency_us,
+        fps,
+        bitrate_mbps,
+        subsystems,
+        pin_expires_in_seconds,
+    );
 
     // Atomic write: write to temp file then rename to prevent partial reads
     let path = dir.join("status.json");
@@ -90,6 +99,7 @@ fn build_status_json(
     fps: Option<u16>,
     bitrate_mbps: Option<u32>,
     subsystems: Option<&SubsystemStatus>,
+    pin_expires_in_seconds: Option<u32>,
 ) -> String {
     let pin_str = pin.map(|p| format!("{:06}", p)).unwrap_or_else(|| "------".to_string());
 
@@ -112,6 +122,14 @@ fn build_status_json(
         if let Some(n) = serde_json::Number::from_f64(rounded as f64) {
             obj.insert("packet_loss_pct".to_string(), serde_json::Value::Number(n));
         }
+    }
+    // Only emit the field when the engine has a value to publish — the
+    // companion treats None as "old engine" rather than "expires now".
+    if let Some(remaining) = pin_expires_in_seconds {
+        obj.insert(
+            "pin_expires_in_seconds".to_string(),
+            serde_json::Value::from(remaining),
+        );
     }
     serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| "{}".to_string())
 }
@@ -164,7 +182,7 @@ pub extern "C" fn fvp_init() -> i32 {
                 if let Ok(mut guard) = ENGINE.write() {
                     *guard = Some(eng);
                 }
-                write_status_file("waiting", None, None, None, None, None);
+                write_status_file("waiting", None, None, None, None, None, None);
                 log::info!("Streaming engine started");
                 0
             }
@@ -569,7 +587,7 @@ mod tests {
 
     #[test]
     fn test_build_status_json_without_subsystems() {
-        let json = build_status_json("idle", Some(123456), Some(5000), Some(90), Some(120), None);
+        let json = build_status_json("idle", Some(123456), Some(5000), Some(90), Some(120), None, None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["status"], "idle");
         assert_eq!(v["pin"], "123456");
@@ -578,6 +596,7 @@ mod tests {
         assert_eq!(v["bitrate_mbps"], 120);
         assert!(v.get("ft_active").is_none());
         assert!(v.get("packet_loss_pct").is_none());
+        assert!(v.get("pin_expires_in_seconds").is_none());
     }
 
     #[test]
@@ -585,7 +604,7 @@ mod tests {
         // Every payload must carry schema_version so a stale companion can
         // detect engine-version mismatch instead of silently parsing the
         // wrong field shape.
-        let json = build_status_json("idle", None, None, None, None, None);
+        let json = build_status_json("idle", None, None, None, None, None, None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["schema_version"], fvp_common::STATUS_SCHEMA_VERSION);
     }
@@ -598,7 +617,7 @@ mod tests {
             audio_enabled: true,
             packet_loss_pct: 3.27,
         };
-        let json = build_status_json("streaming", None, None, None, None, Some(&sub));
+        let json = build_status_json("streaming", None, None, None, None, Some(&sub), None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["status"], "streaming");
         assert_eq!(v["pin"], "------");
@@ -616,8 +635,35 @@ mod tests {
     #[test]
     fn test_build_status_json_escapes_special_chars() {
         // Quote + backslash in status should not break parsing.
-        let json = build_status_json(r#"weird"state\with"#, None, None, None, None, None);
+        let json = build_status_json(r#"weird"state\with"#, None, None, None, None, None, None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["status"], r#"weird"state\with"#);
+    }
+
+    #[test]
+    fn test_build_status_json_emits_pin_expires_in_seconds_when_present() {
+        // The companion uses this field to render the "Expires in: M:SS"
+        // countdown beside the PIN. Missing field → no countdown; present
+        // field → companion can either display the value directly or
+        // count down locally from the moment of receipt.
+        let json = build_status_json(
+            "waiting",
+            Some(742103),
+            None,
+            None,
+            None,
+            None,
+            Some(247),
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["pin"], "742103");
+        assert_eq!(v["pin_expires_in_seconds"], 247);
+    }
+
+    #[test]
+    fn test_build_status_json_omits_pin_expires_when_none() {
+        let json = build_status_json("waiting", Some(742103), None, None, None, None, None);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("pin_expires_in_seconds").is_none());
     }
 }

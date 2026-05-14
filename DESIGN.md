@@ -63,9 +63,17 @@
 | Token | Hex | Usage |
 |-------|-----|-------|
 | success | #34D399 | 接続済み、正常 |
-| warning | #fbbf24 | ネットワーク品質低下 |
-| error | #f87171 | 切断、エラー |
+| warning | #fbbf24 | ネットワーク品質低下 / DEMO MODE バナー / PIN 期限 ≤60 s |
+| error | #f87171 | 切断、エラー / engine-stopped バナー / PIN 期限 ≤30 s |
 | info | #60a5fa | 情報通知 |
+
+### Status Banners
+1 行高、タブバーの直上。色は warning/error トークン、塗りは色を 8 % 程度に
+落とした暗色（例: warning fill = `#261E08`）でテキストを浮かせる。
+- **DEMO MODE**: warning。`--demo` 起動時のみ表示。文言は
+  "DEMO MODE — シミュレーション中（実エンジンは起動していません）"
+- **Engine Stopped**: error。`status.json` が 5 秒以上更新されないとき
+  Home タブ上部にカード形式で表示
 
 ## Spacing
 - **Base unit:** 8px

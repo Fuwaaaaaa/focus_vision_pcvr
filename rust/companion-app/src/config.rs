@@ -13,6 +13,10 @@ pub struct LocalConfig {
     pub face_tracking: FaceTrackingOverride,
     #[serde(default)]
     pub recording: RecordingOverride,
+    #[serde(default)]
+    pub audio: AudioOverride,
+    #[serde(default)]
+    pub deploy: DeployOverride,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,7 +77,35 @@ impl Default for RecordingOverride {
     }
 }
 
+/// Audio capture/encode overrides. Mirrors the engine's `[audio]` section
+/// (config/default.toml) so companion-side toggles persist across runs and
+/// can later be propagated to the engine (CONFIG_UPDATE) without losing state.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AudioOverride {
+    #[serde(default = "default_audio_enabled")]
+    pub enabled: bool,
+    /// Opus target bitrate, matches engine `[audio] bitrate_kbps` range 32..=512
+    #[serde(default = "default_audio_bitrate")]
+    pub bitrate_kbps: u32,
+}
+
+impl Default for AudioOverride {
+    fn default() -> Self {
+        Self { enabled: default_audio_enabled(), bitrate_kbps: default_audio_bitrate() }
+    }
+}
+
+/// Deploy-tab UI state worth keeping across runs (APK path, mostly so the
+/// user doesn't have to re-pick it every launch).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct DeployOverride {
+    #[serde(default)]
+    pub apk_path: String,
+}
+
 fn default_recording_enabled() -> bool { false }
+fn default_audio_enabled() -> bool { true }
+fn default_audio_bitrate() -> u32 { 128 }
 
 fn default_codec() -> String { "h265".to_string() }
 fn default_sleep_enabled() -> bool { true }
@@ -211,5 +243,49 @@ mod tests {
         let deserialized: LocalConfig = toml::from_str(&serialized).unwrap();
         assert!(deserialized.recording.enabled);
         assert_eq!(deserialized.recording.output_dir, "D:/captures");
+    }
+
+    #[test]
+    fn audio_default_matches_engine_defaults() {
+        let config = LocalConfig::default();
+        assert!(config.audio.enabled);
+        assert_eq!(config.audio.bitrate_kbps, 128);
+    }
+
+    #[test]
+    fn audio_override_roundtrip() {
+        let mut config = LocalConfig::default();
+        config.audio.enabled = false;
+        config.audio.bitrate_kbps = 64;
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: LocalConfig = toml::from_str(&serialized).unwrap();
+        assert!(!deserialized.audio.enabled);
+        assert_eq!(deserialized.audio.bitrate_kbps, 64);
+    }
+
+    #[test]
+    fn audio_section_missing_falls_back_to_default() {
+        // Older local.toml files won't have [audio] yet; the section is opt-in
+        // via #[serde(default)] so loading must still succeed with engine defaults.
+        let older_toml = r#"
+[video]
+codec = "h264"
+"#;
+        let config: LocalConfig = toml::from_str(older_toml).expect("should parse");
+        assert_eq!(config.video.codec, "h264");
+        assert!(config.audio.enabled);
+        assert_eq!(config.audio.bitrate_kbps, 128);
+    }
+
+    #[test]
+    fn deploy_apk_path_roundtrip() {
+        let mut config = LocalConfig::default();
+        config.deploy.apk_path = r"C:\builds\fvp-client-debug.apk".to_string();
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: LocalConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.deploy.apk_path,
+            r"C:\builds\fvp-client-debug.apk"
+        );
     }
 }

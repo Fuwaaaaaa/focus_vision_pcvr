@@ -7,6 +7,32 @@
 #include <stdlib.h>
 
 /**
+ * Realistic frame-size targets (bytes). 1832x1920 H.265 at 80 Mbps yields
+ * ~890 KB / IDR and ~110 KB / P-frame typical. We scale these down for
+ * the simulator so the channel doesn't OOM on a slow CI runner — the
+ * transport layer behaves identically at any size above MIN_SLICE_SIZE
+ * (16 KB) where slice FEC kicks in.
+ */
+#define DEFAULT_IDR_SIZE_BYTES (24 * 1024)
+
+#define DEFAULT_P_FRAME_SIZE_BYTES (4 * 1024)
+
+/**
+ * Hard-coded output format — matches `AudioCapture` so the downstream Opus
+ * encoder sees the same shape regardless of source.
+ */
+#define SAMPLE_RATE_HZ 48000
+
+#define CHANNELS 2
+
+/**
+ * Chunk duration. 10 ms matches the Opus default frame size in
+ * `config/default.toml`, so each synthetic chunk maps 1:1 to one
+ * downstream encoder frame.
+ */
+#define CHUNK_MS 10
+
+/**
  * Minimum frame size for slice-based FEC to be beneficial.
  * Below this threshold, RS encoding is already fast enough that slicing adds overhead.
  */
