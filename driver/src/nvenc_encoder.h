@@ -165,6 +165,28 @@ static_assert(offsetof(NV_ENC_CONFIG_H264, h264VUIParameters) == 32,
 static_assert(sizeof(NV_ENC_CODEC_CONFIG) == 1024,
     "NV_ENC_CODEC_CONFIG (union of HEVC/H264 configs) size drifted");
 
+// -----------------------------------------------------------------------------
+// VUI configuration helper.
+//
+// Both H.264 and HEVC code paths in `init()` populate the same VUI fields
+// from `NvencEncoder::Config`. Extracting the body into an inline helper
+// gives us a single, gtest-friendly entry point that the driver test
+// suite can drive without spinning up a real NVENC encoder (which would
+// need a GPU). The signature takes a generic `Vui&` so both
+// `NV_ENC_CONFIG_HEVC_VUI` and `NV_ENC_CONFIG_H264_VUI` can be configured
+// through it — they're a typedef alias today but the template defends
+// against future divergence.
+template <class Vui>
+inline void applyVuiFromConfig(Vui& vui, bool full_range) {
+    vui.videoSignalTypePresentFlag = 1;
+    vui.videoFormat = 5; // Unspecified
+    vui.videoFullRangeFlag = full_range ? 1 : 0;
+    vui.colourDescriptionPresentFlag = 1;
+    vui.colourPrimaries = 1;            // BT.709
+    vui.transferCharacteristics = 1;    // BT.709
+    vui.matrixCoeffs = 1;               // BT.709
+}
+
 struct NV_ENC_CONFIG {
     uint32_t         version;
     GUID             profileGUID;

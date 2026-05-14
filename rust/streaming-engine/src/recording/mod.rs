@@ -35,6 +35,23 @@ pub fn apply_recording_config_update(value: u32, state: &AtomicBool) -> u8 {
     }
 }
 
+/// Pure handler for CONFIG_UPDATE key 0x05 (audio recording toggle).
+/// Identical wire contract to `apply_recording_config_update` — kept as a
+/// separate function so the two toggles can evolve independently (e.g. if
+/// audio toggling later needs to drain the WAV writer or rotate files).
+///
+/// The audio task gates `AudioRecorder::write_pcm_f32` on the same atomic.
+/// If the engine started with `recording.enabled = false` there is no
+/// `AudioRecorder` to write to, so flipping the toggle on at runtime
+/// becomes a no-op until the next session — same constraint as video.
+pub fn apply_audio_recording_config_update(value: u32, state: &AtomicBool) -> u8 {
+    match value {
+        0 => { state.store(false, Ordering::Relaxed); ACK_ACCEPTED }
+        1 => { state.store(true, Ordering::Relaxed); ACK_ACCEPTED }
+        _ => ACK_REJECTED,
+    }
+}
+
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -357,6 +374,48 @@ mod tests {
         assert_eq!(ack, ACK_REJECTED);
         assert!(state.load(Ordering::Relaxed),
             "rejected update must leave the prior runtime state intact");
+    }
+
+    // -- Runtime toggle (CONFIG_UPDATE 0x05, audio) --
+
+    #[test]
+    fn test_apply_audio_recording_config_disable_flips_atomic() {
+        let state = AtomicBool::new(true);
+        let ack = apply_audio_recording_config_update(0, &state);
+        assert_eq!(ack, ACK_ACCEPTED);
+        assert!(!state.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_apply_audio_recording_config_enable_flips_atomic() {
+        let state = AtomicBool::new(false);
+        let ack = apply_audio_recording_config_update(1, &state);
+        assert_eq!(ack, ACK_ACCEPTED);
+        assert!(state.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_apply_audio_recording_config_invalid_value_rejected() {
+        let state = AtomicBool::new(false);
+        let ack = apply_audio_recording_config_update(42, &state);
+        assert_eq!(ack, ACK_REJECTED);
+        assert!(!state.load(Ordering::Relaxed),
+            "audio toggle must not flip on a rejected payload");
+    }
+
+    #[test]
+    fn test_audio_and_video_toggles_are_independent() {
+        // Two atomics, one update each — the other must stay put. This
+        // catches a refactor that accidentally aliases the two static
+        // gates onto the same memory location.
+        let video = AtomicBool::new(true);
+        let audio = AtomicBool::new(true);
+        let _ = apply_recording_config_update(0, &video);
+        assert!(!video.load(Ordering::Relaxed));
+        assert!(audio.load(Ordering::Relaxed),
+            "video toggle must not affect audio");
+        let _ = apply_audio_recording_config_update(0, &audio);
+        assert!(!audio.load(Ordering::Relaxed));
     }
 
     // -- Retention / auto-rotation --

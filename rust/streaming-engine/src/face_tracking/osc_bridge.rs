@@ -4,6 +4,11 @@ use std::net::UdpSocket;
 /// 0.6 gives a good balance between responsiveness and jitter reduction.
 const DEFAULT_SMOOTHING: f32 = 0.6;
 
+/// Default VRChat OSC listener address. The bridge sends here unless
+/// overridden via `set_target()` (used by integration tests to bind a
+/// loopback receiver on an ephemeral port).
+const DEFAULT_TARGET: &str = "127.0.0.1:9000";
+
 /// VRCFaceTracking OSC bridge.
 /// Receives HTC facial blendshapes (51 floats) from HMD via TCP,
 /// applies EMA smoothing to reduce jitter, converts to VRChat OSC
@@ -16,6 +21,9 @@ pub struct OscBridge {
     prev_eye: [f32; 14],
     /// Active expression profile weights. None = all weights 1.0 (no scaling).
     profile_weights: Option<Vec<f32>>,
+    /// OSC destination. `DEFAULT_TARGET` in production; integration tests
+    /// override this to route to a captured-loopback receiver.
+    target: String,
 }
 
 // HTC lip expression names (37), in order of XrLipExpressionHTC enum
@@ -60,7 +68,7 @@ impl OscBridge {
     pub fn with_smoothing(smoothing: f32) -> Self {
         let socket = UdpSocket::bind("0.0.0.0:0").ok();
         if socket.is_some() {
-            log::info!("OSC bridge initialized (target: 127.0.0.1:9000, smoothing={:.2})", smoothing);
+            log::info!("OSC bridge initialized (target: {}, smoothing={:.2})", DEFAULT_TARGET, smoothing);
         }
         Self {
             socket,
@@ -69,7 +77,17 @@ impl OscBridge {
             prev_lip: [0.0; 37],
             prev_eye: [0.0; 14],
             profile_weights: None,
+            target: DEFAULT_TARGET.to_string(),
         }
+    }
+
+    /// Override the OSC destination. Used by integration tests to route
+    /// to a captured-loopback receiver; production code keeps the
+    /// default (`127.0.0.1:9000`, where VRChat listens). Accepts any
+    /// `ToSocketAddrs` shape so callers can pass `"127.0.0.1:N"` or a
+    /// pre-resolved `SocketAddr`.
+    pub fn set_target(&mut self, target: impl Into<String>) {
+        self.target = target.into();
     }
 
     /// Send face data as OSC messages to VRChat (port 9000).
@@ -90,7 +108,7 @@ impl OscBridge {
             None => return,
         };
 
-        let target = "127.0.0.1:9000";
+        let target = self.target.as_str();
         let alpha = self.smoothing;
 
         if lip_valid {
