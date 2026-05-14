@@ -3,6 +3,9 @@ mod config;
 mod driver;
 mod export;
 mod stats_history;
+mod status_parser;
+
+use status_parser::{parse_status_json, ConnectionStatus};
 
 use eframe::egui;
 use egui_plot::{Line, PlotPoints, Plot};
@@ -118,13 +121,6 @@ enum Tab {
     Home,
     Deploy,
     Settings,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum ConnectionStatus {
-    Disconnected,
-    WaitingForPin,
-    Connected,
 }
 
 impl CompanionApp {
@@ -299,53 +295,55 @@ impl CompanionApp {
             Err(_) => false,
         };
 
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
-                // schema_version is absent in pre-v3.0 payloads; treat that as
-                // implicit schema 1 and proceed best-effort. A future-bumped
-                // schema_version is only logged so a stale companion doesn't
-                // refuse to render — extra/renamed fields are tolerated.
-                let observed = val
-                    .get("schema_version")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as u32;
-                if observed != fvp_common::STATUS_SCHEMA_VERSION {
-                    log::debug!(
-                        "status.json schema_version mismatch: companion expects {}, engine wrote {}",
-                        fvp_common::STATUS_SCHEMA_VERSION,
-                        observed
-                    );
-                }
-                let status = val["status"].as_str().unwrap_or("unknown");
-                match status {
-                    "waiting" => {
-                        if let Some(pin) = val["pin"].as_str() {
-                            if pin != "----" {
-                                self.pin_code = pin.to_string();
-                                self.connection_status = ConnectionStatus::WaitingForPin;
-                            } else {
-                                self.connection_status = ConnectionStatus::Disconnected;
-                            }
-                        }
-                    }
-                    "streaming" => {
-                        self.connection_status = ConnectionStatus::Connected;
-                        if let Some(pin) = val["pin"].as_str() {
-                            self.pin_code = pin.to_string();
-                        }
-                        self.latency_ms = val["latency_us"].as_u64().unwrap_or(0) as f32 / 1000.0;
-                        self.fps = val["fps"].as_u64().unwrap_or(0) as u32;
-                        self.bitrate_mbps = val["bitrate_mbps"].as_u64().unwrap_or(0) as f32;
-                        self.sub_ft_active = val["ft_active"].as_bool().unwrap_or(false);
-                        self.sub_sleep_active = val["sleep_active"].as_bool().unwrap_or(false);
-                        self.sub_audio_enabled = val["audio_enabled"].as_bool().unwrap_or(true);
-                        self.sub_packet_loss = val["packet_loss_pct"].as_f64().unwrap_or(0.0) as f32;
-                        self.stats_history.push(self.latency_ms, self.fps as f32, self.sub_packet_loss);
-                    }
-                    _ => {
-                        self.connection_status = ConnectionStatus::Disconnected;
-                    }
-                }
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let parsed = match parse_status_json(&contents) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Forward-compat: a schema bump only logs — the parser already
+        // tolerates extra fields and missing optional ones.
+        if let Some(observed) = parsed.schema_version {
+            if observed != fvp_common::STATUS_SCHEMA_VERSION {
+                log::debug!(
+                    "status.json schema_version mismatch: companion expects {}, engine wrote {}",
+                    fvp_common::STATUS_SCHEMA_VERSION,
+                    observed
+                );
+            }
+        }
+
+        self.apply_parsed_status(parsed);
+    }
+
+    /// Apply a parsed status payload to the live UI state. Split out from
+    /// `read_engine_status` so unit tests can drive the state machine
+    /// without touching the filesystem.
+    fn apply_parsed_status(&mut self, parsed: status_parser::ParsedStatus) {
+        use status_parser::ConnectionStatus as CS;
+        self.connection_status = parsed.connection;
+
+        match parsed.connection {
+            CS::Disconnected => {
+                // Leave stats alone on transient disconnects so the sparkline
+                // doesn't snap to zero between status writes.
+            }
+            CS::WaitingForPin => {
+                self.pin_code = parsed.pin;
+            }
+            CS::Connected => {
+                self.pin_code = parsed.pin;
+                self.latency_ms = parsed.latency_ms;
+                self.fps = parsed.fps;
+                self.bitrate_mbps = parsed.bitrate_mbps;
+                self.sub_ft_active = parsed.subsystems.ft_active.unwrap_or(false);
+                self.sub_sleep_active = parsed.subsystems.sleep_active.unwrap_or(false);
+                self.sub_audio_enabled = parsed.subsystems.audio_enabled.unwrap_or(true);
+                self.sub_packet_loss = parsed.subsystems.packet_loss_pct.unwrap_or(0.0);
+                self.stats_history.push(self.latency_ms, self.fps as f32, self.sub_packet_loss);
             }
         }
     }
