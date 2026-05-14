@@ -8,7 +8,7 @@
 
 [![License: Dual](https://img.shields.io/badge/License-MIT%20%7C%20Commercial-34D399.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-stable-e8e8ec.svg?logo=rust&logoColor=e8e8ec)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-345%2B-34D399.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-450%2B-34D399.svg)](#testing)
 [![Version](https://img.shields.io/badge/version-3.0.0-34D399.svg)](CHANGELOG.md)
 
 </div>
@@ -126,14 +126,17 @@ cargo build --release -p streaming-engine
 cargo build --release -p focus-vision-companion
 
 # テスト
-cargo test --workspace  # 263+ tests
+cargo test --workspace  # 450+ tests
+
+# Companion を「実機なし」で試す（デモモード）
+cargo run -p focus-vision-companion -- --demo
 ```
 
 <details>
 <summary><b>C++ テスト (GoogleTest)</b></summary>
 
 ```bash
-cd driver/build && ctest  # QPマップ計算 7 tests
+cd driver/build && ctest  # 36 tests (QP map / NVENC ABI / VUI)
 ```
 
 </details>

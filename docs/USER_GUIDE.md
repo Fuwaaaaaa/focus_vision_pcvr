@@ -47,6 +47,13 @@ VIVE Focus Vision を Wi-Fi 経由で PC につなぎ、SteamVR ゲームをワ�
 - **Driver status**: `Installed ✓` であることを確認
 - **PIN**: `------` (まだ表示されない) — HMD 接続待ち
 
+> **インストール前に試したい場合 (デモモード):** PowerShell から
+> `focus-vision.exe --demo` または `cargo run -p focus-vision-companion -- --demo`
+> で起動すると、ヘッドセット未接続でも UI が「接続中 → ストリーミング中」と
+> 動いて見えます。画面上部に黄色の "DEMO MODE" バナーが表示され、ADB
+> スキャンや実エンジンとの通信はすべて無効化されます。製品ツアー・スクリーン
+> 録画・操作練習用です。
+
 次に **Deploy to HMD タブ** に移動して APK をインストールします。
 
 ### ステップ 4: HMD に APK を配信
