@@ -25,7 +25,7 @@ fn load(name: &str) -> Scenario {
 }
 
 #[test]
-fn scenario_golden_path() {
+fn scenario_0_golden_path() {
     let scenario = load("golden_path.json");
     let report = run_scenario(&scenario)
         .unwrap_or_else(|e| panic!("scenario runner failed: {}", e));

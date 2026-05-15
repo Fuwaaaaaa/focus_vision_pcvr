@@ -59,6 +59,43 @@ unsafe fn libc_setsockopt(s: usize, level: i32, optname: i32, optval: *const u8,
     unsafe { setsockopt(s, level, optname, optval, optlen) }
 }
 
+/// Simulator-only knob: probability (0..=100) that each outbound packet is
+/// silently dropped before the syscall. Used by scenario tests to inject
+/// packet loss on the engine→HMD video path so the adaptive bitrate
+/// controller (and other loss-sensitive code) get exercised in CI without
+/// a real flaky network. Production builds compile this out completely.
+#[cfg(feature = "simulator")]
+pub static SIMULATOR_LOSS_PCT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Test-only: set the simulator drop probability. Values are clamped to
+/// 0..=100. Pass 0 to disable. No-op in production builds.
+#[cfg(feature = "simulator")]
+pub fn set_simulator_loss_pct(pct: u8) {
+    SIMULATOR_LOSS_PCT.store(pct.min(100), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-only: read the current loss probability.
+#[cfg(feature = "simulator")]
+pub fn simulator_loss_pct() -> u8 {
+    SIMULATOR_LOSS_PCT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Decide whether to drop the current packet. Compiled out of production.
+#[inline(always)]
+fn should_drop_packet() -> bool {
+    #[cfg(feature = "simulator")]
+    {
+        let pct = SIMULATOR_LOSS_PCT.load(std::sync::atomic::Ordering::Relaxed);
+        if pct > 0 {
+            // `rand::random` is already a dependency; using % keeps the
+            // distribution good enough for a coarse loss simulator.
+            return rand::random::<u8>() % 100 < pct;
+        }
+    }
+    false
+}
+
 /// Sends RTP packets over UDP.
 pub struct UdpSender {
     socket: UdpSocket,
@@ -73,11 +110,17 @@ impl UdpSender {
     }
 
     pub async fn send(&self, data: &[u8]) -> std::io::Result<usize> {
+        if should_drop_packet() {
+            return Ok(data.len()); // pretend the send succeeded
+        }
         self.socket.send_to(data, self.target).await
     }
 
     pub async fn send_all(&self, packets: &[super::rtp::RtpPacket]) -> std::io::Result<()> {
         for pkt in packets {
+            if should_drop_packet() {
+                continue;
+            }
             self.socket.send_to(&pkt.data, self.target).await?;
         }
         Ok(())
@@ -145,5 +188,47 @@ mod tests {
             assert_eq!(len, 100);
             assert_eq!(buf[0], i);
         }
+    }
+
+    #[cfg(feature = "simulator")]
+    #[tokio::test]
+    async fn test_simulator_loss_drops_packets() {
+        // Bind sender + receiver, set 100% loss, confirm zero packets reach
+        // the receiver. Reset to 0 at the end so other tests aren't poisoned.
+        let receiver = UdpReceiver::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let recv_addr = receiver.local_addr().unwrap();
+        let sender = UdpSender::new(recv_addr).await.unwrap();
+
+        set_simulator_loss_pct(100);
+        assert_eq!(simulator_loss_pct(), 100);
+
+        for _ in 0..32 {
+            sender.send(&[0xAB; 64]).await.unwrap();
+        }
+
+        // Pure 100% drop ⇒ recv_from with a small timeout must time out.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            receiver.recv(&mut [0u8; 64]),
+        ).await;
+        set_simulator_loss_pct(0); // reset before assert so failure doesn't poison
+        assert!(result.is_err(), "expected no packets through 100% loss, got one");
+    }
+
+    #[cfg(feature = "simulator")]
+    #[tokio::test]
+    async fn test_simulator_loss_zero_passes_through() {
+        // With loss=0 the sender behaves exactly like the un-gated path.
+        set_simulator_loss_pct(0);
+        let receiver = UdpReceiver::new("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let sender = UdpSender::new(receiver.local_addr().unwrap()).await.unwrap();
+
+        sender.send(b"healthy").await.unwrap();
+        let mut buf = [0u8; 32];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            receiver.recv(&mut buf),
+        ).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"healthy");
     }
 }

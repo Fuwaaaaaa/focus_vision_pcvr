@@ -337,8 +337,12 @@ impl StreamingEngine {
         }
     }
 
-    /// Submit a frame for encoding and sending. Called from C++ thread.
+    /// Submit a frame for encoding and sending. Called from C++ thread (via
+    /// FFI) and from Rust callers (scenario runner). Taps the raw NAL into
+    /// the active recorder before queuing so recording captures every frame
+    /// the producer offered — including ones the send channel rejects.
     pub fn submit_frame(&self, frame: EncodedFrame) -> bool {
+        self.write_recording_nal(&frame.nal_data);
         match self.frame_tx.try_send(frame) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {

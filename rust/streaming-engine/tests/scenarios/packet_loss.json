@@ -1,0 +1,25 @@
+{
+  "name": "packet_loss",
+  "timeout_sec": 30,
+  "config_overrides": {
+    "video.framerate": 60,
+    "audio.enabled": false
+  },
+  "client": {
+    "pin_source": "status_json",
+    "duration_sec": 2.0,
+    "tracking_pattern": null,
+    "face_pattern": null,
+    "capture_haptic": false,
+    "capture_sleep_events": false,
+    "osc_listen_port": null
+  },
+  "fault_injection": [],
+  "stimuli": [
+    { "kind": "set_loss_pct", "at_sec": 0.2, "pct": 80 },
+    { "kind": "clear_loss_pct", "at_sec": 1.8 }
+  ],
+  "assertions": {
+    "max_video_packets": 400
+  }
+}
