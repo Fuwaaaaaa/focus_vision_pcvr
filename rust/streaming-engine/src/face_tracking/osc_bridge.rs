@@ -152,7 +152,10 @@ impl OscBridge {
             if scaled > 0.01 {
                 let addr = format!("/avatar/parameters/{}", names[i]);
                 if let Some(msg) = encode_osc_float(&addr, scaled) {
-                    let _ = socket.send_to(&msg, target);
+                    match socket.send_to(&msg, target) {
+                        Ok(n) => log::trace!("OSC send {} -> {} ({}B sent)", addr, target, n),
+                        Err(e) => log::warn!("OSC send to {} failed: {}", target, e),
+                    }
                 }
             }
         }

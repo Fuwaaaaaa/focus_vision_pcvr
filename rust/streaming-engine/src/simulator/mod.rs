@@ -11,6 +11,12 @@
 //! flows over UDP to the tracking port. Stats are aggregated and returned
 //! when the run completes so tests can assert on them.
 
+pub mod face_sender;
+pub mod osc_loopback;
+pub mod scenario;
+pub mod test_helpers;
+pub mod tracking_sender;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,6 +28,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::transport::rtp::RtpDepacketizer;
 use crate::transport::udp::UdpReceiver;
+
+use self::face_sender::{encode_face_data, next_face_sample, FaceMode};
+use self::osc_loopback::{OscCapture, OscLoopback};
 
 /// Configuration knobs for one mock-client run.
 #[derive(Debug, Clone)]
@@ -41,6 +50,14 @@ pub struct MockClientConfig {
     pub tracking_target: SocketAddr,
     /// HEARTBEAT_ACK cadence. Default 500 ms matches `HEARTBEAT_INTERVAL_MS`.
     pub heartbeat_interval: Duration,
+    /// If `Some`, the stream loop emits FACE_DATA (0x35) at `face_send_interval`.
+    pub face_pattern: Option<FaceMode>,
+    /// How often to emit synthetic face data when `face_pattern` is set.
+    pub face_send_interval: Duration,
+    /// If `Some`, bind a UDP loopback on this port to capture OSC messages the
+    /// engine's `OscBridge` emits. `MockClientStats::osc_messages` ends up with
+    /// the captured `address → values` map.
+    pub osc_listen_port: Option<u16>,
 }
 
 impl MockClientConfig {
@@ -58,6 +75,9 @@ impl MockClientConfig {
                 udp_port + fvp_common::TRACKING_PORT_OFFSET,
             ),
             heartbeat_interval: Duration::from_millis(fvp_common::HEARTBEAT_INTERVAL_MS),
+            face_pattern: None,
+            face_send_interval: Duration::from_millis(50), // 20 Hz, plenty for OSC capture
+            osc_listen_port: None,
         }
     }
 }
@@ -73,6 +93,11 @@ pub struct MockClientStats {
     pub video_packets_received: u64,
     /// HEARTBEAT_ACK messages sent.
     pub heartbeats_sent: u64,
+    /// FACE_DATA messages sent (mock-client → engine) when `face_pattern` is set.
+    pub face_messages_sent: u64,
+    /// Captured OSC traffic from the loopback receiver. Empty when
+    /// `osc_listen_port` is `None`.
+    pub osc_messages: OscCapture,
     /// Connection establishment duration (TCP+TLS+handshake total).
     pub connect_duration: Duration,
     /// Total wall time the run spent streaming after the handshake.
@@ -338,14 +363,39 @@ where
                         }
                     }
                     Err(e) => {
-                        log::warn!("mock-client UDP recv error: {}", e);
-                        break;
+                        log::warn!("mock-client UDP recv skipped: {} ({:?})", e, e.kind());
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                 },
                 _ = video_cancel.cancelled() => break,
             }
         }
+        log::info!("mock-client video receiver task exited");
     });
+
+    // Optional OSC loopback: when set, bind a UDP receiver on the supplied
+    // port and capture `/avatar/parameters/*` traffic emitted by the engine's
+    // OscBridge. The handle survives the spawned task so we can snapshot
+    // captured messages after the loop exits.
+    let osc_state = if let Some(port) = config.osc_listen_port {
+        match OscLoopback::bind(port).await {
+            Ok(lb) => {
+                log::debug!("mock-client: OSC loopback bound on port {}", lb.local_port());
+                let handle = lb.capture_handle();
+                let osc_cancel = cancel.clone();
+                let task = tokio::spawn(async move {
+                    lb.run(osc_cancel).await;
+                });
+                Some((handle, task))
+            }
+            Err(e) => {
+                log::warn!("mock-client OSC loopback bind on port {} failed: {}", port, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Periodic HEARTBEAT_ACK on the TCP channel. Payload mirrors a minimal
     // production heartbeat (decode latency + packet loss percentage —
@@ -353,6 +403,16 @@ where
     let deadline = config.duration.map(|d| Instant::now() + d);
     let heartbeat_interval = config.heartbeat_interval;
     let mut next_heartbeat = Instant::now() + heartbeat_interval;
+
+    // Optional FACE_DATA emission on the same TCP channel. `next_face` is
+    // `Some(deadline)` when `face_pattern` is set; we share the heartbeat
+    // loop's timing logic rather than spinning up a second task because the
+    // TCP writer can't be split cheaply without restructuring `send_message`.
+    let face_send_interval = config.face_send_interval;
+    let face_start = Instant::now();
+    let mut next_face: Option<Instant> =
+        config.face_pattern.map(|_| Instant::now() + face_send_interval);
+
     loop {
         if cancel.is_cancelled() {
             break;
@@ -363,8 +423,9 @@ where
                 break;
             }
         }
-        // 6-byte payload: decode_latency_us:u32 (0) + packet_loss_pct:u16 (0)
         let now = Instant::now();
+
+        // 6-byte payload: decode_latency_us:u32 (0) + packet_loss_pct:u16 (0)
         if now >= next_heartbeat {
             let payload = [0u8; 6];
             if let Err(e) = send_message(&mut tcp, msg_type::HEARTBEAT_ACK, &payload).await {
@@ -377,11 +438,37 @@ where
             }
             next_heartbeat = now + heartbeat_interval;
         }
-        // Sleep until either the next heartbeat or cancel/deadline-check tick.
-        let next_event = match deadline {
-            Some(d) => d.min(next_heartbeat),
-            None => next_heartbeat,
-        };
+
+        if let (Some(face_mode), Some(fire_at)) = (config.face_pattern, next_face) {
+            if now >= fire_at {
+                let t_ns = now.saturating_duration_since(face_start).as_nanos() as u64;
+                let (lv, ev, lip, eye) = next_face_sample(face_mode, t_ns);
+                let payload = encode_face_data(lv, ev, &lip, &eye);
+                if let Err(e) = send_message(&mut tcp, msg_type::FACE_DATA, &payload).await {
+                    log::warn!("mock-client face-data send failed: {}", e);
+                    break;
+                }
+                {
+                    let mut s = stats.lock().unwrap();
+                    s.face_messages_sent += 1;
+                }
+                next_face = Some(now + face_send_interval);
+            }
+        }
+
+        // Sleep until either the next heartbeat, next face send, or
+        // cancel/deadline-check tick.
+        let mut next_event = next_heartbeat;
+        if let Some(f) = next_face {
+            if f < next_event {
+                next_event = f;
+            }
+        }
+        if let Some(d) = deadline {
+            if d < next_event {
+                next_event = d;
+            }
+        }
         let now2 = Instant::now();
         let nap = if next_event > now2 {
             (next_event - now2).min(Duration::from_millis(100))
@@ -401,8 +488,24 @@ where
     video_handle.abort();
     let _ = video_handle.await;
 
+    // Drain OSC capture if we spawned it. The loopback's own cancel is fed
+    // by the main `cancel` token; if the loop exited via `deadline` instead
+    // of cancellation, abort the task so we don't dangle.
+    let osc_messages = if let Some((handle, task)) = osc_state {
+        // Give the receiver a brief moment to drain any in-flight UDP
+        // packets before we tear it down. 50 ms is well under each
+        // scenario's overhead budget.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+        handle.lock().map(|g| g.clone()).unwrap_or_default()
+    } else {
+        OscCapture::new()
+    };
+
     let final_stats = {
-        let s = stats.lock().unwrap();
+        let mut s = stats.lock().unwrap();
+        s.osc_messages = osc_messages;
         s.clone()
     };
     Ok(final_stats)

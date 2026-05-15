@@ -1,0 +1,29 @@
+{
+  "name": "face_tracking",
+  "timeout_sec": 30,
+  "config_overrides": {
+    "video.framerate": 60,
+    "audio.enabled": false
+  },
+  "client": {
+    "pin_source": "status_json",
+    "duration_sec": 1.5,
+    "tracking_pattern": null,
+    "face_pattern": { "kind": "exaggerate" },
+    "capture_haptic": false,
+    "osc_listen_port": null
+  },
+  "fault_injection": [],
+  "stimuli": [],
+  "assertions": {
+    "min_frames_decoded": 5,
+    "min_idr_frames": 1,
+    "min_face_messages_sent": 10,
+    "expect_osc_addresses": [
+      "/avatar/parameters/JawOpen",
+      "/avatar/parameters/EyeLeftBlink",
+      "/avatar/parameters/MouthSmileRight"
+    ],
+    "min_osc_messages": 100
+  }
+}
