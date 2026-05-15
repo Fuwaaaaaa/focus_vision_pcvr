@@ -4,7 +4,25 @@
       "Bash(git submodule:*)",
       "Bash(cmake:*)",
       "Bash(cargo build:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(git remote *)",
+      "Bash(git fetch *)",
+      "Bash(git ls-remote *)",
+      "Bash(git push *)",
+      "Bash(gh release *)",
+      "Bash(git tag *)",
+      "Bash(git -C C:/project/test/focus_vision_pcvr status --short)",
+      "Bash(git -C C:/project/test/focus_vision_pcvr log --oneline -15)",
+      "Bash(git -C C:/project/test/focus_vision_pcvr branch --show-current)",
+      "Bash(git -C C:/project/test/focus_vision_pcvr tag --sort=-creatordate)",
+      "Bash(gh run *)",
+      "Bash(git -C C:/project/test/focus_vision_pcvr diff .claude/settings.local.json)",
+      "Bash(gh pr *)",
+      "Bash(git ls-tree *)",
+      "Bash(git checkout *)",
+      "Bash(git cherry-pick *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
