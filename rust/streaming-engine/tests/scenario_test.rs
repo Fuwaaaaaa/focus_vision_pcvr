@@ -37,6 +37,24 @@ fn scenario_golden_path() {
 }
 
 #[test]
+fn scenario_sleep_cycle() {
+    let scenario = load("sleep_cycle.json");
+    let report = run_scenario(&scenario)
+        .unwrap_or_else(|e| panic!("scenario runner failed: {}", e));
+    if let Some(stats) = &report.stats {
+        eprintln!(
+            "sleep_cycle: passed={} duration={:?} frames={} sleep_enter={} sleep_exit={}",
+            report.passed,
+            report.duration,
+            stats.frames_decoded,
+            stats.sleep_enter_count,
+            stats.sleep_exit_count,
+        );
+    }
+    report.assert_passed();
+}
+
+#[test]
 fn scenario_haptic() {
     let scenario = load("haptic.json");
     let report = run_scenario(&scenario)
