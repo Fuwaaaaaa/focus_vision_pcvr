@@ -25,7 +25,9 @@
       "Bash(git commit -m ' *)",
       "Bash(ctest --build-config Release --output-on-failure)",
       "Bash(git stash *)",
-      "Bash(git rebase *)"
+      "Bash(git rebase *)",
+      "Bash(git pull *)",
+      "Bash(git -c core.editor=true cherry-pick --continue)"
     ]
   }
 }
