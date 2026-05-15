@@ -38,8 +38,24 @@ jobs:
         - name: Test (simulator)
           # --test-threads=1 because the headless_e2e_test pair shares
           # %APPDATA%/FocusVisionPCVR/status.json — running them in parallel
-          # would race the PIN reads/writes.
+          # would race the PIN reads/writes. The same flag also keeps the
+          # JSON-driven scenario_test / scenario_transport_test binaries
+          # serial within their process so their status.json polling is
+          # deterministic.
           run: cargo test --release --workspace --features simulator -- --test-threads=1
+        - name: Upload scenario artifacts
+          # Captures the `recording.json` scenario's encoded output and
+          # any other files the scenario runner wrote (session_log JSONL,
+          # etc.). Uploads on both success and failure so a red CI is
+          # debuggable from the artifact tab. The path is the per-crate
+          # target dir cargo uses as the integration tests' CWD.
+          if: always()
+          uses: actions/upload-artifact@v4
+          with:
+            name: scenario-artifacts
+            path: rust/streaming-engine/target/scenario-artifacts/
+            retention-days: 7
+            if-no-files-found: ignore
         - name: Clippy (production)
           run: cargo clippy --workspace -- -D warnings
         - name: Clippy (simulator)
