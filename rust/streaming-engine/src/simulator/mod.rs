@@ -31,6 +31,7 @@ use crate::transport::udp::UdpReceiver;
 
 use self::face_sender::{encode_face_data, next_face_sample, FaceMode};
 use self::osc_loopback::{OscCapture, OscLoopback};
+use crate::engine::HapticEvent;
 
 /// Configuration knobs for one mock-client run.
 #[derive(Debug, Clone)]
@@ -58,6 +59,9 @@ pub struct MockClientConfig {
     /// engine's `OscBridge` emits. `MockClientStats::osc_messages` ends up with
     /// the captured `address → values` map.
     pub osc_listen_port: Option<u16>,
+    /// When true, spawn a TCP reader task that decodes `HAPTIC_EVENT (0x38)`
+    /// messages from the engine into `MockClientStats::haptic_events_received`.
+    pub capture_haptic: bool,
 }
 
 impl MockClientConfig {
@@ -78,6 +82,7 @@ impl MockClientConfig {
             face_pattern: None,
             face_send_interval: Duration::from_millis(50), // 20 Hz, plenty for OSC capture
             osc_listen_port: None,
+            capture_haptic: false,
         }
     }
 }
@@ -98,6 +103,9 @@ pub struct MockClientStats {
     /// Captured OSC traffic from the loopback receiver. Empty when
     /// `osc_listen_port` is `None`.
     pub osc_messages: OscCapture,
+    /// HAPTIC_EVENT messages received from the engine (PC → HMD). Empty
+    /// when `capture_haptic` is false.
+    pub haptic_events_received: Vec<HapticEvent>,
     /// Connection establishment duration (TCP+TLS+handshake total).
     pub connect_duration: Duration,
     /// Total wall time the run spent streaming after the handshake.
@@ -319,22 +327,60 @@ where
     Ok((msg_type, payload))
 }
 
-/// Post-handshake streaming loop. Three concurrent tasks share a
-/// `MockClientStats` via Arc<Mutex>: TCP heartbeats, UDP receive +
-/// depacketize, lifetime/cancel watchdog. Returns when any of them
-/// exits or `cancel` fires.
+/// Post-handshake streaming loop. Concurrent tasks share a
+/// `MockClientStats` via Arc<Mutex>: TCP read (HAPTIC capture), TCP
+/// write (heartbeat + FACE_DATA), UDP receive + depacketize, OSC
+/// loopback. Returns when any of them exits or `cancel` fires.
 async fn stream_loop<S>(
-    mut tcp: S,
+    tcp: S,
     config: &MockClientConfig,
     cancel: CancellationToken,
 ) -> Result<MockClientStats, MockClientError>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use fvp_common::protocol::msg_type;
     use std::sync::Mutex as StdMutex;
 
     let stats = Arc::new(StdMutex::new(MockClientStats::default()));
+
+    // Split the TLS stream so a reader task can decode inbound TCP
+    // messages (HAPTIC_EVENT etc.) while the main loop drives outbound
+    // heartbeats and synthetic FACE_DATA. tokio's split keeps both
+    // halves backed by the same underlying stream via an internal lock.
+    let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp);
+
+    // Inbound TCP reader: capture HAPTIC_EVENT messages emitted by the
+    // engine when production code (or scenario stimuli) call
+    // `engine::queue_haptic`. Other inbound types are ignored — the
+    // mock client doesn't act on them, and silently dropping keeps the
+    // reader simple.
+    let stats_reader = Arc::clone(&stats);
+    let reader_cancel = cancel.clone();
+    let capture_haptic = config.capture_haptic;
+    let reader_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                r = read_message(&mut tcp_read) => match r {
+                    Ok((mt, payload)) => {
+                        if mt == msg_type::HAPTIC_EVENT && capture_haptic {
+                            if let Some(event) = HapticEvent::from_payload(&payload) {
+                                if let Ok(mut s) = stats_reader.lock() {
+                                    s.haptic_events_received.push(event);
+                                }
+                            }
+                        }
+                        // All other inbound types intentionally ignored.
+                    }
+                    Err(e) => {
+                        log::debug!("mock-client TCP reader exiting: {}", e);
+                        break;
+                    }
+                },
+                _ = reader_cancel.cancelled() => break,
+            }
+        }
+    });
 
     // UDP receiver (video). Audio receiver omitted — the simulator's
     // current focus is video transport; audio plumbing lands in B6.
@@ -428,7 +474,7 @@ where
         // 6-byte payload: decode_latency_us:u32 (0) + packet_loss_pct:u16 (0)
         if now >= next_heartbeat {
             let payload = [0u8; 6];
-            if let Err(e) = send_message(&mut tcp, msg_type::HEARTBEAT_ACK, &payload).await {
+            if let Err(e) = send_message(&mut tcp_write, msg_type::HEARTBEAT_ACK, &payload).await {
                 log::warn!("mock-client heartbeat send failed: {}", e);
                 break;
             }
@@ -444,7 +490,7 @@ where
                 let t_ns = now.saturating_duration_since(face_start).as_nanos() as u64;
                 let (lv, ev, lip, eye) = next_face_sample(face_mode, t_ns);
                 let payload = encode_face_data(lv, ev, &lip, &eye);
-                if let Err(e) = send_message(&mut tcp, msg_type::FACE_DATA, &payload).await {
+                if let Err(e) = send_message(&mut tcp_write, msg_type::FACE_DATA, &payload).await {
                     log::warn!("mock-client face-data send failed: {}", e);
                     break;
                 }
@@ -483,10 +529,17 @@ where
 
     // Polite DISCONNECT so the engine logs a clean shutdown instead of
     // counting this against `reconnect_attempts`.
-    let _ = send_message(&mut tcp, msg_type::DISCONNECT, &[]).await;
+    let _ = send_message(&mut tcp_write, msg_type::DISCONNECT, &[]).await;
 
     video_handle.abort();
     let _ = video_handle.await;
+
+    // Brief drain window for haptic events still in flight from the engine,
+    // then stop the reader. Without this delay, a stimulus fired right
+    // before DISCONNECT would race the reader's exit and be missed.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    reader_handle.abort();
+    let _ = reader_handle.await;
 
     // Drain OSC capture if we spawned it. The loopback's own cancel is fed
     // by the main `cancel` token; if the loop exited via `deadline` instead

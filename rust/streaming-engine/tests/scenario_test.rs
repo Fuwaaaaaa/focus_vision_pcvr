@@ -36,14 +36,32 @@ fn scenario_golden_path() {
     report.assert_passed();
 }
 
+#[test]
+fn scenario_haptic() {
+    let scenario = load("haptic.json");
+    let report = run_scenario(&scenario)
+        .unwrap_or_else(|e| panic!("scenario runner failed: {}", e));
+    if let Some(stats) = &report.stats {
+        eprintln!(
+            "haptic: passed={} duration={:?} frames={} haptic_received={} hb={}",
+            report.passed,
+            report.duration,
+            stats.frames_decoded,
+            stats.haptic_events_received.len(),
+            stats.heartbeats_sent,
+        );
+    }
+    report.assert_passed();
+}
+
 // NOTE: Test name prefixed with "z_" so it runs AFTER `scenario_golden_path`
-// in cargo test's default alphabetical order. With the order reversed,
-// some Windows-specific state left by the OSC bridge + FACE_DATA path —
-// likely a lingering UDP socket or WASAPI device handle — prevents the
-// next scenario's video pipeline from delivering RTP packets to the mock
-// client. The root cause is tracked separately; for now we sequence the
-// scenarios so they coexist cleanly in a single test process. Process
-// isolation (e.g. cargo nextest) would also avoid this.
+// (and `scenario_haptic`) in cargo test's default alphabetical order. With
+// the order reversed, some Windows-specific state left by the OSC bridge +
+// FACE_DATA path — likely a lingering UDP socket or WASAPI device handle —
+// prevents the next scenario's video pipeline from delivering RTP packets
+// to the mock client. The root cause is tracked separately; for now we
+// sequence the scenarios so they coexist cleanly in a single test process.
+// Process isolation (e.g. cargo nextest) would also avoid this.
 #[test]
 fn scenario_z_face_tracking() {
     let scenario = load("face_tracking.json");
