@@ -143,6 +143,48 @@ cd driver/build && ctest  # 36 tests (QP map / NVENC ABI / VUI)
 
 ---
 
+## 実機なし回帰テスト
+
+VR ヘッドセットを接続しなくても、エンジンの全コアパス
+(ストリーミング / 顔追跡 OSC / 触覚 / 睡眠モード / 録画 / 適応 FEC) を
+JSON シナリオで end-to-end 検証できます。CI ではすべてのシナリオが
+`cargo test --features simulator` で自動実行されます。
+
+```bash
+# 全シナリオ + 既存単体/結合テスト (CI と同じコマンド)
+cargo test --workspace --features simulator -- --test-threads=1
+
+# シナリオだけ
+cargo test -p streaming-engine --features simulator --test scenario_test           -- --test-threads=1
+cargo test -p streaming-engine --features simulator --test scenario_transport_test -- --test-threads=1
+```
+
+| シナリオ | 検証対象 | 主な assertion |
+|---|---|---|
+| `golden_path` | TCP/TLS+PIN → 2s ストリーム → 正常切断 | `min_frames_decoded`, `min_video_packets`, `max_connect_duration_ms` |
+| `haptic` | `engine::queue_haptic` → TCP `HAPTIC_EVENT (0x38)` → mock-client 受信 | `min_haptic_events_received` |
+| `sleep_cycle` | 静止トラッキング → `SleepDetector` 発火 → `SLEEP_ENTER (0x50)` 送信 | `min_sleep_enter_count` |
+| `face_tracking` | 51 blendshape → engine OSC bridge → `/avatar/parameters/*` 受信 | `expect_osc_addresses`, `min_osc_messages` |
+| `packet_loss` | `UdpSender` で 80% パケットドロップ注入 | `max_video_packets` |
+| `recording` | `recording.enabled=true` で `*.h265` ファイル生成 | `expect_recording_files{dir,min_bytes}` |
+
+### 新規シナリオの追加
+
+1. `rust/streaming-engine/tests/scenarios/<name>.json` を作成
+   - `Scenario` 構造体 (`src/simulator/scenario.rs`) に従う
+   - `deny_unknown_fields` により未知のフィールドはパース時点で失敗
+2. テストランナーに `#[test] fn scenario_<name>()` を追加
+   - 既存テスト (`tests/scenario_test.rs`) と並走させる場合はそこへ
+   - Windows のリソース解放タイミングに敏感な scenario は独立した test binary
+     (`tests/scenario_*_test.rs`) に分離するとプロセス分離で安定する
+3. `cargo test --features simulator --test scenario_<name>_test` で動作確認
+
+詳細は [`docs/E2E_TEST_GUIDE.md`](docs/E2E_TEST_GUIDE.md) と
+[`rust/streaming-engine/src/simulator/scenario.rs`](rust/streaming-engine/src/simulator/scenario.rs)
+を参照。
+
+---
+
 ## Requirements
 
 | 項目 | 要件 |
