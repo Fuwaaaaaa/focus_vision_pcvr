@@ -523,12 +523,19 @@ async fn handle_tcp_control(
                     }
                     fvp_common::protocol::msg_type::FACE_DATA => {
                         let payload = &msg_buf[1..];
+                        log::debug!("engine: FACE_DATA received, payload {}B", payload.len());
                         if let Some((lip_valid, eye_valid, lip, eye)) =
                             crate::face_tracking::osc_bridge::parse_face_data(payload)
                         {
-                            if let Ok(mut bridge) = osc_bridge.try_lock() {
-                                bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
+                            match osc_bridge.try_lock() {
+                                Ok(mut bridge) => {
+                                    log::debug!("engine: forwarding face data to OscBridge (lip_valid={}, eye_valid={})", lip_valid, eye_valid);
+                                    bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
+                                }
+                                Err(_) => log::warn!("engine: FACE_DATA dropped — osc_bridge lock contended"),
                             }
+                        } else {
+                            log::warn!("engine: FACE_DATA parse failed ({}B)", payload.len());
                         }
                     }
                     fvp_common::protocol::msg_type::TRANSPORT_FEEDBACK => {
@@ -1142,10 +1149,24 @@ async fn run_streaming(
         let sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>> =
             Arc::new(StdMutex::new(HashMap::new()));
 
-        // OSC bridge for face tracking data (HMD → VRChat)
-        let osc_bridge = Arc::new(StdMutex::new(
-            crate::face_tracking::osc_bridge::OscBridge::with_smoothing(config.face_tracking.smoothing)
-        ));
+        // OSC bridge for face tracking data (HMD → VRChat). The bridge sends
+        // to `face_tracking.osc_port` so non-default ports (used by E2E
+        // scenarios that capture OSC on a loopback receiver) actually take
+        // effect instead of being silently ignored.
+        // OSC bridge for face tracking data (HMD → VRChat). Apply
+        // `face_tracking.osc_port` to the bridge target so non-default
+        // ports (used by E2E scenarios that capture OSC on a loopback
+        // receiver) actually take effect instead of being silently
+        // ignored as they were before this hook was added.
+        let osc_bridge = Arc::new(StdMutex::new({
+            let mut b = crate::face_tracking::osc_bridge::OscBridge::with_smoothing(
+                config.face_tracking.smoothing,
+            );
+            let osc_target = format!("127.0.0.1:{}", config.face_tracking.osc_port);
+            log::debug!("OSC bridge target: {}", osc_target);
+            b.set_target(osc_target);
+            b
+        }));
 
         // Haptic event channel (PC driver → TCP → HMD)
         let (haptic_tx, haptic_rx) = mpsc::channel::<HapticEvent>(16);
@@ -1208,7 +1229,11 @@ async fn run_streaming(
         } else {
             None
         };
-        spawn_audio_pipeline(audio_target, session_cancel.clone(), audio_recording_dir);
+        if config.audio.enabled {
+            spawn_audio_pipeline(audio_target, session_cancel.clone(), audio_recording_dir);
+        } else {
+            log::info!("Audio disabled by config — streaming video only");
+        }
 
         // Step 3: Process frames with adaptive bitrate + adaptive FEC
         let mut packetizer = RtpPacketizer::new(0x46565000);

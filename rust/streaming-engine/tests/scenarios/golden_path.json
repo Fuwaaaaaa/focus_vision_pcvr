@@ -1,0 +1,25 @@
+{
+  "name": "golden_path",
+  "timeout_sec": 30,
+  "config_overrides": {
+    "video.framerate": 60,
+    "audio.enabled": false
+  },
+  "client": {
+    "pin_source": "status_json",
+    "duration_sec": 2.0,
+    "tracking_pattern": { "kind": "still" },
+    "face_pattern": null,
+    "capture_haptic": false,
+    "osc_listen_port": null
+  },
+  "fault_injection": [],
+  "stimuli": [],
+  "assertions": {
+    "min_frames_decoded": 10,
+    "min_idr_frames": 1,
+    "min_heartbeats_sent": 2,
+    "min_video_packets": 50,
+    "max_connect_duration_ms": 1000
+  }
+}

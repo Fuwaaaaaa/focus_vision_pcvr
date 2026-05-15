@@ -1,0 +1,730 @@
+//! JSON-driven scenario runner for headless full-feature regression.
+//!
+//! Parses `tests/scenarios/*.json` via serde_json, drives the engine and
+//! a mock client (plus optional tracking sender), and aggregates assertion
+//! results into a `ScenarioReport`. Each scenario must run under
+//! `--test-threads=1` because the engine claims a process-global
+//! `status.json` for PIN discovery.
+
+use std::net::{IpAddr, Ipv4Addr};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use fvp_common::protocol::VideoCodec;
+use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::AppConfig;
+use crate::engine::{EncodedFrame, StreamingEngine};
+use crate::metrics::latency::FrameTimestamps;
+use crate::simulator::face_sender::FaceMode;
+use crate::simulator::test_helpers::{
+    delete_stale_status, pick_free_ports, pick_free_udp_port_excluding, wait_for_pin,
+};
+use crate::simulator::tracking_sender::{PoseMode, TrackingSender};
+use crate::simulator::{run as run_mock_client, MockClientConfig, MockClientError, MockClientStats};
+use crate::video::synthetic_nal::SyntheticNalStream;
+
+/// One scenario definition, parsed from `tests/scenarios/<name>.json`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scenario {
+    pub name: String,
+    pub timeout_sec: u64,
+    #[serde(default)]
+    pub config_overrides: serde_json::Map<String, serde_json::Value>,
+    pub client: ClientConfig,
+    /// PR-3+ will type these. PR-2 accepts but ignores the field so future
+    /// scenarios can reference fault entries without parser breakage.
+    #[serde(default)]
+    pub fault_injection: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub stimuli: Vec<serde_json::Value>,
+    pub assertions: Assertions,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfig {
+    pub pin_source: PinSource,
+    pub duration_sec: f64,
+    #[serde(default)]
+    pub tracking_pattern: Option<TrackingPatternSpec>,
+    /// When set, the mock client periodically emits FACE_DATA (0x35) on
+    /// the TCP control channel and the runner allocates a free UDP port
+    /// to capture the engine's OSC output.
+    #[serde(default)]
+    pub face_pattern: Option<FacePatternSpec>,
+    #[serde(default)]
+    pub capture_haptic: bool,
+    /// Manual override for the OSC loopback port. Most scenarios should
+    /// leave this `null` and let the runner allocate dynamically — the
+    /// runner mirrors the chosen port to both `face_tracking.osc_port`
+    /// and the loopback bind.
+    #[serde(default)]
+    pub osc_listen_port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum PinSource {
+    /// Read the engine-published PIN from status.json (golden path).
+    StatusJson,
+    /// Use a guaranteed-wrong PIN to exercise the PIN rejection branch.
+    Wrong,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub enum TrackingPatternSpec {
+    Still,
+    SineWave { amp_m: f32, hz: f32 },
+}
+
+impl TrackingPatternSpec {
+    fn into_pose_mode(self) -> PoseMode {
+        match self {
+            Self::Still => PoseMode::still_origin(),
+            Self::SineWave { amp_m, hz } => PoseMode::SineWave {
+                base: PoseMode::default_head(),
+                amp_m,
+                hz,
+                left: None,
+                right: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
+pub enum FacePatternSpec {
+    Relax,
+    Exaggerate,
+    SineSweep { hz: f32 },
+}
+
+impl FacePatternSpec {
+    fn into_face_mode(self) -> FaceMode {
+        match self {
+            Self::Relax => FaceMode::Relax,
+            Self::Exaggerate => FaceMode::Exaggerate,
+            Self::SineSweep { hz } => FaceMode::SineSweep { hz },
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Assertions {
+    pub min_frames_decoded: Option<u64>,
+    pub min_idr_frames: Option<u64>,
+    pub min_heartbeats_sent: Option<u64>,
+    pub min_video_packets: Option<u64>,
+    pub max_connect_duration_ms: Option<u64>,
+    pub expect_pin_rejected: Option<bool>,
+    /// Required OSC addresses (engine → loopback). Each entry must appear
+    /// as a key in `MockClientStats::osc_messages`.
+    pub expect_osc_addresses: Option<Vec<String>>,
+    /// Lower bound on total OSC messages summed across all addresses.
+    pub min_osc_messages: Option<u64>,
+    /// Lower bound on `face_messages_sent` (mock-client → engine).
+    pub min_face_messages_sent: Option<u64>,
+}
+
+/// Outcome of a single scenario run. `passed` is false iff `failures` is non-empty.
+#[derive(Debug)]
+pub struct ScenarioReport {
+    pub name: String,
+    pub passed: bool,
+    pub failures: Vec<String>,
+    pub stats: Option<MockClientStats>,
+    pub duration: Duration,
+}
+
+impl ScenarioReport {
+    pub fn assert_passed(&self) {
+        if !self.passed {
+            panic!(
+                "scenario '{}' failed in {:?}:\n  - {}",
+                self.name,
+                self.duration,
+                self.failures.join("\n  - "),
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ScenarioError {
+    Io(std::io::Error),
+    Parse(String),
+    Engine(String),
+}
+
+impl std::fmt::Display for ScenarioError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O: {}", e),
+            Self::Parse(s) => write!(f, "parse: {}", s),
+            Self::Engine(s) => write!(f, "engine: {}", s),
+        }
+    }
+}
+impl std::error::Error for ScenarioError {}
+impl From<std::io::Error> for ScenarioError {
+    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+}
+
+pub fn parse_scenario_str(s: &str) -> Result<Scenario, ScenarioError> {
+    serde_json::from_str(s).map_err(|e| ScenarioError::Parse(e.to_string()))
+}
+
+pub fn parse_scenario_file(path: &Path) -> Result<Scenario, ScenarioError> {
+    let content = std::fs::read_to_string(path)?;
+    parse_scenario_str(&content)
+}
+
+/// Run a scenario synchronously. Spins up a tokio runtime for the mock
+/// client and tracking sender; the engine owns its own threads internally.
+/// Returns a report regardless of pass/fail — caller decides what to do.
+pub fn run_scenario(scenario: &Scenario) -> Result<ScenarioReport, ScenarioError> {
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn"),
+    )
+    .is_test(true)
+    .try_init();
+
+    delete_stale_status();
+    let (tcp_port, udp_port) = pick_free_ports();
+
+    let mut config = AppConfig::default();
+    config.network.tcp_port = tcp_port;
+    config.network.udp_port = udp_port;
+    apply_config_overrides(&mut config, &scenario.config_overrides)?;
+
+    // When the scenario emits face data, allocate a free UDP port that
+    // doesn't collide with the mock client's other UDP binds (video at
+    // udp+1, tracking at udp+2, audio at udp+3) and route both the
+    // engine's OSC bridge and the loopback receiver to it. Without the
+    // exclude list, Windows allocates ephemeral ports sequentially and
+    // the auto-pick often lands on udp+1 — which would silently swallow
+    // RTP packets meant for the video receiver.
+    let reserved_ports = [
+        udp_port,
+        udp_port + fvp_common::VIDEO_PORT_OFFSET,
+        udp_port + fvp_common::AUDIO_PORT_OFFSET,
+        udp_port + fvp_common::TRACKING_PORT_OFFSET,
+    ];
+    let osc_port: Option<u16> = if scenario.client.face_pattern.is_some() {
+        Some(
+            scenario
+                .client
+                .osc_listen_port
+                .unwrap_or_else(|| pick_free_udp_port_excluding(&reserved_ports)),
+        )
+    } else {
+        scenario.client.osc_listen_port
+    };
+    if let Some(p) = osc_port {
+        config.face_tracking.osc_port = p;
+        log::debug!(
+            "scenario '{}': OSC port {} (reserved: {:?})",
+            scenario.name, p, reserved_ports
+        );
+    }
+
+    let framerate = config.video.framerate.max(1);
+    let engine = StreamingEngine::new(config)
+        .map_err(|e| ScenarioError::Engine(format!("{:?}", e)))?;
+
+    let pin = match scenario.client.pin_source {
+        PinSource::StatusJson => wait_for_pin(Duration::from_secs(5))
+            .ok_or_else(|| ScenarioError::Engine("engine never published a PIN".into()))?,
+        PinSource::Wrong => {
+            let real = wait_for_pin(Duration::from_secs(5))
+                .ok_or_else(|| ScenarioError::Engine("engine never published a PIN".into()))?;
+            (real.wrapping_add(123_456)) % 1_000_000
+        }
+    };
+
+    let mut client_config = MockClientConfig::from_ports(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        tcp_port,
+        udp_port,
+        pin,
+    );
+    let client_duration = Duration::from_secs_f64(scenario.client.duration_sec);
+    client_config.duration = Some(client_duration);
+    client_config.face_pattern = scenario.client.face_pattern.map(|p| p.into_face_mode());
+    client_config.osc_listen_port = osc_port;
+
+    let tracking_target = client_config.tracking_target;
+    let tracking_spec = scenario.client.tracking_pattern.clone();
+
+    let cancel = CancellationToken::new();
+    let cancel_for_client = cancel.clone();
+
+    let client_thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let tracking_handle = if let Some(spec) = tracking_spec {
+                let cancel_for_tracking = cancel_for_client.clone();
+                let mode = spec.into_pose_mode();
+                match TrackingSender::new(tracking_target).await {
+                    Ok(sender) => Some(tokio::spawn(async move {
+                        sender.run(mode, 90, cancel_for_tracking).await;
+                    })),
+                    Err(e) => {
+                        log::warn!("tracking sender bind failed: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let result = run_mock_client(client_config, cancel_for_client).await;
+
+            if let Some(h) = tracking_handle {
+                h.abort();
+                let _ = h.await;
+            }
+            result
+        })
+    });
+
+    // Pump synthetic frames into the engine for the scenario duration.
+    let stream_window = client_duration + Duration::from_millis(200);
+    let mut stream = SyntheticNalStream::new(VideoCodec::H265, framerate);
+    let frame_period = Duration::from_secs_f64(1.0 / framerate as f64);
+    let start = Instant::now();
+    let mut next_tick = start;
+    while start.elapsed() < stream_window {
+        let synth = stream.next_frame();
+        let frame = EncodedFrame {
+            frame_index: synth.frame_index,
+            nal_data: synth.bytes,
+            is_idr: synth.is_idr,
+            timestamps: FrameTimestamps::new(synth.frame_index),
+        };
+        let _ = engine.submit_frame(frame);
+        next_tick += frame_period;
+        let now = Instant::now();
+        if next_tick > now {
+            std::thread::sleep(next_tick - now);
+        } else {
+            next_tick = now;
+        }
+    }
+
+    cancel.cancel();
+    let stats_result = client_thread
+        .join()
+        .map_err(|_| ScenarioError::Engine("client thread panicked".into()))?;
+    engine.shutdown();
+    // Drop the engine BEFORE sleeping so the tokio runtime begins teardown
+    // and the audio capture thread observes its cancel token. Without the
+    // explicit drop we'd hold the engine in scope through the sleep, which
+    // delays runtime drop until function return — leading to the next
+    // scenario in the test process racing to acquire WASAPI resources the
+    // previous engine still owns.
+    drop(engine);
+    // Give Windows time to release the WASAPI loopback device and any
+    // lingering UDP socket state before the next scenario starts. 500 ms
+    // is empirically enough on the test runner; the alternative is process
+    // isolation (cargo nextest) which we don't require in CI today.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let total_duration = start.elapsed();
+
+    let (stats_opt, pin_rejected) = match stats_result {
+        Ok(stats) => (Some(stats), false),
+        Err(MockClientError::PinRejected) => (None, true),
+        Err(other) => {
+            return Ok(ScenarioReport {
+                name: scenario.name.clone(),
+                passed: false,
+                failures: vec![format!("mock client error: {}", other)],
+                stats: None,
+                duration: total_duration,
+            });
+        }
+    };
+
+    let failures = evaluate_assertions(&scenario.assertions, stats_opt.as_ref(), pin_rejected);
+    Ok(ScenarioReport {
+        name: scenario.name.clone(),
+        passed: failures.is_empty(),
+        failures,
+        stats: stats_opt,
+        duration: total_duration,
+    })
+}
+
+/// Apply dot-path overrides to an `AppConfig`, e.g. `"video.framerate": 60`.
+/// Round-trips through `serde_json::Value` so any field declared by the
+/// AppConfig serde derive is reachable.
+fn apply_config_overrides(
+    config: &mut AppConfig,
+    overrides: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ScenarioError> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    let mut json = serde_json::to_value(&*config)
+        .map_err(|e| ScenarioError::Parse(format!("config to JSON: {}", e)))?;
+    for (path, value) in overrides {
+        set_at_path(&mut json, path, value.clone())
+            .map_err(|e| ScenarioError::Parse(format!("override '{}': {}", path, e)))?;
+    }
+    *config = serde_json::from_value(json)
+        .map_err(|e| ScenarioError::Parse(format!("config from JSON: {}", e)))?;
+    Ok(())
+}
+
+fn set_at_path(
+    json: &mut serde_json::Value,
+    path: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut cur = json;
+    for (i, part) in parts.iter().enumerate() {
+        if i == parts.len() - 1 {
+            let obj = cur
+                .as_object_mut()
+                .ok_or_else(|| format!("path segment '{}' is not an object", part))?;
+            obj.insert((*part).to_string(), value.clone());
+            return Ok(());
+        } else {
+            cur = cur
+                .get_mut(*part)
+                .ok_or_else(|| format!("path segment '{}' not found", part))?;
+        }
+    }
+    Ok(())
+}
+
+fn evaluate_assertions(
+    a: &Assertions,
+    stats: Option<&MockClientStats>,
+    pin_rejected: bool,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if let Some(expect) = a.expect_pin_rejected {
+        if expect != pin_rejected {
+            failures.push(format!(
+                "expect_pin_rejected={}, observed pin_rejected={}",
+                expect, pin_rejected
+            ));
+        }
+    }
+    let Some(s) = stats else {
+        // No stats available (handshake failed). Skip count-based checks.
+        return failures;
+    };
+    if let Some(min) = a.min_frames_decoded {
+        if s.frames_decoded < min {
+            failures.push(format!(
+                "min_frames_decoded: expected >= {}, got {}",
+                min, s.frames_decoded
+            ));
+        }
+    }
+    if let Some(min) = a.min_idr_frames {
+        if s.idr_frames_seen < min {
+            failures.push(format!(
+                "min_idr_frames: expected >= {}, got {}",
+                min, s.idr_frames_seen
+            ));
+        }
+    }
+    if let Some(min) = a.min_heartbeats_sent {
+        if s.heartbeats_sent < min {
+            failures.push(format!(
+                "min_heartbeats_sent: expected >= {}, got {}",
+                min, s.heartbeats_sent
+            ));
+        }
+    }
+    if let Some(min) = a.min_video_packets {
+        if s.video_packets_received < min {
+            failures.push(format!(
+                "min_video_packets: expected >= {}, got {}",
+                min, s.video_packets_received
+            ));
+        }
+    }
+    if let Some(max_ms) = a.max_connect_duration_ms {
+        if s.connect_duration > Duration::from_millis(max_ms) {
+            failures.push(format!(
+                "max_connect_duration: expected <= {} ms, got {:?}",
+                max_ms, s.connect_duration
+            ));
+        }
+    }
+    if let Some(min) = a.min_face_messages_sent {
+        if s.face_messages_sent < min {
+            failures.push(format!(
+                "min_face_messages_sent: expected >= {}, got {}",
+                min, s.face_messages_sent
+            ));
+        }
+    }
+    if let Some(expected) = &a.expect_osc_addresses {
+        for addr in expected {
+            if !s.osc_messages.contains_key(addr) {
+                failures.push(format!("expect_osc_addresses: missing '{}'", addr));
+            }
+        }
+    }
+    if let Some(min) = a.min_osc_messages {
+        let total: u64 = s.osc_messages.values().map(|v| v.len() as u64).sum();
+        if total < min {
+            failures.push(format!(
+                "min_osc_messages: expected >= {}, got {}",
+                min, total
+            ));
+        }
+    }
+    failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_minimal_scenario() {
+        let json = r#"{
+            "name": "test",
+            "timeout_sec": 10,
+            "client": {
+                "pin_source": "status_json",
+                "duration_sec": 1.0
+            },
+            "assertions": {}
+        }"#;
+        let s = parse_scenario_str(json).expect("parse");
+        assert_eq!(s.name, "test");
+        assert!(matches!(s.client.pin_source, PinSource::StatusJson));
+        assert!(s.client.tracking_pattern.is_none());
+    }
+
+    #[test]
+    fn parse_with_tracking_pattern_still() {
+        let json = r#"{
+            "name": "t",
+            "timeout_sec": 5,
+            "client": {
+                "pin_source": "status_json",
+                "duration_sec": 1.0,
+                "tracking_pattern": { "kind": "still" }
+            },
+            "assertions": {}
+        }"#;
+        let s = parse_scenario_str(json).expect("parse");
+        assert!(matches!(s.client.tracking_pattern, Some(TrackingPatternSpec::Still)));
+    }
+
+    #[test]
+    fn parse_with_tracking_pattern_sine_wave() {
+        let json = r#"{
+            "name": "t",
+            "timeout_sec": 5,
+            "client": {
+                "pin_source": "status_json",
+                "duration_sec": 1.0,
+                "tracking_pattern": { "kind": "sine_wave", "amp_m": 0.05, "hz": 0.5 }
+            },
+            "assertions": {}
+        }"#;
+        let s = parse_scenario_str(json).expect("parse");
+        assert!(matches!(
+            s.client.tracking_pattern,
+            Some(TrackingPatternSpec::SineWave { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_top_level_field() {
+        let json = r#"{
+            "name": "x", "timeout_sec": 5,
+            "client": { "pin_source": "status_json", "duration_sec": 1.0 },
+            "assertions": {},
+            "bogus": 1
+        }"#;
+        assert!(parse_scenario_str(json).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_tracking_pattern_kind() {
+        let json = r#"{
+            "name": "x", "timeout_sec": 5,
+            "client": {
+                "pin_source": "status_json",
+                "duration_sec": 1.0,
+                "tracking_pattern": { "kind": "nope" }
+            },
+            "assertions": {}
+        }"#;
+        assert!(parse_scenario_str(json).is_err());
+    }
+
+    #[test]
+    fn parse_with_face_pattern_exaggerate() {
+        let json = r#"{
+            "name": "ft", "timeout_sec": 5,
+            "client": {
+                "pin_source": "status_json",
+                "duration_sec": 1.0,
+                "face_pattern": { "kind": "exaggerate" }
+            },
+            "assertions": {}
+        }"#;
+        let s = parse_scenario_str(json).expect("parse");
+        assert!(matches!(s.client.face_pattern, Some(FacePatternSpec::Exaggerate)));
+    }
+
+    #[test]
+    fn parse_with_face_pattern_sine_sweep() {
+        let json = r#"{
+            "name": "ft", "timeout_sec": 5,
+            "client": {
+                "pin_source": "status_json",
+                "duration_sec": 1.0,
+                "face_pattern": { "kind": "sine_sweep", "hz": 2.0 }
+            },
+            "assertions": { "min_osc_messages": 50 }
+        }"#;
+        let s = parse_scenario_str(json).expect("parse");
+        assert!(matches!(s.client.face_pattern, Some(FacePatternSpec::SineSweep { .. })));
+        assert_eq!(s.assertions.min_osc_messages, Some(50));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_face_pattern_kind() {
+        let json = r#"{
+            "name": "x", "timeout_sec": 5,
+            "client": {
+                "pin_source": "status_json",
+                "duration_sec": 1.0,
+                "face_pattern": { "kind": "nope" }
+            },
+            "assertions": {}
+        }"#;
+        assert!(parse_scenario_str(json).is_err());
+    }
+
+    #[test]
+    fn assertions_expect_osc_addresses_missing_fails() {
+        let a = Assertions {
+            expect_osc_addresses: Some(vec!["/avatar/parameters/JawOpen".to_string()]),
+            ..Default::default()
+        };
+        let stats = MockClientStats::default();
+        let failures = evaluate_assertions(&a, Some(&stats), false);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("JawOpen"));
+    }
+
+    #[test]
+    fn assertions_expect_osc_addresses_present_passes() {
+        let a = Assertions {
+            expect_osc_addresses: Some(vec!["/avatar/parameters/JawOpen".to_string()]),
+            ..Default::default()
+        };
+        let mut osc = crate::simulator::osc_loopback::OscCapture::new();
+        osc.insert("/avatar/parameters/JawOpen".to_string(), vec![0.5]);
+        let stats = MockClientStats {
+            osc_messages: osc,
+            ..Default::default()
+        };
+        let failures = evaluate_assertions(&a, Some(&stats), false);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn assertions_min_osc_messages_total_summed() {
+        let a = Assertions {
+            min_osc_messages: Some(5),
+            ..Default::default()
+        };
+        let mut osc = crate::simulator::osc_loopback::OscCapture::new();
+        osc.insert("/a".to_string(), vec![0.1, 0.2, 0.3]);
+        osc.insert("/b".to_string(), vec![0.4, 0.5]);
+        let stats = MockClientStats {
+            osc_messages: osc,
+            ..Default::default()
+        };
+        // Total = 3 + 2 = 5, meets minimum
+        let failures = evaluate_assertions(&a, Some(&stats), false);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn apply_overrides_changes_video_framerate() {
+        let mut config = AppConfig::default();
+        let original = config.video.framerate;
+        let mut overrides = serde_json::Map::new();
+        overrides.insert("video.framerate".to_string(), serde_json::json!(72));
+        apply_config_overrides(&mut config, &overrides).unwrap();
+        assert_eq!(config.video.framerate, 72);
+        assert_ne!(config.video.framerate, original);
+    }
+
+    #[test]
+    fn apply_overrides_empty_is_noop() {
+        let mut config = AppConfig::default();
+        let original = format!("{:?}", config);
+        apply_config_overrides(&mut config, &serde_json::Map::new()).unwrap();
+        assert_eq!(format!("{:?}", config), original);
+    }
+
+    #[test]
+    fn apply_overrides_rejects_bad_path() {
+        let mut config = AppConfig::default();
+        let mut overrides = serde_json::Map::new();
+        overrides.insert("does.not.exist".to_string(), serde_json::json!(1));
+        assert!(apply_config_overrides(&mut config, &overrides).is_err());
+    }
+
+    #[test]
+    fn assertions_min_frames_below_fails() {
+        let a = Assertions {
+            min_frames_decoded: Some(100),
+            ..Default::default()
+        };
+        let stats = MockClientStats {
+            frames_decoded: 50,
+            ..Default::default()
+        };
+        let failures = evaluate_assertions(&a, Some(&stats), false);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("min_frames_decoded"));
+    }
+
+    #[test]
+    fn assertions_pin_rejected_match_passes() {
+        let a = Assertions {
+            expect_pin_rejected: Some(true),
+            ..Default::default()
+        };
+        let failures = evaluate_assertions(&a, None, true);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn assertions_pin_rejected_mismatch_fails() {
+        let a = Assertions {
+            expect_pin_rejected: Some(true),
+            ..Default::default()
+        };
+        let failures = evaluate_assertions(&a, None, false);
+        assert_eq!(failures.len(), 1);
+    }
+}
