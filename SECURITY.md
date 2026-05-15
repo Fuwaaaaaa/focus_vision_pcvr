@@ -9,9 +9,9 @@ Focus Vision PCVR communicates over Wi-Fi between a Windows PC and an Android HM
 | Threat | Mitigation |
 |--------|-----------|
 | PIN brute-force | 6-digit PIN (1M combinations), 5 attempts then 300s lockout, cryptographic RNG |
-| Man-in-the-middle | TLS 1.3 on TCP control channel (rustls server, MbedTLS client) |
-| PIN eavesdropping | PIN sent only over TLS-encrypted channel |
-| Server impersonation | TOFU certificate pinning (SHA-256 fingerprint saved on first connect) |
+| Man-in-the-middle | TLS 1.3 on TCP control channel (rustls server, MbedTLS client) + TOFU pinning (below) |
+| PIN eavesdropping | PIN sent only over TLS-encrypted channel; client refuses any plaintext fallback |
+| Server impersonation | TOFU certificate pinning: client computes SHA-256 of the server's leaf cert after the TLS handshake and persists it to `<app internal storage>/server_fingerprint.hex`. Subsequent connections refuse any cert that does not match the pinned hash. To re-pair with a different server, delete the file. |
 | PIN prediction | `rand::random()` (cryptographic CSPRNG) replaces `subsec_nanos()` |
 | CONFIG_UPDATE injection | TLS authentication required + input validation (range checks on bitrate 10-200, codec enum) |
 

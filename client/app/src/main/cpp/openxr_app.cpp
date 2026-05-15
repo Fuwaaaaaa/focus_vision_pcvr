@@ -41,6 +41,14 @@ void OpenXRApp::initialize(android_app* app) {
     m_heartbeat.init(&m_tcpClient, &m_stats);
     m_facialTracker.init(m_instance, m_session);
 
+    // TOFU pinning store: app-private, app-uninstall removes it.
+    if (app->activity && app->activity->internalDataPath) {
+        m_tcpClient.setFingerprintStorePath(
+            std::string(app->activity->internalDataPath) + "/server_fingerprint.hex");
+    } else {
+        LOGE("internalDataPath unavailable — TLS pairing will refuse to connect");
+    }
+
     // Initialize video decoder with JNI for zero-copy SurfaceTexture output.
     // EGL context is current at this point (initEGL called above).
     //
