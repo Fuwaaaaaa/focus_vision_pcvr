@@ -2,6 +2,71 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [3.0.0-rc2] - 2026-05-15
+
+Maintenance release-candidate on top of rc1. Three follow-up changes
+that were carried over from the pre-rc1 backlog after the original PRs
+(#51 / #52 / #53) had drifted too far from main to rebase. Each change
+was re-applied to a fresh branch off main and merged independently —
+provenance is documented in each commit's PR body. No hardware
+prerequisites; verification is the existing test suites plus the
+real-device TLS check listed under Out-of-Scope.
+
+### Security
+- **TOFU 証明書ピン留めをクライアント側で実装** (#61): TLS ハンドシェイク
+  後にサーバ leaf cert の SHA-256 を
+  `<app internal storage>/server_fingerprint.hex` に保存し、以降の接続で
+  fingerprint 不一致なら接続を拒否する。これまで `MBEDTLS_SSL_VERIFY_NONE`
+  で**証明書を一切検証していなかった**ため、同一 LAN 上の攻撃者が任意
+  TLS 証明書で MITM し PIN を盗聴可能だった。SECURITY.md が宣言していた
+  TOFU 緩和策がここで初めて実態として動作する。
+- **TLS 失敗時の平文フォールバック削除** (#61): `TcpControlClient::connect()`
+  は TLS / pinning に失敗した場合、平文に降格せず接続を拒否する。
+  これまではハンドシェイクを破壊するだけで暗号化を剥がせる構造だった。
+
+### Fixed
+- **NVENC セッションリーク 2 経路を塞ぐ** (#59): `NvencEncoder::init()` を
+  idempotent 化（再 init 時は先に `shutdown()`）、partial-init fallback
+  パスを `shutdown()` 経由に統一、`shutdown()` の `m_initialized` ガード
+  を撤去。GeForce は同時 NVENC セッションを 2 本までに制限しており、
+  pair / unpair を繰り返すと leak が積み上がって次のユーザーで
+  `NV_ENC_ERR_OUT_OF_MEMORY` が出る経路を閉じる。
+
+### Changed
+- **長寿命 spawn を `spawn_named` 経由に集約** (#60): streaming /
+  tracking-receiver / audio-encoder / tcp-control の 4 spawn を新 helper
+  `spawn_named(handle, name, fut)` 経由にし、debug ログで spawn 時にタスク
+  名を出力。サブシステムがサイレントに停止したときに、どれが停止したか
+  ログから特定可能になる。`panic = "abort"` プロファイル下なので
+  `catch_unwind` は不要（doc コメントに `panic = "unwind"` 切替時の拡張
+  方法を明記）。
+
+### Provenance / なぜ rc1 に入らなかったか
+3 修正とも 2026-04-24 のコードレビューで提起されていたが、当時の PR ブランチ
+（#51 / #52 / #53）は v3.0 Phase E/F の高速変化で main から大きく diverge
+し、GitHub UI の rebase ボタンでは取り込めない状態に。PR #52 はさらに古い
+base のため、そのまま cherry-pick すると rc1 で生きている
+`RECORDING_ENABLED` / `AUDIO_RECORDING_ENABLED` / rustls
+`install_default()` を消す破壊的差分を含んでいた。今回は各修正を main 起点
+で再起票し（#59 / #60 / #61）、CHANGELOG / SECURITY.md の文章コンフリクト
+だけ手動で解決して merge。
+
+### Verification
+- `cargo test -p streaming-engine --lib` — 347/347 pass
+- `ctest --build-config Release --output-on-failure` — 36/36 pass
+- main 上で全 CI ジョブ（Rust Streaming Engine / Companion App /
+  Android OpenXR Client / OpenVR Driver DLL / Version Consistency）
+  green
+- TLS TOFU の Android 実機検証は GA 前の Out-of-Scope（PR #61 の test plan
+  チェックリスト参照）
+
+### Out-of-Scope (Carried over from rc1)
+- 実機（NVIDIA GPU + VIVE Focus Vision）での 30 分以上の連続セッション
+  耐久試験
+- NVENC VUI フルレンジでの色彩確認（コード・テストは完了、目視は実機）
+- HTC Face Tracking 実カメラ入力 → OSC ブリッジの end-to-end
+- DRS（Dynamic Resolution Scaling）
+
 ## [3.0.0-rc1] - 2026-05-14
 
 First release candidate for v3.0.0. Focuses on completion-grade UX,
