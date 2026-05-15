@@ -27,7 +27,9 @@
       "Bash(git stash *)",
       "Bash(git rebase *)",
       "Bash(git pull *)",
-      "Bash(git -c core.editor=true cherry-pick --continue)"
+      "Bash(git -c core.editor=true cherry-pick --continue)",
+      "Bash(gh issue *)",
+      "Bash(grep -lrn \"3\\\\.0\\\\.0-rc1\\\\|3.0.0\\\\\\\\.0\\\\|3_0_0_rc1\" --include=\"*.md\" --include=\"*.rs\" --include=\"*.cpp\" --include=\"*.h\" --include=\"*.toml\" --include=\"*.kt\" --include=\"*.kts\" --include=\"*.gradle\" --include=\"*.nsi\" --include=\"*.ps1\" --include=\"VERSION\")"
     ]
   }
 }
