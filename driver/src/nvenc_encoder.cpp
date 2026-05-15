@@ -12,7 +12,14 @@ NvencEncoder::~NvencEncoder() {
 }
 
 bool NvencEncoder::init(ID3D11Device* device, const Config& config) {
-    if (m_initialized) return true;
+    // Idempotent reinit: if a prior session exists, tear it down fully first.
+    // This covers reconfigure-on-the-fly scenarios and prevents NVENC session
+    // leaks (GeForce caps concurrent sessions at 2 — a leaked session across
+    // pair/unpair cycles would eventually hand the next user
+    // NV_ENC_ERR_OUT_OF_MEMORY until the process exits).
+    if (m_initialized) {
+        shutdown();
+    }
 
     m_device = device;
     device->GetImmediateContext(&m_context);
@@ -27,15 +34,18 @@ bool NvencEncoder::init(ID3D11Device* device, const Config& config) {
         OutputDebugStringA(buf);
     } else {
         // NVENC not available — test pattern mode.
-        char buf[256];
-        snprintf(buf, sizeof(buf),
+        OutputDebugStringA(
             "NvencEncoder: NVENC unavailable. Running in test-pattern mode.\n");
-        OutputDebugStringA(buf);
-        // Clean up partial init
-        if (m_encoder && m_nvencFns.nvEncDestroyEncoder) {
-            m_nvencFns.nvEncDestroyEncoder(m_encoder);
-            m_encoder = nullptr;
-        }
+        // Tear down any partially-created NVENC state (bitstream buffer,
+        // registered resource, encoder session, loaded nvEncodeAPI.dll).
+        // Funnelling through shutdown() keeps the cleanup list in one place
+        // and avoids drift between partial-init and normal-teardown paths.
+        // shutdown() intentionally resets m_device/m_context/m_inputTexture
+        // too, so we re-capture them after the call before returning.
+        shutdown();
+        m_device = device;
+        device->GetImmediateContext(&m_context);
+        m_config = config;
     }
 
     m_initialized = true;
@@ -44,8 +54,13 @@ bool NvencEncoder::init(ID3D11Device* device, const Config& config) {
 }
 
 void NvencEncoder::shutdown() {
-    if (!m_initialized) return;
-
+    // Idempotent — safe to call from the destructor, from a partial-init
+    // failure path, and on an already-shutdown instance. Every field is
+    // null-checked before use, so the absence of the old
+    // `if (!m_initialized) return;` early exit is intentional: partial-init
+    // cleanup must be able to free any resources (nvEncodeAPI.dll,
+    // bitstream buffer, registered resource, encoder session) that were
+    // allocated before the init failure.
     if (m_encoder) {
         if (m_bitstreamBuffer && m_nvencFns.nvEncDestroyBitstreamBuffer)
             m_nvencFns.nvEncDestroyBitstreamBuffer(m_encoder, m_bitstreamBuffer);
