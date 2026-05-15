@@ -61,12 +61,19 @@ pub enum Stimulus {
         freq: f32,
         amp: f32,
     },
+    /// Set the simulator UDP loss probability (0..=100). Use with
+    /// `ClearLossPct` to inject loss for a bounded window.
+    SetLossPct { at_sec: f64, pct: u8 },
+    /// Reset the simulator UDP loss probability to 0.
+    ClearLossPct { at_sec: f64 },
 }
 
 impl Stimulus {
     fn at_sec(&self) -> f64 {
         match self {
             Self::QueueHaptic { at_sec, .. } => *at_sec,
+            Self::SetLossPct { at_sec, .. } => *at_sec,
+            Self::ClearLossPct { at_sec } => *at_sec,
         }
     }
 
@@ -80,6 +87,14 @@ impl Stimulus {
                 ..
             } => {
                 crate::engine::queue_haptic(controller_id, duration_ms, freq, amp);
+            }
+            Self::SetLossPct { pct, .. } => {
+                crate::transport::udp::set_simulator_loss_pct(pct);
+                log::info!("scenario stimulus: loss_pct -> {}", pct);
+            }
+            Self::ClearLossPct { .. } => {
+                crate::transport::udp::set_simulator_loss_pct(0);
+                log::info!("scenario stimulus: loss_pct -> 0");
             }
         }
     }
@@ -182,6 +197,23 @@ pub struct Assertions {
     pub min_sleep_enter_count: Option<u64>,
     /// Lower bound on `sleep_exit_count` (engine-emitted SLEEP_EXIT).
     pub min_sleep_exit_count: Option<u64>,
+    /// Upper bound on `video_packets_received`. Useful for verifying
+    /// that injected packet loss actually reduces throughput.
+    pub max_video_packets: Option<u64>,
+    /// Verify recording output. After the scenario, scan `dir` for files
+    /// ending in `.h265` / `.h264` / `.wav` and assert their cumulative
+    /// size meets `min_bytes`.
+    pub expect_recording_files: Option<RecordingCheck>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingCheck {
+    /// Directory the engine wrote recordings into. Typically matches
+    /// `config_overrides["recording.output_dir"]`.
+    pub dir: String,
+    /// Minimum cumulative size of recorded `.h264/.h265/.wav` files.
+    pub min_bytes: u64,
 }
 
 /// Outcome of a single scenario run. `passed` is false iff `failures` is non-empty.
@@ -248,6 +280,16 @@ pub fn run_scenario(scenario: &Scenario) -> Result<ScenarioReport, ScenarioError
     .try_init();
 
     delete_stale_status();
+    // Reset any simulator UDP loss left over from a prior scenario so the
+    // run begins on a clean network. Stimuli inside the scenario can
+    // re-arm loss as they fire.
+    crate::transport::udp::set_simulator_loss_pct(0);
+    // If the scenario asserts on recording output, wipe the target dir
+    // before the engine opens its file so the assertion only counts THIS
+    // run's bytes.
+    if let Some(check) = &scenario.assertions.expect_recording_files {
+        let _ = std::fs::remove_dir_all(&check.dir);
+    }
     let (tcp_port, udp_port) = pick_free_ports();
 
     let mut config = AppConfig::default();
@@ -606,7 +648,48 @@ fn evaluate_assertions(
             ));
         }
     }
+    if let Some(max) = a.max_video_packets {
+        if s.video_packets_received > max {
+            failures.push(format!(
+                "max_video_packets: expected <= {}, got {}",
+                max, s.video_packets_received
+            ));
+        }
+    }
+    if let Some(check) = &a.expect_recording_files {
+        match measure_recording_dir(std::path::Path::new(&check.dir)) {
+            Ok(total) if total >= check.min_bytes => {}
+            Ok(total) => failures.push(format!(
+                "expect_recording_files: {} total bytes in {}, want >= {}",
+                total, check.dir, check.min_bytes
+            )),
+            Err(e) => failures.push(format!(
+                "expect_recording_files: failed to read '{}': {}",
+                check.dir, e
+            )),
+        }
+    }
     failures
+}
+
+/// Sum the byte sizes of `.h265 / .h264 / .wav` files directly inside
+/// `dir` (non-recursive). Returns 0 if the directory doesn't exist.
+fn measure_recording_dir(dir: &std::path::Path) -> std::io::Result<u64> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut total: u64 = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if matches!(ext, "h265" | "h264" | "wav") {
+            if let Ok(meta) = entry.metadata() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -749,6 +832,7 @@ mod tests {
                 assert_eq!(controller_id, 0);
                 assert_eq!(duration_ms, 100);
             }
+            other => panic!("expected QueueHaptic, got {:?}", other),
         }
         assert_eq!(s.assertions.min_haptic_events_received, Some(1));
     }

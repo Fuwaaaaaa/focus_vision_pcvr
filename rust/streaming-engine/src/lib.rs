@@ -312,8 +312,9 @@ pub unsafe extern "C" fn fvp_submit_encoded_nal(
     // Null check is performed above.
     let nal_slice = unsafe { std::slice::from_raw_parts(nal_data_ptr, nal_data_len as usize) };
 
-    // Tap the raw NAL for session recording (no-op when disabled).
-    engine.write_recording_nal(nal_slice);
+    // Recording is now tapped inside `submit_frame` so both FFI and Rust
+    // callers (scenario runner) record consistently. The explicit call here
+    // is removed to avoid double-tapping.
 
     let nal_data = NAL_BUF.with(|buf| {
         let mut b = buf.borrow_mut();
