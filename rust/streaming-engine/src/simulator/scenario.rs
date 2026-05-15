@@ -34,13 +34,55 @@ pub struct Scenario {
     #[serde(default)]
     pub config_overrides: serde_json::Map<String, serde_json::Value>,
     pub client: ClientConfig,
-    /// PR-3+ will type these. PR-2 accepts but ignores the field so future
-    /// scenarios can reference fault entries without parser breakage.
+    /// Future PRs will type these (TCP disconnect, packet loss). For now
+    /// they parse as raw JSON so existing scenarios can reference fault
+    /// entries without breaking the parser.
     #[serde(default)]
     pub fault_injection: Vec<serde_json::Value>,
+    /// Engine-side stimuli scheduled at `at_sec` offsets from scenario
+    /// start. PR-4 adds `queue_haptic`; future PRs may add config update,
+    /// IDR request, etc.
     #[serde(default)]
-    pub stimuli: Vec<serde_json::Value>,
+    pub stimuli: Vec<Stimulus>,
     pub assertions: Assertions,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Stimulus {
+    /// Inject a haptic event at the engine. Routes through the same
+    /// `engine::queue_haptic` path the SteamVR driver uses, so the
+    /// engine then emits a `HAPTIC_EVENT (0x38)` TCP message to the
+    /// mock client — exercising the full PC → HMD haptic path.
+    QueueHaptic {
+        at_sec: f64,
+        controller_id: u8,
+        duration_ms: u16,
+        freq: f32,
+        amp: f32,
+    },
+}
+
+impl Stimulus {
+    fn at_sec(&self) -> f64 {
+        match self {
+            Self::QueueHaptic { at_sec, .. } => *at_sec,
+        }
+    }
+
+    fn execute(&self) {
+        match *self {
+            Self::QueueHaptic {
+                controller_id,
+                duration_ms,
+                freq,
+                amp,
+                ..
+            } => {
+                crate::engine::queue_haptic(controller_id, duration_ms, freq, amp);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +172,8 @@ pub struct Assertions {
     pub min_osc_messages: Option<u64>,
     /// Lower bound on `face_messages_sent` (mock-client → engine).
     pub min_face_messages_sent: Option<u64>,
+    /// Lower bound on `haptic_events_received` (mock-client decoded).
+    pub min_haptic_events_received: Option<u64>,
 }
 
 /// Outcome of a single scenario run. `passed` is false iff `failures` is non-empty.
@@ -258,12 +302,46 @@ pub fn run_scenario(scenario: &Scenario) -> Result<ScenarioReport, ScenarioError
     client_config.duration = Some(client_duration);
     client_config.face_pattern = scenario.client.face_pattern.map(|p| p.into_face_mode());
     client_config.osc_listen_port = osc_port;
+    client_config.capture_haptic = scenario.client.capture_haptic;
 
     let tracking_target = client_config.tracking_target;
     let tracking_spec = scenario.client.tracking_pattern.clone();
 
     let cancel = CancellationToken::new();
     let cancel_for_client = cancel.clone();
+
+    // Stimuli scheduler: a dedicated OS thread fires each entry at its
+    // `at_sec` offset by calling the same `engine::queue_haptic` etc. the
+    // production SteamVR driver path uses. Sort by `at_sec` so out-of-
+    // order JSON entries still fire in time.
+    let mut stimuli: Vec<Stimulus> = scenario.stimuli.clone();
+    stimuli.sort_by(|a, b| {
+        a.at_sec()
+            .partial_cmp(&b.at_sec())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let stimuli_thread = if stimuli.is_empty() {
+        None
+    } else {
+        let stimuli_cancel = cancel.clone();
+        let stimuli_start = Instant::now();
+        Some(std::thread::spawn(move || {
+            for stim in stimuli {
+                if stimuli_cancel.is_cancelled() {
+                    break;
+                }
+                let target = Duration::from_secs_f64(stim.at_sec());
+                let elapsed = stimuli_start.elapsed();
+                if target > elapsed {
+                    std::thread::sleep(target - elapsed);
+                }
+                if stimuli_cancel.is_cancelled() {
+                    break;
+                }
+                stim.execute();
+            }
+        }))
+    };
 
     let client_thread = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -322,6 +400,9 @@ pub fn run_scenario(scenario: &Scenario) -> Result<ScenarioReport, ScenarioError
     }
 
     cancel.cancel();
+    if let Some(handle) = stimuli_thread {
+        let _ = handle.join();
+    }
     let stats_result = client_thread
         .join()
         .map_err(|_| ScenarioError::Engine("client thread panicked".into()))?;
@@ -475,6 +556,15 @@ fn evaluate_assertions(
             ));
         }
     }
+    if let Some(min) = a.min_haptic_events_received {
+        let received = s.haptic_events_received.len() as u64;
+        if received < min {
+            failures.push(format!(
+                "min_haptic_events_received: expected >= {}, got {}",
+                min, received
+            ));
+        }
+    }
     if let Some(expected) = &a.expect_osc_addresses {
         for addr in expected {
             if !s.osc_messages.contains_key(addr) {
@@ -604,6 +694,69 @@ mod tests {
         let s = parse_scenario_str(json).expect("parse");
         assert!(matches!(s.client.face_pattern, Some(FacePatternSpec::SineSweep { .. })));
         assert_eq!(s.assertions.min_osc_messages, Some(50));
+    }
+
+    #[test]
+    fn parse_stimulus_queue_haptic() {
+        let json = r#"{
+            "name": "h", "timeout_sec": 5,
+            "client": {
+                "pin_source": "status_json",
+                "duration_sec": 2.0,
+                "capture_haptic": true
+            },
+            "stimuli": [
+                {
+                    "kind": "queue_haptic",
+                    "at_sec": 0.5,
+                    "controller_id": 0,
+                    "duration_ms": 100,
+                    "freq": 160.0,
+                    "amp": 0.7
+                }
+            ],
+            "assertions": { "min_haptic_events_received": 1 }
+        }"#;
+        let s = parse_scenario_str(json).expect("parse");
+        assert_eq!(s.stimuli.len(), 1);
+        match s.stimuli[0] {
+            Stimulus::QueueHaptic { controller_id, duration_ms, .. } => {
+                assert_eq!(controller_id, 0);
+                assert_eq!(duration_ms, 100);
+            }
+        }
+        assert_eq!(s.assertions.min_haptic_events_received, Some(1));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_stimulus_kind() {
+        let json = r#"{
+            "name": "x", "timeout_sec": 5,
+            "client": { "pin_source": "status_json", "duration_sec": 1.0 },
+            "stimuli": [{ "kind": "blast_off", "at_sec": 0.0 }],
+            "assertions": {}
+        }"#;
+        assert!(parse_scenario_str(json).is_err());
+    }
+
+    #[test]
+    fn assertions_min_haptic_below_fails() {
+        let a = Assertions {
+            min_haptic_events_received: Some(2),
+            ..Default::default()
+        };
+        let stats = MockClientStats {
+            haptic_events_received: vec![crate::engine::HapticEvent {
+                controller_id: 0,
+                duration_ms: 100,
+                frequency: 160.0,
+                amplitude: 0.7,
+            }],
+            ..Default::default()
+        };
+        let failures = evaluate_assertions(&a, Some(&stats), false);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("min_haptic_events_received"));
     }
 
     #[test]
