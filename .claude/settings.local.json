@@ -22,7 +22,10 @@
       "Bash(git checkout *)",
       "Bash(git cherry-pick *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(ctest --build-config Release --output-on-failure)",
+      "Bash(git stash *)",
+      "Bash(git rebase *)"
     ]
   }
 }
