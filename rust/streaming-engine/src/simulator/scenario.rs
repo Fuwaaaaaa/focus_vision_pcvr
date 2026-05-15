@@ -99,6 +99,10 @@ pub struct ClientConfig {
     pub face_pattern: Option<FacePatternSpec>,
     #[serde(default)]
     pub capture_haptic: bool,
+    /// When true, the mock client counts SLEEP_ENTER/SLEEP_EXIT messages
+    /// sent by the engine into `sleep_enter_count` / `sleep_exit_count`.
+    #[serde(default)]
+    pub capture_sleep_events: bool,
     /// Manual override for the OSC loopback port. Most scenarios should
     /// leave this `null` and let the runner allocate dynamically — the
     /// runner mirrors the chosen port to both `face_tracking.osc_port`
@@ -174,6 +178,10 @@ pub struct Assertions {
     pub min_face_messages_sent: Option<u64>,
     /// Lower bound on `haptic_events_received` (mock-client decoded).
     pub min_haptic_events_received: Option<u64>,
+    /// Lower bound on `sleep_enter_count` (engine-emitted SLEEP_ENTER).
+    pub min_sleep_enter_count: Option<u64>,
+    /// Lower bound on `sleep_exit_count` (engine-emitted SLEEP_EXIT).
+    pub min_sleep_exit_count: Option<u64>,
 }
 
 /// Outcome of a single scenario run. `passed` is false iff `failures` is non-empty.
@@ -303,6 +311,7 @@ pub fn run_scenario(scenario: &Scenario) -> Result<ScenarioReport, ScenarioError
     client_config.face_pattern = scenario.client.face_pattern.map(|p| p.into_face_mode());
     client_config.osc_listen_port = osc_port;
     client_config.capture_haptic = scenario.client.capture_haptic;
+    client_config.capture_sleep_events = scenario.client.capture_sleep_events;
 
     let tracking_target = client_config.tracking_target;
     let tracking_spec = scenario.client.tracking_pattern.clone();
@@ -562,6 +571,22 @@ fn evaluate_assertions(
             failures.push(format!(
                 "min_haptic_events_received: expected >= {}, got {}",
                 min, received
+            ));
+        }
+    }
+    if let Some(min) = a.min_sleep_enter_count {
+        if s.sleep_enter_count < min {
+            failures.push(format!(
+                "min_sleep_enter_count: expected >= {}, got {}",
+                min, s.sleep_enter_count
+            ));
+        }
+    }
+    if let Some(min) = a.min_sleep_exit_count {
+        if s.sleep_exit_count < min {
+            failures.push(format!(
+                "min_sleep_exit_count: expected >= {}, got {}",
+                min, s.sleep_exit_count
             ));
         }
     }

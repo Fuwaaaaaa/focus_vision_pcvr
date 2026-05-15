@@ -3,6 +3,41 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use fvp_common::{MAX_PIN_ATTEMPTS, PIN_LOCKOUT_SECONDS};
 
+/// Override for `PIN_LOCKOUT_SECONDS` used by simulator-based tests so a
+/// pin_lockout scenario can verify the full lock → wait → unlock cycle in
+/// seconds instead of the production five-minute window. Always 0 (no
+/// override) outside the simulator feature, where the setters do not exist.
+#[cfg(feature = "simulator")]
+static PIN_LOCKOUT_OVERRIDE_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only: shorten the lockout window. Pass `0` to clear the override.
+/// Production builds (no `simulator` feature) compile the override out
+/// entirely, so the constant is the only path.
+#[cfg(feature = "simulator")]
+pub fn set_pin_lockout_override(seconds: u64) {
+    PIN_LOCKOUT_OVERRIDE_SECS.store(seconds, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test-only: read the override (mostly for assertion in unit tests).
+#[cfg(feature = "simulator")]
+pub fn pin_lockout_override() -> u64 {
+    PIN_LOCKOUT_OVERRIDE_SECS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resolve the effective lockout window. Production always returns
+/// `PIN_LOCKOUT_SECONDS`; simulator builds honor a runtime override.
+fn effective_lockout_secs() -> u64 {
+    #[cfg(feature = "simulator")]
+    {
+        let v = PIN_LOCKOUT_OVERRIDE_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        if v > 0 {
+            return v;
+        }
+    }
+    PIN_LOCKOUT_SECONDS
+}
+
 /// Serializable form of lockout state, written to disk so the lockout window
 /// survives companion/engine restarts and cannot be reset by an attacker
 /// simply by killing the process.
@@ -158,7 +193,8 @@ impl PairingState {
             log::warn!("PIN incorrect (attempt {}/{})", self.attempts, MAX_PIN_ATTEMPTS);
 
             if self.attempts >= MAX_PIN_ATTEMPTS {
-                let lockout_duration = Duration::from_secs(PIN_LOCKOUT_SECONDS);
+                let lockout_secs = effective_lockout_secs();
+                let lockout_duration = Duration::from_secs(lockout_secs);
                 self.lockout_until = Some(Instant::now() + lockout_duration);
                 self.attempts = 0;
                 self.pin = generate_pin();
@@ -167,7 +203,7 @@ impl PairingState {
                         .saturating_add(lockout_duration.as_micros() as u64),
                 }
                 .save();
-                log::warn!("Locked out for {}s. New PIN: {:06}", PIN_LOCKOUT_SECONDS, self.pin);
+                log::warn!("Locked out for {}s. New PIN: {:06}", lockout_secs, self.pin);
                 Err(PairingError::LockedOut)
             } else {
                 Err(PairingError::WrongPin {
@@ -228,6 +264,42 @@ mod tests {
         assert!(state.is_locked());
         let pin = state.get_pin();
         assert!(matches!(state.verify(pin), Err(PairingError::LockedOut)));
+    }
+
+    #[test]
+    #[cfg(feature = "simulator")]
+    fn test_pin_lockout_override_affects_duration() {
+        // Set override to 1 second, trigger lockout, and verify the resulting
+        // lockout_until is roughly +1s rather than the production 5-minute
+        // window. Use a generous tolerance so timer jitter doesn't flake.
+        let _guard = TempPersist::new();
+        set_pin_lockout_override(1);
+
+        let mut state = PairingState::new();
+        let wrong = state.get_pin().wrapping_add(1);
+        for _ in 0..MAX_PIN_ATTEMPTS {
+            let _ = state.verify(wrong);
+        }
+        assert!(state.is_locked());
+        let until = state.lockout_until.expect("lockout active");
+        let remaining = until.saturating_duration_since(Instant::now());
+        assert!(
+            remaining < Duration::from_secs(5),
+            "override should produce <5s lockout, got {:?}",
+            remaining
+        );
+
+        set_pin_lockout_override(0); // restore default
+    }
+
+    #[test]
+    #[cfg(feature = "simulator")]
+    fn test_pin_lockout_override_zero_falls_back_to_default() {
+        set_pin_lockout_override(0);
+        assert_eq!(effective_lockout_secs(), PIN_LOCKOUT_SECONDS);
+        set_pin_lockout_override(7);
+        assert_eq!(effective_lockout_secs(), 7);
+        set_pin_lockout_override(0);
     }
 
     #[test]

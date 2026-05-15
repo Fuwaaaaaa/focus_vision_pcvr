@@ -419,6 +419,7 @@ async fn handle_tcp_control(
     gcc_estimator: Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>>,
     sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>>,
     mut haptic_rx: mpsc::Receiver<HapticEvent>,
+    mut sleep_rx: mpsc::Receiver<bool>,
     gcc_enabled: bool,
 ) -> Result<DisconnectReason, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -643,6 +644,16 @@ async fn handle_tcp_control(
                     log::warn!("Failed to send haptic event: {}", e);
                 }
             }
+            Some(is_sleep) = sleep_rx.recv() => {
+                let mt = if is_sleep {
+                    fvp_common::protocol::msg_type::SLEEP_ENTER
+                } else {
+                    fvp_common::protocol::msg_type::SLEEP_EXIT
+                };
+                if let Err(e) = send_msg(&mut writer, mt, &[]).await {
+                    log::warn!("Failed to send sleep transition: {}", e);
+                }
+            }
         }
     }
 }
@@ -857,11 +868,15 @@ fn update_adaptive_bitrate(
 }
 
 /// Detect user inactivity from head tracking and enter/exit sleep mode.
+/// On a transition this both adjusts the bitrate (production driver feedback)
+/// and pushes onto `sleep_tx` so the TCP writer task can notify the HMD via
+/// `SLEEP_ENTER (0x50)` / `SLEEP_EXIT (0x51)` for overlay dimming.
 fn check_sleep_mode(
     tracking: &Arc<StdMutex<Option<TrackingData>>>,
     sleep_detector: &mut crate::sleep_mode::SleepDetector,
     normal_bitrate_mbps: u32,
     timeout_seconds: u32,
+    sleep_tx: &mpsc::Sender<bool>,
 ) {
     if let Ok(guard) = tracking.lock() {
         if let Some(ref data) = *guard {
@@ -871,11 +886,13 @@ fn check_sleep_mode(
                         log::info!("Sleep mode: entering (no motion for {}s)", timeout_seconds);
                         let bps = sleep_detector.sleep_bitrate_mbps() * 1_000_000;
                         notify_bitrate_change(bps);
+                        let _ = sleep_tx.try_send(true);
                     }
                     crate::sleep_mode::SleepTransition::Wake => {
                         log::info!("Sleep mode: waking up (motion detected)");
                         let bps = normal_bitrate_mbps * 1_000_000;
                         notify_bitrate_change(bps);
+                        let _ = sleep_tx.try_send(false);
                     }
                 }
             }
@@ -1149,10 +1166,6 @@ async fn run_streaming(
         let sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>> =
             Arc::new(StdMutex::new(HashMap::new()));
 
-        // OSC bridge for face tracking data (HMD → VRChat). The bridge sends
-        // to `face_tracking.osc_port` so non-default ports (used by E2E
-        // scenarios that capture OSC on a loopback receiver) actually take
-        // effect instead of being silently ignored.
         // OSC bridge for face tracking data (HMD → VRChat). Apply
         // `face_tracking.osc_port` to the bridge target so non-default
         // ports (used by E2E scenarios that capture OSC on a loopback
@@ -1174,6 +1187,14 @@ async fn run_streaming(
             *guard = Some(haptic_tx);
         }
 
+        // Sleep-mode transition channel: `check_sleep_mode` on the frame
+        // loop pushes `true` (entering sleep) or `false` (waking) here, and
+        // `handle_tcp_control` drains them onto the TCP wire as
+        // `SLEEP_ENTER (0x50)` / `SLEEP_EXIT (0x51)` messages. The HMD uses
+        // them to dim the overlay; scenario tests assert on them as the
+        // observable side of an otherwise internal state change.
+        let (sleep_tx, sleep_rx) = mpsc::channel::<bool>(8);
+
         // Spawn TCP control reader/writer. Track disconnect reason for hold logic.
         let disconnect_reason: Arc<StdMutex<Option<DisconnectReason>>> = Arc::new(StdMutex::new(None));
         let tcp_session = session_cancel.clone();
@@ -1183,7 +1204,7 @@ async fn run_streaming(
         let sent_log_clone = sent_packet_log.clone();
         let reason_clone = disconnect_reason.clone();
         spawn_named(&tokio::runtime::Handle::current(), "tcp-control", async move {
-            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, gcc_clone, sent_log_clone, haptic_rx, gcc_enabled).await {
+            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, gcc_clone, sent_log_clone, haptic_rx, sleep_rx, gcc_enabled).await {
                 Ok(reason) => {
                     if let Ok(mut guard) = reason_clone.lock() {
                         *guard = Some(reason);
@@ -1347,6 +1368,7 @@ async fn run_streaming(
                     check_sleep_mode(
                         &_tracking, &mut sleep_detector,
                         normal_bitrate_mbps, config.sleep_mode.timeout_seconds,
+                        &sleep_tx,
                     );
 
                     update_latency_atomics(&latency_tracker);
@@ -1655,6 +1677,7 @@ mod tests {
         async fn run_with_input(mut self, input: &[u8]) -> Self {
             let (client, server) = tokio::io::duplex(4096);
             let (_haptic_tx, haptic_rx) = mpsc::channel::<HapticEvent>(16);
+            let (_sleep_tx, sleep_rx) = mpsc::channel::<bool>(8);
 
             // Write input to client side, then close
             let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -1669,7 +1692,7 @@ mod tests {
             // Run handle_tcp_control (will read until EOF)
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                handle_tcp_control(Box::new(server), cancel, stats, osc, self.gcc_estimator.clone(), self.sent_packet_log.clone(), haptic_rx, true)
+                handle_tcp_control(Box::new(server), cancel, stats, osc, self.gcc_estimator.clone(), self.sent_packet_log.clone(), haptic_rx, sleep_rx, true)
             ).await;
 
             // Capture disconnect reason

@@ -62,6 +62,10 @@ pub struct MockClientConfig {
     /// When true, spawn a TCP reader task that decodes `HAPTIC_EVENT (0x38)`
     /// messages from the engine into `MockClientStats::haptic_events_received`.
     pub capture_haptic: bool,
+    /// When true, the TCP reader task counts `SLEEP_ENTER (0x50)` and
+    /// `SLEEP_EXIT (0x51)` messages from the engine into stats. Useful for
+    /// scenarios that exercise the sleep-mode detector.
+    pub capture_sleep_events: bool,
 }
 
 impl MockClientConfig {
@@ -83,6 +87,7 @@ impl MockClientConfig {
             face_send_interval: Duration::from_millis(50), // 20 Hz, plenty for OSC capture
             osc_listen_port: None,
             capture_haptic: false,
+            capture_sleep_events: false,
         }
     }
 }
@@ -106,6 +111,12 @@ pub struct MockClientStats {
     /// HAPTIC_EVENT messages received from the engine (PC → HMD). Empty
     /// when `capture_haptic` is false.
     pub haptic_events_received: Vec<HapticEvent>,
+    /// SLEEP_ENTER messages received (engine → HMD). Only populated when
+    /// `capture_sleep_events` is true.
+    pub sleep_enter_count: u64,
+    /// SLEEP_EXIT messages received (engine → HMD). Only populated when
+    /// `capture_sleep_events` is true.
+    pub sleep_exit_count: u64,
     /// Connection establishment duration (TCP+TLS+handshake total).
     pub connect_duration: Duration,
     /// Total wall time the run spent streaming after the handshake.
@@ -358,19 +369,34 @@ where
     let stats_reader = Arc::clone(&stats);
     let reader_cancel = cancel.clone();
     let capture_haptic = config.capture_haptic;
+    let capture_sleep_events = config.capture_sleep_events;
     let reader_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 r = read_message(&mut tcp_read) => match r {
                     Ok((mt, payload)) => {
-                        if mt == msg_type::HAPTIC_EVENT && capture_haptic {
-                            if let Some(event) = HapticEvent::from_payload(&payload) {
-                                if let Ok(mut s) = stats_reader.lock() {
-                                    s.haptic_events_received.push(event);
+                        match mt {
+                            t if t == msg_type::HAPTIC_EVENT && capture_haptic => {
+                                if let Some(event) = HapticEvent::from_payload(&payload) {
+                                    if let Ok(mut s) = stats_reader.lock() {
+                                        s.haptic_events_received.push(event);
+                                    }
                                 }
                             }
+                            t if t == msg_type::SLEEP_ENTER && capture_sleep_events => {
+                                if let Ok(mut s) = stats_reader.lock() {
+                                    s.sleep_enter_count += 1;
+                                }
+                            }
+                            t if t == msg_type::SLEEP_EXIT && capture_sleep_events => {
+                                if let Ok(mut s) = stats_reader.lock() {
+                                    s.sleep_exit_count += 1;
+                                }
+                            }
+                            _ => {
+                                // All other inbound types intentionally ignored.
+                            }
                         }
-                        // All other inbound types intentionally ignored.
                     }
                     Err(e) => {
                         log::debug!("mock-client TCP reader exiting: {}", e);
