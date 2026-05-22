@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(ts.len(), 20);
         // Verify year is reasonable
         let year: u32 = ts[0..4].parse().unwrap();
-        assert!(year >= 2024 && year <= 2100);
+        assert!((2024..=2100).contains(&year));
     }
 
     #[test]

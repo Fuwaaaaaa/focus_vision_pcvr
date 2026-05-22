@@ -21,7 +21,7 @@ fuzz_target!(|input: FecInput| {
     if input.data.is_empty() || input.data.len() > 32 * 1024 {
         return;
     }
-    let shard_size = (input.shard_size as usize).max(1).min(1200);
+    let shard_size = (input.shard_size as usize).clamp(1, 1200);
     let redundancy = (input.redundancy_pct as f32).clamp(1.0, 100.0) / 100.0;
 
     // Split data into fixed-size shards

@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn test_fvp_submit_encoded_nal_no_engine() {
         reset_engine();
-        let nal_data = vec![0u8; 100];
+        let nal_data = [0u8; 100];
         let result = unsafe { fvp_submit_encoded_nal(nal_data.as_ptr(), nal_data.len() as u32, 0, 1) };
         assert_eq!(result, -1);
     }
@@ -555,7 +555,7 @@ mod tests {
     #[test]
     fn test_fvp_submit_encoded_nal_zero_len() {
         reset_engine();
-        let nal_data = vec![0u8; 100];
+        let nal_data = [0u8; 100];
         let result = unsafe { fvp_submit_encoded_nal(nal_data.as_ptr(), 0, 0, 0) };
         assert_eq!(result, -1);
     }
@@ -565,7 +565,7 @@ mod tests {
         // Pass a tiny real buffer but claim a huge length — the length cap
         // must reject before we read past the allocation.
         reset_engine();
-        let nal_data = vec![0u8; 16];
+        let nal_data = [0u8; 16];
         let bogus_len: u32 = 200 * 1024 * 1024; // 200 MB > 32 MB cap
         let result = unsafe { fvp_submit_encoded_nal(nal_data.as_ptr(), bogus_len, 0, 0) };
         assert_eq!(result, -1);

@@ -285,7 +285,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let data = head.lock().unwrap().clone();
+        let data = *head.lock().unwrap();
         assert!(data.is_some());
         let d = data.unwrap();
         assert_eq!(d.position, [0.5, 1.5, 2.5]);
@@ -355,7 +355,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let ctrls = controllers.lock().unwrap().clone();
+        let ctrls = *controllers.lock().unwrap();
         assert!(ctrls[0].is_some(), "Left controller should be updated");
         let c = ctrls[0].as_ref().unwrap();
         assert_eq!(c.controller_id, 0);
@@ -390,7 +390,7 @@ mod tests {
 
         // Neither head nor controllers should be updated
         assert!(head.lock().unwrap().is_none());
-        let ctrls = controllers.lock().unwrap().clone();
+        let ctrls = *controllers.lock().unwrap();
         assert!(ctrls[0].is_none());
         assert!(ctrls[1].is_none());
 

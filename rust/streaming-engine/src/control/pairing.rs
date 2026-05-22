@@ -59,15 +59,16 @@ thread_local! {
     /// Tests opt into on-disk persistence by setting this to a tempdir path.
     /// Default `None` means `save()` is a no-op and `load()` returns default,
     /// so existing tests do not pollute the real `%APPDATA%/FocusVisionPCVR/`.
-    static TEST_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
-        std::cell::RefCell::new(None);
+    static TEST_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 impl PersistedLockout {
     fn path() -> Option<PathBuf> {
         #[cfg(test)]
         {
-            return TEST_PATH_OVERRIDE.with(|c| c.borrow().clone());
+            TEST_PATH_OVERRIDE.with(|c| c.borrow().clone())
         }
         #[cfg(not(test))]
         dirs_next::data_dir().map(|d| d.join("FocusVisionPCVR").join("lockout.json"))

@@ -81,26 +81,24 @@ fuzz_target!(|input: SliceInput| {
 
         let available = shards_with_loss.iter().filter(|s| s.is_some()).count();
 
-        match FecDecoder::decode(&mut shards_with_loss, data_count) {
-            Ok(recovered) => {
-                if available >= data_count {
-                    // Reconstruct prefixed data
-                    let mut recovered_data: Vec<u8> = recovered.into_iter().flatten().collect();
-                    // Extract length prefix
-                    if recovered_data.len() >= 4 {
-                        let len = u32::from_le_bytes([
-                            recovered_data[0], recovered_data[1],
-                            recovered_data[2], recovered_data[3],
-                        ]);
-                        if (len as usize) + 4 <= recovered_data.len() {
-                            let payload = &recovered_data[4..4 + len as usize];
-                            assert_eq!(payload, *slice_data,
-                                "Slice {} data mismatch after FEC roundtrip", si);
-                        }
+        if let Ok(recovered) = FecDecoder::decode(&mut shards_with_loss, data_count) {
+            if available >= data_count {
+                // Reconstruct prefixed data
+                let recovered_data: Vec<u8> = recovered.into_iter().flatten().collect();
+                // Extract length prefix
+                if recovered_data.len() >= 4 {
+                    let len = u32::from_le_bytes([
+                        recovered_data[0], recovered_data[1],
+                        recovered_data[2], recovered_data[3],
+                    ]);
+                    if (len as usize) + 4 <= recovered_data.len() {
+                        let payload = &recovered_data[4..4 + len as usize];
+                        assert_eq!(payload, *slice_data,
+                            "Slice {} data mismatch after FEC roundtrip", si);
                     }
                 }
             }
-            Err(_) => {}
         }
+        // Decoder Err is acceptable — fuzzer may construct invalid shard sets.
     }
 });
