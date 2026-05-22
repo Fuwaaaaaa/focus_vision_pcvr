@@ -8,6 +8,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fvp_common::protocol::VideoCodec;
@@ -66,7 +67,21 @@ pub enum Stimulus {
     SetLossPct { at_sec: f64, pct: u8 },
     /// Reset the simulator UDP loss probability to 0.
     ClearLossPct { at_sec: f64 },
+    /// Add `latency_us` of extra delay to every subsequent synthetic frame
+    /// submission. Models OpenXR `xrWaitFrame` jitter that the production
+    /// driver pays before pushing a frame to the encoder. Use with
+    /// `ClearFrameLatency` to bound the injected window. Adaptive bitrate
+    /// and GCC paths should react by lowering bitrate when latency climbs.
+    InjectFrameLatency { at_sec: f64, latency_us: u64 },
+    /// Reset the synthetic frame producer delay to 0.
+    ClearFrameLatency { at_sec: f64 },
 }
+
+/// Extra per-frame delay (microseconds) the synthetic frame producer applies
+/// after each `engine.submit_frame()` call. Mutated by
+/// `Stimulus::InjectFrameLatency` and `Stimulus::ClearFrameLatency`; read
+/// inside the frame producer loop in `run_scenario`.
+static FRAME_LATENCY_US: AtomicU64 = AtomicU64::new(0);
 
 impl Stimulus {
     fn at_sec(&self) -> f64 {
@@ -74,6 +89,8 @@ impl Stimulus {
             Self::QueueHaptic { at_sec, .. } => *at_sec,
             Self::SetLossPct { at_sec, .. } => *at_sec,
             Self::ClearLossPct { at_sec } => *at_sec,
+            Self::InjectFrameLatency { at_sec, .. } => *at_sec,
+            Self::ClearFrameLatency { at_sec } => *at_sec,
         }
     }
 
@@ -95,6 +112,14 @@ impl Stimulus {
             Self::ClearLossPct { .. } => {
                 crate::transport::udp::set_simulator_loss_pct(0);
                 log::info!("scenario stimulus: loss_pct -> 0");
+            }
+            Self::InjectFrameLatency { latency_us, .. } => {
+                FRAME_LATENCY_US.store(latency_us, Ordering::Relaxed);
+                log::info!("scenario stimulus: frame_latency -> {} us", latency_us);
+            }
+            Self::ClearFrameLatency { .. } => {
+                FRAME_LATENCY_US.store(0, Ordering::Relaxed);
+                log::info!("scenario stimulus: frame_latency -> 0");
             }
         }
     }
@@ -118,6 +143,12 @@ pub struct ClientConfig {
     /// sent by the engine into `sleep_enter_count` / `sleep_exit_count`.
     #[serde(default)]
     pub capture_sleep_events: bool,
+    /// When true, mock client records per-frame depacketization wall-time
+    /// and reports p50/p95/p99 in stats. Use with
+    /// `Assertions.max_decode_latency_us_p99` to gate codec comparison
+    /// scenarios.
+    #[serde(default)]
+    pub measure_decode_latency: bool,
     /// Manual override for the OSC loopback port. Most scenarios should
     /// leave this `null` and let the runner allocate dynamically — the
     /// runner mirrors the chosen port to both `face_tracking.osc_port`
@@ -163,6 +194,10 @@ pub enum FacePatternSpec {
     Relax,
     Exaggerate,
     SineSweep { hz: f32 },
+    Blink { hz: f32 },
+    Talk { hz: f32 },
+    Smile { intensity: f32 },
+    Frown { intensity: f32 },
 }
 
 impl FacePatternSpec {
@@ -171,6 +206,10 @@ impl FacePatternSpec {
             Self::Relax => FaceMode::Relax,
             Self::Exaggerate => FaceMode::Exaggerate,
             Self::SineSweep { hz } => FaceMode::SineSweep { hz },
+            Self::Blink { hz } => FaceMode::Blink { hz },
+            Self::Talk { hz } => FaceMode::Talk { hz },
+            Self::Smile { intensity } => FaceMode::Smile { intensity },
+            Self::Frown { intensity } => FaceMode::Frown { intensity },
         }
     }
 }
@@ -204,6 +243,14 @@ pub struct Assertions {
     /// ending in `.h265` / `.h264` / `.wav` and assert their cumulative
     /// size meets `min_bytes`.
     pub expect_recording_files: Option<RecordingCheck>,
+    /// Upper bound on the 99th-percentile depacketization wall-time
+    /// reported by the mock client (microseconds). Only meaningful when
+    /// `client.measure_decode_latency = true`.
+    pub max_decode_latency_us_p99: Option<u32>,
+    /// Lower bound on the number of decode-latency samples collected. Use
+    /// to guard against codec scenarios where too few frames complete to
+    /// make the percentile meaningful.
+    pub min_decode_latency_samples: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -354,6 +401,7 @@ pub fn run_scenario(scenario: &Scenario) -> Result<ScenarioReport, ScenarioError
     client_config.osc_listen_port = osc_port;
     client_config.capture_haptic = scenario.client.capture_haptic;
     client_config.capture_sleep_events = scenario.client.capture_sleep_events;
+    client_config.measure_decode_latency = scenario.client.measure_decode_latency;
 
     let tracking_target = client_config.tracking_target;
     let tracking_spec = scenario.client.tracking_pattern.clone();
@@ -427,8 +475,16 @@ pub fn run_scenario(scenario: &Scenario) -> Result<ScenarioReport, ScenarioError
     });
 
     // Pump synthetic frames into the engine for the scenario duration.
+    // Reset any frame-latency injection left over from a prior scenario so
+    // this run starts unperturbed; InjectFrameLatency stimuli inside the
+    // scenario re-arm it.
+    FRAME_LATENCY_US.store(0, Ordering::Relaxed);
+    let codec = match config_video_codec(&scenario.config_overrides) {
+        Some(c) => c,
+        None => VideoCodec::H265,
+    };
     let stream_window = client_duration + Duration::from_millis(200);
-    let mut stream = SyntheticNalStream::new(VideoCodec::H265, framerate);
+    let mut stream = SyntheticNalStream::new(codec, framerate);
     let frame_period = Duration::from_secs_f64(1.0 / framerate as f64);
     let start = Instant::now();
     let mut next_tick = start;
@@ -441,7 +497,12 @@ pub fn run_scenario(scenario: &Scenario) -> Result<ScenarioReport, ScenarioError
             timestamps: FrameTimestamps::new(synth.frame_index),
         };
         let _ = engine.submit_frame(frame);
-        next_tick += frame_period;
+        // InjectFrameLatency stimulus stretches each frame's effective
+        // period — the next submission slides right by `extra_us`. The
+        // engine's adaptive bitrate / GCC controllers should observe the
+        // delay through HEARTBEAT_ACK and react.
+        let extra_us = FRAME_LATENCY_US.load(Ordering::Relaxed);
+        next_tick += frame_period + Duration::from_micros(extra_us);
         let now = Instant::now();
         if next_tick > now {
             std::thread::sleep(next_tick - now);
@@ -669,7 +730,36 @@ fn evaluate_assertions(
             )),
         }
     }
+    if let Some(min) = a.min_decode_latency_samples {
+        if s.depacketize_samples_count < min {
+            failures.push(format!(
+                "min_decode_latency_samples: expected >= {}, got {} (was measure_decode_latency on?)",
+                min, s.depacketize_samples_count
+            ));
+        }
+    }
+    if let Some(max) = a.max_decode_latency_us_p99 {
+        if s.depacketize_latency_us_p99 > max {
+            failures.push(format!(
+                "max_decode_latency_us_p99: expected <= {}, got {}",
+                max, s.depacketize_latency_us_p99
+            ));
+        }
+    }
     failures
+}
+
+/// Resolve the `video.codec` override (if any) into a `VideoCodec`. Falls
+/// back to `None` so the caller can pick H.265 as the default.
+fn config_video_codec(
+    overrides: &serde_json::Map<String, serde_json::Value>,
+) -> Option<VideoCodec> {
+    let v = overrides.get("video.codec")?.as_str()?;
+    match v.to_ascii_lowercase().as_str() {
+        "h264" | "avc" => Some(VideoCodec::H264),
+        "h265" | "hevc" => Some(VideoCodec::H265),
+        _ => None,
+    }
 }
 
 /// Sum the byte sizes of `.h265 / .h264 / .wav` files directly inside
