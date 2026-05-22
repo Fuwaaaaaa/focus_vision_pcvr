@@ -1,4 +1,7 @@
 /target/
+# Workspace target lives at /target above; this also ignores any stray
+# per-crate cache (older toolchain runs occasionally drop one here).
+**/target/
 **/*.rs.bk
 driver/build/
 *.obj
