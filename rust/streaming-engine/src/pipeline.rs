@@ -349,8 +349,7 @@ mod tests {
         // Determine data/total shard counts from the first packet's FVP header
         let total_shard_count =
             u16::from_le_bytes([packets[0].data[18], packets[0].data[19]]) as usize;
-        let data_shard_count =
-            (original.len() + FEC_SHARD_SIZE - 1) / FEC_SHARD_SIZE;
+        let data_shard_count = original.len().div_ceil(FEC_SHARD_SIZE);
 
         let pkt_refs: Vec<&[u8]> = packets.iter().map(|p| p.data.as_slice()).collect();
         let decoded =

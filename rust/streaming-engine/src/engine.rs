@@ -1603,7 +1603,12 @@ mod tests {
         }
     }
 
+    // The explicit `0u64 * tick` / `1u64 * tick` form in these tests is
+    // intentional: it documents the formula `frame_count * tick` so the
+    // reader sees how each frame maps to its RTP timestamp. The clippy
+    // simplifications obscure that, so we silence the lints here only.
     #[test]
+    #[allow(clippy::erasing_op, clippy::identity_op)]
     fn test_rtp_timestamp_at_90fps() {
         // At 90fps: each frame increments by 90000/90 = 1000
         let framerate = 90u64;
@@ -1617,6 +1622,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)]
     fn test_rtp_timestamp_at_96fps() {
         // At 96fps with multiply-first: frame_count * 90000 / 96
         let framerate = 96u64;

@@ -100,8 +100,8 @@ fn test_fec_pipeline_with_packet_loss() {
     // Simulate packet loss: drop up to parity_count shards
     let mut received: Vec<Option<Vec<u8>>> = all_shards.into_iter().map(Some).collect();
     // Drop the first parity_count data shards
-    for i in 0..parity_count {
-        received[i] = None;
+    for slot in received.iter_mut().take(parity_count) {
+        *slot = None;
     }
 
     // FEC decode
@@ -148,7 +148,7 @@ fn test_nal_to_rtp_fec_roundtrip() {
     // Extract shard counts from first packet's FVP header (u16 LE at offset 18)
     let total_shards = u16::from_le_bytes([packets[0].data[18], packets[0].data[19]]) as usize;
     let shard_size = fvp_common::FEC_SHARD_SIZE;
-    let data_shard_count = (nal_data.len() + shard_size - 1) / shard_size;
+    let data_shard_count = nal_data.len().div_ceil(shard_size);
 
     // Reconstruct: collect all packet refs
     let pkt_refs: Vec<&[u8]> = packets.iter().map(|p| p.data.as_slice()).collect();
@@ -170,7 +170,7 @@ fn test_nal_fec_recovery_with_loss() {
 
     let total_shards = u16::from_le_bytes([packets[0].data[18], packets[0].data[19]]) as usize;
     let shard_size = fvp_common::FEC_SHARD_SIZE;
-    let data_shard_count = (nal_data.len() + shard_size - 1) / shard_size;
+    let data_shard_count = nal_data.len().div_ceil(shard_size);
     let parity_count = total_shards - data_shard_count;
 
     // Drop up to parity_count packets (should still recover)

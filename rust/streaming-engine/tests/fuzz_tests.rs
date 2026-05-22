@@ -24,7 +24,7 @@ fn fuzz_rtp_packetize_no_panic() {
         let data = random_bytes(&mut rng, 128 * 1024);
         let frame_index = rng.next_u32();
         let timestamp = rng.next_u32();
-        let is_keyframe = rng.next_u32() % 2 == 0;
+        let is_keyframe = rng.next_u32().is_multiple_of(2);
 
         let packets = packetizer.packetize(&data, frame_index, timestamp, is_keyframe);
 
@@ -80,17 +80,15 @@ fn fuzz_fec_encode_decode_roundtrip() {
         let available = shards.iter().filter(|s| s.is_some()).count();
 
         // Decode — must not panic
-        match FecDecoder::decode(&mut shards, data_count) {
-            Ok(recovered) => {
-                if available >= data_count {
-                    assert_eq!(recovered.len(), data_count);
-                    for (i, shard) in recovered.iter().enumerate() {
-                        assert_eq!(shard, &original[i], "Shard {} mismatch", i);
-                    }
+        if let Ok(recovered) = FecDecoder::decode(&mut shards, data_count) {
+            if available >= data_count {
+                assert_eq!(recovered.len(), data_count);
+                for (i, shard) in recovered.iter().enumerate() {
+                    assert_eq!(shard, &original[i], "Shard {} mismatch", i);
                 }
             }
-            Err(_) => {} // acceptable
         }
+        // Err is acceptable — decoder may reject under-shard scenarios.
     }
 }
 

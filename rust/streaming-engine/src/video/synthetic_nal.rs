@@ -144,7 +144,13 @@ pub struct SyntheticNalFrame {
 mod tests {
     use super::*;
 
+    // These assertions check compile-time constants — clippy flags them as
+    // "constant value" because they cannot fail at runtime, but that's
+    // exactly the point: the test exists as a compile-time guard rail so
+    // a future tweak to DEFAULT_IDR_SIZE_BYTES below 16 KB breaks CI loudly
+    // instead of silently skipping the slice-FEC path in scenarios.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_default_idr_size_above_slice_threshold() {
         // Slice FEC engages for frames >= MIN_SLICE_SIZE (16 KB). Default
         // IDR must be above so the simulator exercises the slice path.
