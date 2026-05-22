@@ -57,8 +57,16 @@ android {
             if (keystorePath != null && file(keystorePath).exists()) {
                 signingConfig = signingConfigs.getByName("release")
             }
-            isMinifyEnabled = false
-            isShrinkResources = false
+            // R8 code+resource shrinking. The Kotlin layer is essentially
+            // just NativeActivity + companion loadLibrary; the bulk of the
+            // app is C++ (libfocusvision_native.so), which R8 does not
+            // touch. Rules in proguard-rules.pro keep JNI callbacks alive.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 
