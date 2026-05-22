@@ -1,0 +1,27 @@
+{
+  "name": "codec_comparison_h265",
+  "timeout_sec": 30,
+  "config_overrides": {
+    "video.framerate": 60,
+    "video.codec": "h265",
+    "audio.enabled": false
+  },
+  "client": {
+    "pin_source": "status_json",
+    "duration_sec": 3.0,
+    "tracking_pattern": null,
+    "face_pattern": null,
+    "capture_haptic": false,
+    "capture_sleep_events": false,
+    "measure_decode_latency": true,
+    "osc_listen_port": null
+  },
+  "fault_injection": [],
+  "stimuli": [],
+  "assertions": {
+    "min_frames_decoded": 30,
+    "min_idr_frames": 1,
+    "min_decode_latency_samples": 20,
+    "max_decode_latency_us_p99": 50000
+  }
+}
