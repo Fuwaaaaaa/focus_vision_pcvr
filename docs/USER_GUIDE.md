@@ -11,6 +11,7 @@ VIVE Focus Vision を Wi-Fi 経由で PC につなぎ、SteamVR ゲームをワ�
 | カテゴリ | 要件 | 備考 |
 |---------|------|------|
 | **PC** | Windows 10 (1909+) / Windows 11 | 32-bit Windows は非対応 |
+| **VC++ ランタイム** | Microsoft Visual C++ 2015-2022 Redistributable (x64) | インストーラ起動時に未検出なら案内・中止。最新版を [aka.ms/vs/17/release/vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe) から取得可能 |
 | **GPU** | NVIDIA GeForce GTX 1060 6GB 以上 | NVENC ハードウェアエンコード必須。AMD / Intel GPU は非対応 |
 | **GPU ドライバ** | NVIDIA Game Ready Driver 528 以上 | 古いドライバは NVENC 構造体が異なり起動に失敗します |
 | **SteamVR** | 最新安定版 | Steam クライアントから自動更新 |
