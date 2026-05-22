@@ -8,8 +8,8 @@
 
 [![License: Dual](https://img.shields.io/badge/License-MIT%20%7C%20Commercial-34D399.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-stable-e8e8ec.svg?logo=rust&logoColor=e8e8ec)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-450%2B-34D399.svg)](#testing)
-[![Version](https://img.shields.io/badge/version-3.0.0-34D399.svg)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-500%2B-34D399.svg)](#testing)
+[![Version](https://img.shields.io/badge/version-3.0.0--rc3-34D399.svg)](CHANGELOG.md)
 
 </div>
 

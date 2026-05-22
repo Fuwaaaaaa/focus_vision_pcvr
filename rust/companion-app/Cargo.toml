@@ -1,7 +1,10 @@
 [package]
 name = "focus-vision-companion"
-version = "3.0.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Focus Vision PCVR companion app — driver install, PIN display, HMD deploy"
 
 [[bin]]

@@ -1,6 +1,6 @@
 # Focus Vision PCVR
 
-VIVE Focus Vision向けPCVRストリーミングツール（v3.0.0、現在 rc1 candidate）。
+VIVE Focus Vision向けPCVRストリーミングツール（v3.0.0、現在 rc3 candidate）。
 
 ## Architecture
 - `rust/streaming-engine/` — Rust static library (C ABI via cbindgen)
