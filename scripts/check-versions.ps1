@@ -25,26 +25,34 @@ function Get-RepoRoot {
 $root = Get-RepoRoot
 $errors = @()
 
-# 1. Canonical version (first line of VERSION, e.g. "3.0.0.0" → "3.0.0")
+# 1. Canonical version (single line of VERSION, e.g. "3.0.0" or "3.0.0-rc3").
+# Pre-release suffix (-rcN, -betaN) is part of the canonical string and must
+# match across all sources.
 $versionFile = Join-Path $root 'VERSION'
 if (-not (Test-Path $versionFile)) {
     Write-Host "ERROR: VERSION file missing at $versionFile"
     exit 1
 }
 $rawVersion = (Get-Content $versionFile -First 1).Trim()
-$parts = $rawVersion -split '\.'
-if ($parts.Count -lt 3) {
-    Write-Host "ERROR: VERSION '$rawVersion' has fewer than 3 components"
+if ($rawVersion -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.+]+)?$') {
+    Write-Host "ERROR: VERSION '$rawVersion' is not semver-shaped"
     exit 1
 }
-$canonical = "$($parts[0]).$($parts[1]).$($parts[2])"
-Write-Host "Canonical version (from VERSION): $canonical (raw: $rawVersion)"
+$canonical = $rawVersion
+Write-Host "Canonical version (from VERSION): $canonical"
 
+# Sub-crate Cargo.toml files can either pin version inline OR inherit from
+# [workspace.package] via `version.workspace = true`. We accept both.
 function Assert-CargoVersion($path, $expected) {
     $full = Join-Path $root $path
-    $line = Get-Content $full | Select-String -Pattern '^version\s*=' | Select-Object -First 1
+    $content = Get-Content $full
+    $line = $content | Select-String -Pattern '^version\s*[=.]' | Select-Object -First 1
     if (-not $line) {
         $script:errors += "$path : no version line found"
+        return
+    }
+    if ($line -match 'version\.workspace\s*=\s*true') {
+        Write-Host "OK  $path  version inherits from [workspace.package]"
         return
     }
     if ($line -match 'version\s*=\s*"([^"]+)"') {
@@ -57,6 +65,20 @@ function Assert-CargoVersion($path, $expected) {
     } else {
         $script:errors += "$path : version line did not parse: $line"
     }
+}
+
+# Root workspace.package.version is the source of truth for all crates.
+$rootCargo = Join-Path $root 'Cargo.toml'
+$rootContent = Get-Content $rootCargo -Raw
+if ($rootContent -match '\[workspace\.package\][^\[]*?version\s*=\s*"([^"]+)"') {
+    $rootVersion = $Matches[1]
+    if ($rootVersion -ne $canonical) {
+        $errors += "Cargo.toml : workspace.package.version=$rootVersion (expected $canonical)"
+    } else {
+        Write-Host "OK  Cargo.toml  workspace.package.version=$rootVersion"
+    }
+} else {
+    $errors += "Cargo.toml : [workspace.package] version not found"
 }
 
 Assert-CargoVersion 'rust/streaming-engine/Cargo.toml' $canonical
@@ -77,11 +99,13 @@ if ($gradleLine -match 'versionName\s*=\s*"([^"]+)"') {
     $errors += "client/app/build.gradle.kts : versionName not found"
 }
 
-# 5. README badge
+# 5. README badge (shields.io escapes "-" as "--", so 3.0.0-rc3 becomes 3.0.0--rc3)
 $readme = Join-Path $root 'README.md'
 $badgeLine = Get-Content $readme | Select-String -Pattern 'badge/version-' | Select-Object -First 1
-if ($badgeLine -match 'badge/version-([0-9]+\.[0-9]+\.[0-9]+)') {
-    $v = $Matches[1]
+if ($badgeLine -match 'badge/version-([0-9]+\.[0-9]+\.[0-9]+(?:--[A-Za-z0-9.+]+)?)') {
+    $rawBadge = $Matches[1]
+    # Un-escape shields.io's "--" back to "-" for comparison
+    $v = $rawBadge -replace '--', '-'
     if ($v -ne $canonical) {
         $errors += "README.md : badge version-$v (expected $canonical)"
     } else {

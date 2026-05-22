@@ -30,7 +30,12 @@ SetCompressor /SOLID lzma
 ; ---- Constants -------------------------------------------------------------
 
 !define APP_NAME       "Focus Vision PCVR"
-!define APP_VERSION    "3.0.0"
+!define APP_VERSION    "3.0.0-rc3"
+; NSIS VIProductVersion requires 4-component numeric (MAJOR.MINOR.PATCH.BUILD).
+; Pre-release tag is encoded by reserving the 4th component for the rc number:
+;   3.0.0-rc3  -> 3.0.0.3
+;   3.0.0      -> 3.0.0.1000 (final, sorts above any rc)
+!define APP_VERSION_NUMERIC "3.0.0.3"
 !define APP_PUBLISHER  "Fuwaaaaaa"
 !define APP_URL        "https://github.com/Fuwaaaaaa/focus_vision_pcvr"
 !define APP_KEY        "FocusVisionPCVR"
@@ -50,7 +55,7 @@ InstallDirRegKey HKLM "${REG_APP}" "InstallDir"
 RequestExecutionLevel admin    ; vrpathreg + ProgramFiles writes need admin
 
 ; Embedded version info so Windows shows clean metadata in Properties
-VIProductVersion "${APP_VERSION}.0"
+VIProductVersion "${APP_VERSION_NUMERIC}"
 VIAddVersionKey "ProductName"     "${APP_NAME}"
 VIAddVersionKey "FileDescription" "${APP_NAME} Installer"
 VIAddVersionKey "FileVersion"     "${APP_VERSION}"
