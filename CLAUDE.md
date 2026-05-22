@@ -39,17 +39,17 @@ See `ARCHITECTURE.md` for detailed system diagrams and data flow.
 cargo build --release -p streaming-engine          # Rust streaming engine
 cargo build --release -p focus-vision-companion    # PC companion app
 cargo build --release -p streaming-engine --features simulator --bins   # E2E binaries
-cargo test --workspace                              # 450+ tests
+cargo test --workspace                              # 500+ Rust tests
 ```
 
 ## Testing
 ```bash
-cargo test --workspace                              # All tests (450+)
-cargo test -p streaming-engine                      # Engine: 340+ tests + integration
+cargo test --workspace                              # All Rust tests (500+ unit + integration)
+cargo test -p streaming-engine                      # Engine: 380+ tests + integration
 cargo test -p focus-vision-companion --bins         # Companion: 60 tests (config, ADB, export, status_parser, demo, svg_export, ui/settings validator)
 cargo test -p fvp-common                            # Common: protocol structs / flags / versioning
 cargo bench -p streaming-engine                     # Criterion benchmarks
-cargo clippy --workspace -- -D warnings             # CI clippy gate (some pre-existing toolchain regressions; new RC code is clean)
+cargo clippy --workspace --all-features --all-targets -- -D warnings  # CI clippy gate, fully clean
 # Fuzz targets (Linux CI / cargo-fuzz):
 cd rust/streaming-engine && cargo fuzz list         # fuzz_rtp, fuzz_fec, fuzz_protocol, fuzz_config, fuzz_slice, fuzz_recording
 # Headless E2E (simulator feature, runs full TCP+TLS+RTP+FEC+UDP loop in-process):

@@ -126,7 +126,7 @@ cargo build --release -p streaming-engine
 cargo build --release -p focus-vision-companion
 
 # テスト
-cargo test --workspace  # 450+ tests
+cargo test --workspace  # 500+ Rust tests
 
 # Companion を「実機なし」で試す（デモモード）
 cargo run -p focus-vision-companion -- --demo
