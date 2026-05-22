@@ -57,9 +57,9 @@ jobs:
             retention-days: 7
             if-no-files-found: ignore
         - name: Clippy (production)
-          run: cargo clippy --workspace -- -D warnings
+          run: cargo clippy --workspace --all-targets -- -D warnings
         - name: Clippy (simulator)
-          run: cargo clippy --workspace --features simulator -- -D warnings
+          run: cargo clippy --workspace --features simulator --all-targets -- -D warnings
         - name: Security audit
           continue-on-error: true
           run: |
@@ -261,6 +261,28 @@ jobs:
           with:
             name: fuzz-artifacts
             path: rust/streaming-engine/fuzz/artifacts/
+
+    long-run-stability:
+      name: Long-Run Stability (nightly)
+      # 15-minute scenario that exercises FEC under intermittent loss with
+      # memory + frame-rate assertions. Excluded from PR / push CI to keep
+      # latency low; only the nightly cron triggers it.
+      if: github.event_name != 'pull_request'
+      runs-on: windows-latest
+      timeout-minutes: 30
+      continue-on-error: true
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            submodules: recursive
+        - uses: dtolnay/rust-toolchain@stable
+        - name: Run long_run_stability scenario
+          # `--ignored` activates the #[ignore]-gated test in
+          # scenario_transport_test.rs. `--test-threads=1` keeps the engine's
+          # status.json sequential. The scenario itself takes ~15 minutes
+          # plus engine + tokio teardown overhead.
+          run: |
+            cargo test --release -p streaming-engine --features simulator --test scenario_transport_test long_run_stability -- --ignored --test-threads=1 --nocapture
 
     coverage:
       name: Coverage (nightly)
