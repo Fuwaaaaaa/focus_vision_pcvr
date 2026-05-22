@@ -66,6 +66,14 @@ pub struct MockClientConfig {
     /// `SLEEP_EXIT (0x51)` messages from the engine into stats. Useful for
     /// scenarios that exercise the sleep-mode detector.
     pub capture_sleep_events: bool,
+    /// When true, the video receiver records per-frame depacketization wall
+    /// time (first RTP packet → reassembled frame) and the run computes
+    /// p50/p95/p99 into `MockClientStats::depacketize_latency_us_*`. This is
+    /// the headless proxy for decode latency — we have no GPU decoder in the
+    /// simulator, but the depacketization+FEC reconstruction span is the
+    /// closest synthetic equivalent and is what the real HMD pays before
+    /// MediaCodec gets the frame. Useful for codec comparison scenarios.
+    pub measure_decode_latency: bool,
 }
 
 impl MockClientConfig {
@@ -88,6 +96,7 @@ impl MockClientConfig {
             osc_listen_port: None,
             capture_haptic: false,
             capture_sleep_events: false,
+            measure_decode_latency: false,
         }
     }
 }
@@ -121,6 +130,16 @@ pub struct MockClientStats {
     pub connect_duration: Duration,
     /// Total wall time the run spent streaming after the handshake.
     pub stream_duration: Duration,
+    /// Number of per-frame depacketization latency samples collected. Zero
+    /// when `MockClientConfig::measure_decode_latency` is false.
+    pub depacketize_samples_count: u64,
+    /// 50th percentile of per-frame depacketization wall time, microseconds.
+    /// Zero when no samples were collected.
+    pub depacketize_latency_us_p50: u32,
+    /// 95th percentile of per-frame depacketization wall time, microseconds.
+    pub depacketize_latency_us_p95: u32,
+    /// 99th percentile of per-frame depacketization wall time, microseconds.
+    pub depacketize_latency_us_p99: u32,
 }
 
 /// Errors a mock-client run can surface to the caller.
@@ -418,19 +437,53 @@ where
 
     let stats_video = Arc::clone(&stats);
     let video_cancel = cancel.clone();
+    let measure_latency = config.measure_decode_latency;
+    // Per-frame depacketization samples. Sent back through the shared
+    // `decode_samples` slot below so the run() epilogue can compute
+    // percentiles after the receiver task exits. Bounded to keep memory
+    // sane on long runs (15 min @ 90fps ≈ 81000 frames @ 4B = 324 KB).
+    let decode_samples: Arc<std::sync::Mutex<Vec<u32>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let decode_samples_recv = Arc::clone(&decode_samples);
     let video_handle = tokio::spawn(async move {
         let mut depacketizer = RtpDepacketizer::new();
         let mut buf = [0u8; 2048];
+        // Track when the first packet of the in-flight frame arrived. The
+        // depacketizer does not expose its frame boundary directly; we
+        // approximate "first packet of a frame" as "the packet immediately
+        // after a frame completion". This matches what the production
+        // Android client measures.
+        let mut frame_start: Option<Instant> = None;
         while !video_cancel.is_cancelled() {
             tokio::select! {
                 r = receiver.recv(&mut buf) => match r {
                     Ok((n, _peer)) => {
+                        if measure_latency && frame_start.is_none() {
+                            frame_start = Some(Instant::now());
+                        }
                         let mut s = stats_video.lock().unwrap();
                         s.video_packets_received += 1;
                         if let Some(frame) = depacketizer.feed(&buf[..n]) {
                             s.frames_decoded += 1;
                             if frame.is_keyframe {
                                 s.idr_frames_seen += 1;
+                            }
+                            if measure_latency {
+                                if let Some(start) = frame_start.take() {
+                                    let us = start.elapsed().as_micros();
+                                    let us = us.min(u32::MAX as u128) as u32;
+                                    if let Ok(mut v) = decode_samples_recv.lock() {
+                                        // Cap memory at 200k samples (covers
+                                        // ~37 min @ 90fps) — beyond that we
+                                        // overwrite oldest to keep the
+                                        // moving window representative.
+                                        if v.len() >= 200_000 {
+                                            let drop_n = v.len() - 199_999;
+                                            v.drain(..drop_n);
+                                        }
+                                        v.push(us);
+                                    }
+                                }
                             }
                         }
                     }
@@ -582,9 +635,33 @@ where
         OscCapture::new()
     };
 
+    // Compute decode latency percentiles from the samples collected during
+    // the run. Done after the receiver task is fully drained so we don't
+    // race with the recv-side pushes.
+    let (p50, p95, p99, sample_count) = {
+        let samples_guard = decode_samples.lock();
+        match samples_guard {
+            Ok(mut g) if !g.is_empty() => {
+                g.sort_unstable();
+                let n = g.len();
+                let p = |q: f64| -> u32 {
+                    // Nearest-rank percentile; for n=1 this just returns the one value.
+                    let idx = ((q * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+                    g[idx]
+                };
+                (p(0.50), p(0.95), p(0.99), n as u64)
+            }
+            _ => (0, 0, 0, 0),
+        }
+    };
+
     let final_stats = {
         let mut s = stats.lock().unwrap();
         s.osc_messages = osc_messages;
+        s.depacketize_samples_count = sample_count;
+        s.depacketize_latency_us_p50 = p50;
+        s.depacketize_latency_us_p95 = p95;
+        s.depacketize_latency_us_p99 = p99;
         s.clone()
     };
     Ok(final_stats)
