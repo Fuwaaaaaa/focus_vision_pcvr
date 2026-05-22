@@ -1,0 +1,43 @@
+{
+  "name": "long_run_stability",
+  "timeout_sec": 1200,
+  "config_overrides": {
+    "video.framerate": 60,
+    "audio.enabled": false
+  },
+  "client": {
+    "pin_source": "status_json",
+    "duration_sec": 900.0,
+    "tracking_pattern": null,
+    "face_pattern": null,
+    "capture_haptic": false,
+    "capture_sleep_events": false,
+    "measure_decode_latency": true,
+    "osc_listen_port": null
+  },
+  "fault_injection": [],
+  "stimuli": [
+    { "kind": "set_loss_pct",   "at_sec":  30.0, "pct": 5 },
+    { "kind": "clear_loss_pct", "at_sec":  60.0 },
+    { "kind": "set_loss_pct",   "at_sec":  90.0, "pct": 5 },
+    { "kind": "clear_loss_pct", "at_sec": 120.0 },
+    { "kind": "set_loss_pct",   "at_sec": 150.0, "pct": 5 },
+    { "kind": "clear_loss_pct", "at_sec": 180.0 },
+    { "kind": "set_loss_pct",   "at_sec": 240.0, "pct": 10 },
+    { "kind": "clear_loss_pct", "at_sec": 270.0 },
+    { "kind": "set_loss_pct",   "at_sec": 360.0, "pct": 5 },
+    { "kind": "clear_loss_pct", "at_sec": 420.0 },
+    { "kind": "set_loss_pct",   "at_sec": 540.0, "pct": 15 },
+    { "kind": "clear_loss_pct", "at_sec": 570.0 },
+    { "kind": "set_loss_pct",   "at_sec": 720.0, "pct": 5 },
+    { "kind": "clear_loss_pct", "at_sec": 780.0 }
+  ],
+  "assertions": {
+    "min_frames_decoded": 30000,
+    "min_idr_frames": 5,
+    "min_heartbeats_sent": 1500,
+    "min_video_packets": 100000,
+    "min_decode_latency_samples": 1000,
+    "max_decode_latency_us_p99": 200000
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "name": "face_tracking_patterns",
+  "timeout_sec": 30,
+  "config_overrides": {
+    "video.framerate": 60,
+    "audio.enabled": false
+  },
+  "client": {
+    "pin_source": "status_json",
+    "duration_sec": 2.0,
+    "tracking_pattern": null,
+    "face_pattern": { "kind": "blink", "hz": 2.0 },
+    "capture_haptic": false,
+    "capture_sleep_events": false,
+    "osc_listen_port": null
+  },
+  "fault_injection": [],
+  "stimuli": [],
+  "assertions": {
+    "min_frames_decoded": 5,
+    "min_idr_frames": 1,
+    "min_face_messages_sent": 10,
+    "expect_osc_addresses": [
+      "/avatar/parameters/EyeLeftBlink",
+      "/avatar/parameters/EyeRightBlink"
+    ],
+    "min_osc_messages": 30
+  }
+}
