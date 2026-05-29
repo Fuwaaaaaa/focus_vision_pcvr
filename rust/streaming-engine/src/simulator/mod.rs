@@ -74,6 +74,11 @@ pub struct MockClientConfig {
     /// closest synthetic equivalent and is what the real HMD pays before
     /// MediaCodec gets the frame. Useful for codec comparison scenarios.
     pub measure_decode_latency: bool,
+    /// When true, bind `audio_udp_port` and count incoming Opus RTP packets
+    /// (PT=111) into `MockClientStats::audio_packets_received`. We do NOT decode
+    /// Opus — matching the codebase's "measure transport, not fidelity"
+    /// philosophy — only confirm the engine's synthetic audio reaches the wire.
+    pub receive_audio: bool,
 }
 
 impl MockClientConfig {
@@ -97,6 +102,7 @@ impl MockClientConfig {
             capture_haptic: false,
             capture_sleep_events: false,
             measure_decode_latency: false,
+            receive_audio: false,
         }
     }
 }
@@ -110,6 +116,11 @@ pub struct MockClientStats {
     pub idr_frames_seen: u64,
     /// RTP packets received on the video UDP socket.
     pub video_packets_received: u64,
+    /// Opus RTP packets (PT=111) received on the audio UDP socket. Zero unless
+    /// `MockClientConfig::receive_audio` is set.
+    pub audio_packets_received: u64,
+    /// Total bytes received on the audio UDP socket (RTP header + Opus payload).
+    pub audio_bytes_received: u64,
     /// HEARTBEAT_ACK messages sent.
     pub heartbeats_sent: u64,
     /// FACE_DATA messages sent (mock-client → engine) when `face_pattern` is set.
@@ -427,8 +438,8 @@ where
         }
     });
 
-    // UDP receiver (video). Audio receiver omitted — the simulator's
-    // current focus is video transport; audio plumbing lands in B6.
+    // UDP receiver (video). The audio receiver below is bound only when
+    // `receive_audio` is set (audio is optional, like the real HMD).
     let video_addr: SocketAddr = format!("0.0.0.0:{}", config.video_udp_port)
         .parse()
         .map_err(|e: std::net::AddrParseError| MockClientError::Protocol(e.to_string()))?;
@@ -497,6 +508,44 @@ where
         }
         log::info!("mock-client video receiver task exited");
     });
+
+    // Optional audio receiver. Mirrors the video task but with no depacketizer:
+    // audio packets carry raw Opus directly after the 12-byte RTP header (no
+    // FVP shard header, no FEC), so we just validate PT=111 and count them.
+    let audio_handle = if config.receive_audio {
+        let audio_addr: SocketAddr = format!("0.0.0.0:{}", config.audio_udp_port)
+            .parse()
+            .map_err(|e: std::net::AddrParseError| MockClientError::Protocol(e.to_string()))?;
+        let receiver = UdpReceiver::new(audio_addr).await?;
+        log::info!("mock-client listening for audio on {}", audio_addr);
+        let stats_audio = Arc::clone(&stats);
+        let audio_cancel = cancel.clone();
+        Some(tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while !audio_cancel.is_cancelled() {
+                tokio::select! {
+                    r = receiver.recv(&mut buf) => match r {
+                        Ok((n, _peer)) => {
+                            // RTP header is 12 bytes; PT is the low 7 bits of byte 1.
+                            if n >= 12 && (buf[1] & 0x7F) == 111 {
+                                let mut s = stats_audio.lock().unwrap();
+                                s.audio_packets_received += 1;
+                                s.audio_bytes_received += n as u64;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("mock-client audio recv skipped: {} ({:?})", e, e.kind());
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    },
+                    _ = audio_cancel.cancelled() => break,
+                }
+            }
+            log::info!("mock-client audio receiver task exited");
+        }))
+    } else {
+        None
+    };
 
     // Optional OSC loopback: when set, bind a UDP receiver on the supplied
     // port and capture `/avatar/parameters/*` traffic emitted by the engine's
@@ -613,6 +662,11 @@ where
     video_handle.abort();
     let _ = video_handle.await;
 
+    if let Some(h) = audio_handle {
+        h.abort();
+        let _ = h.await;
+    }
+
     // Brief drain window for haptic events still in flight from the engine,
     // then stop the reader. Without this delay, a stimulus fired right
     // before DISCONNECT would race the reader's exit and be missed.
@@ -685,6 +739,7 @@ mod tests {
         assert_eq!(cfg.tracking_target.port(), 9947); // udp + 2
         assert_eq!(cfg.pin, 123456);
         assert_eq!(cfg.heartbeat_interval, Duration::from_millis(500));
+        assert!(!cfg.receive_audio); // audio off by default — opt-in per scenario
     }
 
     #[test]
@@ -694,5 +749,73 @@ mod tests {
         assert_eq!(s.idr_frames_seen, 0);
         assert_eq!(s.video_packets_received, 0);
         assert_eq!(s.heartbeats_sent, 0);
+        assert_eq!(s.audio_packets_received, 0);
+        assert_eq!(s.audio_bytes_received, 0);
+    }
+
+    /// The audio receiver must count PT=111 (Opus) RTP packets and ignore
+    /// everything else (e.g. stray video PT=97), validating the wire-level
+    /// guard the real receiver task uses.
+    #[tokio::test]
+    async fn test_audio_receiver_counts_pt111_packets() {
+        use crate::transport::rtp::write_rtp_header;
+        use crate::transport::udp::{UdpReceiver, UdpSender};
+        use tokio_util::sync::CancellationToken;
+
+        // Bind the receiver on an OS-assigned free port, then send to it.
+        let recv_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let receiver = UdpReceiver::new(recv_addr).await.unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        let target: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let sender = UdpSender::new(target).await.unwrap();
+
+        let stats = Arc::new(std::sync::Mutex::new(MockClientStats::default()));
+        let stats_recv = Arc::clone(&stats);
+        let cancel = CancellationToken::new();
+        let recv_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while !recv_cancel.is_cancelled() {
+                tokio::select! {
+                    r = receiver.recv(&mut buf) => if let Ok((n, _)) = r {
+                        if n >= 12 && (buf[1] & 0x7F) == 111 {
+                            let mut s = stats_recv.lock().unwrap();
+                            s.audio_packets_received += 1;
+                            s.audio_bytes_received += n as u64;
+                        }
+                    },
+                    _ = recv_cancel.cancelled() => break,
+                }
+            }
+        });
+
+        // Two Opus (PT=111) packets — should be counted.
+        for seq in 0..2u16 {
+            let mut buf = Vec::new();
+            write_rtp_header(&mut buf, 111, true, seq, 0, 0x41554449);
+            buf.extend_from_slice(&[0xAA; 20]);
+            sender.send_all(&[crate::transport::rtp::RtpPacket { data: buf }]).await.unwrap();
+        }
+        // One video (PT=97) packet — must be ignored.
+        {
+            let mut buf = Vec::new();
+            write_rtp_header(&mut buf, 97, false, 0, 0, 0x56494445);
+            buf.extend_from_slice(&[0xBB; 20]);
+            sender.send_all(&[crate::transport::rtp::RtpPacket { data: buf }]).await.unwrap();
+        }
+
+        // Poll until both audio packets land (or time out).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if stats.lock().unwrap().audio_packets_received >= 2 { break; }
+            if Instant::now() > deadline { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cancel.cancel();
+        let _ = handle.await;
+
+        let s = stats.lock().unwrap();
+        assert_eq!(s.audio_packets_received, 2, "exactly the two PT=111 packets counted");
+        assert_eq!(s.audio_bytes_received, 2 * (12 + 20));
     }
 }
