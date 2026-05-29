@@ -1,0 +1,26 @@
+{
+  "name": "audio_sine",
+  "timeout_sec": 30,
+  "config_overrides": {
+    "video.framerate": 60,
+    "audio.enabled": true,
+    "audio.synthetic_source": "sine"
+  },
+  "client": {
+    "pin_source": "status_json",
+    "duration_sec": 2.0,
+    "tracking_pattern": { "kind": "still" },
+    "face_pattern": null,
+    "capture_haptic": false,
+    "receive_audio": true,
+    "osc_listen_port": null
+  },
+  "fault_injection": [],
+  "stimuli": [],
+  "assertions": {
+    "min_frames_decoded": 10,
+    "min_idr_frames": 1,
+    "min_video_packets": 50,
+    "min_audio_packets": 50
+  }
+}
