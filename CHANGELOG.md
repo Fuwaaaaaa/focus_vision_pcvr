@@ -2,6 +2,48 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [3.0.0] - 2026-06-01
+
+General availability. Promotes rc3 to the stable 3.0.0 release and turns the
+hardware-free path into a shipped, end-user-runnable experience rather than a
+dev-only tool.
+
+### Hardware-free general availability
+- **In-process simulation bundled in the installer.** The companion app is
+  now built with `--features simulator` in CI (`companion-build`) and
+  `build.bat`, so the distributed `focus-vision.exe` carries a real
+  `StreamingEngine` + mock HMD client. End users can run the full pipeline
+  (TCP+TLS+PIN+RTP+FEC+UDP+Opus) with no VR hardware via the Home tab's
+  "▶ Start Simulation" button / `--simulate`, beyond the pre-existing
+  UI-only `--demo`. The SteamVR driver DLL still links `streaming-engine`
+  without the `simulator` feature, so the real VR path and its binary are
+  unaffected.
+
+### Fixes
+- **Engine now publishes a live `"streaming"` status.** During an active
+  session the engine writes status.json as `"streaming"` with live
+  latency/fps/bitrate/subsystems on connect and ~1×/sec, reverting to
+  `"waiting"` on disconnect. Previously nothing ever wrote `"streaming"`, so
+  the companion's Connected view and all live stats never activated — for the
+  simulation OR real hardware. Pinned by a regression assertion in
+  `headless_e2e_basic_video_flow` and the companion's `sim_smoke_round_trip`.
+- **Deterministic `WSAEADDRINUSE` in the simulation removed.** `pick_free_ports`
+  reserves a contiguous, non-ephemeral port block; previously the mock
+  client's fixed video/audio receiver ports were derived from an ephemeral
+  base that the engine's own ephemeral sender sockets could (on Windows)
+  recycle first.
+- Removed a leftover `TEMP-AUDIO-SEND` info log from the audio send loop.
+
+### Docs
+- `docs/USER_GUIDE.md`, `README.md`, `CLAUDE.md`, and the release notes
+  document `--simulate` / "Start Simulation" alongside `--demo`.
+
+### Known limitations
+- The real-hardware verification items carried from rc3 remain validated in
+  simulation only (real MediaCodec decode time, real face-tracking camera
+  input, NVENC full-range color accuracy, NVML GPU thermal thresholds,
+  multi-hour soak). See `docs/RELEASE_NOTES_v3.0.0.md` for the full list.
+
 ## [3.0.0-rc3] - 2026-05-22
 
 Quality-focused release-candidate on top of rc2. No new product features

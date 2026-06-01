@@ -85,7 +85,14 @@ jobs:
             submodules: recursive
         - uses: dtolnay/rust-toolchain@stable
         - name: Build companion app
-          run: cargo build --release -p focus-vision-companion
+          # `--features simulator` ships the in-process simulation (real
+          # StreamingEngine + mock HMD client) inside the distributed exe, so
+          # end users can exercise the full pipeline with no VR hardware via the
+          # "Start Simulation" button / `--simulate`. Adds only `hound` + tokio +
+          # the streaming-engine staticlib — no test-only deps. The driver DLL
+          # (driver-build job) still links streaming-engine WITHOUT simulator,
+          # so the real VR path and its binary are unaffected.
+          run: cargo build --release -p focus-vision-companion --features simulator
         - name: Download fonts
           shell: bash
           run: |

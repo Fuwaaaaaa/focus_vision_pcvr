@@ -23,6 +23,49 @@ impl CompanionApp {
 
         ui.add_space(16.0);
 
+        // Integrated simulation control. Only compiled into the `simulator`
+        // build, and hidden in demo mode (demo is a separate fake path).
+        // Lets the user run the full pipeline locally with no VR hardware.
+        #[cfg(feature = "simulator")]
+        if !self.demo_mode {
+            let blue = egui::Color32::from_rgb(96, 165, 250);
+            ui.group(|ui| {
+                if self.is_simulating() {
+                    if ui
+                        .button(egui::RichText::new("■ Stop Simulation").color(blue).strong())
+                        .clicked()
+                    {
+                        self.stop_sim();
+                    }
+                    ui.label(
+                        egui::RichText::new("ローカルエンジン稼働中 — 実機なしでフルパイプライン実行中")
+                            .size(12.0)
+                            .color(text_muted),
+                    );
+                } else {
+                    if ui
+                        .button(egui::RichText::new("▶ Start Simulation").color(blue).strong())
+                        .clicked()
+                    {
+                        self.start_sim();
+                    }
+                    ui.label(
+                        egui::RichText::new("実機なしでパイプライン全体をローカル実行（ヘッドセット不要）")
+                            .size(12.0)
+                            .color(text_muted),
+                    );
+                }
+                if let Some(err) = &self.sim_error {
+                    ui.label(
+                        egui::RichText::new(err)
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(248, 113, 113)),
+                    );
+                }
+            });
+            ui.add_space(8.0);
+        }
+
         // Engine-died banner. Surfaced when status.json is missing or its
         // mtime is older than ENGINE_STALE_THRESHOLD — the engine has
         // either not started, was killed, or SteamVR crashed.
@@ -31,7 +74,9 @@ impl CompanionApp {
         // the engine lives inside vrserver.exe (loaded as a SteamVR driver
         // staticlib). Only SteamVR's process-lifecycle restart works, so
         // the banner directs the user there instead of offering a button.
-        if !self.engine_alive {
+        // Suppressed while an in-process simulation is running (the sim writes
+        // a real status.json that lights the UI up within ~1 s of start).
+        if !self.engine_alive && !self.is_simulating() {
             let red = egui::Color32::from_rgb(248, 113, 113);
             ui.group(|ui| {
                 ui.horizontal(|ui| {

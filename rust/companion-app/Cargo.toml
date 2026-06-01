@@ -11,6 +11,12 @@ description = "Focus Vision PCVR companion app — driver install, PIN display, 
 name = "focus-vision"
 path = "src/main.rs"
 
+[features]
+# Integrated simulation mode: lets the companion run a real StreamingEngine +
+# mock HMD client in-process so the full pipeline works with no VR hardware.
+# Off by default — the shipped/default build links exactly what it does today.
+simulator = ["dep:streaming-engine", "dep:tokio", "dep:tokio-util"]
+
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence"] }
 egui = "0.31"
@@ -23,6 +29,13 @@ serde_json = "1"
 egui_plot = "0.31"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 fvp-common = { path = "../common" }
+
+# Simulation mode only (feature = "simulator"). `optional = true` keeps these
+# out of the default build entirely. streaming-engine is pulled WITH its own
+# simulator feature so simulator::run / MockClientConfig are available.
+streaming-engine = { path = "../streaming-engine", features = ["simulator"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
 
 # Windows-only: registry access for finding Steam's actual install path
 # (more reliable than guessing common drive letters or parsing

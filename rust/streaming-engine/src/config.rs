@@ -80,6 +80,16 @@ pub struct AudioConfig {
     pub sample_rate: u32,
     #[serde(default = "default_audio_channels")]
     pub channels: u16,
+    /// Simulator-only: source of synthetic audio when no real WASAPI device is
+    /// available. `"off"` uses real capture (production default); `"silence"`,
+    /// `"sine"`, and `"wav"` are honoured only in `simulator`-feature builds —
+    /// see `engine::resolve_synthetic_source`. Kept here unconditionally so
+    /// scenario `config_overrides` can reach it; production simply ignores it.
+    #[serde(default = "default_audio_synthetic_source")]
+    pub synthetic_source: String,
+    /// Path to a WAV file used when `synthetic_source = "wav"`. Empty otherwise.
+    #[serde(default)]
+    pub synthetic_wav_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +364,7 @@ fn default_audio_bitrate() -> u32 { 128 }
 fn default_audio_frame_size() -> u32 { 10 }
 fn default_audio_sample_rate() -> u32 { 48000 }
 fn default_audio_channels() -> u16 { 2 }
+fn default_audio_synthetic_source() -> String { "off".to_string() }
 fn default_max_attempts() -> u8 { fvp_common::MAX_PIN_ATTEMPTS }
 fn default_lockout_seconds() -> u64 { fvp_common::PIN_LOCKOUT_SECONDS }
 
@@ -395,6 +406,8 @@ impl Default for AudioConfig {
             frame_size_ms: default_audio_frame_size(),
             sample_rate: default_audio_sample_rate(),
             channels: default_audio_channels(),
+            synthetic_source: default_audio_synthetic_source(),
+            synthetic_wav_path: String::new(),
         }
     }
 }
@@ -486,6 +499,16 @@ impl AppConfig {
             self.audio.sample_rate = 48000;
         }
         validate_range(&mut self.audio.bitrate_kbps, 32, 512, 128, "audio.bitrate_kbps", &mut errors);
+        // Synthetic source (simulator-only knob, but validated unconditionally
+        // so an over-the-wire / TOML typo is corrected rather than silently
+        // disabling audio in a scenario). Unknown values fall back to "off".
+        if !matches!(self.audio.synthetic_source.as_str(), "off" | "silence" | "sine" | "wav") {
+            errors.push(ConfigError {
+                field: "audio.synthetic_source",
+                message: format!("must be \"off\", \"silence\", \"sine\", or \"wav\", got \"{}\"", self.audio.synthetic_source),
+            });
+            self.audio.synthetic_source = "off".to_string();
+        }
 
         // Foveated
         // fovea_radius: min is exclusive (> 0.0) — keep manual check
@@ -832,6 +855,34 @@ mod tests {
     }
 
     #[test]
+    fn test_default_audio_synthetic_source_off() {
+        let config = AppConfig::default();
+        assert_eq!(config.audio.synthetic_source, "off");
+        assert_eq!(config.audio.synthetic_wav_path, "");
+    }
+
+    #[test]
+    fn test_validate_audio_synthetic_source_invalid() {
+        let mut config = AppConfig::default();
+        config.audio.synthetic_source = "bogus".to_string();
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.field == "audio.synthetic_source"));
+        assert_eq!(config.audio.synthetic_source, "off");
+    }
+
+    #[test]
+    fn test_validate_audio_synthetic_source_valid_variants() {
+        for src in ["off", "silence", "sine", "wav"] {
+            let mut config = AppConfig::default();
+            config.audio.synthetic_source = src.to_string();
+            let errors = config.validate();
+            assert!(!errors.iter().any(|e| e.field == "audio.synthetic_source"),
+                "{src} should be accepted");
+            assert_eq!(config.audio.synthetic_source, src);
+        }
+    }
+
+    #[test]
     fn test_validate_congestion_control_loss() {
         let mut config = AppConfig::default();
         config.network.congestion_control = "loss".to_string();
@@ -901,6 +952,8 @@ mod tests {
         assert_eq!(from_default.audio.frame_size_ms, from_serde.audio.frame_size_ms);
         assert_eq!(from_default.audio.sample_rate, from_serde.audio.sample_rate);
         assert_eq!(from_default.audio.channels, from_serde.audio.channels);
+        assert_eq!(from_default.audio.synthetic_source, from_serde.audio.synthetic_source);
+        assert_eq!(from_default.audio.synthetic_wav_path, from_serde.audio.synthetic_wav_path);
         // pairing
         assert_eq!(from_default.pairing.max_attempts, from_serde.pairing.max_attempts);
         assert_eq!(from_default.pairing.lockout_seconds, from_serde.pairing.lockout_seconds);

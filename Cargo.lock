@@ -1219,7 +1219,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "focus-vision-companion"
-version = "3.0.0-rc3"
+version = "3.0.0"
 dependencies = [
  "dirs-next",
  "eframe",
@@ -1230,6 +1230,9 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "streaming-engine",
+ "tokio",
+ "tokio-util",
  "toml",
  "winreg",
  "zip",
@@ -1327,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "fvp-common"
-version = "3.0.0-rc3"
+version = "3.0.0"
 dependencies = [
  "serde",
 ]
@@ -3261,7 +3264,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streaming-engine"
-version = "3.0.0-rc3"
+version = "3.0.0"
 dependencies = [
  "arbitrary",
  "audiopus",

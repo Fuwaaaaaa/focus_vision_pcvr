@@ -149,6 +149,12 @@ pub struct ClientConfig {
     /// scenarios.
     #[serde(default)]
     pub measure_decode_latency: bool,
+    /// When true, the mock client binds the audio UDP port and counts incoming
+    /// Opus RTP packets into `audio_packets_received`. Pair with
+    /// `audio.enabled = true` + `audio.synthetic_source` in `config_overrides`
+    /// and `Assertions.min_audio_packets` to gate the audio path.
+    #[serde(default)]
+    pub receive_audio: bool,
     /// Manual override for the OSC loopback port. Most scenarios should
     /// leave this `null` and let the runner allocate dynamically — the
     /// runner mirrors the chosen port to both `face_tracking.osc_port`
@@ -221,6 +227,9 @@ pub struct Assertions {
     pub min_idr_frames: Option<u64>,
     pub min_heartbeats_sent: Option<u64>,
     pub min_video_packets: Option<u64>,
+    /// Lower bound on `audio_packets_received` (Opus RTP, PT=111). Requires
+    /// `client.receive_audio = true` and a synthetic audio source.
+    pub min_audio_packets: Option<u64>,
     pub max_connect_duration_ms: Option<u64>,
     pub expect_pin_rejected: Option<bool>,
     /// Required OSC addresses (engine → loopback). Each entry must appear
@@ -402,6 +411,7 @@ pub fn run_scenario(scenario: &Scenario) -> Result<ScenarioReport, ScenarioError
     client_config.capture_haptic = scenario.client.capture_haptic;
     client_config.capture_sleep_events = scenario.client.capture_sleep_events;
     client_config.measure_decode_latency = scenario.client.measure_decode_latency;
+    client_config.receive_audio = scenario.client.receive_audio;
 
     let tracking_target = client_config.tracking_target;
     let tracking_spec = scenario.client.tracking_pattern.clone();
@@ -649,6 +659,14 @@ fn evaluate_assertions(
             failures.push(format!(
                 "min_video_packets: expected >= {}, got {}",
                 min, s.video_packets_received
+            ));
+        }
+    }
+    if let Some(min) = a.min_audio_packets {
+        if s.audio_packets_received < min {
+            failures.push(format!(
+                "min_audio_packets: expected >= {}, got {} (was receive_audio + synthetic_source on?)",
+                min, s.audio_packets_received
             ));
         }
     }
@@ -1058,6 +1076,35 @@ mod tests {
         let failures = evaluate_assertions(&a, Some(&stats), false);
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("min_frames_decoded"));
+    }
+
+    #[test]
+    fn assertions_min_audio_packets_below_fails() {
+        let a = Assertions {
+            min_audio_packets: Some(50),
+            ..Default::default()
+        };
+        let stats = MockClientStats {
+            audio_packets_received: 10,
+            ..Default::default()
+        };
+        let failures = evaluate_assertions(&a, Some(&stats), false);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("min_audio_packets"));
+    }
+
+    #[test]
+    fn assertions_min_audio_packets_met_passes() {
+        let a = Assertions {
+            min_audio_packets: Some(50),
+            ..Default::default()
+        };
+        let stats = MockClientStats {
+            audio_packets_received: 200,
+            ..Default::default()
+        };
+        let failures = evaluate_assertions(&a, Some(&stats), false);
+        assert!(failures.is_empty());
     }
 
     #[test]

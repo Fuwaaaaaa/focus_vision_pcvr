@@ -18,26 +18,13 @@ use streaming_engine::config::AppConfig;
 use streaming_engine::engine::{EncodedFrame, StreamingEngine};
 use streaming_engine::metrics::latency::FrameTimestamps;
 use streaming_engine::simulator::{run as run_mock_client, MockClientConfig};
+// Shared with sim.rs and the scenario runner. Reserves a contiguous,
+// non-ephemeral port block so the engine's ephemeral sender sockets can't
+// collide with the mock client's fixed video/audio receiver ports (see the
+// helper's doc comment for the WSAEADDRINUSE failure mode it prevents).
+use streaming_engine::simulator::test_helpers::pick_free_ports;
 use streaming_engine::video::synthetic_nal::SyntheticNalStream;
 use tokio_util::sync::CancellationToken;
-
-/// Bind temporary TCP and UDP sockets at port 0, capture the OS-assigned
-/// port numbers, then drop the sockets so the test can hand the ports to
-/// the engine. Brief TOCTOU window but unlikely to bite on a quiet test
-/// runner — the alternative (hard-coded ports) collides on every parallel
-/// `cargo test` invocation.
-fn pick_free_ports() -> (u16, u16) {
-    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let tcp_port = tcp.local_addr().unwrap().port();
-    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let udp_port = udp.local_addr().unwrap().port();
-    // Ensure tcp != udp; pick_free_ports rarely returns equal values but
-    // the engine validates against it.
-    let udp_port = if udp_port == tcp_port { udp_port + 1 } else { udp_port };
-    drop(tcp);
-    drop(udp);
-    (tcp_port, udp_port)
-}
 
 /// Path to status.json. The engine writes here on each
 /// TcpControlServer::new() call (see engine.rs::run_streaming).
@@ -126,6 +113,13 @@ fn headless_e2e_basic_video_flow() {
     let mut frames_offered = 0u64;
     let mut frames_accepted = 0u64;
     let mut next_tick = start;
+    // Regression guard for the engine->companion status contract: an active
+    // session must publish status="streaming" with live fps. Before this was
+    // wired the engine only ever wrote "waiting", so the companion's Connected
+    // view (and all live stats) stayed dark -- in the sim AND on real hardware.
+    // Poll *during* the session: the mock client disconnects at its 2 s
+    // duration, after which the engine reverts status.json to "waiting".
+    let mut streaming_seen = false;
     while start.elapsed() < Duration::from_millis(2200) {
         let synth = stream.next_frame();
         let frame = EncodedFrame {
@@ -138,6 +132,16 @@ fn headless_e2e_basic_video_flow() {
         if engine.submit_frame(frame) {
             frames_accepted += 1;
         }
+        if !streaming_seen {
+            if let Some(v) = status_path()
+                .and_then(|p| std::fs::read_to_string(&p).ok())
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            {
+                if v["status"] == "streaming" && v["fps"].as_u64().unwrap_or(0) > 0 {
+                    streaming_seen = true;
+                }
+            }
+        }
         next_tick += frame_period;
         let now = Instant::now();
         if next_tick > now {
@@ -146,6 +150,9 @@ fn headless_e2e_basic_video_flow() {
             next_tick = now;
         }
     }
+
+    assert!(streaming_seen,
+        "engine must publish status=\"streaming\" with fps>0 during an active session");
 
     // 5. Stop the mock-client (it would also stop on its --duration deadline,
     //    but cancelling makes the test deterministic).

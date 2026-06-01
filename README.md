@@ -9,7 +9,7 @@
 [![License: Dual](https://img.shields.io/badge/License-MIT%20%7C%20Commercial-34D399.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-stable-e8e8ec.svg?logo=rust&logoColor=e8e8ec)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-500%2B-34D399.svg)](#testing)
-[![Version](https://img.shields.io/badge/version-3.0.0--rc3-34D399.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.0.0-34D399.svg)](CHANGELOG.md)
 
 </div>
 
@@ -128,8 +128,12 @@ cargo build --release -p focus-vision-companion
 # テスト
 cargo test --workspace  # 500+ Rust tests
 
-# Companion を「実機なし」で試す（デモモード）
+# Companion を「実機なし」で試す（デモモード = 見せかけ UI 合成）
 cargo run -p focus-vision-companion -- --demo
+
+# Companion を「実機なし」でフルパイプライン実走（シミュレーションモード）
+# 実エンジン + モック HMD クライアントをアプリ内で起動。配布 exe にも同梱。
+cargo run -p focus-vision-companion --features simulator -- --simulate
 ```
 
 <details>
