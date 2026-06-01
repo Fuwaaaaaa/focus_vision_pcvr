@@ -3,6 +3,8 @@ mod config;
 mod demo;
 mod driver;
 mod export;
+#[cfg(feature = "simulator")]
+mod sim;
 mod stats_history;
 mod status_parser;
 mod svg_export;
@@ -15,13 +17,35 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Parse the two launch flags. `--demo` and `--simulate` are mutually
+/// exclusive (demo is a fake synthesizer that bypasses status.json; simulate
+/// runs a real engine that writes it) — if both are present, demo wins.
+fn parse_flags<I: IntoIterator<Item = String>>(args: I) -> (bool, bool) {
+    let mut demo = false;
+    let mut simulate = false;
+    for a in args {
+        match a.as_str() {
+            "--demo" => demo = true,
+            "--simulate" => simulate = true,
+            _ => {}
+        }
+    }
+    if demo && simulate {
+        log::warn!("--demo and --simulate are mutually exclusive; --demo takes precedence");
+        simulate = false;
+    }
+    (demo, simulate)
+}
+
 fn main() -> eframe::Result {
     env_logger::init();
 
-    let demo_mode = std::env::args().any(|a| a == "--demo");
+    let (demo_mode, simulate) = parse_flags(std::env::args().skip(1));
 
     let title = if demo_mode {
         "Focus Vision PCVR — DEMO MODE"
+    } else if simulate {
+        "Focus Vision PCVR — SIMULATION"
     } else {
         "Focus Vision PCVR"
     };
@@ -37,7 +61,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Focus Vision PCVR",
         options,
-        Box::new(move |cc| Ok(Box::new(CompanionApp::new(cc, demo_mode)))),
+        Box::new(move |cc| Ok(Box::new(CompanionApp::new(cc, demo_mode, simulate)))),
     )
 }
 
@@ -136,6 +160,16 @@ pub(crate) struct CompanionApp {
     // today — the engine doesn't repaint status.json once a second).
     pub(crate) pin_expires_in_seconds: Option<u32>,
     pub(crate) pin_expires_observed_at: Option<Instant>,
+
+    // Integrated simulation mode (feature = "simulator"). `sim` holds the
+    // running engine+mock-client handle; `sim_error` is the sticky last error
+    // shown in the UI; `sim_autostart` requests a one-shot start on the first
+    // frame when launched with `--simulate`.
+    #[cfg(feature = "simulator")]
+    pub(crate) sim: Option<sim::SimHandle>,
+    #[cfg(feature = "simulator")]
+    pub(crate) sim_error: Option<String>,
+    pub(crate) sim_autostart: bool,
 }
 
 /// status.json is considered stale (engine probably died) once its mtime
@@ -153,7 +187,7 @@ pub(crate) enum Tab {
 }
 
 impl CompanionApp {
-    fn new(cc: &eframe::CreationContext, demo_mode: bool) -> Self {
+    fn new(cc: &eframe::CreationContext, demo_mode: bool, simulate: bool) -> Self {
         // Load custom fonts from DESIGN.md: Instrument Serif (brand) + Geist (UI)
         let mut fonts = egui::FontDefinitions::default();
 
@@ -256,8 +290,74 @@ impl CompanionApp {
             demo_start: Instant::now(),
             pin_expires_in_seconds: None,
             pin_expires_observed_at: None,
+            #[cfg(feature = "simulator")]
+            sim: None,
+            #[cfg(feature = "simulator")]
+            sim_error: None,
+            // Demo wins over simulate (already enforced in parse_flags), so a
+            // demo launch never autostarts a real engine.
+            sim_autostart: simulate && !demo_mode,
             local_config: cfg,
         }
+    }
+
+    /// Start the in-process simulation. No-op stub when the `simulator`
+    /// feature is not compiled in.
+    #[cfg(feature = "simulator")]
+    pub(crate) fn start_sim(&mut self) {
+        if self.sim.is_some() {
+            return; // already running
+        }
+        // Refuse to start if a real engine appears alive — two writers racing
+        // on the single shared status.json would confuse the UI.
+        if self.engine_alive {
+            self.sim_error = Some(
+                "実エンジンが稼働中です（status.json が新しい）。SteamVR を停止してから Simulation を開始してください。".to_string(),
+            );
+            return;
+        }
+        match sim::start() {
+            Ok(h) => {
+                self.sim_error = None;
+                self.sim = Some(h);
+                self.log("Simulation started");
+            }
+            Err(e) => {
+                self.sim_error = Some(e.clone());
+                self.log(&format!("Simulation start failed: {e}"));
+            }
+        }
+    }
+
+    /// Stop the in-process simulation. No-op stub when the feature is off.
+    #[cfg(feature = "simulator")]
+    pub(crate) fn stop_sim(&mut self) {
+        if let Some(h) = self.sim.take() {
+            h.stop();
+            self.log("Simulation stopped");
+        }
+    }
+
+    /// Whether a simulation is currently running.
+    #[cfg(feature = "simulator")]
+    pub(crate) fn is_simulating(&self) -> bool {
+        self.sim.is_some()
+    }
+
+    #[cfg(not(feature = "simulator"))]
+    pub(crate) fn start_sim(&mut self) {
+        log::warn!("--simulate ignored: built without --features simulator");
+    }
+
+    // API-parity stub: only the simulator build has a Stop control that calls
+    // this, so in the default build it is intentionally never invoked.
+    #[cfg(not(feature = "simulator"))]
+    #[allow(dead_code)]
+    pub(crate) fn stop_sim(&mut self) {}
+
+    #[cfg(not(feature = "simulator"))]
+    pub(crate) fn is_simulating(&self) -> bool {
+        false
     }
 
     pub(crate) fn log(&self, msg: &str) {
@@ -423,6 +523,20 @@ impl eframe::App for CompanionApp {
         self.check_deploy_result();
         self.check_export_result();
 
+        // Simulation: one-shot autostart (when launched with --simulate) and
+        // surfacing of any error raised by the worker threads.
+        if self.sim_autostart {
+            self.sim_autostart = false;
+            self.start_sim();
+        }
+        #[cfg(feature = "simulator")]
+        {
+            let err = self.sim.as_ref().and_then(|h| h.error());
+            if let Some(e) = err {
+                self.sim_error = Some(e);
+            }
+        }
+
         // Request repaint every second for live stats
         ctx.request_repaint_after(Duration::from_secs(1));
 
@@ -458,6 +572,35 @@ impl eframe::App for CompanionApp {
                                 "DEMO MODE — シミュレーション中（実エンジンは起動していません）",
                             )
                             .color(egui::Color32::from_rgb(251, 191, 36))
+                            .strong(),
+                        );
+                    });
+                });
+        }
+
+        // Simulation banner — info blue (#60a5fa, DESIGN.md "情報通知"), kept
+        // visually distinct from the demo banner (warning yellow) and the
+        // engine-stopped banner (error red). Shown only while a real
+        // in-process engine is running.
+        #[cfg(feature = "simulator")]
+        if self.is_simulating() {
+            egui::TopBottomPanel::top("sim_banner")
+                .frame(
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgb(8, 22, 38))
+                        .inner_margin(egui::Margin::symmetric(12, 6)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("●")
+                                .color(egui::Color32::from_rgb(96, 165, 250)),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "SIMULATION — ローカルエンジン稼働中（ハードウェア不要）",
+                            )
+                            .color(egui::Color32::from_rgb(96, 165, 250))
                             .strong(),
                         );
                     });
@@ -556,5 +699,42 @@ pub(crate) fn pick_save_path(default_stem: &str, ext: &str) -> Option<PathBuf> {
         // the user's data dir so they can still find it from a script.
         let _ = (default_stem, ext);
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_flags;
+
+    fn flags(args: &[&str]) -> (bool, bool) {
+        parse_flags(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn parse_flags_demo_only() {
+        assert_eq!(flags(&["--demo"]), (true, false));
+    }
+
+    #[test]
+    fn parse_flags_simulate_only() {
+        assert_eq!(flags(&["--simulate"]), (false, true));
+    }
+
+    #[test]
+    fn parse_flags_both_demo_wins() {
+        // Mutually exclusive: demo takes precedence, simulate suppressed.
+        assert_eq!(flags(&["--simulate", "--demo"]), (true, false));
+        assert_eq!(flags(&["--demo", "--simulate"]), (true, false));
+    }
+
+    #[test]
+    fn parse_flags_neither() {
+        assert_eq!(flags(&[]), (false, false));
+        assert_eq!(flags(&["--other", "foo"]), (false, false));
+    }
+
+    #[test]
+    fn parse_flags_order_independent() {
+        assert_eq!(flags(&["foo", "--simulate", "bar"]), (false, true));
     }
 }

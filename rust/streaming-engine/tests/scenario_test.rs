@@ -55,6 +55,25 @@ fn scenario_sleep_cycle() {
 }
 
 #[test]
+fn scenario_audio_sine() {
+    let scenario = load("audio_sine.json");
+    let report = run_scenario(&scenario)
+        .unwrap_or_else(|e| panic!("scenario runner failed: {}", e));
+    if let Some(stats) = &report.stats {
+        eprintln!(
+            "audio_sine: passed={} duration={:?} frames={} video_pkts={} audio_pkts={} audio_bytes={}",
+            report.passed,
+            report.duration,
+            stats.frames_decoded,
+            stats.video_packets_received,
+            stats.audio_packets_received,
+            stats.audio_bytes_received,
+        );
+    }
+    report.assert_passed();
+}
+
+#[test]
 fn scenario_haptic() {
     let scenario = load("haptic.json");
     let report = run_scenario(&scenario)

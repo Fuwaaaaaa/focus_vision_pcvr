@@ -662,23 +662,13 @@ async fn handle_tcp_control(
     }
 }
 
-/// Spawn the audio capture → Opus encode → UDP send pipeline.
-/// Audio is optional: if capture or encoding fails, streaming continues without audio.
-fn spawn_audio_pipeline(
-    target: SocketAddr,
-    cancel: CancellationToken,
-    recording_dir: Option<std::path::PathBuf>,
-) {
-    use crate::audio::{capture::AudioCapture, encoder::AudioEncoder};
-    use crate::transport::rtp::RtpPacket;
-
-    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(32);
-
-    // Create and hold AudioCapture on a dedicated thread.
-    // cpal Stream is !Send, so it must live on the thread where it was created.
-    // The thread blocks until the cancel token fires, then drops the capture.
-    // Poll is_cancelled() every 100ms — avoids creating a tokio runtime just to wait.
-    let hold_cancel = cancel.clone();
+/// Hold a real WASAPI [`AudioCapture`] alive on a dedicated thread until
+/// `cancel` fires. cpal's `Stream` is `!Send`, so it must live on the thread
+/// where it was created; we poll `is_cancelled()` every 100 ms rather than
+/// spin up a tokio runtime just to wait. Capture failure is non-fatal —
+/// `AUDIO_ACTIVE` is cleared and video streaming continues.
+fn spawn_real_capture(audio_tx: mpsc::Sender<Vec<f32>>, cancel: CancellationToken) {
+    use crate::audio::capture::AudioCapture;
     let audio_spawn = std::thread::Builder::new()
         .name("fvp-audio-capture".into())
         .spawn(move || {
@@ -693,7 +683,7 @@ fn spawn_audio_pipeline(
                     return;
                 }
             };
-            while !hold_cancel.is_cancelled() {
+            while !cancel.is_cancelled() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -704,6 +694,89 @@ fn spawn_audio_pipeline(
         // Do not take video streaming down with us; log and continue without audio.
         AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         log::warn!("Failed to spawn audio capture thread: {} — no audio", e);
+    }
+}
+
+/// Map an `[audio] synthetic_source` config string to a concrete synthetic
+/// source. `None` means "fall back to real WASAPI capture" (the `"off"`
+/// case, and any unrecognised value — though `validate()` clamps those
+/// upstream). Simulator-only: production builds never call this.
+#[cfg(feature = "simulator")]
+fn resolve_synthetic_source(
+    cfg: &crate::config::AudioConfig,
+) -> Option<crate::audio::synthetic_capture::SyntheticSource> {
+    use crate::audio::synthetic_capture::SyntheticSource;
+    match cfg.synthetic_source.as_str() {
+        "silence" => Some(SyntheticSource::Silence),
+        "sine" => Some(SyntheticSource::default_sine()),
+        // A bad/empty path makes `from_wav` return None → graceful "no audio".
+        "wav" => SyntheticSource::from_wav(&cfg.synthetic_wav_path),
+        _ => None, // "off" → real capture
+    }
+}
+
+/// Spawn the audio capture → Opus encode → UDP send pipeline.
+/// Audio is optional: if capture or encoding fails, streaming continues without audio.
+///
+/// `audio_config` selects the capture source: production always uses real
+/// WASAPI; under the `simulator` feature, `[audio] synthetic_source` can
+/// substitute a generated source so the engine emits real Opus over UDP with
+/// no audio hardware present.
+fn spawn_audio_pipeline(
+    target: SocketAddr,
+    cancel: CancellationToken,
+    recording_dir: Option<std::path::PathBuf>,
+    audio_config: crate::config::AudioConfig,
+) {
+    use crate::audio::encoder::AudioEncoder;
+    use crate::transport::rtp::RtpPacket;
+
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(32);
+
+    // Source selection. With the simulator feature off this compiles down to
+    // an unconditional `spawn_real_capture`, so production behaviour is
+    // byte-identical to before this branch existed.
+    #[cfg(feature = "simulator")]
+    {
+        match resolve_synthetic_source(&audio_config) {
+            Some(src) => {
+                match crate::audio::synthetic_capture::SyntheticAudioCapture::start(src, audio_tx) {
+                    Some(capture) => {
+                        AUDIO_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let hold_cancel = cancel.clone();
+                        // Hold the synthetic capture (it owns its producer
+                        // thread; Drop cancels + joins it) until the session
+                        // cancel fires, mirroring the real-capture lifecycle.
+                        let spawn = std::thread::Builder::new()
+                            .name("fvp-synthetic-audio-hold".into())
+                            .spawn(move || {
+                                let _capture = capture;
+                                while !hold_cancel.is_cancelled() {
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                                AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+                                log::info!("Synthetic audio source released");
+                            });
+                        if let Err(e) = spawn {
+                            AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+                            log::warn!("Failed to spawn synthetic-audio hold thread: {} — no audio", e);
+                        } else {
+                            log::info!("Audio source: synthetic ({})", audio_config.synthetic_source);
+                        }
+                    }
+                    None => {
+                        AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+                        log::warn!("Synthetic audio source failed to start — no audio");
+                    }
+                }
+            }
+            None => spawn_real_capture(audio_tx, cancel.clone()),
+        }
+    }
+    #[cfg(not(feature = "simulator"))]
+    {
+        let _ = &audio_config; // only consulted under the simulator feature
+        spawn_real_capture(audio_tx, cancel.clone());
     }
 
     // Spawn async task: accumulate raw chunks into 10ms frames, encode, send.
@@ -1047,6 +1120,52 @@ fn log_periodic_stats(frame_count: u64, framerate: u64) {
     }
 }
 
+/// Publish a live `"streaming"` status.json snapshot so the companion app shows
+/// Connected with live latency/fps/bitrate and subsystem indicators while a
+/// session is active. Written once on connect and refreshed ~1×/sec from the
+/// frame loop; the accept loop reverts to `"waiting"` on its next iteration
+/// after a disconnect. This is the real-data source the `--demo` mode fakes —
+/// without it the companion would stay on "WaitingForPin" for the entire
+/// session, even with real hardware.
+fn publish_streaming_status(
+    config: &AppConfig,
+    bitrate_mbps: u32,
+    sleeping: bool,
+    hmd_stats: &Arc<StdMutex<Option<HmdStats>>>,
+) {
+    let latency_us = PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    // Loss% from the most recent HEARTBEAT-reported HMD stats, if any.
+    let packet_loss_pct = hmd_stats
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref().map(|s| {
+                let total = s.packets_received + s.packets_lost;
+                if total == 0 {
+                    0.0
+                } else {
+                    s.packets_lost as f32 / total as f32 * 100.0
+                }
+            })
+        })
+        .unwrap_or(0.0);
+    let subsystems = crate::SubsystemStatus {
+        ft_active: config.face_tracking.enabled,
+        sleep_active: sleeping,
+        audio_enabled: is_audio_active(),
+        packet_loss_pct,
+    };
+    crate::write_status_file(
+        "streaming",
+        None,
+        Some(latency_us),
+        Some(config.video.framerate as u16),
+        Some(bitrate_mbps),
+        Some(&subsystems),
+        None,
+    );
+}
+
 async fn run_streaming(
     config: AppConfig,
     mut frame_rx: mpsc::Receiver<EncodedFrame>,
@@ -1255,7 +1374,7 @@ async fn run_streaming(
             None
         };
         if config.audio.enabled {
-            spawn_audio_pipeline(audio_target, session_cancel.clone(), audio_recording_dir);
+            spawn_audio_pipeline(audio_target, session_cancel.clone(), audio_recording_dir, config.audio.clone());
         } else {
             log::info!("Audio disabled by config — streaming video only");
         }
@@ -1292,6 +1411,15 @@ async fn run_streaming(
             config.sleep_mode.sleep_bitrate_mbps,
         );
         let normal_bitrate_mbps = config.video.bitrate_mbps;
+
+        // Flip status.json to "streaming" the moment the session is up so the
+        // companion shows Connected immediately; refreshed ~1×/sec below.
+        publish_streaming_status(
+            &config,
+            bitrate_ctrl.current_bitrate_mbps(),
+            sleep_detector.is_sleeping(),
+            &hmd_stats,
+        );
 
         loop {
             tokio::select! {
@@ -1378,6 +1506,19 @@ async fn run_streaming(
                     update_latency_atomics(&latency_tracker);
 
                     log_periodic_stats(frame_count, framerate);
+
+                    // Refresh the live "streaming" snapshot ~1×/sec so the
+                    // companion's stats sparklines and subsystem indicators
+                    // track the session. `update_latency_atomics` above just
+                    // refreshed PC_TOTAL_LATENCY_US, which this reads.
+                    if frame_count.is_multiple_of(framerate) {
+                        publish_streaming_status(
+                            &config,
+                            bitrate_ctrl.current_bitrate_mbps(),
+                            sleep_detector.is_sleeping(),
+                            &hmd_stats,
+                        );
+                    }
                 }
                 _ = session_cancel.cancelled() => {
                     log::info!("Session ended — waiting for new connection");
@@ -1465,6 +1606,32 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
     use crate::metrics::latency::FrameTimestamps;
+
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn test_resolve_synthetic_source_selection() {
+        use crate::audio::synthetic_capture::SyntheticSource;
+        let mut cfg = crate::config::AudioConfig {
+            synthetic_source: "off".into(),
+            ..crate::config::AudioConfig::default()
+        };
+        assert!(resolve_synthetic_source(&cfg).is_none());
+
+        cfg.synthetic_source = "silence".into();
+        assert!(matches!(resolve_synthetic_source(&cfg), Some(SyntheticSource::Silence)));
+
+        cfg.synthetic_source = "sine".into();
+        assert!(matches!(resolve_synthetic_source(&cfg), Some(SyntheticSource::Sine { .. })));
+
+        // "wav" with an empty/invalid path degrades to None (graceful no-audio).
+        cfg.synthetic_source = "wav".into();
+        cfg.synthetic_wav_path = String::new();
+        assert!(resolve_synthetic_source(&cfg).is_none());
+
+        // Unknown values are treated as "off" (validate() would clamp them too).
+        cfg.synthetic_source = "bogus".into();
+        assert!(resolve_synthetic_source(&cfg).is_none());
+    }
 
     #[test]
     fn test_engine_creation() {

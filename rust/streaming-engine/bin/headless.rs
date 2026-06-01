@@ -8,10 +8,12 @@
 //! to-end. The companion mock-client (`focus-vision-mock-client`) closes
 //! the loop on the receive side.
 //!
-//! What it does NOT do: NVENC encode (no real video frames exist), audio
-//! capture (production WASAPI loopback runs but reports None when no
-//! output device is present — fine for headless). Synthetic audio injection
-//! lands in B6 alongside the 2-token cancellation work.
+//! What it does NOT do: NVENC encode (no real video frames exist). Audio is
+//! config-driven: with `[audio] enabled = true` and a `synthetic_source`
+//! (`"sine"`, `"silence"`, or `"wav"`) the engine generates Opus and sends it
+//! over UDP+3 with no audio hardware present; with `synthetic_source = "off"`
+//! (the default) the production WASAPI loopback runs and reports None when no
+//! output device exists — fine for headless.
 //!
 //! Gated behind the `simulator` feature. Production builds neither compile
 //! nor expose this binary.
