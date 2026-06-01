@@ -128,8 +128,12 @@ cargo build --release -p focus-vision-companion
 # テスト
 cargo test --workspace  # 500+ Rust tests
 
-# Companion を「実機なし」で試す（デモモード）
+# Companion を「実機なし」で試す（デモモード = 見せかけ UI 合成）
 cargo run -p focus-vision-companion -- --demo
+
+# Companion を「実機なし」でフルパイプライン実走（シミュレーションモード）
+# 実エンジン + モック HMD クライアントをアプリ内で起動。配布 exe にも同梱。
+cargo run -p focus-vision-companion --features simulator -- --simulate
 ```
 
 <details>

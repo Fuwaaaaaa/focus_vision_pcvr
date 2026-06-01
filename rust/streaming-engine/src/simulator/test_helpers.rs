@@ -8,10 +8,35 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Bind temporary TCP and UDP sockets at port 0 to discover free ports,
-/// then drop them so the caller can rebind. Brief TOCTOU window but
-/// fine on quiet test runners.
+/// Reserve a contiguous block of free ports for an in-process engine + mock
+/// client pair, returning `(tcp_port, udp_port)`.
+///
+/// The block is chosen from a LOW, non-ephemeral range on purpose. The mock
+/// client binds the *fixed* `udp_port + 1/2/3` (video/tracking/audio) ports,
+/// while the engine opens additional *ephemeral* (`0.0.0.0:0`) sender sockets
+/// (`UdpSender::new`). If the block lived inside the OS dynamic/ephemeral range,
+/// those sender sockets could be assigned the very ports the client must bind —
+/// Windows readily recycles a just-freed ephemeral port — producing a
+/// deterministic `WSAEADDRINUSE (os error 10048)` on the client's receiver
+/// bind. Keeping the block below the dynamic range (Windows ≥ 49152,
+/// Linux ≥ 32768) ensures the ephemeral allocator never hands out our service
+/// ports, so the engine's senders and the client's receivers can't collide.
 pub fn pick_free_ports() -> (u16, u16) {
+    // 20000..30000 sits below both the Windows and Linux default dynamic
+    // ranges. step_by(8) leaves a gap between adjacent 5-port blocks so a
+    // partially-occupied neighbour can't alias into the next probe.
+    for base in (20000u16..30000).step_by(8) {
+        if try_reserve_block(base) {
+            // tcp_port = base; udp base = base + 1 (video/tracking/audio are
+            // udp+1/+2/+3). The whole block was bindable just above; the brief
+            // gap before the engine/client rebind is safe because nothing else
+            // in the test binds low ports.
+            return (base, base + 1);
+        }
+    }
+    // Fallback: OS-assigned ephemeral probe (original behaviour). Reached only
+    // if every low block is occupied, which on a test runner is effectively
+    // impossible.
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let tcp_port = tcp.local_addr().unwrap().port();
     let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -20,6 +45,32 @@ pub fn pick_free_ports() -> (u16, u16) {
     drop(tcp);
     drop(udp);
     (tcp_port, udp_port)
+}
+
+/// Try to simultaneously bind every port a session based at `base` uses:
+/// TCP control on `base`, and UDP on `base+1..=base+4` (udp base plus the
+/// video/tracking/audio offsets). Binds on `0.0.0.0` to match the engine's and
+/// mock client's real bind addresses, so success guarantees the port is free on
+/// every interface (incl. 127.0.0.1). All sockets drop before returning so the
+/// caller can rebind. Returns true iff the whole block was free.
+fn try_reserve_block(base: u16) -> bool {
+    if base.checked_add(4).is_none() {
+        return false;
+    }
+    let tcp = match std::net::TcpListener::bind(("0.0.0.0", base)) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    let mut udps = Vec::with_capacity(4);
+    for off in 1..=4u16 {
+        match std::net::UdpSocket::bind(("0.0.0.0", base + off)) {
+            Ok(s) => udps.push(s),
+            Err(_) => return false, // tcp + any earlier udp sockets drop here
+        }
+    }
+    drop(udps);
+    drop(tcp);
+    true
 }
 
 /// Bind a UDP socket at port 0, capture the OS-assigned port, then drop

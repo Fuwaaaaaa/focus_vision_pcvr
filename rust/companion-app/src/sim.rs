@@ -38,8 +38,6 @@ pub(crate) struct SimHandle {
     engine_thread: Option<JoinHandle<()>>,
     client_thread: Option<JoinHandle<()>>,
     pub status: Arc<Mutex<SimStatus>>,
-    pub tcp_port: u16,
-    pub udp_port: u16,
 }
 
 impl SimHandle {
@@ -228,8 +226,6 @@ pub(crate) fn start() -> Result<SimHandle, String> {
         engine_thread: Some(engine_thread),
         client_thread: Some(client_thread),
         status,
-        tcp_port,
-        udp_port,
     })
 }
 
@@ -256,7 +252,7 @@ mod tests {
     }
 
     /// Full in-process round trip: start the simulation, wait until the engine
-    /// + mock client reach Connected (via the real status.json), assert no
+    /// and mock client reach Connected (via the real status.json), assert no
     /// worker error, then stop and join. The GUI-free analogue of
     /// streaming-engine's headless_e2e_test. Writes the process-global
     /// status.json, so run the suite with `--test-threads=1`.

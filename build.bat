@@ -13,13 +13,13 @@ where git >nul 2>&1 && (
 )
 
 echo.
-echo [1/3] Building Rust streaming engine...
+echo [1/4] Building Rust streaming engine...
 cargo build --release -p streaming-engine
 if %ERRORLEVEL% neq 0 (echo ERROR: Rust build failed. & exit /b 1)
 echo Rust build OK.
 
 echo.
-echo [2/3] Building simulator binaries (headless, mock-client, etc.) ...
+echo [2/4] Building simulator binaries (headless, mock-client, etc.) ...
 REM Built behind the `simulator` feature so production driver builds stay
 REM lean. Used by JSON-driven scenario tests and for local "no hardware"
 REM dogfooding. A failure here is informational only — production lib
@@ -32,7 +32,17 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo.
-echo [3/3] Building OpenVR driver...
+echo [3/4] Building companion app (with in-process simulation)...
+REM `--features simulator` so the shipped exe (NSIS bundles target\release\
+REM focus-vision.exe) carries the in-process simulation: end users can run the
+REM full pipeline with no VR hardware via the "Start Simulation" button /
+REM `--simulate`. Adds only hound + tokio + the streaming-engine staticlib.
+cargo build --release -p focus-vision-companion --features simulator
+if %ERRORLEVEL% neq 0 (echo ERROR: Companion build failed. & exit /b 1)
+echo Companion build OK.
+
+echo.
+echo [4/4] Building OpenVR driver...
 where cmake >nul 2>&1
 if %ERRORLEVEL% neq 0 (
     echo SKIP: CMake not found. Install CMake to build the driver DLL.
@@ -50,6 +60,9 @@ if %ERRORLEVEL% neq 0 (
 
 if not exist out mkdir out
 if exist target\release\streaming_engine.lib copy /Y target\release\streaming_engine.lib out\ >nul
+REM Companion exe (sim-enabled). NSIS reads it from target\release\, this copy
+REM is just for convenience so `out\` holds a full artifact set.
+if exist target\release\focus-vision.exe copy /Y target\release\focus-vision.exe out\ >nul
 REM Copy simulator binaries when available so devs can run scenarios
 REM from `out\` without re-pointing PATH at `target\release\`.
 if exist target\release\focus-vision-headless.exe copy /Y target\release\focus-vision-headless.exe out\ >nul

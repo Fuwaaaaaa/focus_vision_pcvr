@@ -80,6 +80,7 @@ pub(crate) struct CompanionApp {
 
     // Streaming state
     pub(crate) pin_code: String,
+    pub(crate) connection_status: ConnectionStatus,
     pub(crate) latency_ms: f32,
     pub(crate) fps: u32,
     pub(crate) bitrate_mbps: f32,
@@ -166,6 +167,7 @@ pub(crate) struct CompanionApp {
     // frame when launched with `--simulate`.
     #[cfg(feature = "simulator")]
     pub(crate) sim: Option<sim::SimHandle>,
+    #[cfg(feature = "simulator")]
     pub(crate) sim_error: Option<String>,
     pub(crate) sim_autostart: bool,
 }
@@ -253,6 +255,7 @@ impl CompanionApp {
             deploy_status: String::new(),
             last_device_scan: Instant::now() - Duration::from_secs(10),
             pin_code: "----".to_string(),
+            connection_status: ConnectionStatus::Disconnected,
             latency_ms: 0.0,
             fps: 0,
             bitrate_mbps: 0.0,
@@ -289,6 +292,7 @@ impl CompanionApp {
             pin_expires_observed_at: None,
             #[cfg(feature = "simulator")]
             sim: None,
+            #[cfg(feature = "simulator")]
             sim_error: None,
             // Demo wins over simulate (already enforced in parse_flags), so a
             // demo launch never autostarts a real engine.
@@ -342,11 +346,13 @@ impl CompanionApp {
 
     #[cfg(not(feature = "simulator"))]
     pub(crate) fn start_sim(&mut self) {
-        self.sim_error =
-            Some("このビルドは --features simulator なしでビルドされています。".to_string());
+        log::warn!("--simulate ignored: built without --features simulator");
     }
 
+    // API-parity stub: only the simulator build has a Stop control that calls
+    // this, so in the default build it is intentionally never invoked.
     #[cfg(not(feature = "simulator"))]
+    #[allow(dead_code)]
     pub(crate) fn stop_sim(&mut self) {}
 
     #[cfg(not(feature = "simulator"))]
@@ -446,6 +452,7 @@ impl CompanionApp {
     /// without touching the filesystem.
     fn apply_parsed_status(&mut self, parsed: status_parser::ParsedStatus) {
         use status_parser::ConnectionStatus as CS;
+        self.connection_status = parsed.connection;
         // Pin expiry: when the engine emits a fresh value, snapshot it
         // along with the wall-clock time we received it, so the UI can
         // count down locally even though status.json isn't rewritten
