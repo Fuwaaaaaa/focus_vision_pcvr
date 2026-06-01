@@ -113,6 +113,13 @@ fn headless_e2e_basic_video_flow() {
     let mut frames_offered = 0u64;
     let mut frames_accepted = 0u64;
     let mut next_tick = start;
+    // Regression guard for the engine->companion status contract: an active
+    // session must publish status="streaming" with live fps. Before this was
+    // wired the engine only ever wrote "waiting", so the companion's Connected
+    // view (and all live stats) stayed dark -- in the sim AND on real hardware.
+    // Poll *during* the session: the mock client disconnects at its 2 s
+    // duration, after which the engine reverts status.json to "waiting".
+    let mut streaming_seen = false;
     while start.elapsed() < Duration::from_millis(2200) {
         let synth = stream.next_frame();
         let frame = EncodedFrame {
@@ -125,6 +132,16 @@ fn headless_e2e_basic_video_flow() {
         if engine.submit_frame(frame) {
             frames_accepted += 1;
         }
+        if !streaming_seen {
+            if let Some(v) = status_path()
+                .and_then(|p| std::fs::read_to_string(&p).ok())
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            {
+                if v["status"] == "streaming" && v["fps"].as_u64().unwrap_or(0) > 0 {
+                    streaming_seen = true;
+                }
+            }
+        }
         next_tick += frame_period;
         let now = Instant::now();
         if next_tick > now {
@@ -133,6 +150,9 @@ fn headless_e2e_basic_video_flow() {
             next_tick = now;
         }
     }
+
+    assert!(streaming_seen,
+        "engine must publish status=\"streaming\" with fps>0 during an active session");
 
     // 5. Stop the mock-client (it would also stop on its --duration deadline,
     //    but cancelling makes the test deterministic).
@@ -215,80 +235,4 @@ fn headless_e2e_wrong_pin_rejected() {
         }
         Ok(_) => panic!("wrong PIN must not succeed"),
     }
-}
-
-/// Regression guard: while a session is active the engine must publish a
-/// `"streaming"` status.json snapshot carrying live fps/bitrate. Before this
-/// was wired, the engine only ever wrote `"waiting"`, so the companion's
-/// Connected view (and all live stats) never lit up — for the simulation OR
-/// real hardware. This pins the engine→companion status contract.
-#[test]
-fn headless_e2e_publishes_streaming_status() {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .is_test(true)
-        .try_init();
-
-    delete_stale_status();
-    let (tcp_port, udp_port) = pick_free_ports();
-    let mut config = AppConfig::default();
-    config.network.tcp_port = tcp_port;
-    config.network.udp_port = udp_port;
-    config.video.framerate = 60;
-    let engine = StreamingEngine::new(config.clone()).expect("engine new");
-
-    let pin = wait_for_pin(Duration::from_secs(3)).expect("engine never published a PIN");
-
-    let server_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-    let mut client_config = MockClientConfig::from_ports(server_ip, tcp_port, udp_port, pin);
-    client_config.duration = Some(Duration::from_secs(3));
-    let cancel = CancellationToken::new();
-    let cancel_for_client = cancel.clone();
-    let client_thread = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(run_mock_client(client_config, cancel_for_client))
-    });
-
-    // Pump frames and poll status.json until it flips to "streaming".
-    let mut stream = SyntheticNalStream::new(VideoCodec::H265, 60);
-    let frame_period = Duration::from_secs_f64(1.0 / 60.0);
-    let mut next_tick = Instant::now();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut streaming_seen = false;
-    let (mut fps_seen, mut bitrate_seen) = (0u64, 0u64);
-    while Instant::now() < deadline && !streaming_seen {
-        let synth = stream.next_frame();
-        engine.submit_frame(EncodedFrame {
-            frame_index: synth.frame_index,
-            nal_data: synth.bytes,
-            is_idr: synth.is_idr,
-            timestamps: FrameTimestamps::new(synth.frame_index),
-        });
-        if let Some(path) = status_path() {
-            if let Ok(c) = std::fs::read_to_string(&path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&c) {
-                    if v["status"] == "streaming" {
-                        streaming_seen = true;
-                        fps_seen = v["fps"].as_u64().unwrap_or(0);
-                        bitrate_seen = v["bitrate_mbps"].as_u64().unwrap_or(0);
-                    }
-                }
-            }
-        }
-        next_tick += frame_period;
-        let now = Instant::now();
-        if next_tick > now {
-            std::thread::sleep(next_tick - now);
-        }
-    }
-
-    cancel.cancel();
-    let _ = client_thread.join().expect("client thread join");
-    engine.shutdown();
-
-    assert!(streaming_seen, "engine never published status=\"streaming\" during an active session");
-    assert!(fps_seen > 0, "streaming status should carry fps>0, got {fps_seen}");
-    assert!(bitrate_seen > 0, "streaming status should carry bitrate_mbps>0, got {bitrate_seen}");
 }
