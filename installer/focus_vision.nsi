@@ -30,12 +30,12 @@ SetCompressor /SOLID lzma
 ; ---- Constants -------------------------------------------------------------
 
 !define APP_NAME       "Focus Vision PCVR"
-!define APP_VERSION    "3.0.0-rc3"
+!define APP_VERSION    "3.0.0"
 ; NSIS VIProductVersion requires 4-component numeric (MAJOR.MINOR.PATCH.BUILD).
 ; Pre-release tag is encoded by reserving the 4th component for the rc number:
 ;   3.0.0-rc3  -> 3.0.0.3
 ;   3.0.0      -> 3.0.0.1000 (final, sorts above any rc)
-!define APP_VERSION_NUMERIC "3.0.0.3"
+!define APP_VERSION_NUMERIC "3.0.0.1000"
 !define APP_PUBLISHER  "Fuwaaaaaa"
 !define APP_URL        "https://github.com/Fuwaaaaaa/focus_vision_pcvr"
 !define APP_KEY        "FocusVisionPCVR"

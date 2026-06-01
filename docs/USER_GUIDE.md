@@ -28,14 +28,14 @@ VIVE Focus Vision を Wi-Fi 経由で PC につなぎ、SteamVR ゲームをワ�
 ### ステップ 1: インストーラをダウンロード
 
 1. [GitHub Releases](https://github.com/Fuwaaaaaa/focus_vision_pcvr/releases/latest) を開く
-2. **Assets** から `FocusVision-3.0.0-rc3-Setup.exe` を選んでダウンロード
-3. (オプション) APK を Play Store で配信していないため、HMD 側アプリも同じページから `FocusVision-Client-3.0.0-rc3.apk` をダウンロード
+2. **Assets** から `FocusVision-3.0.0-Setup.exe` を選んでダウンロード
+3. (オプション) APK を Play Store で配信していないため、HMD 側アプリも同じページから `FocusVision-Client-3.0.0.apk` をダウンロード
 
 > **SmartScreen 警告について:** Authenticode 証明書を取得するまでの間、初回起動時に Windows Defender SmartScreen が「認識されないアプリです」と警告を出します。**詳細情報 → 実行** で進めれば動作します。信頼性が気になる場合は、リポジトリのソースコードから自分でビルドできます (`./build.bat`)。
 
 ### ステップ 2: PC コンパニオンアプリをインストール
 
-ダウンロードした `FocusVision-3.0.0-rc3-Setup.exe` をダブルクリックし、ウィザードに従ってインストールします。デフォルトインストール先: `C:\Program Files\Focus Vision PCVR\`。
+ダウンロードした `FocusVision-3.0.0-Setup.exe` をダブルクリックし、ウィザードに従ってインストールします。デフォルトインストール先: `C:\Program Files\Focus Vision PCVR\`。
 
 インストール時に **SteamVR ドライバの自動登録** も行われるので、追加で `vrpathreg adddriver` を手動実行する必要はありません。
 
@@ -74,7 +74,7 @@ VIVE Focus Vision を Wi-Fi 経由で PC につなぎ、SteamVR ゲームをワ�
 3. HMD 側で「USB デバッグを許可しますか?」が表示されたら **常に許可** を選択
 4. コンパニオンアプリの **Deploy タブ** で:
    - **Refresh** ボタンを押すと検出されたデバイスが表示される
-   - **APK パス** に手順1でダウンロードした `FocusVision-Client-3.0.0-rc3.apk` をドラッグ&ドロップ
+   - **APK パス** に手順1でダウンロードした `FocusVision-Client-3.0.0.apk` をドラッグ&ドロップ
    - **Deploy** ボタンを押す
 5. 「Install complete」と表示されたら USB ケーブルを外して OK
 
