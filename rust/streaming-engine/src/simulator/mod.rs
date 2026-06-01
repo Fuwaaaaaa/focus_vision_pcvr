@@ -521,11 +521,13 @@ where
         let stats_audio = Arc::clone(&stats);
         let audio_cancel = cancel.clone();
         Some(tokio::spawn(async move {
+            log::info!("TEMP-AUDIO-TASK-START");
             let mut buf = [0u8; 2048];
             while !audio_cancel.is_cancelled() {
                 tokio::select! {
                     r = receiver.recv(&mut buf) => match r {
                         Ok((n, _peer)) => {
+                            log::info!("TEMP-AUDIO-RECV n={} pt={}", n, if n>=2 {buf[1]&0x7F} else {255});
                             // RTP header is 12 bytes; PT is the low 7 bits of byte 1.
                             if n >= 12 && (buf[1] & 0x7F) == 111 {
                                 let mut s = stats_audio.lock().unwrap();

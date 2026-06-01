@@ -854,6 +854,9 @@ fn spawn_audio_pipeline(
                         if let Err(e) = udp_sender.send_all(&[packet]).await {
                             log::debug!("Audio UDP send error: {}", e);
                         }
+                        if sequence.is_multiple_of(50) {
+                            log::info!("TEMP-AUDIO-SEND seq={} to {}", sequence, target);
+                        }
 
                         sequence = sequence.wrapping_add(1);
                         timestamp = timestamp.wrapping_add(480);
@@ -1120,6 +1123,52 @@ fn log_periodic_stats(frame_count: u64, framerate: u64) {
     }
 }
 
+/// Publish a live `"streaming"` status.json snapshot so the companion app shows
+/// Connected with live latency/fps/bitrate and subsystem indicators while a
+/// session is active. Written once on connect and refreshed ~1×/sec from the
+/// frame loop; the accept loop reverts to `"waiting"` on its next iteration
+/// after a disconnect. This is the real-data source the `--demo` mode fakes —
+/// without it the companion would stay on "WaitingForPin" for the entire
+/// session, even with real hardware.
+fn publish_streaming_status(
+    config: &AppConfig,
+    bitrate_mbps: u32,
+    sleeping: bool,
+    hmd_stats: &Arc<StdMutex<Option<HmdStats>>>,
+) {
+    let latency_us = PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as u64;
+    // Loss% from the most recent HEARTBEAT-reported HMD stats, if any.
+    let packet_loss_pct = hmd_stats
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref().map(|s| {
+                let total = s.packets_received + s.packets_lost;
+                if total == 0 {
+                    0.0
+                } else {
+                    s.packets_lost as f32 / total as f32 * 100.0
+                }
+            })
+        })
+        .unwrap_or(0.0);
+    let subsystems = crate::SubsystemStatus {
+        ft_active: config.face_tracking.enabled,
+        sleep_active: sleeping,
+        audio_enabled: is_audio_active(),
+        packet_loss_pct,
+    };
+    crate::write_status_file(
+        "streaming",
+        None,
+        Some(latency_us),
+        Some(config.video.framerate as u16),
+        Some(bitrate_mbps),
+        Some(&subsystems),
+        None,
+    );
+}
+
 async fn run_streaming(
     config: AppConfig,
     mut frame_rx: mpsc::Receiver<EncodedFrame>,
@@ -1366,6 +1415,15 @@ async fn run_streaming(
         );
         let normal_bitrate_mbps = config.video.bitrate_mbps;
 
+        // Flip status.json to "streaming" the moment the session is up so the
+        // companion shows Connected immediately; refreshed ~1×/sec below.
+        publish_streaming_status(
+            &config,
+            bitrate_ctrl.current_bitrate_mbps(),
+            sleep_detector.is_sleeping(),
+            &hmd_stats,
+        );
+
         loop {
             tokio::select! {
                 frame_opt = frame_rx.recv() => {
@@ -1451,6 +1509,19 @@ async fn run_streaming(
                     update_latency_atomics(&latency_tracker);
 
                     log_periodic_stats(frame_count, framerate);
+
+                    // Refresh the live "streaming" snapshot ~1×/sec so the
+                    // companion's stats sparklines and subsystem indicators
+                    // track the session. `update_latency_atomics` above just
+                    // refreshed PC_TOTAL_LATENCY_US, which this reads.
+                    if frame_count.is_multiple_of(framerate) {
+                        publish_streaming_status(
+                            &config,
+                            bitrate_ctrl.current_bitrate_mbps(),
+                            sleep_detector.is_sleeping(),
+                            &hmd_stats,
+                        );
+                    }
                 }
                 _ = session_cancel.cancelled() => {
                     log::info!("Session ended — waiting for new connection");
@@ -1543,9 +1614,10 @@ mod tests {
     #[test]
     fn test_resolve_synthetic_source_selection() {
         use crate::audio::synthetic_capture::SyntheticSource;
-        let mut cfg = crate::config::AudioConfig::default();
-
-        cfg.synthetic_source = "off".into();
+        let mut cfg = crate::config::AudioConfig {
+            synthetic_source: "off".into(),
+            ..crate::config::AudioConfig::default()
+        };
         assert!(resolve_synthetic_source(&cfg).is_none());
 
         cfg.synthetic_source = "silence".into();

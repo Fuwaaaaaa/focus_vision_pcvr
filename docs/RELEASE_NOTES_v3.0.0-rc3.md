@@ -2,7 +2,7 @@
 
 **リリース日:** 2026-05-22
 **ステータス:** Release Candidate（実機検証前 / rc2 + 配布物品質強化 + 実機なしエビデンス拡張）
-**rc2 からの差分:** 配布物メタデータ / ライセンス開示 / NSIS 前提チェック / Android R8 / clippy clean / シナリオハーネス 5 件追加
+**rc2 からの差分:** 配布物メタデータ / ライセンス開示 / NSIS 前提チェック / Android R8 / clippy clean / シナリオハーネス 5 件追加 / 配布 exe に in-process シミュレーション同梱
 
 v3.0.0-rc2（2026-05-15）の品質強化版です。**新規プロダクト機能はゼロ**。
 代わりに「実機なしで人手に渡せる完成品」と言い切れる根拠を積み増しました:
@@ -69,6 +69,28 @@ regressions）:
 #### CI clippy 強化
 `.github/workflows/build.yml` の clippy ステップを `--all-targets` 付きに
 拡張し、テストファイルの regression も merge 前に捕捉。
+
+### 配布インストーラに in-process シミュレーションを同梱
+
+これまで「実機なしでフルパイプラインを動かす」には開発者がソースから
+`--features simulator` でビルドする必要があり、配布インストーラの
+`focus-vision.exe` では `--demo`（見せかけ UI 合成）しか使えなかった。
+本リリースから **配布 exe 自体を `--features simulator` 付きでビルド**するように
+CI (`companion-build` ジョブ) と `build.bat` を変更。受け取った人が
+ヘッドセットなしで、ホームタブの **「▶ Start Simulation」** ボタン /
+`focus-vision.exe --simulate` から **実 `StreamingEngine` + モック HMD
+クライアント**を起動し、TCP+TLS+PIN+RTP+FEC+UDP+音声 (Opus) のパイプライン
+全体を実走できる（`rust/companion-app/src/sim.rs`）。
+
+- 追加される依存は `hound`（WAV I/O）+ `tokio` + `streaming-engine` staticlib
+  のみで、テスト専用依存は混入しない
+- ドライバ DLL (`driver-build` ジョブ) は引き続き `streaming-engine` を
+  `simulator` なしでビルドするため、実 VR ストリーミング経路・バイナリは無影響
+- シミュレーションは localhost・OS 割当の空きポートのみ使用し、実エンジン
+  稼働中 (`status.json` が新しい) は開始を拒否する
+
+これにより「実機なしで人手に渡せる完成品」は、**開発者の検証だけでなく
+エンドユーザーの手元でも**成立する。
 
 ### 実機なしエビデンス（シナリオハーネス拡張）
 
@@ -232,10 +254,13 @@ cargo test --release -p streaming-engine --features simulator \
 cd client && ./gradlew assembleRelease && apksigner verify --print-certs \
   app/build/outputs/apk/release/*.apk
 
-# 10. Companion --demo モード
+# 10. Companion --demo モード（見せかけ UI 合成）
 cargo run -p focus-vision-companion -- --demo
 
-# 11. Headless E2E (TCP+TLS+PIN+RTP+FEC+UDP)
+# 11. Companion --simulate モード（実エンジン + モック HMD のフルパイプライン、配布 exe 同梱）
+cargo run -p focus-vision-companion --features simulator -- --simulate
+
+# 12. Headless E2E (TCP+TLS+PIN+RTP+FEC+UDP)
 cargo run -p streaming-engine --bin focus-vision-headless --features simulator
 ```
 

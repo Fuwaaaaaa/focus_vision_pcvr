@@ -64,6 +64,7 @@ ctest --test-dir driver/build --build-config Release --output-on-failure  # 36 g
 ```bash
 cargo run -p focus-vision-companion          # Run the PC companion app
 cargo run -p focus-vision-companion -- --demo  # Demo mode — synthesizes status without engine
+cargo run -p focus-vision-companion --features simulator -- --simulate  # In-process simulation — real engine + mock HMD, no hardware
 ```
 
 `--demo` runs a 60 s scripted cycle (Disconnected → WaitingForPin
@@ -71,8 +72,17 @@ cargo run -p focus-vision-companion -- --demo  # Demo mode — synthesizes statu
 disables ADB scans, and shows a yellow "DEMO MODE" banner so the UI
 can be exercised without a VR rig.
 
+`--simulate` (or the Home tab's "▶ Start Simulation" button) is the
+hardware-free *full pipeline*: `sim.rs` spawns a real `StreamingEngine`
+plus a mock HMD client in-process (TCP+TLS+PIN+RTP+FEC+UDP+Opus over
+synthetic NALs), so PIN/stats/subsystem indicators reflect a live engine
+rather than demo's fake synthesis. Gated behind the `simulator` feature,
+which the shipped installer exe is now built with (CI `companion-build` +
+`build.bat`), so end users get it too. The driver DLL still links
+streaming-engine without `simulator`, so the real VR path is unaffected.
+
 Tabs (file-per-tab under `rust/companion-app/src/ui/`):
-- **Home** — engine-stopped banner, driver status, contextual setup hint, PIN display (with `Expires in` countdown when active), live stats sparklines, subsystem indicators, "Recent activity" log tail (collapsing)
+- **Home** — simulation control ("▶ Start/■ Stop Simulation", `simulator` build only, hidden in demo mode), engine-stopped banner, driver status, contextual setup hint, PIN display (with `Expires in` countdown when active), live stats sparklines, subsystem indicators, "Recent activity" log tail (collapsing)
 - **Deploy** — ADB device list, APK picker (path persists), install button
 - **Settings** — driver, audio (persists), sleep mode, face tracking, session recording with inline dir validation, codec radio, diagnostics zip export, **stats SVG export**, reset-to-defaults (2-stage confirm)
 

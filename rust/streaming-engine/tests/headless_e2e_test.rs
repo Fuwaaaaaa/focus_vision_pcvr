@@ -18,26 +18,13 @@ use streaming_engine::config::AppConfig;
 use streaming_engine::engine::{EncodedFrame, StreamingEngine};
 use streaming_engine::metrics::latency::FrameTimestamps;
 use streaming_engine::simulator::{run as run_mock_client, MockClientConfig};
+// Shared with sim.rs and the scenario runner. Reserves a contiguous,
+// non-ephemeral port block so the engine's ephemeral sender sockets can't
+// collide with the mock client's fixed video/audio receiver ports (see the
+// helper's doc comment for the WSAEADDRINUSE failure mode it prevents).
+use streaming_engine::simulator::test_helpers::pick_free_ports;
 use streaming_engine::video::synthetic_nal::SyntheticNalStream;
 use tokio_util::sync::CancellationToken;
-
-/// Bind temporary TCP and UDP sockets at port 0, capture the OS-assigned
-/// port numbers, then drop the sockets so the test can hand the ports to
-/// the engine. Brief TOCTOU window but unlikely to bite on a quiet test
-/// runner — the alternative (hard-coded ports) collides on every parallel
-/// `cargo test` invocation.
-fn pick_free_ports() -> (u16, u16) {
-    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let tcp_port = tcp.local_addr().unwrap().port();
-    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let udp_port = udp.local_addr().unwrap().port();
-    // Ensure tcp != udp; pick_free_ports rarely returns equal values but
-    // the engine validates against it.
-    let udp_port = if udp_port == tcp_port { udp_port + 1 } else { udp_port };
-    drop(tcp);
-    drop(udp);
-    (tcp_port, udp_port)
-}
 
 /// Path to status.json. The engine writes here on each
 /// TcpControlServer::new() call (see engine.rs::run_streaming).
