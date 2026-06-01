@@ -854,9 +854,6 @@ fn spawn_audio_pipeline(
                         if let Err(e) = udp_sender.send_all(&[packet]).await {
                             log::debug!("Audio UDP send error: {}", e);
                         }
-                        if sequence.is_multiple_of(50) {
-                            log::info!("TEMP-AUDIO-SEND seq={} to {}", sequence, target);
-                        }
 
                         sequence = sequence.wrapping_add(1);
                         timestamp = timestamp.wrapping_add(480);
