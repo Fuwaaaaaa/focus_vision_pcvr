@@ -4,7 +4,7 @@ exclude = ["rust/streaming-engine/fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "3.0.0-rc3"
+version = "3.0.0"
 authors = ["Fuwaaaaaa"]
 edition = "2021"
 license = "MIT OR LicenseRef-Commercial"
