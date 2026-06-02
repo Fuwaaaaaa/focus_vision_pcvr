@@ -293,13 +293,18 @@
 ## AI Super Resolution (resolution_scale) フォローアップ
 （2026-06-02 /plan-eng-review で起票。設計doc: AI Super Resolution — HMD側アップスケール）
 
-### ⚠ BLOCKER: クライアント TCP 制御接続 (connect/handshake) が app 未配線
-- **What:** `TcpControlClient::connect()` と `handshake(pin)`(tcp_client.cpp) は実装済みだが、**openxr_app/main/JNI/Kotlin のどこからも呼ばれていない**(全走査済み。使用は isConnected/requestIdr/sendMessage のみ)。
-- **影響:** STREAM_CONFIG がランタイムで受信されず、`m_config.encodedWidth/Height` は常に 0。よって **T10(decoder を encoded 解像度にサイジング)は seam を用意しても実効しない**。resolution_scale 機能のクライアント側全体がこの配線に依存。PIN ペアリング/TOFU 確立も同様に未実行の可能性。
-- **要調査:** 未配線は意図的か(別担当/別フェーズ/外部トリガ)、それとも欠落か。接続トリガ(サーバアドレス・PIN 供給元)とスレッド設計を確認。
-- **T10 現状:** decoderInitDims(encoded>0?encoded:native) + named 定数で magic number は解消・seam 設置済み(handshake 配線時に自動で効く)。実効は配線完了後。
-- **Priority:** P1 (Phase 0 クライアント完了の前提)
-- **Depends on:** なし(調査が先)
+### ⚠ BLOCKER (P0): Android クライアントにストリーミングセッション統合が無い
+- **調査結果(2026-06-02 read-only 全走査):** 単なる connect/handshake の配線漏れではなく、**「PC に接続してストリーミングを開始する」オーケストレーション自体が未実装**。
+  - `initialize()` が init するのは renderer/timewarp/overlay/heartbeat/facialTracker/videoDecoder のみ。
+  - `m_networkReceiver.init()` 未呼出 → `mainLoop()` の `if(!m_networkReceiver.isInitialized()) return;`(openxr_app.cpp:265) で UDP 受信が毎回早期 return。
+  - `m_tcpClient.connect()/handshake()`・`m_trackingSender.init()` いずれも未呼出。
+  - **サーバアドレスの供給元が皆無**(UI/config/ハードコードIP/JNIブリッジ なし)。`MainActivity.kt` は NativeActivity + loadLibrary のみ。
+  - git 履歴上、connect/handshake を app に配線したコミットは存在しない。
+- **意味:** 実 Android クライアントは end-to-end で未動作の足場。動作実証は Rust simulator(mock_client+headless) で行われている(実機なし前提と整合)。
+- **配線に必要(規模):** ①サーバアドレス取得(HMD UI/config/discovery=UX設計) ②セッション・オーケストレータ(connect→handshake(PIN)→receiver/sender init→run + 再接続) ③PIN入力UX。**OpenXR+MediaCodec+実接続を要し実機なしで検証不能** → Phase 1 と同じハード制約でブロック。
+- **resolution_scale への影響:** PC側(Rust+driver)は機能的。クライアント T8-T10 は正しいが、このセッション統合が無いため inert。
+- **Priority:** P0 (クライアント実機動作の前提・Phase 1 より上流)
+- **Depends on:** 実機(検証に必須) + UX設計
 
 ### Phase 0/1 分離（実装シーケンシング・/plan-eng-review で確定）
 - **What:** 本機能を2段に分離。**Phase 0**=半解像度エンコード + caps gate + HMD bilinear直描き(GlslUpscalerなし)。**Phase 1**=GlslUpscaler(bicubic+inline unsharp)を追加。
