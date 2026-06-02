@@ -96,3 +96,43 @@ TEST(ClientSession, FlakyLinkWarnsAfterSoftCapButKeepsTrying) {
     // Never permanently gives up — still cycling, not stuck in Disconnected.
     EXPECT_NE(s.state(), SessionState::Disconnected);
 }
+
+TEST(ServerEndpoint, ParsesIpWithDefaultPort) {
+    ServerEndpoint e;
+    ASSERT_TRUE(parse_server_endpoint("192.168.1.10", e));
+    EXPECT_EQ(e.ip, "192.168.1.10");
+    EXPECT_EQ(e.port, DEFAULT_CONTROL_PORT);  // 9944
+}
+
+TEST(ServerEndpoint, ParsesIpWithExplicitPort) {
+    ServerEndpoint e;
+    ASSERT_TRUE(parse_server_endpoint("10.0.0.1:5000", e));
+    EXPECT_EQ(e.ip, "10.0.0.1");
+    EXPECT_EQ(e.port, 5000);
+}
+
+TEST(ServerEndpoint, AcceptsBoundaryOctetsAndPorts) {
+    ServerEndpoint e;
+    EXPECT_TRUE(parse_server_endpoint("0.0.0.0", e));
+    EXPECT_TRUE(parse_server_endpoint("255.255.255.255:65535", e));
+    EXPECT_EQ(e.port, 65535);
+}
+
+TEST(ServerEndpoint, RejectsMalformedInput) {
+    ServerEndpoint e;
+    EXPECT_FALSE(parse_server_endpoint("", e));
+    EXPECT_FALSE(parse_server_endpoint("192.168.1", e));        // 3 octets
+    EXPECT_FALSE(parse_server_endpoint("1.2.3.4.5", e));        // 5 octets
+    EXPECT_FALSE(parse_server_endpoint("192.168.1.256", e));    // octet > 255
+    EXPECT_FALSE(parse_server_endpoint("192.168..1", e));       // empty octet
+    EXPECT_FALSE(parse_server_endpoint("not.an.ip.x", e));      // non-numeric
+    EXPECT_FALSE(parse_server_endpoint("::1", e));              // IPv6 unsupported
+}
+
+TEST(ServerEndpoint, RejectsBadPorts) {
+    ServerEndpoint e;
+    EXPECT_FALSE(parse_server_endpoint("192.168.1.10:0", e));      // port 0
+    EXPECT_FALSE(parse_server_endpoint("192.168.1.10:70000", e));  // > 65535
+    EXPECT_FALSE(parse_server_endpoint("192.168.1.10:abc", e));    // non-numeric
+    EXPECT_FALSE(parse_server_endpoint("192.168.1.10:", e));       // empty port
+}

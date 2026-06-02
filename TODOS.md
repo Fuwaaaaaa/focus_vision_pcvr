@@ -302,7 +302,10 @@
   - git 履歴上、connect/handshake を app に配線したコミットは存在しない。
 - **意味:** 実 Android クライアントは end-to-end で未動作の足場。動作実証は Rust simulator(mock_client+headless) で行われている(実機なし前提と整合)。
 - **配線に必要(規模):** ①サーバアドレス取得(HMD UI/config/discovery=UX設計) ②セッション・オーケストレータ(connect→handshake(PIN)→receiver/sender init→run + 再接続) ③PIN入力UX。**OpenXR+MediaCodec+実接続を要し実機なしで検証不能** → Phase 1 と同じハード制約でブロック。
-- **進捗(2026-06-02):** ②の**オーケストレーション・ポリシーは純粋部として完成・テスト済み** — `client/app/src/main/cpp/client_session.h` の `ClientSession` 状態機械(Disconnected→Connecting→Pairing→Configuring→Streaming→Reconnecting、PIN拒否は再接続しない、指数backoff base1s×2 cap16s = engine reconnect.rs と一致)。client gtest 9件で検証。残りは「この状態機械を**実I/O(connect/handshake/receiver init)に配線**」+ ①アドレス取得 + ③PIN UX（いずれも実機検証が要る部分）。
+- **進捗(2026-06-02):** 純粋部はローカル完結検証で前進:
+  - ②**オーケストレーション・ポリシー**: `client_session.h` の `ClientSession` 状態機械(Disconnected→Connecting→Pairing→Configuring→Streaming→Reconnecting、PIN拒否は再接続しない、指数backoff base1s×2 cap16s = engine reconnect.rs と一致)。client gtest 9件。
+  - ①**サーバアドレス検証**: `client_session.h` の `parse_server_endpoint("ip"/"ip:port")`(IPv4 4オクテット + port 1-65535 検証、default 9944 = engine と一致)。client gtest 5件。アドレス文字列の**供給元**(config ファイル読込 or UI)は別途。
+  - **残り(実機検証が要る部分)**: 状態機械を**実I/O(connect/handshake/receiver init)に配線**、アドレス文字列の供給(config/UI)、PIN入力UX。
 - **resolution_scale への影響:** PC側(Rust+driver)は機能的。クライアント T8-T10 は正しいが、このセッション統合が無いため inert。
 - **Priority:** P0 (クライアント実機動作の前提・Phase 1 より上流)
 - **Depends on:** 実機(検証に必須) + UX設計

@@ -13,8 +13,95 @@
 // attempt cap that only drives a "flaky link" warning — the client never
 // permanently gives up on a dropped Wi-Fi link.
 #include <cstdint>
+#include <string>
 
 namespace fvp_session {
+
+/// Default control-channel port — must match the engine's DEFAULT_TCP_PORT.
+inline constexpr uint16_t DEFAULT_CONTROL_PORT = 9944;
+
+/// A validated server connection target. `ip` is a dotted-quad IPv4 literal
+/// (what the client passes to inet_pton(AF_INET, ...)).
+struct ServerEndpoint {
+    std::string ip;
+    uint16_t port = DEFAULT_CONTROL_PORT;
+};
+
+/// Parse one decimal octet (0-255). Empty / non-digit / >255 / >3 chars fail.
+inline bool parse_octet(const std::string& s, uint8_t& out) {
+    if (s.empty() || s.size() > 3) {
+        return false;
+    }
+    int v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        v = v * 10 + (c - '0');
+    }
+    if (v > 255) {
+        return false;
+    }
+    out = static_cast<uint8_t>(v);
+    return true;
+}
+
+/// Parse a server endpoint string: "ip" (default port) or "ip:port". Validates
+/// IPv4 (exactly four octets 0-255) and an optional port (1-65535). Returns
+/// false for anything malformed — empty, wrong octet count, octet/port out of
+/// range, non-numeric, IPv6, or a trailing colon. Pure: no DNS, no sockets.
+inline bool parse_server_endpoint(const std::string& s, ServerEndpoint& out) {
+    if (s.empty()) {
+        return false;
+    }
+    std::string host = s;
+    uint16_t port = DEFAULT_CONTROL_PORT;
+
+    const auto colon = s.find(':');
+    if (colon != std::string::npos) {
+        host = s.substr(0, colon);
+        const std::string port_str = s.substr(colon + 1);
+        if (port_str.empty() || port_str.size() > 5) {
+            return false;
+        }
+        uint32_t p = 0;
+        for (char c : port_str) {
+            if (c < '0' || c > '9') {
+                return false;
+            }
+            p = p * 10 + static_cast<uint32_t>(c - '0');
+        }
+        if (p == 0 || p > 65535) {
+            return false;
+        }
+        port = static_cast<uint16_t>(p);
+    }
+
+    // Exactly four dot-separated octets.
+    int octets = 0;
+    size_t start = 0;
+    while (true) {
+        const size_t dot = host.find('.', start);
+        const std::string oct =
+            host.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+        uint8_t b = 0;
+        if (!parse_octet(oct, b)) {
+            return false;
+        }
+        octets++;
+        if (dot == std::string::npos) {
+            break;
+        }
+        start = dot + 1;
+    }
+    if (octets != 4) {
+        return false;
+    }
+
+    out.ip = host;
+    out.port = port;
+    return true;
+}
 
 enum class SessionState {
     Disconnected,  // idle; nothing in flight
