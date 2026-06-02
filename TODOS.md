@@ -293,6 +293,14 @@
 ## AI Super Resolution (resolution_scale) フォローアップ
 （2026-06-02 /plan-eng-review で起票。設計doc: AI Super Resolution — HMD側アップスケール）
 
+### ⚠ BLOCKER: クライアント TCP 制御接続 (connect/handshake) が app 未配線
+- **What:** `TcpControlClient::connect()` と `handshake(pin)`(tcp_client.cpp) は実装済みだが、**openxr_app/main/JNI/Kotlin のどこからも呼ばれていない**(全走査済み。使用は isConnected/requestIdr/sendMessage のみ)。
+- **影響:** STREAM_CONFIG がランタイムで受信されず、`m_config.encodedWidth/Height` は常に 0。よって **T10(decoder を encoded 解像度にサイジング)は seam を用意しても実効しない**。resolution_scale 機能のクライアント側全体がこの配線に依存。PIN ペアリング/TOFU 確立も同様に未実行の可能性。
+- **要調査:** 未配線は意図的か(別担当/別フェーズ/外部トリガ)、それとも欠落か。接続トリガ(サーバアドレス・PIN 供給元)とスレッド設計を確認。
+- **T10 現状:** decoderInitDims(encoded>0?encoded:native) + named 定数で magic number は解消・seam 設置済み(handshake 配線時に自動で効く)。実効は配線完了後。
+- **Priority:** P1 (Phase 0 クライアント完了の前提)
+- **Depends on:** なし(調査が先)
+
 ### Phase 0/1 分離（実装シーケンシング・/plan-eng-review で確定）
 - **What:** 本機能を2段に分離。**Phase 0**=半解像度エンコード + caps gate + HMD bilinear直描き(GlslUpscalerなし)。**Phase 1**=GlslUpscaler(bicubic+inline unsharp)を追加。
 - **Why:** Phase 0 の帯域削減効果は simulator E2E で NAL サイズを測れば**ハード無しで検証可能**。bicubic/unsharp の bilinear 超えだけが検証不能 → 検証可能部を先に出し、不能部(Phase 1)は実機で bilinear 超えを証明してから着手(incremental/reversible)。
@@ -323,9 +331,7 @@
 - **What:** C++クライアントが HELLO で {1,0}=version 1 を名乗っていた。サーバの PROTOCOL_VERSION は 3。
 - **解決:** T8 で HELLO を v3 名乗り + caps バイトに修正(tcp_client.cpp)。調査の結果クライアントは既に v3 ワイヤ形式(fvp_flags slice/stream — fec_decoder.h:70-73)を実装済みのため v3 名乗りは安全。
 
-### client C++ テスト基盤 (host-buildable gtest)
-- **What:** client/app/src/main/cpp にホストビルド可能な gtest ターゲットを新設(driver の gtest と同等の CMake セットアップ)。HELLO ペイロード構築・STREAM_CONFIG パース・FVP flag 解析等の純粋ロジックを単体テスト可能に。
-- **Why:** 現状クライアント C++ には自動テストが一切なく(T8 のレビューで判明)、ワイヤ形式の正しさは Rust 側の対称テストと CI ビルドにのみ依拠している。client 側の回帰を機械的に検知できない。
-- **Context:** T8(HELLO caps)・T9(STREAM_CONFIG parse)・T10(decoder sizing) はいずれもこの基盤があれば TDD できた。Phase 0 の残タスク(T9-T11)着手前に整備すると以降が楽。
-- **Priority:** P2
-- **Depends on:** なし(独立)
+### ~~client C++ テスト基盤 (host-buildable gtest)~~ (完了)
+- **What:** `client/tests/`（host CMake プロジェクト）+ `client/app/src/main/cpp/client_protocol.h`（Android非依存の純粋ロジック）。driver と同じ gtest パターン。
+- **解決:** `client_protocol.h` に HELLO ペイロード構築 + 定数を抽出し `tcp_client.cpp` がそれを使用。`client/tests/test_client_protocol.cpp` で単体テスト(3件)。CI に `client-tests`(ubuntu) ジョブ追加、CLAUDE.md に手順記載。`ctest --test-dir client/tests/build` で実行。
+- **今後:** T9(STREAM_CONFIG parse)・T10(decoder sizing) の純粋部もこの基盤で TDD する。FVP flag 解析(fec_decoder.h)も将来ここへ取り込み可。
