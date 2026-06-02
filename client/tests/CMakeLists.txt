@@ -26,6 +26,7 @@ enable_testing()
 
 add_executable(client_tests
     test_client_protocol.cpp
+    test_client_session.cpp
 )
 # Pure, host-buildable client logic lives alongside the NDK sources.
 target_include_directories(client_tests PRIVATE
