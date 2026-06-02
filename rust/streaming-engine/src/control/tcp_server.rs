@@ -132,9 +132,9 @@ impl TcpControlServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        step_hello_exchange(&mut stream).await?;
+        let client_caps = step_hello_exchange(&mut stream).await?;
         self.step_pin_pairing(&mut stream).await?;
-        step_stream_config(&mut stream, &self.encode_stream_config()).await?;
+        step_stream_config(&mut stream, &self.encode_stream_config(client_caps)).await?;
         step_stream_start(&mut stream).await?;
         log::info!("Handshake complete, streaming ready");
         Ok(stream)
@@ -174,7 +174,24 @@ impl TcpControlServer {
         }
     }
 
-    fn encode_stream_config(&self) -> Vec<u8> {
+    /// Build the STREAM_CONFIG payload.
+    ///
+    /// Wire format (little-endian), 25 bytes:
+    /// ```text
+    ///   [0..4]   native render_w  (u32)   ← target/restore resolution
+    ///   [4..8]   native render_h  (u32)
+    ///   [8..12]  bitrate_mbps     (u32)
+    ///   [12..16] framerate        (u32)
+    ///   [16]     codec            (u8: 0=h264, 1=h265)
+    ///   [17..21] encoded_w        (u32)   ← what is actually encoded/sent
+    ///   [21..25] encoded_h        (u32)
+    /// ```
+    /// The first 17 bytes are byte-identical to the legacy layout, so a client
+    /// that reads only 17 bytes is unaffected. `encoded_*` is downscaled only
+    /// when the client advertises `hello_caps::RESOLUTION_SCALE` AND
+    /// `resolution_scale < 1.0`; otherwise it equals native (no silent
+    /// degradation for clients that cannot upscale).
+    fn encode_stream_config(&self, client_caps: u8) -> Vec<u8> {
         let v = &self.config.video;
         let mut buf = Vec::new();
         buf.extend_from_slice(&v.resolution_per_eye[0].to_le_bytes());
@@ -185,6 +202,21 @@ impl TcpControlServer {
             fvp_common::protocol::VideoCodec::H264 => 0,
             fvp_common::protocol::VideoCodec::H265 => 1,
         });
+
+        let supports_scale =
+            client_caps & fvp_common::protocol::hello_caps::RESOLUTION_SCALE != 0;
+        let (enc_w, enc_h) = if supports_scale && v.resolution_scale < 1.0 {
+            compute_encoded_dims(
+                v.resolution_per_eye[0],
+                v.resolution_per_eye[1],
+                v.resolution_scale,
+                2,
+            )
+        } else {
+            (v.resolution_per_eye[0], v.resolution_per_eye[1])
+        };
+        buf.extend_from_slice(&enc_w.to_le_bytes());
+        buf.extend_from_slice(&enc_h.to_le_bytes());
         buf
     }
 
@@ -193,9 +225,29 @@ impl TcpControlServer {
     }
 }
 
-/// Step 1-2: Receive HELLO and reply with HELLO_ACK carrying our protocol version.
+/// Round `v` to the nearest multiple of `align` (round-half-up), with a floor of
+/// `align` so the encoder never receives a zero dimension.
+fn round_to_align(v: u32, align: u32) -> u32 {
+    let aligned = ((v + align / 2) / align) * align;
+    aligned.max(align)
+}
+
+/// Compute the encoded (downscaled) per-eye dimensions for a render size and
+/// scale. Scale is clamped to [0, 1]; the result is aligned to `align` (even for
+/// NVENC). A scale of 1.0 returns the native dims unchanged when they are
+/// already aligned. Pure so the dimension math is unit-testable.
+pub(crate) fn compute_encoded_dims(render_w: u32, render_h: u32, scale: f32, align: u32) -> (u32, u32) {
+    let s = scale.clamp(0.0, 1.0);
+    let w = round_to_align((render_w as f32 * s).round() as u32, align);
+    let h = round_to_align((render_h as f32 * s).round() as u32, align);
+    (w, h)
+}
+
+/// Step 1-2: Receive HELLO and reply with HELLO_ACK carrying our protocol
+/// version. Returns the client's advertised capability flags (0 for legacy
+/// clients that send no caps byte).
 async fn step_hello_exchange<S>(stream: &mut S)
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    -> Result<u8, Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -206,13 +258,14 @@ where
         return Err(format!("Expected HELLO, got msg_type {}", msg.0).into());
     }
     let client_version = fvp_common::protocol::parse_hello_version(&msg.1);
-    log::info!("Received HELLO from client (protocol v{})", client_version);
+    let client_caps = fvp_common::protocol::parse_hello_caps(&msg.1);
+    log::info!("Received HELLO from client (protocol v{}, caps 0x{:02x})", client_version, client_caps);
 
     log::debug!("handshake step: HELLO_ACK");
     let version_payload = fvp_common::protocol::encode_version(fvp_common::protocol::PROTOCOL_VERSION);
     send_message_generic(stream, msg_type::HELLO_ACK, &version_payload).await
         .map_err(|e| format!("step HELLO_ACK send failed: {e}"))?;
-    Ok(())
+    Ok(client_caps)
 }
 
 /// Step 6: Send STREAM_CONFIG with session-specific payload.
@@ -688,22 +741,81 @@ mod tests {
     #[tokio::test]
     async fn test_encode_stream_config_layout_matches_spec() {
         // Wire format: res_x_le_u32 | res_y_le_u32 | bitrate_le_u32 |
-        //              framerate_le_u32 | codec_byte (0=h264, 1=h265).
-        // Total: 17 bytes.
+        //              framerate_le_u32 | codec_byte (0=h264, 1=h265) |
+        //              encoded_x_le_u32 | encoded_y_le_u32. Total: 25 bytes.
+        // The first 17 bytes are byte-identical to the legacy layout so old
+        // clients that read only 17 bytes are unaffected.
         let mut config = crate::config::AppConfig::default();
         config.video.resolution_per_eye = [1920, 1080];
         config.video.bitrate_mbps = 100;
         config.video.framerate = 90;
         config.video.codec = fvp_common::protocol::VideoCodec::H265;
         let server = TcpControlServer::new_without_tls(config);
-        let bytes = server.encode_stream_config();
+        let bytes = server.encode_stream_config(fvp_common::protocol::hello_caps::RESOLUTION_SCALE);
 
-        assert_eq!(bytes.len(), 17, "STREAM_CONFIG payload size shifted");
+        assert_eq!(bytes.len(), 25, "STREAM_CONFIG payload size shifted");
         assert_eq!(&bytes[0..4], &1920u32.to_le_bytes());
         assert_eq!(&bytes[4..8], &1080u32.to_le_bytes());
         assert_eq!(&bytes[8..12], &100u32.to_le_bytes());
         assert_eq!(&bytes[12..16], &90u32.to_le_bytes());
         assert_eq!(bytes[16], 1, "h265 codec byte");
+        // scale defaults to 1.0 → encoded dims equal native.
+        assert_eq!(&bytes[17..21], &1920u32.to_le_bytes());
+        assert_eq!(&bytes[21..25], &1080u32.to_le_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_stream_config_scale_1_0_encoded_equals_native() {
+        // REGRESSION: default scale (1.0) must leave the first 17 bytes intact
+        // and set encoded dims equal to native.
+        let config = crate::config::AppConfig::default(); // scale 1.0
+        let server = TcpControlServer::new_without_tls(config);
+        let bytes = server.encode_stream_config(fvp_common::protocol::hello_caps::RESOLUTION_SCALE);
+        assert_eq!(bytes.len(), 25);
+        assert_eq!(&bytes[17..21], &bytes[0..4], "encoded_w must equal native");
+        assert_eq!(&bytes[21..25], &bytes[4..8], "encoded_h must equal native");
+    }
+
+    #[tokio::test]
+    async fn test_stream_config_scale_half_with_caps_downscales() {
+        let mut config = crate::config::AppConfig::default();
+        config.video.resolution_per_eye = [1832, 1920];
+        config.video.resolution_scale = 0.5;
+        let server = TcpControlServer::new_without_tls(config);
+        let bytes = server.encode_stream_config(fvp_common::protocol::hello_caps::RESOLUTION_SCALE);
+        // native unchanged
+        assert_eq!(&bytes[0..4], &1832u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &1920u32.to_le_bytes());
+        // encoded = half (even-aligned)
+        assert_eq!(&bytes[17..21], &916u32.to_le_bytes());
+        assert_eq!(&bytes[21..25], &960u32.to_le_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_stream_config_scale_half_without_caps_stays_native() {
+        // CRITICAL gate: a client that does NOT advertise the capability must
+        // never receive a sub-native stream — prevents silent degradation.
+        let mut config = crate::config::AppConfig::default();
+        config.video.resolution_per_eye = [1832, 1920];
+        config.video.resolution_scale = 0.5;
+        let server = TcpControlServer::new_without_tls(config);
+        let bytes = server.encode_stream_config(0); // no caps
+        assert_eq!(&bytes[17..21], &1832u32.to_le_bytes(), "must stay native");
+        assert_eq!(&bytes[21..25], &1920u32.to_le_bytes(), "must stay native");
+    }
+
+    #[test]
+    fn test_compute_encoded_dims_even_aligned() {
+        // Clean half.
+        assert_eq!(compute_encoded_dims(1832, 1920, 0.5, 2), (916, 960));
+        // scale 1.0 returns native (already even).
+        assert_eq!(compute_encoded_dims(1832, 1920, 1.0, 2), (1832, 1920));
+        // Odd intermediate rounds up to the next even multiple.
+        assert_eq!(compute_encoded_dims(1830, 1830, 0.5, 2), (916, 916)); // 915 → 916
+        // Result is always even.
+        let (w, h) = compute_encoded_dims(1280, 720, 0.75, 2);
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
     }
 
     /// Test-only certificate verifier that accepts any server cert.
