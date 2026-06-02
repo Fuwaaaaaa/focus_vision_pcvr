@@ -89,8 +89,9 @@ impl SyntheticNalStream {
         let (enc_w, enc_h) = crate::config::compute_encoded_dims(render_w, render_h, scale, 2);
         let encoded_area = enc_w as u64 * enc_h as u64;
         let render_area = (render_w as u64 * render_h as u64).max(1);
-        self.idr_bytes = (DEFAULT_IDR_SIZE_BYTES as u64 * encoded_area / render_area) as usize;
-        self.p_bytes = (DEFAULT_P_FRAME_SIZE_BYTES as u64 * encoded_area / render_area) as usize;
+        // .max(1): never feed the packetizer a zero-byte frame at extreme scales.
+        self.idr_bytes = ((DEFAULT_IDR_SIZE_BYTES as u64 * encoded_area / render_area) as usize).max(1);
+        self.p_bytes = ((DEFAULT_P_FRAME_SIZE_BYTES as u64 * encoded_area / render_area) as usize).max(1);
         self
     }
 

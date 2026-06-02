@@ -598,7 +598,7 @@ where
 /// Round `v` to the nearest multiple of `align` (round-half-up), with a floor of
 /// `align` so an encoder never receives a zero dimension.
 fn round_to_align(v: u32, align: u32) -> u32 {
-    let aligned = ((v + align / 2) / align) * align;
+    let aligned = (v.saturating_add(align / 2) / align) * align;
     aligned.max(align)
 }
 
