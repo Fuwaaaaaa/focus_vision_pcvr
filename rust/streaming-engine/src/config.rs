@@ -595,6 +595,26 @@ where
     }
 }
 
+/// Round `v` to the nearest multiple of `align` (round-half-up), with a floor of
+/// `align` so an encoder never receives a zero dimension.
+fn round_to_align(v: u32, align: u32) -> u32 {
+    let aligned = ((v + align / 2) / align) * align;
+    aligned.max(align)
+}
+
+/// Compute the encoded (downscaled) per-eye dimensions for a render size and
+/// scale. Scale is clamped to [0, 1]; the result is aligned to `align` (even for
+/// NVENC). A scale of 1.0 returns the native dims unchanged when they are
+/// already aligned. Single source of truth shared by the STREAM_CONFIG payload
+/// (what the client is told) and the FvpConfig the driver encodes with, so the
+/// two can never disagree.
+pub(crate) fn compute_encoded_dims(render_w: u32, render_h: u32, scale: f32, align: u32) -> (u32, u32) {
+    let s = scale.clamp(0.0, 1.0);
+    let w = round_to_align((render_w as f32 * s).round() as u32, align);
+    let h = round_to_align((render_h as f32 * s).round() as u32, align);
+    (w, h)
+}
+
 /// f32-specialized range check: also rejects NaN and Infinity. Intended for
 /// cases where min is inclusive; for exclusive-min checks, keep a manual block.
 fn validate_f32_range(
@@ -703,6 +723,20 @@ mod tests {
         "#).unwrap();
         assert_eq!(cfg.video.resolution_scale, 1.0);
         assert_eq!(cfg.video.bitrate_pixel_factor, 2.0);
+    }
+
+    #[test]
+    fn test_compute_encoded_dims_even_aligned() {
+        // Clean half.
+        assert_eq!(compute_encoded_dims(1832, 1920, 0.5, 2), (916, 960));
+        // scale 1.0 returns native (already even).
+        assert_eq!(compute_encoded_dims(1832, 1920, 1.0, 2), (1832, 1920));
+        // Odd intermediate rounds up to the next even multiple.
+        assert_eq!(compute_encoded_dims(1830, 1830, 0.5, 2), (916, 916)); // 915 → 916
+        // Result is always even.
+        let (w, h) = compute_encoded_dims(1280, 720, 0.75, 2);
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
     }
 
     #[test]

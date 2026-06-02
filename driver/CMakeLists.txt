@@ -46,6 +46,7 @@ enable_testing()
 add_executable(driver_tests
     tests/test_qp_map.cpp
     tests/test_nvenc_vui.cpp
+    tests/test_encode_params.cpp
 )
 target_include_directories(driver_tests PRIVATE src)
 target_link_libraries(driver_tests PRIVATE GTest::gtest_main)
