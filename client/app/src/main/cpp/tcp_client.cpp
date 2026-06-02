@@ -25,6 +25,17 @@ static constexpr uint8_t MSG_STREAM_CONFIG = 0x06;
 static constexpr uint8_t MSG_STREAM_START = 0x07;
 static constexpr uint8_t MSG_IDR_REQUEST = 0x30;
 
+// Protocol version (must match Rust PROTOCOL_VERSION). The client already
+// implements the v3 wire format (FVP slice/stream flags — see fec_decoder.h
+// fvp_flags), so it advertises v3 rather than the historical v1.
+static constexpr uint16_t PROTOCOL_VERSION = 3;
+
+// HELLO capability flags (must match Rust protocol::hello_caps). RESOLUTION_SCALE
+// signals that the client sizes its decoder from the STREAM_CONFIG encoded_w/h
+// and deliberately handles a sub-native (downscaled) stream. The server only
+// downscales for clients that advertise this bit.
+static constexpr uint8_t CAP_RESOLUTION_SCALE = 0x01;
+
 bool TcpControlClient::initTls() {
     mbedtls_ssl_init(&m_ssl);
     mbedtls_ssl_config_init(&m_sslConf);
@@ -152,9 +163,14 @@ bool TcpControlClient::handshake(uint32_t pin) {
     uint8_t type;
     std::vector<uint8_t> payload;
 
-    // Step 1: Send HELLO
-    uint8_t version[] = {1, 0}; // v1.0
-    if (!sendMessage(MSG_HELLO, version, 2)) return false;
+    // Step 1: Send HELLO — protocol version (u16 LE) followed by a capability
+    // byte. Layout matches Rust encode_hello(): [ver_lo, ver_hi, caps].
+    uint8_t hello[] = {
+        (uint8_t)(PROTOCOL_VERSION & 0xFF),
+        (uint8_t)((PROTOCOL_VERSION >> 8) & 0xFF),
+        CAP_RESOLUTION_SCALE,
+    };
+    if (!sendMessage(MSG_HELLO, hello, static_cast<int>(sizeof(hello)))) return false;
 
     // Step 2: Receive HELLO_ACK
     if (!recvMessage(type, payload) || type != MSG_HELLO_ACK) {
