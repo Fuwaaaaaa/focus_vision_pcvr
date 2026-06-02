@@ -652,6 +652,74 @@ mod tests {
         assert!(server_task.await.unwrap().is_ok());
     }
 
+    /// Drive a full handshake against the real server over loopback TCP with a
+    /// client that advertises `client_caps` in its HELLO, and return the
+    /// STREAM_CONFIG payload the server sent. Exercises the end-to-end wire path
+    /// (HELLO caps -> encode_stream_config -> framed bytes), unlike the
+    /// encode_stream_config unit tests which call the method directly.
+    async fn capture_stream_config_via_handshake(
+        config: crate::config::AppConfig,
+        client_caps: u8,
+    ) -> Vec<u8> {
+        let server = TcpControlServer::new_without_tls(config);
+        let pin = server.pairing.lock().await.get_pin();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            server.handle_handshake_generic(stream).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let hello = fvp_common::protocol::encode_hello(
+            fvp_common::protocol::PROTOCOL_VERSION, client_caps);
+        send_message(&mut client, msg_type::HELLO, &hello).await.unwrap();
+        let _ = read_message(&mut client).await.unwrap(); // HELLO_ACK
+        let _ = read_message(&mut client).await.unwrap(); // PIN_REQUEST
+        send_message(&mut client, msg_type::PIN_RESPONSE, &pin.to_le_bytes()).await.unwrap();
+        let _ = read_message(&mut client).await.unwrap(); // PIN_RESULT
+        let (t, payload) = read_message(&mut client).await.unwrap(); // STREAM_CONFIG
+        assert_eq!(t, msg_type::STREAM_CONFIG);
+        send_message(&mut client, msg_type::STREAM_START, &[]).await.unwrap();
+        assert!(server_task.await.unwrap().is_ok());
+        payload
+    }
+
+    #[tokio::test]
+    async fn e2e_handshake_downscales_for_caps_client() {
+        let mut config = crate::config::AppConfig::default();
+        config.video.resolution_per_eye = [1832, 1920];
+        config.video.resolution_scale = 0.5;
+        let payload = capture_stream_config_via_handshake(
+            config, fvp_common::protocol::hello_caps::RESOLUTION_SCALE).await;
+        assert_eq!(payload.len(), 25);
+        assert_eq!(&payload[0..4], &1832u32.to_le_bytes(), "native unchanged");
+        assert_eq!(&payload[17..21], &916u32.to_le_bytes(), "encoded_w halved");
+        assert_eq!(&payload[21..25], &960u32.to_le_bytes(), "encoded_h halved");
+    }
+
+    #[tokio::test]
+    async fn e2e_handshake_gate_keeps_native_for_non_caps_client() {
+        // CRITICAL gate end-to-end: a client that does not advertise the
+        // capability must receive native dims even when scale < 1.0.
+        let mut config = crate::config::AppConfig::default();
+        config.video.resolution_per_eye = [1832, 1920];
+        config.video.resolution_scale = 0.5;
+        let payload = capture_stream_config_via_handshake(config, 0).await;
+        assert_eq!(&payload[17..21], &1832u32.to_le_bytes(), "must stay native");
+        assert_eq!(&payload[21..25], &1920u32.to_le_bytes(), "must stay native");
+    }
+
+    #[tokio::test]
+    async fn e2e_handshake_scale_1_0_sends_native_encoded() {
+        let config = crate::config::AppConfig::default(); // scale 1.0
+        let payload = capture_stream_config_via_handshake(
+            config, fvp_common::protocol::hello_caps::RESOLUTION_SCALE).await;
+        assert_eq!(&payload[17..21], &payload[0..4], "encoded_w == native");
+        assert_eq!(&payload[21..25], &payload[4..8], "encoded_h == native");
+    }
+
     #[tokio::test]
     async fn test_handshake_rejects_short_pin_response() {
         // PIN_RESPONSE is supposed to carry 4 bytes (u32 LE). Anything shorter
