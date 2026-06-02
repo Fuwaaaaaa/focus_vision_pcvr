@@ -191,6 +191,89 @@ fn headless_e2e_basic_video_flow() {
         "engine should accept some submitted frames once the channel drains");
 }
 
+/// Run the full headless pipeline at a given `resolution_scale`, feeding
+/// synthetic NALs whose size scales with the encoded area, and return
+/// `(video_bytes_received, frames_decoded)` measured by the mock client.
+fn run_pipeline_video_bytes(resolution_scale: f32) -> (u64, u64) {
+    delete_stale_status();
+    let (tcp_port, udp_port) = pick_free_ports();
+    let mut config = AppConfig::default();
+    config.network.tcp_port = tcp_port;
+    config.network.udp_port = udp_port;
+    config.video.framerate = 60;
+    config.video.resolution_scale = resolution_scale;
+    let render = config.video.resolution_per_eye;
+
+    let engine = StreamingEngine::new(config.clone()).expect("engine new");
+    let pin = wait_for_pin(Duration::from_secs(3)).expect("engine never published a PIN");
+
+    let server_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let mut client_config = MockClientConfig::from_ports(server_ip, tcp_port, udp_port, pin);
+    client_config.duration = Some(Duration::from_secs(2));
+    let cancel = CancellationToken::new();
+    let cancel_for_client = cancel.clone();
+    let client_thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        rt.block_on(run_mock_client(client_config, cancel_for_client))
+    });
+
+    let mut stream = SyntheticNalStream::new(VideoCodec::H265, 60)
+        .with_resolution(render[0], render[1], resolution_scale);
+    let frame_period = Duration::from_secs_f64(1.0 / 60.0);
+    let start = Instant::now();
+    let mut next_tick = start;
+    while start.elapsed() < Duration::from_millis(2200) {
+        let synth = stream.next_frame();
+        let frame = EncodedFrame {
+            frame_index: synth.frame_index,
+            nal_data: synth.bytes,
+            is_idr: synth.is_idr,
+            timestamps: FrameTimestamps::new(synth.frame_index),
+        };
+        let _ = engine.submit_frame(frame);
+        next_tick += frame_period;
+        let now = Instant::now();
+        if next_tick > now { std::thread::sleep(next_tick - now); } else { next_tick = now; }
+    }
+    cancel.cancel();
+    let stats = client_thread.join().expect("client thread join").expect("mock-client run");
+    engine.shutdown();
+    (stats.video_bytes_received, stats.frames_decoded)
+}
+
+/// The verifiable core of Phase 0: a half-resolution encode genuinely puts fewer
+/// bytes on the wire. Same pipeline, two scales. The *payload* is exactly a
+/// quarter (proven deterministically by the synthetic_nal unit test); the *wire*
+/// ratio is higher — typically ~0.4 — because fixed per-packet RTP/FVP headers
+/// and FEC redundancy don't shrink with the payload, and the smaller IDR drops
+/// below the 16 KB slice-FEC threshold into the bulk-FEC regime. The band is
+/// chosen to prove a substantial (≳45%) reduction while tolerating that
+/// overhead and run-to-run IDR-mix variance.
+#[test]
+fn headless_e2e_resolution_scale_reduces_bandwidth() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .is_test(true).try_init();
+
+    let (full_bytes, full_frames) = run_pipeline_video_bytes(1.0);
+    let (half_bytes, half_frames) = run_pipeline_video_bytes(0.5);
+    assert!(full_frames > 5 && half_frames > 5,
+        "both runs must decode frames: full={full_frames} half={half_frames}");
+
+    let full_bpf = full_bytes as f64 / full_frames as f64;
+    let half_bpf = half_bytes as f64 / half_frames as f64;
+    let ratio = half_bpf / full_bpf;
+    eprintln!(
+        "bandwidth: full={full_bytes}B/{full_frames}f={full_bpf:.0} B/frame, \
+         half={half_bytes}B/{half_frames}f={half_bpf:.0} B/frame, ratio={ratio:.3}");
+
+    assert!(half_bpf < full_bpf,
+        "half-res must send fewer bytes per frame (full={full_bpf:.0}, half={half_bpf:.0})");
+    assert!((0.20..0.50).contains(&ratio),
+        "half-res per-frame wire bytes should be a substantial reduction over full-res \
+         (~1/4 payload + fixed overhead → ~0.4); got ratio {ratio:.3}");
+}
+
 #[test]
 fn headless_e2e_wrong_pin_rejected() {
     // Sanity check that the engine actually validates the PIN — if this

@@ -116,6 +116,10 @@ pub struct MockClientStats {
     pub idr_frames_seen: u64,
     /// RTP packets received on the video UDP socket.
     pub video_packets_received: u64,
+    /// Total bytes received on the video UDP socket (RTP header + FVP header +
+    /// payload, including FEC shards). Lets the E2E measure bandwidth, e.g. that
+    /// resolution_scale=0.5 roughly quarters the bytes on the wire.
+    pub video_bytes_received: u64,
     /// Opus RTP packets (PT=111) received on the audio UDP socket. Zero unless
     /// `MockClientConfig::receive_audio` is set.
     pub audio_packets_received: u64,
@@ -478,6 +482,7 @@ where
                         }
                         let mut s = stats_video.lock().unwrap();
                         s.video_packets_received += 1;
+                        s.video_bytes_received += n as u64;
                         if let Some(frame) = depacketizer.feed(&buf[..n]) {
                             s.frames_decoded += 1;
                             if frame.is_keyframe {
