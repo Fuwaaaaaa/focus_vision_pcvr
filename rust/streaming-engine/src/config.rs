@@ -136,9 +136,20 @@ pub struct VideoConfig {
     /// Requires NVENC VUI parameter support — see TODOS.md for SDK verification.
     #[serde(default = "default_full_range")]
     pub full_range: bool,
+    /// Encode resolution scale (0.5–1.0). 1.0 = native (no downscaling, existing
+    /// behavior). Fixed at session start — see TODOS.md "AI Super Resolution".
+    #[serde(default = "default_resolution_scale")]
+    pub resolution_scale: f32,
+    /// Bits-per-pixel multiplier for the NVENC bitrate (bitrate = enc_w * enc_h *
+    /// factor). Tunable so quality at sub-native resolution can be adjusted
+    /// without a rebuild.
+    #[serde(default = "default_bitrate_pixel_factor")]
+    pub bitrate_pixel_factor: f32,
 }
 
 fn default_full_range() -> bool { true }
+fn default_resolution_scale() -> f32 { 1.0 }
+fn default_bitrate_pixel_factor() -> f32 { 2.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairingConfig {
@@ -385,7 +396,7 @@ impl Default for NetworkConfig {
 }
 impl Default for VideoConfig {
     fn default() -> Self {
-        Self { codec: VideoCodec::default(), bitrate_mbps: default_bitrate(), resolution_per_eye: default_resolution(), framerate: default_framerate(), full_range: default_full_range() }
+        Self { codec: VideoCodec::default(), bitrate_mbps: default_bitrate(), resolution_per_eye: default_resolution(), framerate: default_framerate(), full_range: default_full_range(), resolution_scale: default_resolution_scale(), bitrate_pixel_factor: default_bitrate_pixel_factor() }
     }
 }
 impl Default for PairingConfig {
@@ -479,6 +490,8 @@ impl AppConfig {
         // Video
         validate_range(&mut self.video.bitrate_mbps, 10, 200, 80, "video.bitrate_mbps", &mut errors);
         validate_range(&mut self.video.framerate, 30, 120, 90, "video.framerate", &mut errors);
+        validate_f32_range(&mut self.video.resolution_scale, 0.5, 1.0, 1.0, "video.resolution_scale", &mut errors);
+        validate_f32_range(&mut self.video.bitrate_pixel_factor, 1.0, 4.0, 2.0, "video.bitrate_pixel_factor", &mut errors);
 
         // Face tracking
         validate_f32_range(&mut self.face_tracking.smoothing, 0.0, 0.99, 0.6, "face_tracking.smoothing", &mut errors);
@@ -672,6 +685,69 @@ mod tests {
         assert!(!errors.is_empty());
         assert_eq!(cfg.video.bitrate_mbps, 80); // clamped to default
         assert_eq!(errors[0].field, "video.bitrate_mbps");
+    }
+
+    #[test]
+    fn test_default_resolution_scale_and_pixel_factor() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.video.resolution_scale, 1.0);
+        assert_eq!(cfg.video.bitrate_pixel_factor, 2.0);
+    }
+
+    #[test]
+    fn test_resolution_scale_defaults_when_absent_in_toml() {
+        // Older config files won't have the new keys — serde defaults must apply.
+        let cfg: AppConfig = toml::from_str(r#"
+            [video]
+            bitrate_mbps = 100
+        "#).unwrap();
+        assert_eq!(cfg.video.resolution_scale, 1.0);
+        assert_eq!(cfg.video.bitrate_pixel_factor, 2.0);
+    }
+
+    #[test]
+    fn test_validate_resolution_scale_out_of_range() {
+        let mut cfg = AppConfig::default();
+        cfg.video.resolution_scale = 0.4; // below the 0.5 floor
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "video.resolution_scale"));
+        assert_eq!(cfg.video.resolution_scale, 1.0); // clamped to default
+    }
+
+    #[test]
+    fn test_validate_resolution_scale_nan() {
+        let mut cfg = AppConfig::default();
+        cfg.video.resolution_scale = f32::NAN;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "video.resolution_scale"));
+        assert_eq!(cfg.video.resolution_scale, 1.0);
+    }
+
+    #[test]
+    fn test_validate_resolution_scale_accepts_half() {
+        let mut cfg = AppConfig::default();
+        cfg.video.resolution_scale = 0.5; // inclusive lower bound
+        let errors = cfg.validate();
+        assert!(!errors.iter().any(|e| e.field == "video.resolution_scale"));
+        assert_eq!(cfg.video.resolution_scale, 0.5);
+    }
+
+    #[test]
+    fn test_validate_bitrate_pixel_factor_out_of_range() {
+        let mut cfg = AppConfig::default();
+        cfg.video.bitrate_pixel_factor = 5.0; // above the 4.0 ceiling
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "video.bitrate_pixel_factor"));
+        assert_eq!(cfg.video.bitrate_pixel_factor, 2.0); // clamped to default
+    }
+
+    #[test]
+    fn test_validate_bitrate_pixel_factor_nan() {
+        let mut cfg = AppConfig::default();
+        cfg.video.bitrate_pixel_factor = f32::NAN;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "video.bitrate_pixel_factor"));
+        assert_eq!(cfg.video.bitrate_pixel_factor, 2.0);
     }
 
     #[test]

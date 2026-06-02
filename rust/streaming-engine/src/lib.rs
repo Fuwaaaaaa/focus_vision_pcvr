@@ -153,6 +153,30 @@ pub struct FvpConfig {
     pub mid_radius: f32,
     pub mid_qp_offset: i32,
     pub peripheral_qp_offset: i32,
+    // AI Super Resolution (Phase 0): encode resolution scale + bits-per-pixel.
+    pub resolution_scale: f32,
+    pub bitrate_pixel_factor: f32,
+}
+
+/// Build the C-ABI config snapshot from the loaded app config. Pure (no global
+/// state) so the field mapping is unit-testable without the FFI/CONFIG plumbing.
+fn build_fvp_config(cfg: &config::AppConfig) -> FvpConfig {
+    let (mid_qp_offset, peripheral_qp_offset) = cfg.foveated.effective_qp_offsets();
+    FvpConfig {
+        render_width: cfg.video.resolution_per_eye[0],
+        render_height: cfg.video.resolution_per_eye[1],
+        refresh_rate: cfg.video.framerate as f32,
+        ipd: cfg.display.ipd,
+        seconds_from_vsync_to_photons: cfg.display.seconds_from_vsync_to_photons,
+        full_range: if cfg.video.full_range { 1 } else { 0 },
+        foveated_enabled: if cfg.foveated.enabled { 1 } else { 0 },
+        fovea_radius: cfg.foveated.fovea_radius,
+        mid_radius: cfg.foveated.mid_radius,
+        mid_qp_offset,
+        peripheral_qp_offset,
+        resolution_scale: cfg.video.resolution_scale,
+        bitrate_pixel_factor: cfg.video.bitrate_pixel_factor,
+    }
 }
 
 /// Initialize the streaming engine. Returns 0 on success.
@@ -415,25 +439,7 @@ pub unsafe extern "C" fn fvp_get_config(out: *mut FvpConfig) -> i32 {
         None => return -1,
     };
 
-    out.write(FvpConfig {
-        render_width: cfg.video.resolution_per_eye[0],
-        render_height: cfg.video.resolution_per_eye[1],
-        refresh_rate: cfg.video.framerate as f32,
-        ipd: cfg.display.ipd,
-        seconds_from_vsync_to_photons: cfg.display.seconds_from_vsync_to_photons,
-        full_range: if cfg.video.full_range { 1 } else { 0 },
-        foveated_enabled: if cfg.foveated.enabled { 1 } else { 0 },
-        fovea_radius: cfg.foveated.fovea_radius,
-        mid_radius: cfg.foveated.mid_radius,
-        mid_qp_offset: {
-            let (mid, _) = cfg.foveated.effective_qp_offsets();
-            mid
-        },
-        peripheral_qp_offset: {
-            let (_, periph) = cfg.foveated.effective_qp_offsets();
-            periph
-        },
-    });
+    out.write(build_fvp_config(cfg));
     0
 }
 
@@ -511,6 +517,19 @@ mod tests {
     }
 
     #[test]
+    fn test_build_fvp_config_includes_resolution_fields() {
+        let mut cfg = config::AppConfig::default();
+        cfg.video.resolution_scale = 0.5;
+        cfg.video.bitrate_pixel_factor = 2.5;
+        let out = build_fvp_config(&cfg);
+        assert_eq!(out.resolution_scale, 0.5);
+        assert_eq!(out.bitrate_pixel_factor, 2.5);
+        // Existing fields still populated correctly.
+        assert_eq!(out.render_width, cfg.video.resolution_per_eye[0]);
+        assert_eq!(out.render_height, cfg.video.resolution_per_eye[1]);
+    }
+
+    #[test]
     fn test_fvp_get_config_no_config() {
         reset_engine();
         let mut cfg = FvpConfig {
@@ -525,6 +544,8 @@ mod tests {
             mid_radius: 0.0,
             mid_qp_offset: 0,
             peripheral_qp_offset: 0,
+            resolution_scale: 0.0,
+            bitrate_pixel_factor: 0.0,
         };
         let result = unsafe { fvp_get_config(&mut cfg) };
         assert_eq!(result, -1);

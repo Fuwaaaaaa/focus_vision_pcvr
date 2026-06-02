@@ -100,6 +100,8 @@ typedef struct FvpConfig {
     float mid_radius;
     int32_t mid_qp_offset;
     int32_t peripheral_qp_offset;
+    float resolution_scale;
+    float bitrate_pixel_factor;
 } FvpConfig;
 
 #ifdef __cplusplus

@@ -289,3 +289,39 @@
 - Dynamic Resolution Scaling (DRS) - adaptive bitrate の延長
 - Hand Tracking (OpenXR XR_EXT_hand_tracking)
 - Community Plugin API (v3.0)
+
+## AI Super Resolution (resolution_scale) フォローアップ
+（2026-06-02 /plan-eng-review で起票。設計doc: AI Super Resolution — HMD側アップスケール）
+
+### Phase 0/1 分離（実装シーケンシング・/plan-eng-review で確定）
+- **What:** 本機能を2段に分離。**Phase 0**=半解像度エンコード + caps gate + HMD bilinear直描き(GlslUpscalerなし)。**Phase 1**=GlslUpscaler(bicubic+inline unsharp)を追加。
+- **Why:** Phase 0 の帯域削減効果は simulator E2E で NAL サイズを測れば**ハード無しで検証可能**。bicubic/unsharp の bilinear 超えだけが検証不能 → 検証可能部を先に出し、不能部(Phase 1)は実機で bilinear 超えを証明してから着手(incremental/reversible)。
+- **Context:** 確定済み10決定はそのまま生きる(GlslUpscaler 関連=Decision 4,6,7,9 のみ Phase 1 へ)。Issue0(scale固定)/Issue2(encoded_w/h)/Issue4(caps gate)/P-1(bitrate_pixel_factor) は Phase 0 に含む。
+- **⚠ 決定1↔7 精緻化(外部声指摘):** 実行中(サーマル/メモリ逼迫)に upscaler が死んだ場合、サーバは半解像度送出中のため "native" には戻れない。正しい runtime fallback は **bilinear引き伸ばし + 警告バナー**(画像は出るが鮮鋭化なし)。init失敗だけでなく runtime失敗も同経路で扱うこと。
+- **状態:**
+  - **Phase 0 = P1・今すぐ着手可（依存なし、ハード無しで検証可能）。**
+  - **Phase 1 (GlslUpscaler) = 🔒 HELD — 実機(VIVE Focus Vision)入手まで保留（2026-06-02 ユーザー確定）。** 実機で bicubic+unsharp の bilinear 超え + ≤5ms + 電力 を確認できるまで着手しない。GlslUpscaler 関連の確定済み決定(Decision 4,6,7,9)はこの保留に含まれる。
+- **Priority:** Phase 0=P1 / Phase 1=P3(blocked: hardware)
+- **Depends on:** Phase 0=なし / Phase 1=実機入手 + Phase 0完了 + 実機検証ガントレットで bilinear 超え実証
+
+### Phase 2: AI超解像 (LiteRT/TFLite delegate)
+- **What:** Phase 1 の GlslUpscaler を AIモデル(ESPCN/RealSR等)実装に差し替え、真のAI超解像で品質向上。
+- **Why:** 本機能の差別化の核心(ALVR/VD未実装)。モデル選定・量子化・電力が実機検証必須。
+- **Context:** CQ-1 決定により Phase 1 は具象 GlslUpscaler 1つのみ。Phase 2 でAI実装が実在したら両者から抽象 Upscaler interface を抽出。詳細は別 /office-hours。
+- **⚠ API選定(外部声指摘):** NNAPI は Android 15(2024) で deprecated 方向。**LiteRT(旧TFLite) GPU/NPU delegate** を前提にすること。設計doc記載の「NNAPI」は読み替え。
+- **Priority:** P3
+- **Depends on:** 実機(VIVE Focus Vision)入手 + Phase 1完了
+
+### 実機検証ガントレット (Phase 1 の Success Criteria 確定)
+- **What:** 実機入手時に走らせる検証一式 — bench_upscaler_glsl_latency(adb計測, ≤5ms)、bilinear比較の知覚品質、電力(3hセッション)、VR酔い主観テスト、unsharp amount と bitrate_pixel_factor のチューニング。
+- **Why:** 本機能の"価値そのもの"が全てこのガントレットでしか検証できない。Success Criteria 達成可否はここで初めて判明。
+- **Context:** Phase 1 実装時に config ノブ(bitrate_pixel_factor)と unsharp amount uniform を出しておくので、再ビルドなしでチューニング可能。
+- **Priority:** P2
+- **Depends on:** 実機入手 + Phase 1完了
+
+### クライアント HELLO version 名乗り修正
+- **What:** C++クライアントが HELLO で {1,0}=version 1 を名乗っている(tcp_client.cpp:156)。サーバの PROTOCOL_VERSION は 3。適切な version 名乗りに修正。
+- **Why:** negotiated_version<3 となり v3 機能(latency waterfall 等の分岐, protocol.rs:155)を取りこぼしている可能性。
+- **Context:** Issue 4 の caps ビット追加でどうせクライアント HELLO を触るので bundle 可。本機能のスコープ外として起票。
+- **Priority:** P2
+- **Depends on:** なし(独立) / caps 追加とbundle推奨
