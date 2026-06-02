@@ -64,6 +64,25 @@ fn wait_for_pin(timeout: Duration) -> Option<u32> {
     None
 }
 
+/// Build an `AppConfig` for the headless E2E that never touches real audio
+/// hardware. With the default `synthetic_source = "off"` the engine falls back
+/// to real WASAPI capture (`spawn_real_capture`), whose cpal `Stream` holds
+/// COM/WASAPI device handles on a detached thread. Constructing a SECOND engine
+/// in the same process (as `headless_e2e_resolution_scale_reduces_bandwidth`
+/// does — two full lifecycles) then crashes that teardown on a headless CI
+/// runner with no audio device (STATUS_ACCESS_VIOLATION, 0xc0000005). Selecting
+/// synthetic "sine" audio keeps the full Opus-over-UDP path exercised while
+/// matching `companion-app/src/sim.rs::load_sim_config`'s hardware-free
+/// contract, so the simulator stays truly hardware-independent.
+fn sim_test_config(tcp_port: u16, udp_port: u16) -> AppConfig {
+    let mut config = AppConfig::default();
+    config.network.tcp_port = tcp_port;
+    config.network.udp_port = udp_port;
+    config.audio.enabled = true;
+    config.audio.synthetic_source = "sine".to_string();
+    config
+}
+
 #[test]
 fn headless_e2e_basic_video_flow() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
@@ -73,9 +92,7 @@ fn headless_e2e_basic_video_flow() {
     // 1. Pick ports, clear stale PIN, configure engine, launch.
     delete_stale_status();
     let (tcp_port, udp_port) = pick_free_ports();
-    let mut config = AppConfig::default();
-    config.network.tcp_port = tcp_port;
-    config.network.udp_port = udp_port;
+    let mut config = sim_test_config(tcp_port, udp_port);
     // Use a small framerate so the test is bounded and the channel
     // doesn't spam frame drops while waiting for the client.
     config.video.framerate = 60;
@@ -197,9 +214,7 @@ fn headless_e2e_basic_video_flow() {
 fn run_pipeline_video_bytes(resolution_scale: f32) -> (u64, u64) {
     delete_stale_status();
     let (tcp_port, udp_port) = pick_free_ports();
-    let mut config = AppConfig::default();
-    config.network.tcp_port = tcp_port;
-    config.network.udp_port = udp_port;
+    let mut config = sim_test_config(tcp_port, udp_port);
     config.video.framerate = 60;
     config.video.resolution_scale = resolution_scale;
     let render = config.video.resolution_per_eye;
@@ -284,9 +299,7 @@ fn headless_e2e_wrong_pin_rejected() {
 
     delete_stale_status();
     let (tcp_port, udp_port) = pick_free_ports();
-    let mut config = AppConfig::default();
-    config.network.tcp_port = tcp_port;
-    config.network.udp_port = udp_port;
+    let config = sim_test_config(tcp_port, udp_port);
     let _engine = StreamingEngine::new(config).expect("engine new");
 
     let real_pin = wait_for_pin(Duration::from_secs(3))
