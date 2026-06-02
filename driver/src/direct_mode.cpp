@@ -22,11 +22,11 @@ bool CDirectModeComponent::initEncoder(ID3D11Device* device, uint32_t width, uin
     FvpConfig fvpCfg = {};
     NvencEncoder::Config encConfig;
     if (fvp_get_config(&fvpCfg) == 0) {
-        // Encode at the engine-resolved encoded dimensions (== native when
-        // resolution_scale is 1.0). The engine is the single source of truth, so
-        // these always match the STREAM_CONFIG encoded dims sent to the client.
-        // NOTE: feeding NVENC a sub-native frame requires the downscale blit
-        // (T7); until then a scale < 1.0 needs that copy to match these dims.
+        // Encode at the engine-resolved encoded dimensions. The engine applies a
+        // SAFETY GUARD (build_fvp_config) that keeps encoded_* == native until
+        // per-session caps gating + the T7 downscale blit land, so this is
+        // always native today and matches the native m_frameCopy surface below.
+        // STREAM_CONFIG still negotiates scaled dims on the wire (separate path).
         encConfig.width = fvpCfg.encoded_width;
         encConfig.height = fvpCfg.encoded_height;
         encConfig.fps = (uint32_t)fvpCfg.refresh_rate;

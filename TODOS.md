@@ -293,6 +293,18 @@
 ## AI Super Resolution (resolution_scale) フォローアップ
 （2026-06-02 /plan-eng-review で起票。設計doc: AI Super Resolution — HMD側アップスケール）
 
+### エンコーダの縮小を client caps でゲートする（/review 検出 → 安全ガード適用済み）
+- **検出:** `encode_stream_config` は caps でゲートするが、`build_fvp_config`→`FvpConfig.encoded_*` は global scale 算出（caps 非依存）だった → scale<1.0 + 非caps クライアントで STREAM_CONFIG=native と driver encode=scaled の不一致。
+- **適用済み(安全ガード):** `build_fvp_config` で **encoded_* を当面 native に固定**（エンコーダは縮小しない）。これで scale<1.0 でも不一致・壊れ encode はゼロ。STREAM_CONFIG ネゴ/帯域測定は別経路で不変。`test_build_fvp_config_encoder_stays_native_until_gated` で検証。
+- **残り(縮小を実際に有効化する条件):** ①per-session で接続クライアントの caps を見てエンコーダ解像度を確定（再init）②T7 縮小blit。両方が揃った時点でガードを外す。いずれも実機/制御接続配線(P0)依存。
+- **Priority:** P1（scale<1.0 を有効化する前に必須）
+
+### bitrate 公式の不整合（pre-existing・/review 検出）
+- **What:** driver の `bitrate = width*height*2` は 1832×1920 で **~7Mbps** だが、config `bitrate_mbps=80`（STREAM_CONFIG で client へも 80 を送信）。約11×の乖離。fallback 分岐は `80'000'000`（=80Mbps）で経路間も不整合。
+- **影響:** NVENC 目標ビットレートが意図(80Mbps)の ~1/11。pre-existing（`width*height*2` は本変更前から存在）。本PRは `bitrate_pixel_factor` で可変化したが、range 1.0-4.0 では 80Mbps（factor≈22.7 相当）を**表現できない**。
+- **要検討:** 公式を `bitrate_mbps` 由来にするか、factor の range/default を見直すか。実機でのレート確認が要る。
+- **Priority:** P2
+
 ### ⚠ BLOCKER (P0): Android クライアントにストリーミングセッション統合が無い
 - **調査結果(2026-06-02 read-only 全走査):** 単なる connect/handshake の配線漏れではなく、**「PC に接続してストリーミングを開始する」オーケストレーション自体が未実装**。
   - `initialize()` が init するのは renderer/timewarp/overlay/heartbeat/facialTracker/videoDecoder のみ。
