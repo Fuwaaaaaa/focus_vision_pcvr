@@ -2,6 +2,7 @@
 extern "C" {
 #include "streaming_engine.h"
 }
+#include "encode_params.h"
 #include <cstring>
 #include <algorithm>
 
@@ -21,10 +22,16 @@ bool CDirectModeComponent::initEncoder(ID3D11Device* device, uint32_t width, uin
     FvpConfig fvpCfg = {};
     NvencEncoder::Config encConfig;
     if (fvp_get_config(&fvpCfg) == 0) {
-        encConfig.width = fvpCfg.render_width;
-        encConfig.height = fvpCfg.render_height;
+        // Encode at the engine-resolved encoded dimensions (== native when
+        // resolution_scale is 1.0). The engine is the single source of truth, so
+        // these always match the STREAM_CONFIG encoded dims sent to the client.
+        // NOTE: feeding NVENC a sub-native frame requires the downscale blit
+        // (T7); until then a scale < 1.0 needs that copy to match these dims.
+        encConfig.width = fvpCfg.encoded_width;
+        encConfig.height = fvpCfg.encoded_height;
         encConfig.fps = (uint32_t)fvpCfg.refresh_rate;
-        encConfig.bitrate_bps = fvpCfg.render_width * fvpCfg.render_height * 2; // ~80Mbps at native res
+        encConfig.bitrate_bps = fvp_encode::computeBitrateBps(
+            fvpCfg.encoded_width, fvpCfg.encoded_height, fvpCfg.bitrate_pixel_factor);
         encConfig.use_hevc = true;
     } else {
         // Fallback if engine not initialized yet

@@ -156,12 +156,22 @@ pub struct FvpConfig {
     // AI Super Resolution (Phase 0): encode resolution scale + bits-per-pixel.
     pub resolution_scale: f32,
     pub bitrate_pixel_factor: f32,
+    // Encoded (downscaled) per-eye dimensions the driver must encode at — the
+    // single source of truth, identical to the STREAM_CONFIG encoded dims.
+    pub encoded_width: u32,
+    pub encoded_height: u32,
 }
 
 /// Build the C-ABI config snapshot from the loaded app config. Pure (no global
 /// state) so the field mapping is unit-testable without the FFI/CONFIG plumbing.
 fn build_fvp_config(cfg: &config::AppConfig) -> FvpConfig {
     let (mid_qp_offset, peripheral_qp_offset) = cfg.foveated.effective_qp_offsets();
+    let (encoded_width, encoded_height) = config::compute_encoded_dims(
+        cfg.video.resolution_per_eye[0],
+        cfg.video.resolution_per_eye[1],
+        cfg.video.resolution_scale,
+        2,
+    );
     FvpConfig {
         render_width: cfg.video.resolution_per_eye[0],
         render_height: cfg.video.resolution_per_eye[1],
@@ -176,6 +186,8 @@ fn build_fvp_config(cfg: &config::AppConfig) -> FvpConfig {
         peripheral_qp_offset,
         resolution_scale: cfg.video.resolution_scale,
         bitrate_pixel_factor: cfg.video.bitrate_pixel_factor,
+        encoded_width,
+        encoded_height,
     }
 }
 
@@ -530,6 +542,26 @@ mod tests {
     }
 
     #[test]
+    fn test_build_fvp_config_computes_encoded_dims() {
+        // Single source of truth: the driver consumes these, and they are the
+        // same compute_encoded_dims values the server puts in STREAM_CONFIG.
+        let mut cfg = config::AppConfig::default();
+        cfg.video.resolution_per_eye = [1832, 1920];
+        cfg.video.resolution_scale = 0.5;
+        let out = build_fvp_config(&cfg);
+        assert_eq!(out.encoded_width, 916);
+        assert_eq!(out.encoded_height, 960);
+    }
+
+    #[test]
+    fn test_build_fvp_config_scale_1_0_encoded_equals_native() {
+        let cfg = config::AppConfig::default(); // scale 1.0
+        let out = build_fvp_config(&cfg);
+        assert_eq!(out.encoded_width, out.render_width);
+        assert_eq!(out.encoded_height, out.render_height);
+    }
+
+    #[test]
     fn test_fvp_get_config_no_config() {
         reset_engine();
         let mut cfg = FvpConfig {
@@ -546,6 +578,8 @@ mod tests {
             peripheral_qp_offset: 0,
             resolution_scale: 0.0,
             bitrate_pixel_factor: 0.0,
+            encoded_width: 0,
+            encoded_height: 0,
         };
         let result = unsafe { fvp_get_config(&mut cfg) };
         assert_eq!(result, -1);

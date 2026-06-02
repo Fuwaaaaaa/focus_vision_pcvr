@@ -206,7 +206,7 @@ impl TcpControlServer {
         let supports_scale =
             client_caps & fvp_common::protocol::hello_caps::RESOLUTION_SCALE != 0;
         let (enc_w, enc_h) = if supports_scale && v.resolution_scale < 1.0 {
-            compute_encoded_dims(
+            crate::config::compute_encoded_dims(
                 v.resolution_per_eye[0],
                 v.resolution_per_eye[1],
                 v.resolution_scale,
@@ -223,24 +223,6 @@ impl TcpControlServer {
     pub fn is_connected(&self) -> Arc<Mutex<bool>> {
         self.connected.clone()
     }
-}
-
-/// Round `v` to the nearest multiple of `align` (round-half-up), with a floor of
-/// `align` so the encoder never receives a zero dimension.
-fn round_to_align(v: u32, align: u32) -> u32 {
-    let aligned = ((v + align / 2) / align) * align;
-    aligned.max(align)
-}
-
-/// Compute the encoded (downscaled) per-eye dimensions for a render size and
-/// scale. Scale is clamped to [0, 1]; the result is aligned to `align` (even for
-/// NVENC). A scale of 1.0 returns the native dims unchanged when they are
-/// already aligned. Pure so the dimension math is unit-testable.
-pub(crate) fn compute_encoded_dims(render_w: u32, render_h: u32, scale: f32, align: u32) -> (u32, u32) {
-    let s = scale.clamp(0.0, 1.0);
-    let w = round_to_align((render_w as f32 * s).round() as u32, align);
-    let h = round_to_align((render_h as f32 * s).round() as u32, align);
-    (w, h)
 }
 
 /// Step 1-2: Receive HELLO and reply with HELLO_ACK carrying our protocol
@@ -872,19 +854,6 @@ mod tests {
         assert_eq!(&bytes[21..25], &1920u32.to_le_bytes(), "must stay native");
     }
 
-    #[test]
-    fn test_compute_encoded_dims_even_aligned() {
-        // Clean half.
-        assert_eq!(compute_encoded_dims(1832, 1920, 0.5, 2), (916, 960));
-        // scale 1.0 returns native (already even).
-        assert_eq!(compute_encoded_dims(1832, 1920, 1.0, 2), (1832, 1920));
-        // Odd intermediate rounds up to the next even multiple.
-        assert_eq!(compute_encoded_dims(1830, 1830, 0.5, 2), (916, 916)); // 915 → 916
-        // Result is always even.
-        let (w, h) = compute_encoded_dims(1280, 720, 0.75, 2);
-        assert_eq!(w % 2, 0);
-        assert_eq!(h % 2, 0);
-    }
 
     /// Test-only certificate verifier that accepts any server cert.
     #[derive(Debug)]
