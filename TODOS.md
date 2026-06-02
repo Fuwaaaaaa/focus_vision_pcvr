@@ -319,9 +319,13 @@
 - **Priority:** P2
 - **Depends on:** 実機入手 + Phase 1完了
 
-### クライアント HELLO version 名乗り修正
-- **What:** C++クライアントが HELLO で {1,0}=version 1 を名乗っている(tcp_client.cpp:156)。サーバの PROTOCOL_VERSION は 3。適切な version 名乗りに修正。
-- **Why:** negotiated_version<3 となり v3 機能(latency waterfall 等の分岐, protocol.rs:155)を取りこぼしている可能性。
-- **Context:** Issue 4 の caps ビット追加でどうせクライアント HELLO を触るので bundle 可。本機能のスコープ外として起票。
+### ~~クライアント HELLO version 名乗り修正~~ (T8 完了)
+- **What:** C++クライアントが HELLO で {1,0}=version 1 を名乗っていた。サーバの PROTOCOL_VERSION は 3。
+- **解決:** T8 で HELLO を v3 名乗り + caps バイトに修正(tcp_client.cpp)。調査の結果クライアントは既に v3 ワイヤ形式(fvp_flags slice/stream — fec_decoder.h:70-73)を実装済みのため v3 名乗りは安全。
+
+### client C++ テスト基盤 (host-buildable gtest)
+- **What:** client/app/src/main/cpp にホストビルド可能な gtest ターゲットを新設(driver の gtest と同等の CMake セットアップ)。HELLO ペイロード構築・STREAM_CONFIG パース・FVP flag 解析等の純粋ロジックを単体テスト可能に。
+- **Why:** 現状クライアント C++ には自動テストが一切なく(T8 のレビューで判明)、ワイヤ形式の正しさは Rust 側の対称テストと CI ビルドにのみ依拠している。client 側の回帰を機械的に検知できない。
+- **Context:** T8(HELLO caps)・T9(STREAM_CONFIG parse)・T10(decoder sizing) はいずれもこの基盤があれば TDD できた。Phase 0 の残タスク(T9-T11)着手前に整備すると以降が楽。
 - **Priority:** P2
-- **Depends on:** なし(独立) / caps 追加とbundle推奨
+- **Depends on:** なし(独立)
