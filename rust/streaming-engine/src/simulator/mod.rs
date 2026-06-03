@@ -116,6 +116,10 @@ pub struct MockClientStats {
     pub idr_frames_seen: u64,
     /// RTP packets received on the video UDP socket.
     pub video_packets_received: u64,
+    /// Total bytes received on the video UDP socket (RTP header + FVP header +
+    /// payload, including FEC shards). Lets the E2E measure bandwidth, e.g. that
+    /// resolution_scale=0.5 roughly quarters the bytes on the wire.
+    pub video_bytes_received: u64,
     /// Opus RTP packets (PT=111) received on the audio UDP socket. Zero unless
     /// `MockClientConfig::receive_audio` is set.
     pub audio_packets_received: u64,
@@ -292,8 +296,12 @@ where
 {
     use fvp_common::protocol::msg_type;
 
-    // HELLO with our protocol version.
-    let hello_payload = fvp_common::protocol::encode_version(fvp_common::protocol::PROTOCOL_VERSION);
+    // HELLO with our protocol version + RESOLUTION_SCALE capability, matching
+    // the real client. When the engine runs with resolution_scale < 1.0 this
+    // makes the server send downscaled encoded dims (otherwise gated to native).
+    let hello_payload = fvp_common::protocol::encode_hello(
+        fvp_common::protocol::PROTOCOL_VERSION,
+        fvp_common::protocol::hello_caps::RESOLUTION_SCALE);
     send_message(stream, msg_type::HELLO, &hello_payload).await?;
 
     let (mt, _payload) = read_message(stream).await?;
@@ -322,7 +330,7 @@ where
         return Err(MockClientError::PinRejected);
     }
 
-    // STREAM_CONFIG (17-byte payload, parsed for log only — we don't enforce
+    // STREAM_CONFIG (25-byte payload, parsed for log only — we don't enforce
     // the values match a local expectation, just acknowledge receipt).
     let (mt, payload) = read_message(stream).await?;
     if mt != msg_type::STREAM_CONFIG {
@@ -474,6 +482,7 @@ where
                         }
                         let mut s = stats_video.lock().unwrap();
                         s.video_packets_received += 1;
+                        s.video_bytes_received += n as u64;
                         if let Some(frame) = depacketizer.feed(&buf[..n]) {
                             s.frames_decoded += 1;
                             if frame.is_keyframe {

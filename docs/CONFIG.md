@@ -22,6 +22,26 @@ All values are validated on startup. Invalid values are clamped to defaults with
 | `resolution_per_eye` | [u32; 2] | [1832, 1920] | — | Per-eye render resolution [width, height]. Must match SteamVR render target |
 | `framerate` | u32 | 90 | 30-120 | Target framerate. Supported: 72, 90, 96, 120 |
 | `full_range` | bool | true | — | Full RGB (0-255) vs limited range (16-235). Affects NVENC VUI parameters |
+| `resolution_scale` | f32 | 1.0 | 0.5-1.0 | Encode resolution scale. 1.0 = native (no change). Below 1.0 encodes at a smaller resolution to cut bandwidth; the HMD restores it. **Fixed at session start.** See AI Super Resolution below |
+| `bitrate_pixel_factor` | f32 | 2.0 | 1.0-4.0 | Bits-per-pixel multiplier for the encoder bitrate (`bitrate = encoded_w * encoded_h * factor`). Raise it to spend more bits on a downscaled stream |
+
+### AI Super Resolution — `resolution_scale` (Phase 0)
+
+`resolution_scale < 1.0` makes the PC encode each eye at a smaller resolution
+(e.g. `0.5` → 916×960 instead of 1832×1920), roughly quartering the encoded
+pixel count and the bandwidth. The HMD is told the real encoded size in
+STREAM_CONFIG and decodes at that size.
+
+**Phase 0 is a bandwidth ↔ softness trade-off only.** The current build stretches
+the decoded frame back to native with plain bilinear filtering — there is *no*
+sharpening yet, so a downscaled stream looks softer. The GLSL bicubic + sharpen
+upscaler (Phase 1) is held until the target hardware is available (see
+`TODOS.md`). A client that does not advertise upscaler support is always sent the
+native resolution, so older clients are never silently degraded.
+
+`bitrate_pixel_factor` lets you tune perceived quality at a given
+`resolution_scale` without a rebuild: at `resolution_scale = 0.5`, a factor of
+`2.0` gives ~20 Mbps and `3.0` gives ~30 Mbps for the same frame.
 
 ## `[display]`
 

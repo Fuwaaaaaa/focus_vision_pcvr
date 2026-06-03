@@ -1,4 +1,5 @@
 #include "tcp_client.h"
+#include "client_protocol.h"
 #include "xr_utils.h"
 
 #include <sys/socket.h>
@@ -24,6 +25,9 @@ static constexpr uint8_t MSG_PIN_RESULT = 0x05;
 static constexpr uint8_t MSG_STREAM_CONFIG = 0x06;
 static constexpr uint8_t MSG_STREAM_START = 0x07;
 static constexpr uint8_t MSG_IDR_REQUEST = 0x30;
+
+// Protocol version + HELLO capability flags live in client_protocol.h so they
+// are host-buildable and unit-tested (see client/tests/).
 
 bool TcpControlClient::initTls() {
     mbedtls_ssl_init(&m_ssl);
@@ -152,9 +156,11 @@ bool TcpControlClient::handshake(uint32_t pin) {
     uint8_t type;
     std::vector<uint8_t> payload;
 
-    // Step 1: Send HELLO
-    uint8_t version[] = {1, 0}; // v1.0
-    if (!sendMessage(MSG_HELLO, version, 2)) return false;
+    // Step 1: Send HELLO — protocol version (u16 LE) + capability byte.
+    auto hello = fvp_client_protocol::buildHelloPayload(
+        fvp_client_protocol::PROTOCOL_VERSION,
+        fvp_client_protocol::hello_caps::RESOLUTION_SCALE);
+    if (!sendMessage(MSG_HELLO, hello.data(), static_cast<int>(hello.size()))) return false;
 
     // Step 2: Receive HELLO_ACK
     if (!recvMessage(type, payload) || type != MSG_HELLO_ACK) {
@@ -189,15 +195,18 @@ bool TcpControlClient::handshake(uint32_t pin) {
         LOGE("Expected STREAM_CONFIG, got %d", type);
         return false;
     }
-    if (payload.size() >= 17) {
-        memcpy(&m_config.width, &payload[0], 4);
-        memcpy(&m_config.height, &payload[4], 4);
-        memcpy(&m_config.bitrateMbps, &payload[8], 4);
-        memcpy(&m_config.framerate, &payload[12], 4);
-        m_config.codec = payload[16];
-        LOGI("Stream config: %ux%u @ %u Mbps, %u fps, codec=%u",
-            m_config.width, m_config.height, m_config.bitrateMbps,
-            m_config.framerate, m_config.codec);
+    fvp_client_protocol::StreamConfigView cfg;
+    if (fvp_client_protocol::parseStreamConfig(payload.data(), payload.size(), cfg)) {
+        m_config.width = cfg.width;
+        m_config.height = cfg.height;
+        m_config.bitrateMbps = cfg.bitrateMbps;
+        m_config.framerate = cfg.framerate;
+        m_config.codec = cfg.codec;
+        m_config.encodedWidth = cfg.encodedWidth;
+        m_config.encodedHeight = cfg.encodedHeight;
+        LOGI("Stream config: native %ux%u, encoded %ux%u @ %u Mbps, %u fps, codec=%u",
+            m_config.width, m_config.height, m_config.encodedWidth, m_config.encodedHeight,
+            m_config.bitrateMbps, m_config.framerate, m_config.codec);
     }
 
     // Step 7: Send STREAM_START

@@ -150,6 +150,16 @@ jobs:
             name: openvr-driver
             path: driver/build/focus_vision_pcvr/
 
+    client-tests:
+      name: Android Client Host Tests
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - run: cmake -S client/tests -B client/tests/build -DCMAKE_BUILD_TYPE=Release
+        - run: cmake --build client/tests/build --config Release
+        - name: Run client C++ tests (hardware-independent logic)
+          run: ctest --test-dir client/tests/build --build-config Release --output-on-failure
+
     android-build:
       name: Android OpenXR Client
       runs-on: ubuntu-latest

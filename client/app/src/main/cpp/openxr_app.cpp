@@ -1,5 +1,6 @@
 #include "openxr_app.h"
 #include "xr_utils.h"
+#include "client_protocol.h"
 
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
@@ -68,7 +69,19 @@ void OpenXRApp::initialize(android_app* app) {
         }
     }
     if (env) {
-        m_videoDecoder.init(env, 1832, 1920); // Per-eye resolution from config
+        // Native per-eye resolution (decoder fallback before STREAM_CONFIG). The
+        // decoder is initialised at app startup, before the control handshake, so
+        // encoded dims are 0 here and we fall back to native — MediaCodec also
+        // re-derives the true resolution from the stream SPS. Once the control
+        // channel is wired (see TODOS: client TCP control connect/handshake
+        // unwired), re-running this with getStreamConfig().encoded* sizes the
+        // decoder to the downscaled stream.
+        constexpr uint32_t kNativeWidthPerEye = 1832;
+        constexpr uint32_t kNativeHeightPerEye = 1920;
+        const auto& sc = m_tcpClient.getStreamConfig();
+        auto dims = fvp_client_protocol::decoderInitDims(
+            kNativeWidthPerEye, kNativeHeightPerEye, sc.encodedWidth, sc.encodedHeight);
+        m_videoDecoder.init(env, static_cast<int>(dims.width), static_cast<int>(dims.height));
     }
     if (didAttach) {
         vm->DetachCurrentThread();

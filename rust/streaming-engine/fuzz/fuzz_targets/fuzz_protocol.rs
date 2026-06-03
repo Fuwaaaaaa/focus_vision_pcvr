@@ -7,6 +7,22 @@ fuzz_target!(|data: &[u8]| {
     // Fuzz parse_hello_version — must not panic on any input
     let _ = protocol::parse_hello_version(data);
 
+    // Fuzz parse_hello_caps — must not panic on any input. HELLO is the first
+    // message from an unauthenticated client, so its parsing is a trust boundary.
+    let _ = protocol::parse_hello_caps(data);
+
+    // encode_hello -> parse roundtrip: the version and caps we encode must come
+    // back out, and the appended caps byte must not disturb version parsing.
+    if data.len() >= 3 {
+        let version = u16::from_le_bytes([data[0], data[1]]);
+        let caps = data[2];
+        let payload = protocol::encode_hello(version, caps);
+        assert_eq!(protocol::parse_hello_version(&payload), version,
+            "encode_hello/parse_hello_version roundtrip mismatch");
+        assert_eq!(protocol::parse_hello_caps(&payload), caps,
+            "encode_hello/parse_hello_caps roundtrip mismatch");
+    }
+
     // Fuzz parse_transport_feedback — must not panic on any input
     let _ = protocol::parse_transport_feedback(data);
 
