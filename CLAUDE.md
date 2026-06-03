@@ -58,6 +58,9 @@ cargo test --workspace --features simulator -- --test-threads=1  # includes head
 # C++ tests (requires CMake build):
 cd driver/build && cmake --build . --config Release
 ctest --test-dir driver/build --build-config Release --output-on-failure  # 36 gtest cases
+# Android client host tests (hardware-independent logic, no NDK — host toolchain):
+cmake -S client/tests -B client/tests/build && cmake --build client/tests/build --config Release
+ctest --test-dir client/tests/build --build-config Release --output-on-failure  # client_protocol gtest
 ```
 
 ## Companion App

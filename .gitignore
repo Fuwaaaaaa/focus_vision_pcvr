@@ -15,6 +15,7 @@ CMakeFiles/
 client/.gradle/
 client/build/
 client/app/build/
+client/tests/build/
 client/local.properties
 *.apk
 *.aab

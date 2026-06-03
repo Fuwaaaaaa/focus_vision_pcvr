@@ -79,6 +79,22 @@ impl SyntheticNalStream {
         self
     }
 
+    /// Scale the default frame sizes in proportion to the encoded pixel area for
+    /// a given `render` size and `resolution_scale`. A half-resolution encode
+    /// (a quarter of the area) yields quarter-size frames, modelling the
+    /// bandwidth a real encoder saves — so the headless E2E can measure the
+    /// reduction. `scale == 1.0` leaves the defaults untouched. Uses the same
+    /// `compute_encoded_dims` the engine and STREAM_CONFIG use.
+    pub fn with_resolution(mut self, render_w: u32, render_h: u32, scale: f32) -> Self {
+        let (enc_w, enc_h) = crate::config::compute_encoded_dims(render_w, render_h, scale, 2);
+        let encoded_area = enc_w as u64 * enc_h as u64;
+        let render_area = (render_w as u64 * render_h as u64).max(1);
+        // .max(1): never feed the packetizer a zero-byte frame at extreme scales.
+        self.idr_bytes = ((DEFAULT_IDR_SIZE_BYTES as u64 * encoded_area / render_area) as usize).max(1);
+        self.p_bytes = ((DEFAULT_P_FRAME_SIZE_BYTES as u64 * encoded_area / render_area) as usize).max(1);
+        self
+    }
+
     /// Reset the frame index to 0. Useful for replay tests.
     pub fn reset(&mut self) {
         self.next_frame = 0;
@@ -158,6 +174,22 @@ mod tests {
             "IDR fixture must exceed slice FEC threshold");
         assert!(DEFAULT_P_FRAME_SIZE_BYTES < 16 * 1024,
             "P-frame fixture must stay below slice FEC threshold to test both paths");
+    }
+
+    #[test]
+    fn test_with_resolution_scales_frame_bytes_by_area() {
+        // Half resolution = a quarter of the encoded area = quarter-size frames,
+        // modelling the bandwidth a real encoder saves at resolution_scale=0.5.
+        let native = SyntheticNalStream::new(VideoCodec::H265, 60)
+            .with_resolution(1832, 1920, 1.0);
+        let half = SyntheticNalStream::new(VideoCodec::H265, 60)
+            .with_resolution(1832, 1920, 0.5);
+        // scale 1.0 leaves the defaults untouched (regression-safe).
+        assert_eq!(native.idr_bytes, DEFAULT_IDR_SIZE_BYTES);
+        assert_eq!(native.p_bytes, DEFAULT_P_FRAME_SIZE_BYTES);
+        // 916*960 / (1832*1920) == 0.25 exactly.
+        assert_eq!(half.idr_bytes, DEFAULT_IDR_SIZE_BYTES / 4);
+        assert_eq!(half.p_bytes, DEFAULT_P_FRAME_SIZE_BYTES / 4);
     }
 
     #[test]

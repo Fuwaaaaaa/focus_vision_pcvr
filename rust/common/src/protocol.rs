@@ -112,6 +112,30 @@ pub fn encode_version(version: u16) -> [u8; 2] {
     version.to_le_bytes()
 }
 
+/// HELLO capability flags — a single byte appended after the 2-byte version in
+/// the HELLO payload. An absent byte (legacy / version-only payload) means no
+/// capabilities, so older clients are never sent a sub-native stream.
+pub mod hello_caps {
+    /// Client understands sub-native `resolution_scale` streams: it sizes its
+    /// decoder from the STREAM_CONFIG encoded dimensions and handles a half-res
+    /// stream deliberately (Phase 0 = bilinear stretch, Phase 1 = GLSL upscaler).
+    pub const RESOLUTION_SCALE: u8 = 0x01;
+}
+
+/// Parse HELLO capability flags from the payload. Returns 0 when the capability
+/// byte is absent (empty or version-only payload), so legacy clients advertise
+/// no capabilities.
+pub fn parse_hello_caps(payload: &[u8]) -> u8 {
+    if payload.len() >= 3 { payload[2] } else { 0 }
+}
+
+/// Encode a HELLO/HELLO_ACK payload: 2-byte little-endian version followed by a
+/// one-byte capability bitmask.
+pub fn encode_hello(version: u16, caps: u8) -> [u8; 3] {
+    let v = version.to_le_bytes();
+    [v[0], v[1], caps]
+}
+
 /// FVP header flags bit layout (u16):
 ///   bit 0:     keyframe
 ///   bit 1-4:   slice_index (0-15, for slice-based FEC)
@@ -278,6 +302,35 @@ mod tests {
     fn protocol_version_single_byte_is_v1() {
         // Partial payload — also treated as legacy v1
         assert_eq!(parse_hello_version(&[2]), 1);
+    }
+
+    #[test]
+    fn hello_caps_round_trip() {
+        let payload = encode_hello(PROTOCOL_VERSION, hello_caps::RESOLUTION_SCALE);
+        // Version still parses from the first two bytes (regression: caps must
+        // not disturb existing version parsing).
+        assert_eq!(parse_hello_version(&payload), PROTOCOL_VERSION);
+        assert_eq!(parse_hello_caps(&payload), hello_caps::RESOLUTION_SCALE);
+    }
+
+    #[test]
+    fn hello_caps_empty_payload_is_zero() {
+        // Legacy client with no payload advertises no capabilities.
+        assert_eq!(parse_hello_caps(&[]), 0);
+    }
+
+    #[test]
+    fn hello_caps_version_only_is_zero() {
+        // v2/v3 client that sends only the 2-byte version (no caps byte) must
+        // be read as advertising no capabilities — REGRESSION guard.
+        assert_eq!(parse_hello_caps(&encode_version(3)), 0);
+    }
+
+    #[test]
+    fn hello_caps_clear_bit_is_zero() {
+        let payload = encode_hello(PROTOCOL_VERSION, 0);
+        assert_eq!(parse_hello_caps(&payload), 0);
+        assert_eq!(parse_hello_version(&payload), PROTOCOL_VERSION);
     }
 
     #[test]

@@ -153,6 +153,47 @@ pub struct FvpConfig {
     pub mid_radius: f32,
     pub mid_qp_offset: i32,
     pub peripheral_qp_offset: i32,
+    // AI Super Resolution (Phase 0): encode resolution scale + bits-per-pixel.
+    pub resolution_scale: f32,
+    pub bitrate_pixel_factor: f32,
+    // Per-eye dimensions the driver encodes at. Currently always == native:
+    // the encoder downscale is gated on future work (per-session caps gating +
+    // the T7 blit), so `build_fvp_config` keeps these at native even when
+    // resolution_scale < 1.0. See the SAFETY GUARD in build_fvp_config.
+    pub encoded_width: u32,
+    pub encoded_height: u32,
+}
+
+/// Build the C-ABI config snapshot from the loaded app config. Pure (no global
+/// state) so the field mapping is unit-testable without the FFI/CONFIG plumbing.
+fn build_fvp_config(cfg: &config::AppConfig) -> FvpConfig {
+    let (mid_qp_offset, peripheral_qp_offset) = cfg.foveated.effective_qp_offsets();
+    // SAFETY GUARD: the encoder does NOT downscale yet. Two preconditions are
+    // unmet — (1) per-session gating, so we'd never downscale for a non-caps
+    // client that STREAM_CONFIG told native, and (2) the T7 downscale blit, so
+    // NVENC isn't fed a native surface while configured for scaled dims. Until
+    // both land, the driver encodes at native even when resolution_scale < 1.0.
+    // STREAM_CONFIG still negotiates scaled dims on the wire (separate path).
+    // See TODOS "encoder downscale not gated by client caps".
+    let (encoded_width, encoded_height) =
+        (cfg.video.resolution_per_eye[0], cfg.video.resolution_per_eye[1]);
+    FvpConfig {
+        render_width: cfg.video.resolution_per_eye[0],
+        render_height: cfg.video.resolution_per_eye[1],
+        refresh_rate: cfg.video.framerate as f32,
+        ipd: cfg.display.ipd,
+        seconds_from_vsync_to_photons: cfg.display.seconds_from_vsync_to_photons,
+        full_range: if cfg.video.full_range { 1 } else { 0 },
+        foveated_enabled: if cfg.foveated.enabled { 1 } else { 0 },
+        fovea_radius: cfg.foveated.fovea_radius,
+        mid_radius: cfg.foveated.mid_radius,
+        mid_qp_offset,
+        peripheral_qp_offset,
+        resolution_scale: cfg.video.resolution_scale,
+        bitrate_pixel_factor: cfg.video.bitrate_pixel_factor,
+        encoded_width,
+        encoded_height,
+    }
 }
 
 /// Initialize the streaming engine. Returns 0 on success.
@@ -415,25 +456,7 @@ pub unsafe extern "C" fn fvp_get_config(out: *mut FvpConfig) -> i32 {
         None => return -1,
     };
 
-    out.write(FvpConfig {
-        render_width: cfg.video.resolution_per_eye[0],
-        render_height: cfg.video.resolution_per_eye[1],
-        refresh_rate: cfg.video.framerate as f32,
-        ipd: cfg.display.ipd,
-        seconds_from_vsync_to_photons: cfg.display.seconds_from_vsync_to_photons,
-        full_range: if cfg.video.full_range { 1 } else { 0 },
-        foveated_enabled: if cfg.foveated.enabled { 1 } else { 0 },
-        fovea_radius: cfg.foveated.fovea_radius,
-        mid_radius: cfg.foveated.mid_radius,
-        mid_qp_offset: {
-            let (mid, _) = cfg.foveated.effective_qp_offsets();
-            mid
-        },
-        peripheral_qp_offset: {
-            let (_, periph) = cfg.foveated.effective_qp_offsets();
-            periph
-        },
-    });
+    out.write(build_fvp_config(cfg));
     0
 }
 
@@ -511,6 +534,41 @@ mod tests {
     }
 
     #[test]
+    fn test_build_fvp_config_includes_resolution_fields() {
+        let mut cfg = config::AppConfig::default();
+        cfg.video.resolution_scale = 0.5;
+        cfg.video.bitrate_pixel_factor = 2.5;
+        let out = build_fvp_config(&cfg);
+        assert_eq!(out.resolution_scale, 0.5);
+        assert_eq!(out.bitrate_pixel_factor, 2.5);
+        // Existing fields still populated correctly.
+        assert_eq!(out.render_width, cfg.video.resolution_per_eye[0]);
+        assert_eq!(out.render_height, cfg.video.resolution_per_eye[1]);
+    }
+
+    #[test]
+    fn test_build_fvp_config_encoder_stays_native_until_gated() {
+        // SAFETY GUARD: the encoder does not downscale yet (gated on per-session
+        // caps gating + the T7 blit), so encoded_* equals native even at
+        // scale < 1.0 — preventing a mismatch with what a non-caps client is
+        // told in STREAM_CONFIG.
+        let mut cfg = config::AppConfig::default();
+        cfg.video.resolution_per_eye = [1832, 1920];
+        cfg.video.resolution_scale = 0.5;
+        let out = build_fvp_config(&cfg);
+        assert_eq!(out.encoded_width, 1832);
+        assert_eq!(out.encoded_height, 1920);
+    }
+
+    #[test]
+    fn test_build_fvp_config_scale_1_0_encoded_equals_native() {
+        let cfg = config::AppConfig::default(); // scale 1.0
+        let out = build_fvp_config(&cfg);
+        assert_eq!(out.encoded_width, out.render_width);
+        assert_eq!(out.encoded_height, out.render_height);
+    }
+
+    #[test]
     fn test_fvp_get_config_no_config() {
         reset_engine();
         let mut cfg = FvpConfig {
@@ -525,6 +583,10 @@ mod tests {
             mid_radius: 0.0,
             mid_qp_offset: 0,
             peripheral_qp_offset: 0,
+            resolution_scale: 0.0,
+            bitrate_pixel_factor: 0.0,
+            encoded_width: 0,
+            encoded_height: 0,
         };
         let result = unsafe { fvp_get_config(&mut cfg) };
         assert_eq!(result, -1);

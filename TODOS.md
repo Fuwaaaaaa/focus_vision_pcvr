@@ -289,3 +289,70 @@
 - Dynamic Resolution Scaling (DRS) - adaptive bitrate の延長
 - Hand Tracking (OpenXR XR_EXT_hand_tracking)
 - Community Plugin API (v3.0)
+
+## AI Super Resolution (resolution_scale) フォローアップ
+（2026-06-02 /plan-eng-review で起票。設計doc: AI Super Resolution — HMD側アップスケール）
+
+### エンコーダの縮小を client caps でゲートする（/review 検出 → 安全ガード適用済み）
+- **検出:** `encode_stream_config` は caps でゲートするが、`build_fvp_config`→`FvpConfig.encoded_*` は global scale 算出（caps 非依存）だった → scale<1.0 + 非caps クライアントで STREAM_CONFIG=native と driver encode=scaled の不一致。
+- **適用済み(安全ガード):** `build_fvp_config` で **encoded_* を当面 native に固定**（エンコーダは縮小しない）。これで scale<1.0 でも不一致・壊れ encode はゼロ。STREAM_CONFIG ネゴ/帯域測定は別経路で不変。`test_build_fvp_config_encoder_stays_native_until_gated` で検証。
+- **残り(縮小を実際に有効化する条件):** ①per-session で接続クライアントの caps を見てエンコーダ解像度を確定（再init）②T7 縮小blit。両方が揃った時点でガードを外す。いずれも実機/制御接続配線(P0)依存。
+- **Priority:** P1（scale<1.0 を有効化する前に必須）
+
+### bitrate 公式の不整合（pre-existing・/review 検出）
+- **What:** driver の `bitrate = width*height*2` は 1832×1920 で **~7Mbps** だが、config `bitrate_mbps=80`（STREAM_CONFIG で client へも 80 を送信）。約11×の乖離。fallback 分岐は `80'000'000`（=80Mbps）で経路間も不整合。
+- **影響:** NVENC 目標ビットレートが意図(80Mbps)の ~1/11。pre-existing（`width*height*2` は本変更前から存在）。本PRは `bitrate_pixel_factor` で可変化したが、range 1.0-4.0 では 80Mbps（factor≈22.7 相当）を**表現できない**。
+- **要検討:** 公式を `bitrate_mbps` 由来にするか、factor の range/default を見直すか。実機でのレート確認が要る。
+- **Priority:** P2
+
+### ⚠ BLOCKER (P0): Android クライアントにストリーミングセッション統合が無い
+- **調査結果(2026-06-02 read-only 全走査):** 単なる connect/handshake の配線漏れではなく、**「PC に接続してストリーミングを開始する」オーケストレーション自体が未実装**。
+  - `initialize()` が init するのは renderer/timewarp/overlay/heartbeat/facialTracker/videoDecoder のみ。
+  - `m_networkReceiver.init()` 未呼出 → `mainLoop()` の `if(!m_networkReceiver.isInitialized()) return;`(openxr_app.cpp:265) で UDP 受信が毎回早期 return。
+  - `m_tcpClient.connect()/handshake()`・`m_trackingSender.init()` いずれも未呼出。
+  - **サーバアドレスの供給元が皆無**(UI/config/ハードコードIP/JNIブリッジ なし)。`MainActivity.kt` は NativeActivity + loadLibrary のみ。
+  - git 履歴上、connect/handshake を app に配線したコミットは存在しない。
+- **意味:** 実 Android クライアントは end-to-end で未動作の足場。動作実証は Rust simulator(mock_client+headless) で行われている(実機なし前提と整合)。
+- **配線に必要(規模):** ①サーバアドレス取得(HMD UI/config/discovery=UX設計) ②セッション・オーケストレータ(connect→handshake(PIN)→receiver/sender init→run + 再接続) ③PIN入力UX。**OpenXR+MediaCodec+実接続を要し実機なしで検証不能** → Phase 1 と同じハード制約でブロック。
+- **進捗(2026-06-02):** 純粋部はローカル完結検証で前進:
+  - ②**オーケストレーション・ポリシー**: `client_session.h` の `ClientSession` 状態機械(Disconnected→Connecting→Pairing→Configuring→Streaming→Reconnecting、PIN拒否は再接続しない、指数backoff base1s×2 cap16s = engine reconnect.rs と一致)。client gtest 9件。
+  - ①**サーバアドレス検証**: `client_session.h` の `parse_server_endpoint("ip"/"ip:port")`(IPv4 4オクテット + port 1-65535 検証、default 9944 = engine と一致)。client gtest 5件。アドレス文字列の**供給元**(config ファイル読込 or UI)は別途。
+  - **残り(実機検証が要る部分)**: 状態機械を**実I/O(connect/handshake/receiver init)に配線**、アドレス文字列の供給(config/UI)、PIN入力UX。
+- **resolution_scale への影響:** PC側(Rust+driver)は機能的。クライアント T8-T10 は正しいが、このセッション統合が無いため inert。
+- **Priority:** P0 (クライアント実機動作の前提・Phase 1 より上流)
+- **Depends on:** 実機(検証に必須) + UX設計
+
+### Phase 0/1 分離（実装シーケンシング・/plan-eng-review で確定）
+- **What:** 本機能を2段に分離。**Phase 0**=半解像度エンコード + caps gate + HMD bilinear直描き(GlslUpscalerなし)。**Phase 1**=GlslUpscaler(bicubic+inline unsharp)を追加。
+- **Why:** Phase 0 の帯域削減効果は simulator E2E で NAL サイズを測れば**ハード無しで検証可能**。bicubic/unsharp の bilinear 超えだけが検証不能 → 検証可能部を先に出し、不能部(Phase 1)は実機で bilinear 超えを証明してから着手(incremental/reversible)。
+- **Context:** 確定済み10決定はそのまま生きる(GlslUpscaler 関連=Decision 4,6,7,9 のみ Phase 1 へ)。Issue0(scale固定)/Issue2(encoded_w/h)/Issue4(caps gate)/P-1(bitrate_pixel_factor) は Phase 0 に含む。
+- **⚠ 決定1↔7 精緻化(外部声指摘):** 実行中(サーマル/メモリ逼迫)に upscaler が死んだ場合、サーバは半解像度送出中のため "native" には戻れない。正しい runtime fallback は **bilinear引き伸ばし + 警告バナー**(画像は出るが鮮鋭化なし)。init失敗だけでなく runtime失敗も同経路で扱うこと。
+- **状態:**
+  - **Phase 0 = P1・今すぐ着手可（依存なし、ハード無しで検証可能）。**
+  - **Phase 1 (GlslUpscaler) = 🔒 HELD — 実機(VIVE Focus Vision)入手まで保留（2026-06-02 ユーザー確定）。** 実機で bicubic+unsharp の bilinear 超え + ≤5ms + 電力 を確認できるまで着手しない。GlslUpscaler 関連の確定済み決定(Decision 4,6,7,9)はこの保留に含まれる。
+- **Priority:** Phase 0=P1 / Phase 1=P3(blocked: hardware)
+- **Depends on:** Phase 0=なし / Phase 1=実機入手 + Phase 0完了 + 実機検証ガントレットで bilinear 超え実証
+
+### Phase 2: AI超解像 (LiteRT/TFLite delegate)
+- **What:** Phase 1 の GlslUpscaler を AIモデル(ESPCN/RealSR等)実装に差し替え、真のAI超解像で品質向上。
+- **Why:** 本機能の差別化の核心(ALVR/VD未実装)。モデル選定・量子化・電力が実機検証必須。
+- **Context:** CQ-1 決定により Phase 1 は具象 GlslUpscaler 1つのみ。Phase 2 でAI実装が実在したら両者から抽象 Upscaler interface を抽出。詳細は別 /office-hours。
+- **⚠ API選定(外部声指摘):** NNAPI は Android 15(2024) で deprecated 方向。**LiteRT(旧TFLite) GPU/NPU delegate** を前提にすること。設計doc記載の「NNAPI」は読み替え。
+- **Priority:** P3
+- **Depends on:** 実機(VIVE Focus Vision)入手 + Phase 1完了
+
+### 実機検証ガントレット (Phase 1 の Success Criteria 確定)
+- **What:** 実機入手時に走らせる検証一式 — bench_upscaler_glsl_latency(adb計測, ≤5ms)、bilinear比較の知覚品質、電力(3hセッション)、VR酔い主観テスト、unsharp amount と bitrate_pixel_factor のチューニング。
+- **Why:** 本機能の"価値そのもの"が全てこのガントレットでしか検証できない。Success Criteria 達成可否はここで初めて判明。
+- **Context:** Phase 1 実装時に config ノブ(bitrate_pixel_factor)と unsharp amount uniform を出しておくので、再ビルドなしでチューニング可能。
+- **Priority:** P2
+- **Depends on:** 実機入手 + Phase 1完了
+
+### ~~クライアント HELLO version 名乗り修正~~ (T8 完了)
+- **What:** C++クライアントが HELLO で {1,0}=version 1 を名乗っていた。サーバの PROTOCOL_VERSION は 3。
+- **解決:** T8 で HELLO を v3 名乗り + caps バイトに修正(tcp_client.cpp)。調査の結果クライアントは既に v3 ワイヤ形式(fvp_flags slice/stream — fec_decoder.h:70-73)を実装済みのため v3 名乗りは安全。
+
+### ~~client C++ テスト基盤 (host-buildable gtest)~~ (完了)
+- **What:** `client/tests/`（host CMake プロジェクト）+ `client/app/src/main/cpp/client_protocol.h`（Android非依存の純粋ロジック）。driver と同じ gtest パターン。
+- **解決:** `client_protocol.h` に HELLO ペイロード構築 + 定数を抽出し `tcp_client.cpp` がそれを使用。`client/tests/test_client_protocol.cpp` で単体テスト(3件)。CI に `client-tests`(ubuntu) ジョブ追加、CLAUDE.md に手順記載。`ctest --test-dir client/tests/build` で実行。
+- **今後:** T9(STREAM_CONFIG parse)・T10(decoder sizing) の純粋部もこの基盤で TDD する。FVP flag 解析(fec_decoder.h)も将来ここへ取り込み可。

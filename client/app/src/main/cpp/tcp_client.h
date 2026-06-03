@@ -20,11 +20,13 @@
 class TcpControlClient {
 public:
     struct StreamConfig {
-        uint32_t width = 0;
+        uint32_t width = 0;          // native render (target) resolution
         uint32_t height = 0;
         uint32_t bitrateMbps = 0;
         uint32_t framerate = 0;
         uint8_t codec = 1; // 0=H264, 1=H265
+        uint32_t encodedWidth = 0;   // actually-decoded resolution (== native unless downscaled)
+        uint32_t encodedHeight = 0;
     };
 
     /// Set the file path used to persist the pinned server cert SHA-256.
