@@ -3,6 +3,25 @@
 Config file: `config/default.toml` (override with `config/local.toml`, gitignored).
 All values are validated on startup. Invalid values are clamped to defaults with a warning.
 
+## Where the engine reads its config
+
+The engine runs inside SteamVR's `vrserver.exe`, so files are located relative
+to the driver DLL, not the working directory. Layers, lowest precedence first:
+
+1. **`config/default.toml`** — found by walking up from the driver DLL's folder
+   (installed: `<install dir>\config\default.toml`; dev build: `<repo>\config\default.toml`),
+   falling back to `config/default.toml` under the working directory.
+2. **`config/local.toml`** next to that `default.toml` — dev checkouts (gitignored).
+3. **`%APPDATA%\FocusVisionPCVR\config\local.toml`** — per-user overrides. The
+   companion app's Settings tab writes here, and hand-written keys in this file
+   are kept when the companion saves.
+
+Later layers override earlier ones **key by key** (a `local.toml` only needs the
+keys it changes). Unknown keys and sections are ignored. A layer that fails to
+parse is skipped with a warning; if the overrides produce an invalid value type,
+the engine falls back to `default.toml` alone. Changes apply on the next engine
+(SteamVR) start. The engine log lists the layers it applied.
+
 ## `[network]`
 
 | Field | Type | Default | Range | Description |
