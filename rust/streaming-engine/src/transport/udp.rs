@@ -7,9 +7,17 @@ const DEFAULT_SEND_BUF: u32 = 2 * 1024 * 1024;
 const DEFAULT_RECV_BUF: u32 = 2 * 1024 * 1024;
 /// DSCP value for Expedited Forwarding (EF) — best-effort QoS marking.
 /// Many routers ignore this, but it's free to set.
+#[cfg(windows)]
 const DSCP_EF: u32 = 46 << 2; // 0xB8
 
+/// Socket tuning (buffer sizes, DSCP) is only wired up for Windows, the
+/// shipping platform. Other targets — the Linux CI fuzz build — keep the OS
+/// defaults, so the crate still compiles there.
+#[cfg(not(windows))]
+fn apply_socket_opts(_socket: &UdpSocket, _send_buf: Option<u32>, _recv_buf: Option<u32>) {}
+
 /// Apply socket optimizations. Failures are logged but not fatal.
+#[cfg(windows)]
 fn apply_socket_opts(socket: &UdpSocket, send_buf: Option<u32>, recv_buf: Option<u32>) {
     use std::os::windows::io::AsRawSocket;
     let raw = socket.as_raw_socket();
@@ -45,16 +53,23 @@ fn apply_socket_opts(socket: &UdpSocket, send_buf: Option<u32>, recv_buf: Option
 }
 
 // Windows socket constants
+#[cfg(windows)]
 const SOL_SOCKET: i32 = 0xFFFF;
+#[cfg(windows)]
 const SO_SNDBUF: i32 = 0x1001;
+#[cfg(windows)]
 const SO_RCVBUF: i32 = 0x1002;
+#[cfg(windows)]
 const IPPROTO_IP: i32 = 0;
+#[cfg(windows)]
 const IP_TOS: i32 = 3;
 
+#[cfg(windows)]
 extern "system" {
     fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
 }
 
+#[cfg(windows)]
 unsafe fn libc_setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32 {
     unsafe { setsockopt(s, level, optname, optval, optlen) }
 }

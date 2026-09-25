@@ -173,6 +173,11 @@ jobs:
             java-version: '17'
         - name: Setup Android SDK
           uses: android-actions/setup-android@v3
+          with:
+            # The action's default ("tools platform-tools") asks sdkmanager
+            # for the long-removed legacy `tools` package, which now fails
+            # with "Failed to find package 'tools'" before the build starts.
+            packages: platform-tools
         - name: Install NDK and CMake
           run: |
             sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1"
@@ -263,6 +268,10 @@ jobs:
           with:
             submodules: recursive
         - uses: dtolnay/rust-toolchain@nightly
+        - name: Install ALSA headers
+          # cpal (audio capture) links alsa-sys on Linux; without the dev
+          # package its build script fails before any fuzz target compiles.
+          run: sudo apt-get update && sudo apt-get install -y libasound2-dev
         - name: Install cargo-fuzz
           run: cargo install cargo-fuzz --locked
         - name: Smoke-fuzz each target (30 s budget)
@@ -321,10 +330,12 @@ jobs:
         - name: Generate coverage (workspace + simulator)
           # --test-threads=1 mirrors the rust-build job: the headless_e2e_test
           # pair shares status.json. Cobertura output for downstream tooling,
-          # plus a human-readable summary line for the action log.
+          # plus a human-readable summary line for the action log. `report`
+          # reads the profile data the first run left behind and does not
+          # accept build flags such as --features.
           run: |
             cargo llvm-cov --workspace --features simulator --cobertura --output-path coverage.xml -- --test-threads=1
-            cargo llvm-cov report --features simulator --summary-only
+            cargo llvm-cov report --summary-only
         - name: Upload coverage XML
           uses: actions/upload-artifact@v4
           with:
