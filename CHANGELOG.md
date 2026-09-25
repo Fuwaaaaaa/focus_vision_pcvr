@@ -2,6 +2,34 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [Unreleased]
+
+### Protocol (breaking: v4)
+- **FVP header carries `data_shard_count` (FEC fix).** The HMD derived the
+  data/parity split as `total_shards / 1.2`, which is only right at exactly
+  20 % redundancy — adaptive FEC moves between 5 % and 40 %, so frames were
+  mis-split (too few data shards → corrupt frame; too many → a recoverable
+  frame discarded). The FVP header grows 10 → 12 bytes with
+  `data_shard_count: u16 LE` appended after `flags` (bytes 22..24; older
+  fields keep their offsets, payload now starts at byte 24).
+  `PROTOCOL_VERSION` is 4 on both sides; the server logs a warning for older
+  clients. Receivers validate `0 < data <= total <= 4096` and
+  `shard_index < total` before sizing or indexing buffers (a forged
+  `data > total` previously read past the end of the C++ decoder's arrays).
+- New `pipeline::FecFrameReassembler` (Rust receive side, bulk + sliced,
+  header-driven RS recovery) now used by the simulator's mock client, and a
+  dependency-free `parseFvpHeader()` in the Android client.
+- Client receive-path fixes found on the way: the sliced decoder reported
+  "complete" before its first frame (pushing an empty frame — IDR request +
+  decoder flush — every render loop), completed frames were re-submitted
+  every loop until the next frame arrived, frame index 0 never started, and a
+  timed-out slice re-requested an IDR on every loop.
+- Tests: redundancy 0.05 / 0.2 / 0.4 / 1.0 recovery at maximum loss,
+  per-frame redundancy changes, regression tests for the old `/1.2` guess,
+  cross-language golden RS vectors shared by `fec.rs` and
+  `client/tests/test_fec_decoder.cpp` (host-built via `client/tests/shim/`),
+  forged-header fuzz cases.
+
 ## [3.0.0] - 2026-06-01
 
 General availability. Promotes rc3 to the stable 3.0.0 release and turns the

@@ -6,6 +6,16 @@ pub const DEFAULT_UDP_PORT: u16 = 9945;
 pub const MTU_SIZE: usize = 1400;
 /// FEC shard size in bytes
 pub const FEC_SHARD_SIZE: usize = 1200;
+/// RTP fixed header length (RFC 3550, no CSRC list or extensions).
+pub const RTP_HEADER_LEN: usize = 12;
+/// FVP header length that follows the RTP header (see `protocol::FvpHeader`).
+pub const FVP_HEADER_LEN: usize = 12;
+/// Bytes preceding the shard payload in every video packet.
+pub const PACKET_HEADER_LEN: usize = RTP_HEADER_LEN + FVP_HEADER_LEN;
+/// Upper bound on shards (data + parity) in one frame or slice. Receivers
+/// reject larger `shard_count` values so a forged header cannot force a huge
+/// allocation (~5 MB at FEC_SHARD_SIZE — far beyond any real frame).
+pub const MAX_FRAME_SHARDS: usize = 4096;
 /// Default FEC redundancy ratio
 pub const DEFAULT_FEC_REDUNDANCY: f32 = 0.2;
 /// Heartbeat interval in milliseconds

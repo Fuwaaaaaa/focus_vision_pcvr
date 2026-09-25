@@ -1,5 +1,5 @@
 use streaming_engine::transport::fec::{FecDecoder, FecEncoder};
-use streaming_engine::transport::rtp::{RtpDepacketizer, RtpPacketizer};
+use streaming_engine::transport::rtp::{read_fvp_header, RtpDepacketizer, RtpPacketizer};
 use streaming_engine::transport::udp::{UdpReceiver, UdpSender};
 use streaming_engine::video::test_pattern::generate_nv12_frame;
 
@@ -145,10 +145,12 @@ fn test_nal_to_rtp_fec_roundtrip() {
     let packets = encode_frame_to_packets(&nal_data, 42, 90000, true, 0.2, &mut packetizer);
     assert!(packets.len() > 1, "NAL should span multiple RTP packets");
 
-    // Extract shard counts from first packet's FVP header (u16 LE at offset 18)
-    let total_shards = u16::from_le_bytes([packets[0].data[18], packets[0].data[19]]) as usize;
-    let shard_size = fvp_common::FEC_SHARD_SIZE;
-    let data_shard_count = nal_data.len().div_ceil(shard_size);
+    // Shard counts come from the first packet's FVP header: shard_count
+    // (u16 LE at offset 18) and data_shard_count (u16 LE at offset 22, v4).
+    let hdr = read_fvp_header(&packets[0].data).expect("full FVP header");
+    let total_shards = hdr.shard_count as usize;
+    let data_shard_count = hdr.data_shard_count as usize;
+    assert_eq!(data_shard_count, nal_data.len().div_ceil(fvp_common::FEC_SHARD_SIZE));
 
     // Reconstruct: collect all packet refs
     let pkt_refs: Vec<&[u8]> = packets.iter().map(|p| p.data.as_slice()).collect();
@@ -168,9 +170,9 @@ fn test_nal_fec_recovery_with_loss() {
     let mut packetizer = RtpPacketizer::new(0x9ABC);
     let packets = encode_frame_to_packets(&nal_data, 7, 63000, false, 0.2, &mut packetizer);
 
-    let total_shards = u16::from_le_bytes([packets[0].data[18], packets[0].data[19]]) as usize;
-    let shard_size = fvp_common::FEC_SHARD_SIZE;
-    let data_shard_count = nal_data.len().div_ceil(shard_size);
+    let hdr = read_fvp_header(&packets[0].data).expect("full FVP header");
+    let total_shards = hdr.shard_count as usize;
+    let data_shard_count = hdr.data_shard_count as usize;
     let parity_count = total_shards - data_shard_count;
 
     // Drop up to parity_count packets (should still recover)

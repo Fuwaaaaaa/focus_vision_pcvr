@@ -21,7 +21,7 @@ Key modules in streaming-engine:
 - `face_tracking/profiles.rs` — Per-avatar expression profiles (51 blendshape weights, JSON)
 - `face_tracking/calibration.rs` — Guided auto-calibration (min/max → weight computation)
 - `config.rs` — TOML config with validation (structured ConfigError, range checks, NaN rejection)
-- `transport/` — RTP packetization, FEC (adaptive + fixed + slice), UDP with buffer pool
+- `transport/` — RTP packetization, FEC (adaptive + fixed + slice), UDP with buffer pool. Video packet = 12 B RTP + 12 B FVP header (protocol v4: `data_shard_count` at bytes 22..24, payload from byte 24)
 - `transport/slice.rs` — SliceSplitter: NAL → N slices at byte boundaries
 - `adaptive/` — Bandwidth estimation, bitrate controller, GCC delay estimator, burst detector
 - `control/` — TCP server with TLS, PIN pairing, CONFIG_UPDATE protocol (`0x03` video, `0x05` audio)
@@ -60,7 +60,7 @@ cd driver/build && cmake --build . --config Release
 ctest --test-dir driver/build --build-config Release --output-on-failure  # 36 gtest cases
 # Android client host tests (hardware-independent logic, no NDK — host toolchain):
 cmake -S client/tests -B client/tests/build && cmake --build client/tests/build --config Release
-ctest --test-dir client/tests/build --build-config Release --output-on-failure  # client_protocol gtest
+ctest --test-dir client/tests/build --build-config Release --output-on-failure  # 40 gtest cases: client_protocol (incl. FVP header parse), session, fec_decoder (golden RS vectors; host shims in client/tests/shim/)
 ```
 
 ## Companion App

@@ -11,8 +11,13 @@ pub struct RtpHeader {
     pub ssrc: u32,
 }
 
-/// Focus Vision PCVR custom header (10 bytes)
+/// Focus Vision PCVR custom header (12 bytes, all fields little-endian).
 /// shard_index/count are u16 to support large IDR keyframes (>256 shards at 80Mbps).
+///
+/// `shard_count` is the total (data + parity) for the frame — or for the
+/// slice, when `fvp_flags::slice_count > 0`. `data_shard_count` (v4) is how
+/// many of those are data shards: adaptive FEC varies the parity ratio per
+/// frame, so the receiver cannot derive it from `shard_count`.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct FvpHeader {
@@ -20,6 +25,7 @@ pub struct FvpHeader {
     pub shard_index: u16,
     pub shard_count: u16,
     pub flags: u16,
+    pub data_shard_count: u16,
 }
 
 /// Tracking data sent from HMD to PC
@@ -96,7 +102,9 @@ pub mod msg_type {
 /// v1 = initial release (v1.0-v1.3)
 /// v2 = added protocol versioning, latency waterfall, UDP optimization (v2.0)
 /// v3 = TRANSPORT_FEEDBACK, FVP flags bit layout (slice/stream fields), adaptive FEC (v2.2)
-pub const PROTOCOL_VERSION: u16 = 3;
+/// v4 = FVP header grows 10 → 12 bytes: `data_shard_count` appended after
+///      `flags`, payload now starts at byte 24 (v3.0)
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Parse protocol version from HELLO payload. Returns 1 if payload is empty (v1 client).
 pub fn parse_hello_version(payload: &[u8]) -> u16 {
@@ -253,8 +261,15 @@ mod tests {
     }
 
     #[test]
-    fn fvp_header_size_is_10_bytes() {
-        assert_eq!(std::mem::size_of::<FvpHeader>(), 10);
+    fn fvp_header_size_is_12_bytes() {
+        assert_eq!(std::mem::size_of::<FvpHeader>(), 12);
+        assert_eq!(std::mem::size_of::<FvpHeader>(), crate::FVP_HEADER_LEN);
+    }
+
+    #[test]
+    fn packet_header_len_is_rtp_plus_fvp() {
+        assert_eq!(std::mem::size_of::<RtpHeader>(), crate::RTP_HEADER_LEN);
+        assert_eq!(crate::PACKET_HEADER_LEN, 24);
     }
 
     #[test]
@@ -449,8 +464,10 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_3() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn protocol_version_is_4() {
+        // v4 = 12-byte FVP header carrying data_shard_count. Must match the
+        // C++ client's fvp_client_protocol::PROTOCOL_VERSION.
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]

@@ -21,26 +21,45 @@ public:
         bool isKeyframe;
     };
 
-    /// Start collecting shards for a new frame.
-    void beginFrame(uint32_t frameIndex, uint16_t totalShards, uint16_t dataShards, bool isKeyframe);
+    /// Start collecting shards for a new frame. `dataShards` comes from the
+    /// packet's FVP header (v4). Returns false — leaving the decoder inactive,
+    /// so every shard is ignored until the next beginFrame — unless
+    /// 0 < dataShards <= totalShards <= MAX_TOTAL_SHARDS. Those counts size
+    /// and index the shard buffers, so they are never trusted unchecked.
+    bool beginFrame(uint32_t frameIndex, uint16_t totalShards, uint16_t dataShards, bool isKeyframe);
 
     /// Add a received shard.
     void addShard(uint16_t shardIndex, const uint8_t* data, int dataLen);
 
     /// Attempt to reconstruct the frame.
-    /// Returns the decoded frame data if enough shards are available.
+    /// Returns the decoded frame data if enough shards are available. A frame
+    /// is returned at most once: after a successful decode, further calls
+    /// (flush on the next render loop, late parity shards) return nullopt.
     std::optional<DecodedFrame> tryDecode();
 
     /// Check if enough shards have been received (data count reached).
     bool isComplete() const;
 
+    /// True once this frame has been returned by tryDecode().
+    bool isDelivered() const { return m_delivered; }
+
+    /// True while collecting `frameIndex` (after a successful beginFrame).
+    /// Unlike comparing currentFrameIndex(), this is false before the first
+    /// frame, so frame index 0 is not mistaken for an already-started frame.
+    bool isActiveFor(uint32_t frameIndex) const { return m_active && m_frameIndex == frameIndex; }
+
     uint32_t currentFrameIndex() const { return m_frameIndex; }
+
+    /// Upper bound on shards per frame/slice — Rust MAX_FRAME_SHARDS.
+    static constexpr uint16_t MAX_TOTAL_SHARDS = 4096;
 
 private:
     uint32_t m_frameIndex = 0;
     uint16_t m_totalShards = 0;
     uint16_t m_dataShards = 0;
     bool m_isKeyframe = false;
+    bool m_active = false;     // beginFrame accepted the current counts
+    bool m_delivered = false;  // tryDecode already returned this frame
     int m_shardSize = 0;
     uint16_t m_receivedCount = 0;
 
@@ -101,16 +120,30 @@ public:
     /// sliceCount must be > 0 (caller checks fvp_flags).
     void beginFrame(uint32_t frameIndex, uint8_t sliceCount, bool isKeyframe);
 
-    /// Add a shard to the appropriate slice context.
+    /// Add a shard to the appropriate slice context. `totalShards` /
+    /// `dataShards` are the slice's own counts from the FVP header.
     void addShard(uint8_t sliceIndex, uint16_t shardIndex, uint16_t totalShards,
                   uint16_t dataShards, const uint8_t* data, int dataLen);
 
     /// Try to assemble the complete frame from all slice contexts.
-    /// Returns decoded frame if ALL slices are reconstructed.
+    /// Returns decoded frame if ALL slices are reconstructed — at most once
+    /// per frame.
     std::optional<DecodedFrame> tryDecode();
 
-    /// Check if all slices have been reconstructed.
+    /// Check if all slices have been reconstructed. Always false before the
+    /// first beginFrame (sliceCount 0 would otherwise make the empty bitmask
+    /// look "complete" and push empty frames into the video decoder).
     bool isComplete() const;
+
+    /// True while collecting `frameIndex` (see FecFrameDecoder::isActiveFor).
+    bool isActiveFor(uint32_t frameIndex) const { return m_active && m_frameIndex == frameIndex; }
+
+    /// True between beginFrame and delivery/abandon of the current frame.
+    bool isActive() const { return m_active && !m_delivered; }
+
+    /// Give up on the current frame (after a timeout IDR request): it will
+    /// never complete, time out again, or accept more shards.
+    void abandon() { m_active = false; }
 
     /// Check if the frame has timed out (100ms since first shard).
     bool isTimedOut() const;
@@ -122,6 +155,8 @@ private:
     uint32_t m_frameIndex = 0;
     uint8_t m_sliceCount = 0;
     bool m_isKeyframe = false;
+    bool m_active = false;
+    bool m_delivered = false;
     uint16_t m_sliceCompleted = 0; // bitmask: bit i = slice i decoded
     std::chrono::steady_clock::time_point m_startTime;
     bool m_started = false;

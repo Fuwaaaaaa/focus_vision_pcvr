@@ -253,6 +253,32 @@ focus_vision_psvr/
   IDR_REQUEST rate limited to max 2/sec (500ms debounce).
 ```
 
+## Video Packet Header (protocol v4)
+
+```
+  offset  size  field              notes
+  ──────  ────  ─────────────────  ───────────────────────────────────────────
+   0      12    RTP header         V=2 | M,PT | seq BE | timestamp BE | SSRC BE
+  12       4    frame_index        u32 LE
+  16       2    shard_index        u16 LE, < shard_count
+  18       2    shard_count        u16 LE, data + parity (per slice if sliced)
+  20       2    flags              u16 LE, fvp_flags (keyframe/slice/stream)
+  22       2    data_shard_count   u16 LE, 1..=shard_count            ← v4
+  24       …    shard payload      FEC_SHARD_SIZE (1200 B) for FEC packets
+```
+
+`data_shard_count` tells the receiver where data ends and Reed-Solomon parity
+begins. Adaptive FEC picks a different parity ratio per frame (5–40%, config
+allows up to 100%, and an RS failure falls back to parity-free), so the split
+cannot be inferred from `shard_count` — the pre-v4 client guessed
+`shard_count / 1.2`, which is only right near 20%. Receivers drop packets whose
+shard fields are inconsistent (`data_shard_count` 0 or > `shard_count`,
+`shard_index >= shard_count`, `shard_count > 4096`). Rust: `transport/rtp.rs`
+(`write_fvp_header` / `read_fvp_header` / `FvpHeader::is_valid`),
+`pipeline::FecFrameReassembler` (receiver used by the simulator's mock HMD);
+C++: `client_protocol.h` `parseFvpHeader` → `FecFrameDecoder` /
+`SlicedFecFrameDecoder`.
+
 ## Congestion Control
 
 ```

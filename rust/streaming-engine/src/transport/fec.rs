@@ -415,6 +415,47 @@ mod tests {
         assert!((ctrl.bandwidth_delta_from_default() - 0.10).abs() < 0.001);
     }
 
+    /// Cross-language golden vectors shared with the C++ client's host test
+    /// (`client/tests/test_fec_decoder.cpp`, `kGoldenParity`). Data shard `i`
+    /// byte `j` is `(i*37 + j*11 + 5) & 0xFF`, 10 data shards of 8 bytes.
+    /// If reed-solomon-erasure's matrix construction ever changes, this test
+    /// fails first — and the client decoder (which re-derives the same
+    /// matrix) must be updated in lockstep.
+    const GOLDEN_DATA_SHARDS: usize = 10;
+    const GOLDEN_SHARD_LEN: usize = 8;
+    const GOLDEN_PARITY: [[u8; 8]; 4] = [
+        [0x89, 0x4B, 0xA8, 0xC9, 0xAF, 0x9C, 0xA2, 0xB2],
+        [0x09, 0x9C, 0x7D, 0x5A, 0xB1, 0x6F, 0xAD, 0x8E],
+        [0xC5, 0x35, 0x6B, 0xE8, 0xB1, 0xEC, 0xAE, 0x95],
+        [0x3A, 0xE8, 0x86, 0xFC, 0x06, 0x29, 0xB3, 0xD6],
+    ];
+
+    fn golden_data() -> Vec<Vec<u8>> {
+        (0..GOLDEN_DATA_SHARDS)
+            .map(|i| {
+                (0..GOLDEN_SHARD_LEN)
+                    .map(|j| ((i * 37 + j * 11 + 5) & 0xFF) as u8)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_fec_golden_parity_matches_client_fixture() {
+        // redundancy 0.1 / 0.2 / 0.4 → parity 1 / 2 / 4 for 10 data shards.
+        // Parity row k is identical across parity counts (same Vandermonde
+        // row, same V_top inverse), so every config is a prefix of the table.
+        for (redundancy, parity) in [(0.1f32, 1usize), (0.2, 2), (0.4, 4)] {
+            let mut enc = FecEncoder::new(redundancy);
+            let shards = enc.encode(golden_data()).unwrap();
+            assert_eq!(shards.len(), GOLDEN_DATA_SHARDS + parity);
+            for (k, row) in GOLDEN_PARITY.iter().take(parity).enumerate() {
+                assert_eq!(&shards[GOLDEN_DATA_SHARDS + k][..], &row[..],
+                    "parity row {k} drifted (redundancy {redundancy})");
+            }
+        }
+    }
+
     #[test]
     fn test_fec_20_percent_default() {
         let mut encoder = FecEncoder::new(0.2);

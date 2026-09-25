@@ -64,7 +64,8 @@ tracker, pose history, pairing state, dashboard state.
 ### Video pipeline
 | File | Class | Role |
 |---|---|---|
-| `fec_decoder.h/.cpp` | `FecFrameDecoder` / `SlicedFecFrameDecoder` | Reed-Solomon recovery. Sliced version has 4 independent RS contexts, u32 length prefix, 100 ms timeout |
+| `client_protocol.h` | `parseFvpHeader` / `FvpHeaderView` | Parses + validates the 12-byte FVP header (v4). `dataShards` comes from the header's `data_shard_count` — never derived from the total |
+| `fec_decoder.h/.cpp` | `FecFrameDecoder` / `SlicedFecFrameDecoder` | Reed-Solomon recovery. Sliced version has 4 independent RS contexts, u32 length prefix, 100 ms timeout. `beginFrame` rejects `dataShards` 0 / > total; each frame is returned by `tryDecode` at most once |
 | `nal_validator.h/.cpp` | `NalValidator` | Sanity-check NAL unit header before feeding MediaCodec |
 | `video_decoder.h/.cpp` | `VideoDecoder` | MediaCodec via JNI + SurfaceTexture zero-copy path |
 | `timewarp.h/.cpp` | `Timewarp` | GL_TEXTURE_EXTERNAL_OES rotation correction shader |
@@ -117,16 +118,18 @@ composition stack.
 
 ## Tests
 
-**Currently 0** — all 17 .cpp files are untested.
+Host-built GoogleTest suite in `client/tests/` (desktop toolchain, no NDK):
+- `test_client_protocol.cpp` — HELLO / STREAM_CONFIG / FVP header parsing
+- `test_client_session.cpp` — session state machine, server endpoint parsing
+- `test_fec_decoder.cpp` — `fec_decoder.cpp` compiled for the host against
+  `client/tests/shim/` (stub `android/log.h`, `openxr/openxr.h`). RS recovery
+  uses cross-language golden parity vectors pinned on the Rust side by
+  `transport/fec.rs` `test_fec_golden_parity_matches_client_fixture`.
 
-Highest-value test targets (audit item #11):
-- `fec_decoder.cpp` — RS decode correctness for synthetic lost shards
+Remaining untested targets:
 - `nal_validator.cpp` — rejection of malformed NAL headers
-- `sliced_fec` timeout + length-prefix validation
+- sliced FEC timeout path (wall-clock dependent)
 - `PoseHistory` ring buffer behavior (deterministic, no external deps)
-
-Blocking factor: test framework setup on Android NDK build. GoogleTest
-works but needs separate CMake target + `cargo ndk` integration.
 
 ---
 

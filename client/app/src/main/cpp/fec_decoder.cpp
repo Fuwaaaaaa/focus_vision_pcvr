@@ -45,16 +45,36 @@ namespace {
     }
 } // namespace
 
-void FecFrameDecoder::beginFrame(uint32_t frameIndex, uint16_t totalShards,
+bool FecFrameDecoder::beginFrame(uint32_t frameIndex, uint16_t totalShards,
                                   uint16_t dataShards, bool isKeyframe) {
     m_frameIndex = frameIndex;
-    m_totalShards = totalShards;
-    m_dataShards = dataShards;
     m_isKeyframe = isKeyframe;
     m_shardSize = 0;
     m_receivedCount = 0;
+    m_delivered = false;
+
+    // SECURITY: the counts come from the (unauthenticated) UDP header.
+    // dataShards > totalShards would make tryDecode() read m_received[i]
+    // past the end; dataShards == 0 would make isComplete() true with no
+    // data at all. Reject both, and cap the total so a forged header can't
+    // force a huge allocation. An inactive decoder ignores every shard.
+    if (totalShards == 0 || totalShards > MAX_TOTAL_SHARDS
+        || dataShards == 0 || dataShards > totalShards) {
+        LOGW("FEC: frame %u rejected (total=%u data=%u)", frameIndex, totalShards, dataShards);
+        m_active = false;
+        m_totalShards = 0;
+        m_dataShards = 0;
+        m_shards.clear();
+        m_received.clear();
+        return false;
+    }
+
+    m_active = true;
+    m_totalShards = totalShards;
+    m_dataShards = dataShards;
     m_shards.assign(totalShards, std::vector<uint8_t>());
     m_received.assign(totalShards, false);
+    return true;
 }
 
 void FecFrameDecoder::ensureEncodingMatrix() {
@@ -123,6 +143,7 @@ void FecFrameDecoder::ensureEncodingMatrix() {
 }
 
 void FecFrameDecoder::addShard(uint16_t shardIndex, const uint8_t* data, int dataLen) {
+    if (!m_active || m_delivered) return;
     if (dataLen <= 0) return;
     if (shardIndex >= m_totalShards) return;
     if (m_received[shardIndex]) return; // duplicate
@@ -140,11 +161,11 @@ void FecFrameDecoder::addShard(uint16_t shardIndex, const uint8_t* data, int dat
 
 bool FecFrameDecoder::isComplete() const {
     // We need at least data_shard_count shards (any combination of data + parity)
-    return m_receivedCount >= m_dataShards;
+    return m_active && m_receivedCount >= m_dataShards;
 }
 
 std::optional<FecFrameDecoder::DecodedFrame> FecFrameDecoder::tryDecode() {
-    if (!isComplete()) {
+    if (!isComplete() || m_delivered) {
         return std::nullopt;
     }
 
@@ -164,6 +185,7 @@ std::optional<FecFrameDecoder::DecodedFrame> FecFrameDecoder::tryDecode() {
         for (uint16_t i = 0; i < m_dataShards; i++) {
             frame.data.insert(frame.data.end(), m_shards[i].begin(), m_shards[i].end());
         }
+        m_delivered = true;
         return frame;
     }
 
@@ -284,6 +306,7 @@ std::optional<FecFrameDecoder::DecodedFrame> FecFrameDecoder::tryDecode() {
 
     LOGI("FEC: frame %u reconstructed (%u data shards recovered from %u parity)",
          m_frameIndex, missing, availableParity);
+    m_delivered = true;
     return frame;
 }
 
@@ -293,6 +316,8 @@ void SlicedFecFrameDecoder::beginFrame(uint32_t frameIndex, uint8_t sliceCount, 
     m_frameIndex = frameIndex;
     m_sliceCount = (sliceCount > MAX_SLICES) ? MAX_SLICES : sliceCount;
     m_isKeyframe = isKeyframe;
+    m_active = m_sliceCount > 0;
+    m_delivered = false;
     m_sliceCompleted = 0;
     m_started = false;
     for (int i = 0; i < m_sliceCount; i++) {
@@ -303,6 +328,7 @@ void SlicedFecFrameDecoder::beginFrame(uint32_t frameIndex, uint8_t sliceCount, 
 void SlicedFecFrameDecoder::addShard(uint8_t sliceIndex, uint16_t shardIndex,
                                       uint16_t totalShards, uint16_t dataShards,
                                       const uint8_t* data, int dataLen) {
+    if (!m_active || m_delivered) return;
     if (sliceIndex >= m_sliceCount) return;
 
     if (!m_started) {
@@ -310,10 +336,14 @@ void SlicedFecFrameDecoder::addShard(uint8_t sliceIndex, uint16_t shardIndex,
         m_started = true;
     }
 
-    // Initialize the per-slice context if this is the first shard for this slice
+    // Initialize the per-slice context if this is the first shard for this
+    // slice. isActiveFor (not a bare frame-index compare) so that frame 0 —
+    // which equals the contexts' initial index — still gets initialized.
     auto& ctx = m_contexts[sliceIndex];
-    if (ctx.currentFrameIndex() != m_frameIndex) {
-        ctx.beginFrame(m_frameIndex, totalShards, dataShards, m_isKeyframe);
+    if (!ctx.isActiveFor(m_frameIndex)) {
+        if (!ctx.beginFrame(m_frameIndex, totalShards, dataShards, m_isKeyframe)) {
+            return;
+        }
     }
 
     ctx.addShard(shardIndex, data, dataLen);
@@ -362,6 +392,11 @@ void SlicedFecFrameDecoder::addShard(uint8_t sliceIndex, uint16_t shardIndex,
 }
 
 bool SlicedFecFrameDecoder::isComplete() const {
+    // Before the first beginFrame m_sliceCount is 0, and an empty bitmask
+    // would compare equal — reporting "complete" and making the caller push
+    // an empty frame into the decoder (NAL reject → IDR request + flush) on
+    // every render loop while only bulk frames are arriving.
+    if (!m_active) return false;
     uint16_t allBits = (1 << m_sliceCount) - 1;
     return (m_sliceCompleted & allBits) == allBits;
 }
@@ -372,9 +407,10 @@ bool SlicedFecFrameDecoder::isTimedOut() const {
 }
 
 std::optional<SlicedFecFrameDecoder::DecodedFrame> SlicedFecFrameDecoder::tryDecode() {
-    if (!isComplete()) {
+    if (!isComplete() || m_delivered) {
         return std::nullopt;
     }
+    m_delivered = true;
 
     DecodedFrame frame;
     frame.frameIndex = m_frameIndex;

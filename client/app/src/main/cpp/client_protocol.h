@@ -11,8 +11,9 @@
 namespace fvp_client_protocol {
 
 // Protocol version — must match Rust PROTOCOL_VERSION. The client implements the
-// v3 wire format (FVP slice/stream flags — see fec_decoder.h fvp_flags).
-inline constexpr uint16_t PROTOCOL_VERSION = 3;
+// v4 wire format: v3 FVP slice/stream flags (see fec_decoder.h fvp_flags) plus
+// the 12-byte FVP header carrying data_shard_count (parseFvpHeader below).
+inline constexpr uint16_t PROTOCOL_VERSION = 4;
 
 // HELLO capability flags — must match Rust protocol::hello_caps. An absent caps
 // byte (legacy / version-only HELLO) means no capabilities.
@@ -79,6 +80,57 @@ inline bool parseStreamConfig(const uint8_t* payload, size_t len, StreamConfigVi
         out.encodedWidth = out.width;
         out.encodedHeight = out.height;
     }
+    return true;
+}
+
+// --- Video packet header (RTP + FVP) — must match Rust transport/rtp.rs ---
+inline constexpr size_t RTP_HEADER_LEN = 12;
+inline constexpr size_t FVP_HEADER_LEN = 12;
+// Payload (one FEC shard) starts right after both headers.
+inline constexpr size_t PACKET_HEADER_LEN = RTP_HEADER_LEN + FVP_HEADER_LEN;
+// Upper bound on shards (data + parity) per frame or slice — Rust
+// MAX_FRAME_SHARDS. Larger counts are rejected before any allocation.
+inline constexpr uint16_t MAX_FRAME_SHARDS = 4096;
+
+inline uint16_t readU16Le(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0] | (p[1] << 8));
+}
+
+// Parsed FVP header. `totalShards` counts data + parity for the frame (or for
+// the slice when fvp_flags::sliceCount(flags) > 0); `dataShards` says how many
+// of them are data. Adaptive FEC varies the parity ratio per frame, so the
+// data count must come from the header — it cannot be derived from the total.
+struct FvpHeaderView {
+    uint32_t frameIndex = 0;
+    uint16_t shardIndex = 0;
+    uint16_t totalShards = 0;
+    uint16_t flags = 0;
+    uint16_t dataShards = 0;
+};
+
+// Parse and validate the FVP header of a received video packet. Layout
+// (little-endian), offsets from the start of the UDP payload:
+//   [12..16] frame_index | [16..18] shard_index | [18..20] shard_count |
+//   [20..22] flags | [22..24] data_shard_count (v4) | [24..] shard payload
+// Returns false — drop the packet — when it is too short or the shard fields
+// are inconsistent: shard_count must be 1..MAX_FRAME_SHARDS, shard_index <
+// shard_count, and data_shard_count 1..shard_count. These fields size and
+// index the FEC decoder's buffers, so they must never be trusted unchecked.
+inline bool parseFvpHeader(const uint8_t* packet, size_t len, FvpHeaderView& out) {
+    if (packet == nullptr || len < PACKET_HEADER_LEN) {
+        return false;
+    }
+    const uint8_t* f = packet + RTP_HEADER_LEN;
+    FvpHeaderView h;
+    h.frameIndex = readU32Le(f + 0);
+    h.shardIndex = readU16Le(f + 4);
+    h.totalShards = readU16Le(f + 6);
+    h.flags = readU16Le(f + 8);
+    h.dataShards = readU16Le(f + 10);
+    if (h.totalShards == 0 || h.totalShards > MAX_FRAME_SHARDS) return false;
+    if (h.shardIndex >= h.totalShards) return false;
+    if (h.dataShards == 0 || h.dataShards > h.totalShards) return false;
+    out = h;
     return true;
 }
 

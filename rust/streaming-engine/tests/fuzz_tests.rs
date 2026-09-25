@@ -29,7 +29,7 @@ fn fuzz_rtp_packetize_no_panic() {
         let packets = packetizer.packetize(&data, frame_index, timestamp, is_keyframe);
 
         for pkt in &packets {
-            assert!(pkt.data.len() >= 22, "Packet too small: {}", pkt.data.len());
+            assert!(pkt.data.len() >= fvp_common::PACKET_HEADER_LEN, "Packet too small: {}", pkt.data.len());
         }
 
         packetizer.recycle(packets);
@@ -89,6 +89,42 @@ fn fuzz_fec_encode_decode_roundtrip() {
             }
         }
         // Err is acceptable — decoder may reject under-shard scenarios.
+    }
+}
+
+#[test]
+fn fuzz_fec_reassembler_forged_headers_no_panic() {
+    // Receiver-side hardening: packets with random shard_index /
+    // shard_count / data_shard_count / flags (including data > total,
+    // data = 0, slice_index >= slice_count) and random payload sizes must
+    // never panic, and a frame index change must always start cleanly.
+    use streaming_engine::pipeline::FecFrameReassembler;
+    use streaming_engine::transport::rtp::{write_fvp_header, write_rtp_header};
+
+    let mut rng = rand::thread_rng();
+    let mut reassembler = FecFrameReassembler::new();
+
+    for _ in 0..ITERATIONS {
+        let mut pkt = Vec::new();
+        write_rtp_header(&mut pkt, 97, rng.next_u32() & 1 == 0, 0, 0, 0);
+        let small = |v: u32| (v % 24) as u16; // keep counts small so frames can complete
+        write_fvp_header(
+            &mut pkt,
+            rng.next_u32() % 4,
+            small(rng.next_u32()),
+            small(rng.next_u32()),
+            rng.next_u32() as u16,
+            small(rng.next_u32()),
+        );
+        let payload_len = (rng.next_u32() % 64) as usize;
+        let mut payload = vec![0u8; payload_len];
+        rng.fill_bytes(&mut payload);
+        pkt.extend_from_slice(&payload);
+
+        let _ = reassembler.feed(&pkt);
+        // Truncated copies exercise the length checks.
+        let cut = (rng.next_u32() as usize) % (pkt.len() + 1);
+        let _ = reassembler.feed(&pkt[..cut]);
     }
 }
 
