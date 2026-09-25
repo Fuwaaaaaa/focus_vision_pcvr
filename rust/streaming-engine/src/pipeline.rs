@@ -29,17 +29,7 @@ pub fn encode_frame_to_packets_with_fec(
     packetizer: &mut RtpPacketizer,
 ) -> Vec<RtpPacket> {
     // Step 1: Split frame into FEC shards
-    let shard_size = FEC_SHARD_SIZE;
-    let data_shards: Vec<Vec<u8>> = frame_data
-        .chunks(shard_size)
-        .map(|chunk| {
-            // Pre-allocate exact size, copy data, zero-pad remainder
-            let mut shard = vec![0u8; shard_size];
-            shard[..chunk.len()].copy_from_slice(chunk);
-            shard
-        })
-        .collect();
-
+    let data_shards = to_data_shards(frame_data);
     if data_shards.is_empty() {
         return vec![];
     }
@@ -51,23 +41,38 @@ pub fn encode_frame_to_packets_with_fec(
         Ok(shards) => shards,
         Err(e) => {
             log::warn!("FEC encode failed: {e}, sending without FEC");
-            // Rebuild minimal shards for fallback (rare error path). The
-            // header still reports data_count == total, so the receiver
-            // knows there is no parity to wait for.
-            frame_data
-                .chunks(shard_size)
-                .map(|chunk| {
-                    let mut shard = chunk.to_vec();
-                    shard.resize(shard_size, 0);
-                    shard
-                })
-                .collect()
+            return encode_frame_without_fec(frame_data, frame_index, timestamp_90khz, is_keyframe, packetizer);
         }
     };
 
     // Step 3: Each shard becomes an RTP packet payload.
     let flags = fvp_flags::encode_simple(is_keyframe);
     shards_to_packets(&all_shards, data_count, frame_index, timestamp_90khz, flags, packetizer)
+}
+
+/// Data shards only, for a frame no FEC layout can carry. The header reports
+/// data_count == total, so the receiver knows there is no parity to wait for.
+fn encode_frame_without_fec(
+    frame_data: &[u8],
+    frame_index: u32,
+    timestamp_90khz: u32,
+    is_keyframe: bool,
+    packetizer: &mut RtpPacketizer,
+) -> Vec<RtpPacket> {
+    let shards = to_data_shards(frame_data);
+    let flags = fvp_flags::encode_simple(is_keyframe);
+    shards_to_packets(&shards, shards.len(), frame_index, timestamp_90khz, flags, packetizer)
+}
+
+/// Cut `data` into `FEC_SHARD_SIZE` shards, zero-padding the last one.
+fn to_data_shards(data: &[u8]) -> Vec<Vec<u8>> {
+    data.chunks(FEC_SHARD_SIZE)
+        .map(|chunk| {
+            let mut shard = vec![0u8; FEC_SHARD_SIZE];
+            shard[..chunk.len()].copy_from_slice(chunk);
+            shard
+        })
+        .collect()
 }
 
 /// Wrap each shard in RTP + FVP headers. `data_count` is written into every
@@ -83,8 +88,11 @@ fn shards_to_packets(
     packetizer: &mut RtpPacketizer,
 ) -> Vec<RtpPacket> {
     let total_shards = all_shards.len();
-    if total_shards > u16::MAX as usize {
-        log::error!("Frame too large: {} shards exceeds u16 max. Dropping frame.", total_shards);
+    if total_shards > MAX_FRAME_SHARDS {
+        log::error!(
+            "Frame too large: {} shards exceeds MAX_FRAME_SHARDS ({}), receivers would reject it. Dropping frame.",
+            total_shards, MAX_FRAME_SHARDS
+        );
         return vec![];
     }
     debug_assert!(data_count > 0 && data_count <= total_shards);
@@ -115,9 +123,61 @@ fn shards_to_packets(
 /// Below this threshold, RS encoding is already fast enough that slicing adds overhead.
 pub const MIN_SLICE_SIZE: usize = 16_384; // 16KB
 
+/// Bytes of the u32 length prefix at the start of every slice.
+const SLICE_LEN_PREFIX: usize = 4;
+
+/// How a frame is split into Reed-Solomon code words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FecLayout {
+    /// The whole frame is one code word.
+    Bulk,
+    /// The frame is split into this many slices, each its own code word.
+    Sliced(u8),
+    /// Too big for any layout: data shards only, no parity.
+    Unprotected,
+}
+
+/// Data shards one slice of `slice_len` bytes needs, length prefix included.
+fn slice_data_shards(slice_len: usize) -> usize {
+    (slice_len + SLICE_LEN_PREFIX).div_ceil(FEC_SHARD_SIZE)
+}
+
+/// Pick how to FEC-code a `frame_len`-byte frame when one RS code word holds
+/// at most `max_data_shards` data shards ([`FecEncoder::max_data_shards`]).
+///
+/// With slicing enabled, frames of at least [`MIN_SLICE_SIZE`] use
+/// `slice_count` slices, raised (up to [`fvp_flags::MAX_SLICE_COUNT`]) until
+/// every slice fits in one code word. Other frames go bulk, unless they are
+/// too big for one code word: those are sliced anyway so they keep their
+/// parity. Only a frame that does not fit even in the maximum slice count
+/// (about 3.8 MB at 20 % redundancy, 3.3 MB at 40 %) goes out unprotected.
+pub fn choose_fec_layout(
+    frame_len: usize,
+    slice_fec_enabled: bool,
+    slice_count: u8,
+    max_data_shards: usize,
+) -> FecLayout {
+    let slice = slice_fec_enabled && frame_len >= MIN_SLICE_SIZE;
+    if !slice && frame_len.div_ceil(FEC_SHARD_SIZE) <= max_data_shards {
+        return FecLayout::Bulk;
+    }
+    let from = if slice { slice_count.clamp(1, fvp_flags::MAX_SLICE_COUNT) } else { 1 };
+    // SliceSplitter puts the remainder on the first slices, so the first
+    // slice (ceil(len / n) bytes) is the largest.
+    (from..=fvp_flags::MAX_SLICE_COUNT)
+        .find(|&n| slice_data_shards(frame_len.div_ceil(n as usize)) <= max_data_shards)
+        .map_or(FecLayout::Unprotected, FecLayout::Sliced)
+}
+
 /// Encode a frame using slice-based FEC: split into N slices, RS-encode each independently.
 /// Each slice's packets are returned as a separate Vec so the caller can send progressively.
 /// The first shard of each slice contains a u32 length prefix for the original slice data.
+///
+/// All or nothing: a receiver can only rebuild the frame from every slice,
+/// so if any slice cannot be FEC-coded (more shards than one RS code word
+/// holds — [`choose_fec_layout`] avoids that — or fewer encoders than
+/// slices) nothing is returned. A frame shorter than `slice_count` bytes
+/// gets one slice per byte, so no slice is ever empty.
 pub fn encode_frame_sliced(
     frame_data: &[u8],
     frame_index: u32,
@@ -127,61 +187,124 @@ pub fn encode_frame_sliced(
     fec_encoders: &mut [FecEncoder],
     packetizer: &mut RtpPacketizer,
 ) -> Vec<Vec<RtpPacket>> {
+    let slice_count = slice_count
+        .min(fvp_flags::MAX_SLICE_COUNT)
+        .min(frame_data.len().min(u8::MAX as usize) as u8);
+    if slice_count == 0 {
+        return vec![];
+    }
+    if fec_encoders.len() < slice_count as usize {
+        log::error!(
+            "Slice FEC: {} slices but only {} encoders, dropping frame {}",
+            slice_count, fec_encoders.len(), frame_index
+        );
+        return vec![];
+    }
+
     let slices = SliceSplitter::split(frame_data, slice_count);
-    let mut all_packets = Vec::with_capacity(slices.len());
-
-    for (slice_idx, slice_data) in slices.iter().enumerate() {
-        if slice_data.is_empty() {
-            all_packets.push(vec![]);
-            continue;
-        }
-
+    let mut batches = Vec::with_capacity(slices.len());
+    for (slice_idx, (slice_data, fec)) in slices.iter().zip(fec_encoders.iter_mut()).enumerate() {
         // Prepend u32 length prefix to the slice data so the decoder can truncate after RS
-        let original_len = slice_data.len() as u32;
-        let mut prefixed = Vec::with_capacity(4 + slice_data.len());
-        prefixed.extend_from_slice(&original_len.to_le_bytes());
+        let mut prefixed = Vec::with_capacity(SLICE_LEN_PREFIX + slice_data.len());
+        prefixed.extend_from_slice(&(slice_data.len() as u32).to_le_bytes());
         prefixed.extend_from_slice(slice_data);
 
-        let shard_size = FEC_SHARD_SIZE;
-        let data_shards: Vec<Vec<u8>> = prefixed
-            .chunks(shard_size)
-            .map(|chunk| {
-                let mut shard = vec![0u8; shard_size];
-                shard[..chunk.len()].copy_from_slice(chunk);
-                shard
-            })
-            .collect();
-
-        if data_shards.is_empty() {
-            all_packets.push(vec![]);
-            continue;
-        }
-
-        // Check RS shard limit: if per-slice data shards > 200, caller should use bulk FEC
-        if data_shards.len() > 200 {
-            log::warn!("Slice {} has {} data shards (>200), skipping slice FEC", slice_idx, data_shards.len());
-            all_packets.push(vec![]);
-            continue;
-        }
-
+        let data_shards = to_data_shards(&prefixed);
         let data_count = data_shards.len();
-        let fec = &mut fec_encoders[slice_idx];
         let all_shards = match fec.encode(data_shards) {
             Ok(shards) => shards,
             Err(e) => {
-                log::warn!("Slice {} FEC encode failed: {e}", slice_idx);
-                all_packets.push(vec![]);
-                continue;
+                log::warn!(
+                    "Slice {}/{} FEC encode failed ({} data shards): {e}. Dropping frame {}",
+                    slice_idx, slice_count, data_count, frame_index
+                );
+                for batch in batches {
+                    packetizer.recycle(batch);
+                }
+                return vec![];
             }
         };
 
         let flags = fvp_flags::encode(is_keyframe, slice_idx as u8, slice_count, 0);
-        all_packets.push(shards_to_packets(
+        batches.push(shards_to_packets(
             &all_shards, data_count, frame_index, timestamp_90khz, flags, packetizer,
         ));
     }
 
-    all_packets
+    batches
+}
+
+/// Per-session FEC state for outgoing video: one encoder for bulk frames and
+/// one for each possible slice, all at the same redundancy, plus the
+/// `[network]` slicing settings. Picks the layout for every frame with
+/// [`choose_fec_layout`].
+pub struct FrameFecEncoder {
+    bulk: FecEncoder,
+    slices: Vec<FecEncoder>,
+    slice_fec_enabled: bool,
+    slice_count: u8,
+    unprotected_frames: u64,
+}
+
+impl FrameFecEncoder {
+    pub fn new(redundancy: f32, slice_fec_enabled: bool, slice_count: u8) -> Self {
+        Self {
+            bulk: FecEncoder::new(redundancy),
+            slices: (0..fvp_flags::MAX_SLICE_COUNT).map(|_| FecEncoder::new(redundancy)).collect(),
+            slice_fec_enabled,
+            slice_count,
+            unprotected_frames: 0,
+        }
+    }
+
+    pub fn redundancy(&self) -> f32 {
+        self.bulk.redundancy()
+    }
+
+    /// Change the redundancy of every encoder, bulk and slices alike.
+    pub fn set_redundancy(&mut self, redundancy: f32) {
+        self.bulk.set_redundancy(redundancy);
+        for enc in &mut self.slices {
+            enc.set_redundancy(redundancy);
+        }
+    }
+
+    /// Encode one frame. Returns its packets grouped per RS code word in
+    /// send order: one batch per slice, or a single batch otherwise. Nothing
+    /// is returned for an empty frame or one that had to be dropped.
+    pub fn encode(
+        &mut self,
+        frame_data: &[u8],
+        frame_index: u32,
+        timestamp_90khz: u32,
+        is_keyframe: bool,
+        packetizer: &mut RtpPacketizer,
+    ) -> Vec<Vec<RtpPacket>> {
+        let layout = choose_fec_layout(
+            frame_data.len(), self.slice_fec_enabled, self.slice_count, self.bulk.max_data_shards(),
+        );
+        let packets = match layout {
+            FecLayout::Sliced(n) => {
+                return encode_frame_sliced(
+                    frame_data, frame_index, timestamp_90khz, is_keyframe, n, &mut self.slices, packetizer,
+                );
+            }
+            FecLayout::Bulk => encode_frame_to_packets_with_fec(
+                frame_data, frame_index, timestamp_90khz, is_keyframe, &mut self.bulk, packetizer,
+            ),
+            FecLayout::Unprotected => {
+                self.unprotected_frames += 1;
+                if self.unprotected_frames % 100 == 1 {
+                    log::warn!(
+                        "Frame {} ({} bytes) is too big for FEC even in {} slices; sending it unprotected ({} such frames so far)",
+                        frame_index, frame_data.len(), fvp_flags::MAX_SLICE_COUNT, self.unprotected_frames
+                    );
+                }
+                encode_frame_without_fec(frame_data, frame_index, timestamp_90khz, is_keyframe, packetizer)
+            }
+        };
+        if packets.is_empty() { vec![] } else { vec![packets] }
+    }
 }
 
 /// Decode FEC-protected RTP packets back into a frame.
@@ -645,20 +768,23 @@ mod tests {
     }
 
     #[test]
-    fn test_sliced_fec_small_frame_skips_empty_slices() {
-        // A 3-byte frame split into 4 slices: [1B, 1B, 1B, 0B]
-        // The 0-byte slice should produce empty batch
+    fn test_sliced_fec_tiny_frame_uses_one_slice_per_byte() {
+        // A 3-byte frame cannot fill 4 slices. An empty 4th slice would send
+        // nothing, and the receiver would wait for it forever, so the frame
+        // goes out as 3 one-byte slices instead.
         let frame = vec![1, 2, 3];
         let mut pkt = make_packetizer();
         let mut encoders: Vec<FecEncoder> = (0..4).map(|_| FecEncoder::new(0.2)).collect();
 
         let batches = encode_frame_sliced(&frame, 0, 0, false, 4, &mut encoders, &mut pkt);
-        assert_eq!(batches.len(), 4);
-        // First 3 slices have data, 4th is empty
-        assert!(!batches[0].is_empty());
-        assert!(!batches[1].is_empty());
-        assert!(!batches[2].is_empty());
-        assert!(batches[3].is_empty());
+        assert_eq!(batches.len(), 3);
+        for batch in &batches {
+            assert!(!batch.is_empty());
+            assert_eq!(fvp_flags::slice_count(header_of(&batch[0]).flags), 3);
+        }
+        let frames = reassemble_batches(&mut FecFrameReassembler::new(), &batches, &[]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, frame);
     }
 
     #[test]
@@ -729,6 +855,18 @@ mod tests {
             .filter(|(i, _)| !drop.contains(i))
             .filter_map(|(_, p)| r.feed(&p.data))
             .collect()
+    }
+
+    /// Feed every batch (one per slice) through one reassembler, dropping
+    /// the packets at positions `drop` within each batch.
+    fn reassemble_batches(r: &mut FecFrameReassembler, batches: &[Vec<RtpPacket>], drop: &[usize]) -> Vec<ReassembledFrame> {
+        batches.iter().flat_map(|b| reassemble(r, b, drop)).collect()
+    }
+
+    /// Frame of `len` bytes that is not all one value, so a misplaced slice
+    /// would show.
+    fn patterned(len: usize, seed: u8) -> Vec<u8> {
+        (0..len).map(|i| ((i % 251) as u8).wrapping_add(seed)).collect()
     }
 
     fn assert_bulk_frame_eq(frame: &ReassembledFrame, original: &[u8]) {
@@ -933,5 +1071,151 @@ mod tests {
         let frames: Vec<_> = packets[1..].iter().filter_map(|p| r.feed(&p.data)).collect();
         assert_eq!(frames.len(), 1);
         assert_bulk_frame_eq(&frames[0], &original);
+    }
+
+    // --- FEC layout per frame (large IDRs) ---
+
+    #[test]
+    fn test_choose_fec_layout() {
+        let max_20 = FecEncoder::new(0.2).max_data_shards(); // 213
+        let max_40 = FecEncoder::new(0.4).max_data_shards(); // 182
+        let cases = [
+            // (frame bytes, slicing on, configured slices, RS max, expected)
+            (1_000, true, 4, max_20, FecLayout::Bulk),
+            (20_000, true, 4, max_20, FecLayout::Sliced(4)),
+            // 275 KB slices need 230 shards > 213: one more slice fits.
+            (1_100_000, true, 4, max_20, FecLayout::Sliced(5)),
+            // 220 KB slices need 184 shards: fine at 20 %, too many at 40 %.
+            (880_000, true, 4, max_20, FecLayout::Sliced(4)),
+            (880_000, true, 4, max_40, FecLayout::Sliced(5)),
+            // Slicing off: bulk while it fits one code word, else the fewest slices.
+            (200_000, false, 4, max_20, FecLayout::Bulk),
+            (300_000, false, 4, max_20, FecLayout::Sliced(2)),
+            // Beyond 15 slices nothing keeps FEC.
+            (4_000_000, true, 4, max_20, FecLayout::Unprotected),
+        ];
+        for (len, enabled, slices, max, expected) in cases {
+            assert_eq!(choose_fec_layout(len, enabled, slices, max), expected,
+                "len {len}, slicing {enabled}, max {max}");
+        }
+    }
+
+    #[test]
+    fn test_large_idr_is_sent_in_more_slices_and_recovered() {
+        // REGRESSION: a slice with more data shards than one RS code word
+        // holds (a literal 200 cap, or RS's 256 total at high redundancy) was
+        // sent as an empty batch, so the receiver could never complete the
+        // frame — a realistic ~0.9-1.1 MB IDR was lost every time. The 40 %
+        // threshold is covered by `test_choose_fec_layout`; one full-size
+        // frame here keeps unoptimized test builds fast.
+        let original = patterned(1_100_000, 3);
+        let mut enc = FrameFecEncoder::new(0.2, true, 4);
+        let batches = enc.encode(&original, 7, 0, true, &mut make_packetizer());
+        assert_eq!(batches.len(), 5);
+        for (i, batch) in batches.iter().enumerate() {
+            let h = header_of(&batch[0]);
+            assert_eq!(fvp_flags::slice_index(h.flags), i as u8);
+            assert_eq!(fvp_flags::slice_count(h.flags), 5);
+            assert!(h.data_shard_count < h.shard_count, "slice {i} keeps its parity");
+        }
+        // Lose the length-prefix shard of the last slice: RS must restore it.
+        let mut r = FecFrameReassembler::new();
+        let mut frames = reassemble_batches(&mut r, &batches[..4], &[]);
+        frames.extend(reassemble(&mut r, &batches[4], &[0]));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, original);
+    }
+
+    #[test]
+    fn test_reassembler_follows_slice_count_changes_between_frames() {
+        // The encoder now picks the slice count per frame, so consecutive
+        // frames can be sliced(4), sliced(5), bulk, sliced(4).
+        let mut encs: Vec<FecEncoder> = (0..5).map(|_| FecEncoder::new(0.2)).collect();
+        let mut bulk = FecEncoder::new(0.2);
+        let mut pkt = make_packetizer();
+        let mut r = FecFrameReassembler::new();
+        for (idx, slices) in [4u8, 5, 0, 4].into_iter().enumerate() {
+            let original = patterned(20_000, idx as u8);
+            let batches = if slices == 0 {
+                vec![encode_frame_to_packets_with_fec(&original, idx as u32, 0, false, &mut bulk, &mut pkt)]
+            } else {
+                encode_frame_sliced(&original, idx as u32, 0, false, slices, &mut encs, &mut pkt)
+            };
+            let frames = reassemble_batches(&mut r, &batches, &[1]);
+            assert_eq!(frames.len(), 1, "frame {idx} ({slices} slices)");
+            assert_eq!(frames[0].frame_index, idx as u32);
+            if slices == 0 {
+                assert_bulk_frame_eq(&frames[0], &original);
+            } else {
+                assert_eq!(frames[0].data, original);
+            }
+        }
+    }
+
+    #[test]
+    fn test_frame_fec_encoder_slices_big_frames_even_with_slicing_off() {
+        // A bulk frame above the RS limit used to go out without any parity.
+        // At 100 % redundancy one code word holds 128 data shards (153.6 KB).
+        let original = patterned(160_000, 1);
+        let mut enc = FrameFecEncoder::new(1.0, false, 4);
+        let batches = enc.encode(&original, 0, 0, true, &mut make_packetizer());
+        assert_eq!(batches.len(), 2);
+        for batch in &batches {
+            let h = header_of(&batch[0]);
+            assert_eq!(fvp_flags::slice_count(h.flags), 2);
+            assert!(h.data_shard_count < h.shard_count);
+        }
+        let frames = reassemble_batches(&mut FecFrameReassembler::new(), &batches, &[0]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, original);
+    }
+
+    #[test]
+    fn test_frame_fec_encoder_set_redundancy_reaches_every_slice() {
+        let mut enc = FrameFecEncoder::new(0.05, true, 4);
+        enc.set_redundancy(0.4);
+        assert_eq!(enc.redundancy(), 0.4);
+        let batches = enc.encode(&patterned(100_000, 2), 0, 0, false, &mut make_packetizer());
+        assert_eq!(batches.len(), 4);
+        for batch in &batches {
+            let h = header_of(&batch[0]);
+            let data = h.data_shard_count as usize;
+            assert_eq!(h.shard_count as usize - data, (data as f32 * 0.4).ceil() as usize);
+        }
+    }
+
+    #[test]
+    fn test_frame_fec_encoder_unprotected_and_oversized_frames() {
+        let mut enc = FrameFecEncoder::new(0.2, true, 4);
+        let mut pkt = make_packetizer();
+        // Too big for 15 slices: data shards only, header says data == total.
+        let original = patterned(4_000_000, 4);
+        let batches = enc.encode(&original, 0, 0, true, &mut pkt);
+        assert_eq!(batches.len(), 1);
+        let h = header_of(&batches[0][0]);
+        assert_eq!(h.shard_count, h.data_shard_count);
+        assert_eq!(h.shard_count as usize, original.len().div_ceil(FEC_SHARD_SIZE));
+        let frames = reassemble_batches(&mut FecFrameReassembler::new(), &batches, &[]);
+        assert_eq!(frames.len(), 1);
+        assert_bulk_frame_eq(&frames[0], &original);
+
+        // Over MAX_FRAME_SHARDS every receiver rejects the frame: not sent.
+        let huge = vec![0u8; FEC_SHARD_SIZE * (MAX_FRAME_SHARDS + 1)];
+        assert!(enc.encode(&huge, 1, 0, true, &mut pkt).is_empty());
+        assert!(enc.encode(&[], 2, 0, false, &mut pkt).is_empty());
+    }
+
+    #[test]
+    fn test_sliced_fec_is_all_or_nothing() {
+        // Called directly with a slice count whose slices exceed the RS limit
+        // (275 KB slices at 20 %), or with too few encoders: nothing is sent,
+        // rather than a partial frame the receiver can never complete.
+        let frame = patterned(1_100_000, 5);
+        let mut encs: Vec<FecEncoder> = (0..4).map(|_| FecEncoder::new(0.2)).collect();
+        assert!(encode_frame_sliced(&frame, 0, 0, true, 4, &mut encs, &mut make_packetizer()).is_empty());
+
+        let small = patterned(20_000, 6);
+        let mut two: Vec<FecEncoder> = (0..2).map(|_| FecEncoder::new(0.2)).collect();
+        assert!(encode_frame_sliced(&small, 0, 0, false, 4, &mut two, &mut make_packetizer()).is_empty());
     }
 }

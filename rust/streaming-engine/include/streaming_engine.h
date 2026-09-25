@@ -33,6 +33,12 @@
 #define CHUNK_MS 10
 
 /**
+ * Reed-Solomon over GF(2^8) allows at most this many data + parity shards
+ * in one code word (`reed_solomon_erasure` rejects more with `TooManyShards`).
+ */
+#define RS_MAX_TOTAL_SHARDS 256
+
+/**
  * Minimum frame size for slice-based FEC to be beneficial.
  * Below this threshold, RS encoding is already fast enough that slicing adds overhead.
  */

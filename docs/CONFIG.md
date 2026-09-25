@@ -30,6 +30,8 @@ the engine falls back to `default.toml` alone. Changes apply on the next engine
 | `tcp_port` | u16 | 9944 | >= 1024 | TCP control channel port (TLS handshake, PIN pairing, heartbeat, face tracking) |
 | `udp_port` | u16 | 9945 | >= 1024, != tcp_port | Base UDP port. Video = udp_port + VIDEO_PORT_OFFSET, Audio = udp_port + AUDIO_PORT_OFFSET |
 | `fec_redundancy` | f32 | 0.2 | 0.0-1.0 | FEC parity ratio. 0.2 = 20% parity shards added to each frame |
+| `slice_fec_enabled` | bool | true | — | Split frames ≥ 16 KB into independently FEC-coded slices |
+| `slice_count` | u8 | 4 | 2-15 | Slices per frame. Raised for a single frame (up to 15) when a slice would exceed one Reed-Solomon code word (data + parity ≤ 256 shards of 1200 B) — e.g. a ~1 MB IDR goes out in 5 slices |
 
 **Validation:** tcp_port and udp_port must be >= 1024. If they're equal, udp_port is auto-incremented. Below 1024 is clamped to default.
 
