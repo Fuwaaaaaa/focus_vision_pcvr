@@ -40,12 +40,12 @@ the engine falls back to `default.toml` alone. Changes apply on the next engine
 | Field | Type | Default | Range | Description |
 |-------|------|---------|-------|-------------|
 | `codec` | string | "h265" | "h264", "h265" | Video codec. H.265 = better compression, H.264 = faster decode on some devices |
-| `bitrate_mbps` | u32 | 80 | 10-200 | Target bitrate in Mbps. Adaptive bitrate may adjust this at runtime |
+| `bitrate_mbps` | u32 | 80 | 10-200 | Target bitrate in Mbps: the NVENC target, the value STREAM_CONFIG sends to the HMD, and the adaptive bitrate controller's starting point (the controller's changes do not reach NVENC yet — see TODOS) |
 | `resolution_per_eye` | [u32; 2] | [1832, 1920] | — | Per-eye render resolution [width, height]. Must match SteamVR render target |
 | `framerate` | u32 | 90 | 30-120 | Target framerate. Supported: 72, 90, 96, 120 |
 | `full_range` | bool | true | — | Full RGB (0-255) vs limited range (16-235). Affects NVENC VUI parameters |
 | `resolution_scale` | f32 | 1.0 | 0.5-1.0 | Encode resolution scale. 1.0 = native (no change). Below 1.0 encodes at a smaller resolution to cut bandwidth; the HMD restores it. **Fixed at session start.** See AI Super Resolution below |
-| `bitrate_pixel_factor` | f32 | 2.0 | 1.0-4.0 | Bits-per-pixel multiplier for the encoder bitrate (`bitrate = encoded_w * encoded_h * factor`). Raise it to spend more bits on a downscaled stream |
+| `bitrate_pixel_factor` | — | — | — | **Deprecated, ignored.** Used to set the encoder bitrate to `encoded_w * encoded_h * factor` (~7 Mbps at native), contradicting `bitrate_mbps`. Old files that set it still load; the engine logs a warning |
 
 ### AI Super Resolution — `resolution_scale` (Phase 0)
 
@@ -61,9 +61,8 @@ upscaler (Phase 1) is held until the target hardware is available (see
 `TODOS.md`). A client that does not advertise upscaler support is always sent the
 native resolution, so older clients are never silently degraded.
 
-`bitrate_pixel_factor` lets you tune perceived quality at a given
-`resolution_scale` without a rebuild: at `resolution_scale = 0.5`, a factor of
-`2.0` gives ~20 Mbps and `3.0` gives ~30 Mbps for the same frame.
+The encoder bitrate is `bitrate_mbps` at any `resolution_scale`; lower it
+together with the scale if the goal is to save bandwidth.
 
 ## `[display]`
 

@@ -107,7 +107,12 @@ typedef struct FvpConfig {
     int32_t mid_qp_offset;
     int32_t peripheral_qp_offset;
     float resolution_scale;
-    float bitrate_pixel_factor;
+    /**
+     * NVENC target bitrate in bits per second: `[video] bitrate_mbps`, the
+     * same value STREAM_CONFIG tells the client and the adaptive bitrate
+     * controller starts from.
+     */
+    uint32_t bitrate_bps;
     uint32_t encoded_width;
     uint32_t encoded_height;
 } FvpConfig;

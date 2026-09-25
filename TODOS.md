@@ -301,11 +301,10 @@
 - **残り(縮小を実際に有効化する条件):** ①per-session で接続クライアントの caps を見てエンコーダ解像度を確定（再init）②T7 縮小blit。両方が揃った時点でガードを外す。いずれも実機/制御接続配線(P0)依存。
 - **Priority:** P1（scale<1.0 を有効化する前に必須）
 
-### bitrate 公式の不整合（pre-existing・/review 検出）
+### ~~bitrate 公式の不整合（pre-existing・/review 検出）~~ (2026-09-25 修正)
 - **What:** driver の `bitrate = width*height*2` は 1832×1920 で **~7Mbps** だが、config `bitrate_mbps=80`（STREAM_CONFIG で client へも 80 を送信）。約11×の乖離。fallback 分岐は `80'000'000`（=80Mbps）で経路間も不整合。
-- **影響:** NVENC 目標ビットレートが意図(80Mbps)の ~1/11。pre-existing（`width*height*2` は本変更前から存在）。本PRは `bitrate_pixel_factor` で可変化したが、range 1.0-4.0 では 80Mbps（factor≈22.7 相当）を**表現できない**。
-- **要検討:** 公式を `bitrate_mbps` 由来にするか、factor の range/default を見直すか。実機でのレート確認が要る。
-- **Priority:** P2
+- **解決:** `[video] bitrate_mbps` を唯一の値にした。`FvpConfig.bitrate_bps` を追加し、driver はそれを NVENC に渡す (0 なら 80 Mbps)。`bitrate_pixel_factor` は非推奨で無視 (古い設定ファイルは読めて、警告が出る)。
+- **残り:** 実際の NVENC のレートは実機で確認する。ただし末尾の P0「ドライバが NVENC を初期化しない」が直るまで、エンコーダ自体が動かない。
 
 ### ⚠ BLOCKER (P0): Android クライアントにストリーミングセッション統合が無い
 - **調査結果(2026-06-02 read-only 全走査):** 単なる connect/handshake の配線漏れではなく、**「PC に接続してストリーミングを開始する」オーケストレーション自体が未実装**。
@@ -346,7 +345,7 @@
 ### 実機検証ガントレット (Phase 1 の Success Criteria 確定)
 - **What:** 実機入手時に走らせる検証一式 — bench_upscaler_glsl_latency(adb計測, ≤5ms)、bilinear比較の知覚品質、電力(3hセッション)、VR酔い主観テスト、unsharp amount と bitrate_pixel_factor のチューニング。
 - **Why:** 本機能の"価値そのもの"が全てこのガントレットでしか検証できない。Success Criteria 達成可否はここで初めて判明。
-- **Context:** Phase 1 実装時に config ノブ(bitrate_pixel_factor)と unsharp amount uniform を出しておくので、再ビルドなしでチューニング可能。
+- **Context:** Phase 1 実装時に config ノブ(bitrate_pixel_factor)と unsharp amount uniform を出しておくので、再ビルドなしでチューニング可能。（2026-09-25: `bitrate_pixel_factor` は廃止。エンコーダの bitrate は `bitrate_mbps`。縮小時の bitrate が要るなら `build_fvp_config` で面積比から出す）
 - **Priority:** P2
 - **Depends on:** 実機入手 + Phase 1完了
 
@@ -358,3 +357,25 @@
 - **What:** `client/tests/`（host CMake プロジェクト）+ `client/app/src/main/cpp/client_protocol.h`（Android非依存の純粋ロジック）。driver と同じ gtest パターン。
 - **解決:** `client_protocol.h` に HELLO ペイロード構築 + 定数を抽出し `tcp_client.cpp` がそれを使用。`client/tests/test_client_protocol.cpp` で単体テスト(3件)。CI に `client-tests`(ubuntu) ジョブ追加、CLAUDE.md に手順記載。`ctest --test-dir client/tests/build` で実行。
 - **今後:** T9(STREAM_CONFIG parse)・T10(decoder sizing) の純粋部もこの基盤で TDD する。FVP flag 解析(fec_decoder.h)も将来ここへ取り込み可。
+
+## ⚠ BLOCKER (P0): ドライバが NVENC を初期化しない — 実機では映像が 1 フレームも出ない
+（2026-09-25 のコード調査で判明。GPU・SteamVR が無い開発機では検証できないため、直さずに記録）
+- **What:** `CDirectModeComponent::initEncoder`（`driver/src/direct_mode.cpp`）を呼ぶ場所がどこにもない（`git log -S` でも追加以来ずっと未使用）。`m_encoderReady` は常に false で、`Present()` は毎回早期 return する。
+- **同じ経路のほかの問題:**
+  - driver は D3D11 デバイスを作っていない。`CreateSwapTextureSet` は `m_encoder.getDevice()`（初期化前は null）を使うので、スワップテクスチャも作れない。
+  - `rSharedTextureHandles` に入れているのは `m_nextHandle++` の連番で、DXGI の本物の共有ハンドル（`IDXGIResource::GetSharedHandle`）ではない。SteamVR の compositor はこれを開けない。
+  - `nvenc_encoder.h` の手書きの NVENC 関数テーブルの並びが、公式の `nvEncodeAPI.h`（`NV_ENCODE_API_FUNCTION_LIST`）と合っていない疑いがある（例: 先頭が `nvEncOpenEncodeSessionEx`）。SDK のヘッダと突き合わせが要る。
+  - `fvp_set_bitrate_callback` を driver が登録しておらず、`NvencEncoder` に reconfigure（`nvEncReconfigureEncoder`）の経路もない。adaptive bitrate の変更は NVENC に届かない。
+- **直すのに必要なこと:** D3D11 デバイスの作成（SteamVR が使うアダプタ）、本物の共有テクスチャ、`initEncoder` の呼び出し、関数テーブルの検証、bitrate callback と reconfigure（Present スレッドで適用する atomic な保留値）。
+- **Priority:** P0（実機での映像の前提）
+- **Depends on:** NVIDIA GPU + SteamVR のある環境（ビルドと gtest 以外は検証できない）
+
+## コード調査で見つけた問題（2026-09-25、未対応）
+- **C++ クライアントの受信が遅い:** `openxr_app.cpp` は 1 回の render loop で最大 64 パケットしか読まず、ループは `xrWaitFrame` で止まる。約 5.8k パケット/秒が上限で、80 Mbps には足りない。約 900 パケットのスライス IDR は 100 ms の `SLICE_TIMEOUT` 内に読み切れない可能性がある。実機で確認が要る。
+- **MediaCodec に渡る順番が入れ替わる:** 完成したフレームは、同じ decoder が次のフレームを見たときか flush のときにしか渡されず、flush は bulk → sliced の順。bulk と sliced が混ざると N+1 が N より先に（IDR より先に P が）渡ることがある。
+- **RS の行列をほぼ毎フレーム作り直している:** `FecEncoder` のキャッシュはデータ shard 数が前回と同じときしか効かず、実際のエンコーダ出力はフレームごとにサイズが変わる。IDR 級のスライス（約 180 shard）では行列の作成が重い。スライスをまたいで共有する `ReedSolomon` の LRU があるとよい。
+- **bitrate を変える経路がばらばら:** adaptive controller、sleep（起きると controller の値ではなく `bitrate_mbps` に戻る）、CONFIG_UPDATE 0x01（controller を通らない）、thermal（`notify` しない）がそれぞれ別に動いている。1 つの実効値（min(controller, sleep, thermal, user)）にまとめたい。`GccEstimator::set_current_bitrate` はどこからも呼ばれていない。
+- **status の packet loss がほぼ 0:** `update_adaptive_bitrate` が `hmd_stats` を `take()` するので、1 秒ごとの status 出力のときには空になっていることが多い。
+- **`config.pairing.max_attempts` / `lockout_seconds` が使われていない:** `PairingState` は定数を直接使う。
+- **tcp-control タスクが cancel されない / `HAPTIC_TX` が残る:** UDP sender の作成失敗などでセッションを抜けても、`handle_tcp_control` は HMD が TCP を切るまで動き続ける。セッション終了後も `HAPTIC_TX` に古い sender が残る。
+- **UDP のパケットごとの認証がない:** tracking の送信元チェックは IP だけ（SECURITY.md の Known Limitations に記載済み）。

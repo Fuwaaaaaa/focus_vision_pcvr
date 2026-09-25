@@ -153,9 +153,12 @@ pub struct FvpConfig {
     pub mid_radius: f32,
     pub mid_qp_offset: i32,
     pub peripheral_qp_offset: i32,
-    // AI Super Resolution (Phase 0): encode resolution scale + bits-per-pixel.
+    // AI Super Resolution (Phase 0): encode resolution scale.
     pub resolution_scale: f32,
-    pub bitrate_pixel_factor: f32,
+    /// NVENC target bitrate in bits per second: `[video] bitrate_mbps`, the
+    /// same value STREAM_CONFIG tells the client and the adaptive bitrate
+    /// controller starts from.
+    pub bitrate_bps: u32,
     // Per-eye dimensions the driver encodes at. Currently always == native:
     // the encoder downscale is gated on future work (per-session caps gating +
     // the T7 blit), so `build_fvp_config` keeps these at native even when
@@ -190,7 +193,7 @@ fn build_fvp_config(cfg: &config::AppConfig) -> FvpConfig {
         mid_qp_offset,
         peripheral_qp_offset,
         resolution_scale: cfg.video.resolution_scale,
-        bitrate_pixel_factor: cfg.video.bitrate_pixel_factor,
+        bitrate_bps: cfg.video.bitrate_mbps.saturating_mul(1_000_000),
         encoded_width,
         encoded_height,
     }
@@ -547,13 +550,25 @@ mod tests {
     fn test_build_fvp_config_includes_resolution_fields() {
         let mut cfg = config::AppConfig::default();
         cfg.video.resolution_scale = 0.5;
-        cfg.video.bitrate_pixel_factor = 2.5;
         let out = build_fvp_config(&cfg);
         assert_eq!(out.resolution_scale, 0.5);
-        assert_eq!(out.bitrate_pixel_factor, 2.5);
         // Existing fields still populated correctly.
         assert_eq!(out.render_width, cfg.video.resolution_per_eye[0]);
         assert_eq!(out.render_height, cfg.video.resolution_per_eye[1]);
+    }
+
+    #[test]
+    fn test_build_fvp_config_bitrate_is_bitrate_mbps() {
+        // REGRESSION: the driver derived NVENC's bitrate from the frame size
+        // (1832 * 1920 * 2 = ~7 Mbps) while `bitrate_mbps = 80` was sent to
+        // the client and seeded the adaptive controller — ~11x apart.
+        let cfg = config::AppConfig::default();
+        assert_eq!(cfg.video.bitrate_mbps, 80);
+        assert_eq!(build_fvp_config(&cfg).bitrate_bps, 80_000_000);
+
+        let mut cfg = config::AppConfig::default();
+        cfg.video.bitrate_mbps = 200; // validated maximum still fits in u32
+        assert_eq!(build_fvp_config(&cfg).bitrate_bps, 200_000_000);
     }
 
     #[test]
@@ -594,7 +609,7 @@ mod tests {
             mid_qp_offset: 0,
             peripheral_qp_offset: 0,
             resolution_scale: 0.0,
-            bitrate_pixel_factor: 0.0,
+            bitrate_bps: 0,
             encoded_width: 0,
             encoded_height: 0,
         };

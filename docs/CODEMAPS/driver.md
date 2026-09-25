@@ -39,7 +39,8 @@ SteamVR loads DLL
 
 CServerDriver::Init()
   → fvp_init() (Rust engine start)
-  → fvp_set_idr_callback / fvp_set_gaze_callback / fvp_set_bitrate_callback
+  → fvp_set_idr_callback / fvp_set_gaze_callback
+    (fvp_set_bitrate_callback is not registered yet — see TODOS P0 "NVENC")
   → create CHmdDevice + 2x CControllerDevice
   → TrackedDeviceAdded() for each
   → spawn pose polling thread
@@ -50,6 +51,8 @@ per-frame (driven by SteamVR compositor):
   → CDirectModeComponent::Present()
     → FrameCopy::copy(texture)
     → NvencEncoder::encode() → fvp_submit_encoded_nal()
+    (today Present() returns early: nothing calls initEncoder, so
+     m_encoderReady stays false — see TODOS P0 "NVENC")
 
 CServerDriver::Cleanup()
   → fvp_shutdown()
@@ -64,7 +67,7 @@ CServerDriver::Cleanup()
 ### `CServerDriver` (server_driver.h)
 - `vr::IServerTrackedDeviceProvider` implementation
 - Owns: `m_hmd`, `m_leftController`, `m_rightController`, pose thread
-- Static `s_instance` for IDR / gaze / bitrate callbacks from Rust
+- Static `s_instance` for IDR / gaze callbacks from Rust
 - Known race: callback can fire during `Cleanup()` while `s_instance` goes null — audit flagged
 
 ### `CHmdDevice` (hmd_device.h)

@@ -60,6 +60,15 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   replaced it.
 
 ### Fixes
+- **The encoder bitrate is `bitrate_mbps`.** The driver set NVENC's target
+  to `encoded_w * encoded_h * bitrate_pixel_factor` — about 7 Mbps at the
+  native 1832×1920 — while `bitrate_mbps = 80` was sent to the HMD in
+  STREAM_CONFIG and seeded the adaptive bitrate controller (and the
+  fallback path used 80 Mbps). `FvpConfig` now carries `bitrate_bps` from
+  `[video] bitrate_mbps` and the driver uses it. `bitrate_pixel_factor` is
+  deprecated and ignored; config files that set it still load, with a
+  warning. (FFI layout change: `FvpConfig.bitrate_pixel_factor` is replaced
+  by `bitrate_bps` in the same slot; driver and engine ship together.)
 - **Reconnecting within the 5 s hold works.** When a session dropped
   without DISCONNECT (Wi-Fi blip), the engine listened for 5 s with a new
   server and a **new** PIN — which the HMD cannot know — and if a client did
@@ -126,6 +135,17 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   and masks SSIDs, the pairing PIN, user names in profile paths, e-mail, MAC,
   IPv4 (octets 0–255) and IPv6 addresses, without touching version strings,
   C++ `Class::method` scopes or clock times.
+
+### Known issues
+- **The SteamVR driver never initializes NVENC, so the real VR path sends no
+  video.** Nothing calls `CDirectModeComponent::initEncoder`, the driver
+  creates no D3D11 device, and the swap-texture "shared handles" are
+  counters rather than DXGI shared handles, so `Present()` returns before
+  encoding. Runtime bitrate changes also never reach NVENC (the bitrate
+  callback is not registered and there is no reconfigure path). The
+  hardware-free simulator path is unaffected. Found by code review; it
+  needs an NVIDIA GPU + SteamVR to fix and verify — tracked as P0 in
+  TODOS.md.
 
 ## [3.0.0] - 2026-06-01
 

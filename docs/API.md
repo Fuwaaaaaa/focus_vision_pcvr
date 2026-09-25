@@ -32,6 +32,7 @@ Register a callback for eye gaze updates from HMD tracking data.
 Register a callback for adaptive bitrate changes.
 - `bitrate_bps`: New target bitrate in **bits per second** (not Mbps).
 - Fires when: bandwidth estimator detects loss, sleep mode transitions, or HMD dashboard CONFIG_UPDATE.
+- **Not registered by the bundled driver yet**, and `NvencEncoder` has no reconfigure path, so runtime bitrate changes do not reach NVENC. The encoder runs at `FvpConfig.bitrate_bps` (`[video] bitrate_mbps`). See TODOS.md.
 
 ## Frame Submission
 

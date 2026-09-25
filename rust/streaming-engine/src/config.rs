@@ -142,16 +142,16 @@ pub struct VideoConfig {
     /// behavior). Fixed at session start — see TODOS.md "AI Super Resolution".
     #[serde(default = "default_resolution_scale")]
     pub resolution_scale: f32,
-    /// Bits-per-pixel multiplier for the NVENC bitrate (bitrate = enc_w * enc_h *
-    /// factor). Tunable so quality at sub-native resolution can be adjusted
-    /// without a rebuild.
-    #[serde(default = "default_bitrate_pixel_factor")]
-    pub bitrate_pixel_factor: f32,
+    /// Deprecated and ignored. The driver used to set the NVENC bitrate to
+    /// `enc_w * enc_h * factor` (~7 Mbps at native), contradicting
+    /// `bitrate_mbps`; the encoder now uses `bitrate_mbps`. Still parsed so
+    /// old config files load, and `validate` warns when it is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_pixel_factor: Option<f32>,
 }
 
 fn default_full_range() -> bool { true }
 fn default_resolution_scale() -> f32 { 1.0 }
-fn default_bitrate_pixel_factor() -> f32 { 2.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairingConfig {
@@ -398,7 +398,7 @@ impl Default for NetworkConfig {
 }
 impl Default for VideoConfig {
     fn default() -> Self {
-        Self { codec: VideoCodec::default(), bitrate_mbps: default_bitrate(), resolution_per_eye: default_resolution(), framerate: default_framerate(), full_range: default_full_range(), resolution_scale: default_resolution_scale(), bitrate_pixel_factor: default_bitrate_pixel_factor() }
+        Self { codec: VideoCodec::default(), bitrate_mbps: default_bitrate(), resolution_per_eye: default_resolution(), framerate: default_framerate(), full_range: default_full_range(), resolution_scale: default_resolution_scale(), bitrate_pixel_factor: None }
     }
 }
 impl Default for PairingConfig {
@@ -673,7 +673,12 @@ impl AppConfig {
         validate_range(&mut self.video.bitrate_mbps, 10, 200, 80, "video.bitrate_mbps", &mut errors);
         validate_range(&mut self.video.framerate, 30, 120, 90, "video.framerate", &mut errors);
         validate_f32_range(&mut self.video.resolution_scale, 0.5, 1.0, 1.0, "video.resolution_scale", &mut errors);
-        validate_f32_range(&mut self.video.bitrate_pixel_factor, 1.0, 4.0, 2.0, "video.bitrate_pixel_factor", &mut errors);
+        if self.video.bitrate_pixel_factor.take().is_some() {
+            errors.push(ConfigError {
+                field: "video.bitrate_pixel_factor",
+                message: "is deprecated and ignored; the encoder bitrate is video.bitrate_mbps".to_string(),
+            });
+        }
 
         // Face tracking
         validate_f32_range(&mut self.face_tracking.smoothing, 0.0, 0.99, 0.6, "face_tracking.smoothing", &mut errors);
@@ -890,10 +895,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_resolution_scale_and_pixel_factor() {
+    fn test_default_resolution_scale() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.video.resolution_scale, 1.0);
-        assert_eq!(cfg.video.bitrate_pixel_factor, 2.0);
+        assert_eq!(cfg.video.bitrate_pixel_factor, None);
     }
 
     #[test]
@@ -904,7 +909,7 @@ mod tests {
             bitrate_mbps = 100
         "#).unwrap();
         assert_eq!(cfg.video.resolution_scale, 1.0);
-        assert_eq!(cfg.video.bitrate_pixel_factor, 2.0);
+        assert_eq!(cfg.video.bitrate_pixel_factor, None);
     }
 
     #[test]
@@ -949,21 +954,19 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_bitrate_pixel_factor_out_of_range() {
-        let mut cfg = AppConfig::default();
-        cfg.video.bitrate_pixel_factor = 5.0; // above the 4.0 ceiling
+    fn test_deprecated_bitrate_pixel_factor_still_loads_and_is_reported() {
+        // Config files written for 3.0.0 set it; they must keep loading, and
+        // the user is told the key no longer does anything.
+        let mut cfg: AppConfig = toml::from_str(r#"
+            [video]
+            bitrate_mbps = 100
+            bitrate_pixel_factor = 2.0
+        "#).unwrap();
+        assert_eq!(cfg.video.bitrate_pixel_factor, Some(2.0));
         let errors = cfg.validate();
         assert!(errors.iter().any(|e| e.field == "video.bitrate_pixel_factor"));
-        assert_eq!(cfg.video.bitrate_pixel_factor, 2.0); // clamped to default
-    }
-
-    #[test]
-    fn test_validate_bitrate_pixel_factor_nan() {
-        let mut cfg = AppConfig::default();
-        cfg.video.bitrate_pixel_factor = f32::NAN;
-        let errors = cfg.validate();
-        assert!(errors.iter().any(|e| e.field == "video.bitrate_pixel_factor"));
-        assert_eq!(cfg.video.bitrate_pixel_factor, 2.0);
+        assert_eq!(cfg.video.bitrate_mbps, 100, "the encoder bitrate comes from bitrate_mbps");
+        assert_eq!(cfg.video.bitrate_pixel_factor, None);
     }
 
     #[test]
