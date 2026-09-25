@@ -91,8 +91,8 @@ Module declarations: `src/lib.rs:1-14` (14 modules).
 
 | File | Key items |
 |---|---|
-| `tcp_server.rs` | `TcpControlServer`, step_hello_exchange / step_pin_pairing / step_stream_config / step_stream_start, AsyncStream trait, read_message_generic / send_message_generic |
-| `pairing.rs` | `PairingState` (6-digit PIN, 5 attempts, 300 s lockout, CSPRNG) |
+| `tcp_server.rs` | `TcpControlServer` (`listen_and_accept` rotates an expired PIN between connections; `pin_status` for status.json; `rearm_for_reconnect` for the hold), step_hello_exchange / step_pin_pairing / step_stream_config / step_stream_start, AsyncStream trait, read_message_generic / send_message_generic |
+| `pairing.rs` | `PairingState` (6-digit PIN, 5 attempts, 300 s lockout, CSPRNG, 300 s PIN lifetime via `expires_in` / `rotate_if_expired`, `rearm_for_reconnect`) |
 | `tls.rs` | self-signed cert + `TlsAcceptor`, SHA-256 fingerprint |
 
 ---

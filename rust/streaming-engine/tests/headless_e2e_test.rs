@@ -236,10 +236,25 @@ fn run_pipeline(
         rt.block_on(run_mock_client(client_config, cancel_for_client))
     });
 
+    pump_frames(&engine, &mut stream, duration + Duration::from_millis(200), || {});
+    cancel.cancel();
+    let stats = client_thread.join().expect("client thread join").expect("mock-client run");
+    engine.shutdown();
+    stats
+}
+
+/// Submit frames from `stream` to `engine` at 60 fps for `duration`,
+/// calling `tick` after each one.
+fn pump_frames(
+    engine: &StreamingEngine,
+    stream: &mut SyntheticNalStream,
+    duration: Duration,
+    mut tick: impl FnMut(),
+) {
     let frame_period = Duration::from_secs_f64(1.0 / 60.0);
     let start = Instant::now();
     let mut next_tick = start;
-    while start.elapsed() < duration + Duration::from_millis(200) {
+    while start.elapsed() < duration {
         let synth = stream.next_frame();
         let frame = EncodedFrame {
             frame_index: synth.frame_index,
@@ -248,14 +263,87 @@ fn run_pipeline(
             timestamps: FrameTimestamps::new(synth.frame_index),
         };
         let _ = engine.submit_frame(frame);
+        tick();
         next_tick += frame_period;
         let now = Instant::now();
         if next_tick > now { std::thread::sleep(next_tick - now); } else { next_tick = now; }
     }
-    cancel.cancel();
-    let stats = client_thread.join().expect("client thread join").expect("mock-client run");
+}
+
+/// Run a mock HMD on its own thread (and tokio runtime) until its
+/// `duration` ends.
+fn spawn_mock_client(
+    config: MockClientConfig,
+) -> std::thread::JoinHandle<Result<MockClientStats, streaming_engine::simulator::MockClientError>> {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(run_mock_client(config, CancellationToken::new()))
+    })
+}
+
+fn read_status() -> Option<serde_json::Value> {
+    let content = std::fs::read_to_string(status_path()?).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// REGRESSION: when the link dropped (no DISCONNECT) and the HMD came back
+/// inside the 5 s hold window, the engine accepted the connection, threw it
+/// away and started over with a NEW PIN — which the HMD cannot know, so it
+/// never got back in without the user pairing again. The hold now accepts
+/// the session's PIN once more and streams on the reconnected connection.
+#[test]
+fn headless_e2e_reconnect_within_hold_keeps_pin_and_streams() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .is_test(true).try_init();
+
+    delete_stale_status();
+    let (tcp_port, udp_port) = pick_free_ports();
+    let mut config = sim_test_config(tcp_port, udp_port);
+    config.video.framerate = 60;
+    let engine = StreamingEngine::new(config).expect("engine new");
+    let pin = wait_for_pin(Duration::from_secs(3)).expect("engine never published a PIN");
+    let server_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let mut stream = SyntheticNalStream::new(VideoCodec::H265, 60);
+
+    // 1. First connection streams, then the link drops without DISCONNECT.
+    let mut first = MockClientConfig::from_ports(server_ip, tcp_port, udp_port, pin);
+    first.duration = Some(Duration::from_millis(1500));
+    first.abrupt_close = true;
+    let first = spawn_mock_client(first);
+    pump_frames(&engine, &mut stream, Duration::from_millis(1700), || {});
+    let first = first.join().unwrap().expect("first session");
+    assert!(first.frames_decoded > 5, "first session must stream, got {}", first.frames_decoded);
+
+    // 2. The engine is in its hold window, still offering the same PIN.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let hold_status = loop {
+        let v = read_status();
+        if v.as_ref().is_some_and(|v| v["status"] == "waiting") || Instant::now() > deadline {
+            break v;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let hold_status = hold_status.expect("status.json must exist");
+    assert_eq!(hold_status["status"], "waiting", "engine must notice the drop: {hold_status}");
+    assert_eq!(hold_status["pin"], format!("{pin:06}"), "hold must offer the session PIN");
+    assert!(hold_status["pin_expires_in_seconds"].as_u64().unwrap_or(u64::MAX) <= 5,
+        "the countdown shows the hold window: {hold_status}");
+
+    // 3. The HMD comes back with the PIN it paired with and keeps streaming.
+    let mut second = MockClientConfig::from_ports(server_ip, tcp_port, udp_port, pin);
+    second.duration = Some(Duration::from_millis(1500));
+    let second = spawn_mock_client(second);
+    let mut streaming_seen = false;
+    pump_frames(&engine, &mut stream, Duration::from_millis(1700), || {
+        streaming_seen |= read_status().is_some_and(|v| v["status"] == "streaming");
+    });
+    let second = second.join().unwrap().expect("reconnect with the session PIN must succeed");
     engine.shutdown();
-    stats
+
+    eprintln!("reconnect: first={} frames, second={} frames",
+        first.frames_decoded, second.frames_decoded);
+    assert!(second.frames_decoded > 5, "reconnected session must stream, got {}", second.frames_decoded);
+    assert!(streaming_seen, "status must return to \"streaming\" after the reconnect");
 }
 
 /// Run the pipeline at a given `resolution_scale`, feeding synthetic NALs

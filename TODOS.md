@@ -190,9 +190,10 @@
 - MemoryMonitor構造体: 60秒ポーリング、1時間で50MB以上増加→警告ログ
 - config: [memory_monitor] enabled/poll_interval_seconds/growth_threshold_mb
 
-### ~~TCP再接続PINスキップ: SECURITY.md脅威モデル更新~~ (完了)
+### ~~TCP再接続PINスキップ: SECURITY.md脅威モデル更新~~ (完了 → 2026-09 に訂正)
 - SECURITY.mdのKnown Limitationsテーブルに5秒PINスキップウィンドウの脅威分析を追記
 - TLS session resumption + TOFUピニングによる緩和を明記
+- **訂正 (2026-09-25):** PIN スキップも TLS session resumption も実装されていなかった。実際の動き (hold の 5 秒間だけセッションの PIN を再び受け付ける) に SECURITY.md を合わせた。
 
 ### ~~GCC Lite（遅延ベース帯域推定の簡易版）~~ (完了)
 - BandwidthEstimator.process_feedback() + delay_gradient() 実装済み
@@ -232,7 +233,8 @@
 - hold中にTCPリスナーを再作成しHMDが再接続可能に
 - accept_failures(5回で停止)とreconnect_attempts(10回で警告のみ)を分離
 - Wi-Fi断でエンジンが永久停止するリスクを解消
-- 残: TLS session resumption（session ticket）による再接続時PINスキップは実機テスト後
+- ~~hold 中に再接続を受け付けても、その接続を捨てて新しい PIN で listen し直していた~~ (2026-09-25 修正): hold はセッションの server を再利用してセッションの PIN を 5 秒だけ再び受け付け、再接続した接続でストリーミングを続ける (`headless_e2e_reconnect_within_hold_keeps_pin_and_streams`)
+- 残: PIN を使わない再接続 (TLS 内で渡す再接続トークン、または TLS session resumption) はプロトコル変更とクライアント実装が要る。hold の 5 秒が進行中のハンドシェイクを途中で切ってしまう問題 (bind と accept を分ける) も未対応
 
 ### ~~Adaptive FEC無効化オプション~~ (完了)
 - config.toml: adaptive_fec_enabled（デフォルトtrue）を追加

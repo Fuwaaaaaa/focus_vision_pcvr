@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AppConfig;
-use crate::control::tcp_server::TcpControlServer;
+use crate::control::tcp_server::{AsyncStream, TcpControlServer};
 use crate::metrics::latency::{FrameTimestamps, LatencyTracker};
 use crate::pipeline;
 use crate::tracking::receiver::{AuthorizedPeer, TrackingReceiver};
@@ -1173,18 +1173,29 @@ async fn with_heartbeat<F: std::future::Future>(
     }
 }
 
-/// `"waiting"` status: with the pairing PIN while a TCP server is listening,
-/// or `None` (rendered as "------", i.e. not yet pairable) during backoff.
-fn publish_waiting_status(pin: Option<u32>) {
+/// `"waiting"` status: with the pairing PIN and the seconds until it expires
+/// while a TCP server is listening, or `None` (rendered as "------", i.e. not
+/// yet pairable) during backoff.
+fn publish_waiting_status(pin: Option<(u32, u32)>) {
     crate::write_status_file(
         "waiting",
-        pin,
+        pin.map(|(pin, _)| pin),
         None,
         None,
         None,
         None,
-        pin.map(|_| fvp_common::PIN_LIFETIME_SECONDS),
+        pin.map(|(_, expires_in)| expires_in),
     );
+}
+
+/// Heartbeat for a listening `server`: publish its current PIN (it rotates
+/// on expiry, and on lockout) with the time left. `last` keeps the previous
+/// value for the rare beat where a handshake holds the pairing lock.
+fn publish_pin_status(server: &TcpControlServer, last: &mut Option<(u32, u32)>) {
+    if let Some(status) = server.pin_status() {
+        *last = Some(status);
+    }
+    publish_waiting_status(*last);
 }
 
 /// Marks `ip` as the paired HMD for the tracking receiver's source check
@@ -1251,55 +1262,62 @@ async fn run_streaming(
         );
     }
 
+    // A connection accepted during the previous session's hold window —
+    // already through TLS + PIN with that session's server — to resume on.
+    let mut resumed: Option<(TcpControlServer, Box<dyn AsyncStream>, SocketAddr)> = None;
+
     loop {
         if cancel.is_cancelled() { break; }
 
-        if let Some(delay) = reconnect_state.next_backoff() {
-            log::info!(
-                "Retrying accept in {:?} (failure {}/{})",
-                delay,
-                reconnect_state.accept_failures(),
-                crate::control::reconnect::MAX_ACCEPT_FAILURES,
-            );
-            // Backoff can last up to 16 s — keep status.json fresh so the
-            // companion doesn't report the engine as stopped meanwhile.
-            tokio::select! {
-                _ = with_heartbeat(tokio::time::sleep(delay), STATUS_HEARTBEAT, || publish_waiting_status(None)) => {}
-                _ = cancel.cancelled() => { break; }
-            }
-        }
-
-        // Step 1: Wait for HMD to connect via TCP
-        let tcp_server = TcpControlServer::new(config.clone());
-        // Publish the freshly-generated PIN to status.json so the companion
-        // app (or the simulator mock-client) can read it. The PIN rotates
-        // each time we re-enter this loop after a disconnect, so the write
-        // must repeat per iteration.
-        //
-        // The same payload is re-emitted every STATUS_HEARTBEAT while we
-        // wait: the companion judges engine liveness from the file's mtime,
-        // and waiting for the HMD can take minutes. PIN_LIFETIME_SECONDS
-        // stays constant across the re-emits, so the companion keeps its
-        // own local "Expires in: M:SS" countdown running.
-        let pin_to_publish = tcp_server.current_pin().await;
-        let accept_result = tokio::select! {
-            r = with_heartbeat(tcp_server.listen_and_accept(), STATUS_HEARTBEAT, || publish_waiting_status(Some(pin_to_publish))) => r,
-            _ = cancel.cancelled() => { break; }
-        };
-
-        let (tcp_control_stream, peer_addr) = match accept_result {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("TCP accept failed: {}", e);
-                reconnect_state.record_accept_failure();
-                if reconnect_state.should_stop_engine() {
-                    log::error!(
-                        "Max accept failures reached ({}) — stopping engine",
+        let (tcp_server, tcp_control_stream, peer_addr) = match resumed.take() {
+            Some(session) => session,
+            None => {
+                if let Some(delay) = reconnect_state.next_backoff() {
+                    log::info!(
+                        "Retrying accept in {:?} (failure {}/{})",
+                        delay,
                         reconnect_state.accept_failures(),
+                        crate::control::reconnect::MAX_ACCEPT_FAILURES,
                     );
-                    break;
+                    // Backoff can last up to 16 s — keep status.json fresh so the
+                    // companion doesn't report the engine as stopped meanwhile.
+                    tokio::select! {
+                        _ = with_heartbeat(tokio::time::sleep(delay), STATUS_HEARTBEAT, || publish_waiting_status(None)) => {}
+                        _ = cancel.cancelled() => { break; }
+                    }
                 }
-                continue;
+
+                // Step 1: Wait for HMD to connect via TCP
+                let tcp_server = TcpControlServer::new(config.clone());
+                // Publish the server's PIN to status.json so the companion app
+                // (or the simulator mock-client) can read it, and re-publish it
+                // every STATUS_HEARTBEAT while we wait: the companion judges
+                // engine liveness from the file's mtime, and waiting for the
+                // HMD can take minutes. Each beat reads the PIN afresh — it
+                // rotates when PIN_LIFETIME_SECONDS runs out and on lockout —
+                // with the seconds left, so the companion's "Expires in: M:SS"
+                // countdown follows the real PIN.
+                let mut shown = None;
+                let accept_result = tokio::select! {
+                    r = with_heartbeat(tcp_server.listen_and_accept(), STATUS_HEARTBEAT, || publish_pin_status(&tcp_server, &mut shown)) => r,
+                    _ = cancel.cancelled() => { break; }
+                };
+
+                match accept_result {
+                    Ok((stream, addr)) => (tcp_server, stream, addr),
+                    Err(e) => {
+                        log::error!("TCP accept failed: {}", e);
+                        reconnect_state.record_accept_failure();
+                        if reconnect_state.should_stop_engine() {
+                            log::error!(
+                                "Max accept failures reached ({}) — stopping engine",
+                                reconnect_state.accept_failures(),
+                            );
+                            break;
+                        }
+                        continue;
+                    }
+                }
             }
         };
 
@@ -1588,15 +1606,19 @@ async fn run_streaming(
                     );
                 }
 
-                // Re-create TCP server and listen during hold period. Publish
-                // its PIN (and keep status.json fresh) so the companion
-                // stops showing the dead session as Connected.
-                let tcp_server = TcpControlServer::new(config.clone());
-                let hold_pin = tcp_server.current_pin().await;
+                // Listen again for the hold period with the session's own
+                // server, which accepts the PIN the HMD paired with (still
+                // on the companion's screen) once more, so a Wi-Fi blip
+                // doesn't need a new PIN. Publishing it (and keeping
+                // status.json fresh) also stops the companion showing the
+                // dead session as Connected. After the window, the next
+                // iteration starts over with a new server and PIN.
                 let hold_duration = std::time::Duration::from_secs(5);
+                tcp_server.rearm_for_reconnect(hold_duration).await;
+                let mut shown = None;
 
                 let reconnect_result = tokio::select! {
-                    r = with_heartbeat(tcp_server.listen_and_accept(), STATUS_HEARTBEAT, || publish_waiting_status(Some(hold_pin))) => Some(r),
+                    r = with_heartbeat(tcp_server.listen_and_accept(), STATUS_HEARTBEAT, || publish_pin_status(&tcp_server, &mut shown)) => Some(r),
                     _ = tokio::time::sleep(hold_duration) => None,
                     _ = cancel.cancelled() => {
                         log::info!("Engine shutdown during hold period");
@@ -1605,11 +1627,12 @@ async fn run_streaming(
                 };
 
                 match reconnect_result {
-                    Some(Ok((_stream, addr))) => {
-                        log::info!("HMD reconnected from {} during hold period", addr);
-                        // HMD reconnected — loop will accept again immediately.
-                        // The key improvement: listener was open, so HMD could find us.
-                        reconnect_state.record_clean_disconnect();
+                    Some(Ok((stream, addr))) => {
+                        log::info!("HMD reconnected from {} during hold period — resuming", addr);
+                        // Stream on the connection we just authenticated.
+                        // (It used to be dropped here, and the HMD had to
+                        // pair again with a new PIN.)
+                        resumed = Some((tcp_server, stream, addr));
                         continue; // Skip backoff, go directly to new session
                     }
                     Some(Err(e)) => {

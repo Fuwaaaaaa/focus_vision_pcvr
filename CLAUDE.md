@@ -112,7 +112,7 @@ Config values are validated on startup (range checks, NaN rejection, port confli
 
 ## Security
 - TCP control channel encrypted with TLS 1.3 (rustls server, MbedTLS client)
-- 6-digit PIN with cryptographic RNG (1M combinations, 5 attempts then 300s lockout)
+- 6-digit PIN with cryptographic RNG (1M combinations, 5 attempts then 300s lockout); a PIN expires 300 s after issue, and the 5 s reconnect hold accepts the session's PIN again
 - TOFU certificate pinning (SHA-256 fingerprint); server identity persisted in `%APPDATA%/FocusVisionPCVR/tls_identity.bin` (`control/tls.rs`) so the pin survives reconnects/restarts
 - Handshake phases time-bounded (TLS 10 s, steps 10 s, PIN 30 s) so a silent client can't block the accept loop
 - Tracking UDP accepted only from the paired HMD's IP during its session (`tracking/receiver.rs` `AuthorizedPeer`)
