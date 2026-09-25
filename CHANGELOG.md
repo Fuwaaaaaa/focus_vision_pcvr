@@ -51,6 +51,34 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   foveation gaze point. A transient `recv_from` error no longer ends the
   receiver loop for the rest of the engine's life.
 
+### Fixes
+- **status.json heartbeat.** The engine now rewrites status.json every second
+  while waiting for the HMD, during reconnect backoff, during the 5 s hold
+  period (with the hold server's PIN) and while streaming (wall-clock tick
+  instead of every Nth frame). Before, the file went untouched while waiting
+  or when frames stalled, so the companion's 5 s mtime check showed the red
+  "engine stopped" banner for a healthy engine.
+- **Companion: stale status is no longer shown as live.** A missing or stale
+  status.json (engine crashed) used to keep the last payload on screen —
+  Connected, frozen stats, an old PIN. It now shows Disconnected and clears
+  the PIN and its countdown. A slightly-future mtime (coarse FS timestamps,
+  clock step) no longer reads as "engine stopped", and a rotated PIN restarts
+  the "Expires in" countdown.
+- **Companion: settings persistence.** `local.toml` moves to
+  `%APPDATA%/FocusVisionPCVR/config/local.toml` (the path USER_GUIDE already
+  documented; the old exe/CWD-relative path under Program Files was not
+  user-writable and was wiped by the installer on reinstall). The legacy file
+  is migrated on first load. Writes are atomic and merge only the keys the
+  companion manages, so hand-written keys survive; an unparsable file is
+  backed up to `local.toml.bak` before being replaced. Saves are debounced
+  (500 ms, flushed on exit) instead of written every frame of a slider drag.
+- **Companion: diagnostics PII masking.** The sanitizer converted input byte
+  by byte, garbling all non-ASCII text (Japanese log lines) in exported logs,
+  and let a sentence-ending IP (`192.168.1.5.`) through. It is now UTF-8 safe
+  and masks SSIDs, the pairing PIN, user names in profile paths, e-mail, MAC,
+  IPv4 (octets 0–255) and IPv6 addresses, without touching version strings,
+  C++ `Class::method` scopes or clock times.
+
 ## [3.0.0] - 2026-06-01
 
 General availability. Promotes rc3 to the stable 3.0.0 release and turns the

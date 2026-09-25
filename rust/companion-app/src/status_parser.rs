@@ -11,7 +11,29 @@
 //! a v2-era payload (no `schema_version`) still parses, and an unknown
 //! future schema only logs a debug message instead of refusing to render.
 
+use std::time::{Duration, SystemTime};
+
 use serde::{Deserialize, Serialize};
+
+/// Decide whether `status.json` is recent enough to trust.
+///
+/// The engine rewrites the file at least once a second while it is running
+/// (waiting for the HMD, backing off, or streaming), so an mtime older than
+/// `threshold` means the engine has stopped or crashed. `mtime == None`
+/// (file missing / metadata unreadable) is stale.
+///
+/// An mtime slightly in the *future* happens with coarse filesystem
+/// timestamps or a clock step; it is treated as age 0 (fresh) as long as it is
+/// no further ahead than `threshold`. A file stamped further in the future
+/// is treated as stale, otherwise it would read as "alive" until the wall
+/// clock caught up, however long after the engine died.
+pub fn is_status_fresh(mtime: Option<SystemTime>, now: SystemTime, threshold: Duration) -> bool {
+    let Some(mtime) = mtime else { return false };
+    match now.duration_since(mtime) {
+        Ok(age) => age < threshold,
+        Err(ahead) => ahead.duration() <= threshold,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionStatus {
@@ -326,6 +348,43 @@ mod tests {
         }"#;
         let parsed = parse_status_json(json).unwrap();
         assert_eq!(parsed.pin_expires_in_seconds, None);
+    }
+
+    const THRESHOLD: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn freshness_recent_mtime_is_fresh() {
+        let now = SystemTime::now();
+        assert!(is_status_fresh(Some(now), now, THRESHOLD));
+        assert!(is_status_fresh(Some(now - Duration::from_secs(4)), now, THRESHOLD));
+    }
+
+    #[test]
+    fn freshness_old_mtime_is_stale() {
+        let now = SystemTime::now();
+        assert!(!is_status_fresh(Some(now - Duration::from_secs(5)), now, THRESHOLD));
+        assert!(!is_status_fresh(Some(now - Duration::from_secs(3600)), now, THRESHOLD));
+    }
+
+    #[test]
+    fn freshness_missing_file_is_stale() {
+        assert!(!is_status_fresh(None, SystemTime::now(), THRESHOLD));
+    }
+
+    #[test]
+    fn freshness_slightly_future_mtime_is_fresh() {
+        // Regression: duration_since() errs for a future mtime (coarse FS
+        // timestamps, clock step) and that used to read as "engine stopped".
+        let now = SystemTime::now();
+        assert!(is_status_fresh(Some(now + Duration::from_secs(2)), now, THRESHOLD));
+    }
+
+    #[test]
+    fn freshness_far_future_mtime_is_stale() {
+        // A file stamped far ahead must not keep a dead engine "alive" until
+        // the wall clock catches up.
+        let now = SystemTime::now();
+        assert!(!is_status_fresh(Some(now + Duration::from_secs(3600)), now, THRESHOLD));
     }
 
     #[test]

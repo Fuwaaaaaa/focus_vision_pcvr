@@ -46,7 +46,7 @@ cargo test --workspace                              # 500+ Rust tests
 ```bash
 cargo test --workspace                              # All Rust tests (500+ unit + integration)
 cargo test -p streaming-engine                      # Engine: 380+ tests + integration
-cargo test -p focus-vision-companion --bins         # Companion: 60 tests (config, ADB, export, status_parser, demo, svg_export, ui/settings validator)
+cargo test -p focus-vision-companion --bins         # Companion: 97 tests (config, ADB, export/PII mask, status_parser, status state machine, demo, svg_export, ui/settings validator)
 cargo test -p fvp-common                            # Common: protocol structs / flags / versioning
 cargo bench -p streaming-engine                     # Criterion benchmarks
 cargo clippy --workspace --all-features --all-targets -- -D warnings  # CI clippy gate, fully clean
@@ -91,8 +91,13 @@ Tabs (file-per-tab under `rust/companion-app/src/ui/`):
 
 ## Config
 `config/default.toml` — override with `config/local.toml` (gitignored).
-Companion app additionally writes a `local.toml` for its UI-side overrides
-(`[video] [sleep_mode] [face_tracking] [recording] [audio] [deploy]`).
+Companion app writes its UI-side overrides
+(`[video] [sleep_mode] [face_tracking] [recording] [audio] [deploy]`) to
+`%APPDATA%/FocusVisionPCVR/config/local.toml` — debounced, atomic, merging only
+its own keys (other keys are preserved; an unparsable file is backed up to
+`local.toml.bak`). A legacy exe/CWD-relative `config/local.toml` is migrated on
+first load. Note: the engine does not read `local.toml` yet (it loads only
+`config/default.toml`).
 Config values are validated on startup (range checks, NaN rejection, port conflict detection).
 
 ## Release / Signing
