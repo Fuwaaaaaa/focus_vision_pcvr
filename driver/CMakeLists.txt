@@ -16,9 +16,14 @@ if(DRIVER_SOURCES)
     if(MSVC)
         target_compile_options(driver_focus_vision_pcvr PRIVATE /utf-8)
     endif()
+    # runtimeobject: cpal's WASAPI backend pulls in windows-core, whose WinRT
+    # factory cache calls RoGetActivationFactory. The Rust side expects that
+    # import to come from the windows-targets import lib (windows.0.52.0.lib),
+    # which this CMake build does not link — without runtimeobject the DLL
+    # fails with LNK2019 __imp_RoGetActivationFactory.
     target_link_libraries(driver_focus_vision_pcvr PRIVATE
         "${RUST_TARGET_DIR}/streaming_engine.lib"
-        ws2_32 userenv ntdll bcrypt d3d11 dxgi propsys ole32 oleaut32)
+        ws2_32 userenv ntdll bcrypt d3d11 dxgi propsys ole32 oleaut32 runtimeobject)
     set_target_properties(driver_focus_vision_pcvr PROPERTIES
         OUTPUT_NAME "driver_focus_vision_pcvr"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/focus_vision_pcvr/bin/win64")
