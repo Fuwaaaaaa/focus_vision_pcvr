@@ -395,6 +395,7 @@ impl StreamingEngine {
 
 /// Heartbeat stats received from HMD.
 /// Parsed from HEARTBEAT TCP message payload.
+#[derive(Debug, Clone, Copy)]
 pub struct HmdStats {
     pub packets_received: u32,
     pub packets_lost: u32,
@@ -402,7 +403,6 @@ pub struct HmdStats {
     pub fps: u16,
 }
 
-/// Read TCP control messages and write haptic events.
 /// TCP disconnect reason, used to decide whether to hold state for reconnection.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum DisconnectReason {
@@ -414,23 +414,63 @@ pub(crate) enum DisconnectReason {
     ProtocolError,
 }
 
-/// Handles: IDR_REQUEST, HEARTBEAT, FACE_DATA, TRANSPORT_FEEDBACK, DISCONNECT (inbound).
-/// Sends: HAPTIC_EVENT (outbound to HMD).
-/// When the connection closes or errors, cancels the provided token to stop streaming.
-/// Returns the disconnect reason so the caller can decide whether to hold state.
-#[allow(clippy::too_many_arguments)]
+/// What the TCP control task hands to the frame loop. The frame loop owns
+/// all adaptive-bitrate state ([`AdaptiveState`]), so neither side takes a
+/// lock — and feedback is no longer dropped because the other side happened
+/// to hold one.
+#[derive(Debug)]
+enum ControlEvent {
+    /// HEARTBEAT: the HMD's receive stats since its previous heartbeat.
+    Heartbeat(HmdStats),
+    /// TRANSPORT_FEEDBACK: per-packet receive times for delay-based estimation.
+    TransportFeedback(Vec<fvp_common::protocol::TransportFeedbackEntry>),
+}
+
+/// Room for this many [`ControlEvent`]s while the frame loop is busy (a
+/// heartbeat every 500 ms plus transport feedback). If it fills, the frame
+/// loop has stalled for seconds and the stale events are dropped.
+const CONTROL_EVENT_CAPACITY: usize = 256;
+
+/// Events dropped because the frame loop fell behind.
+static CONTROL_EVENT_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One session's TCP control connection, run by the "tcp-control" task.
+/// Handles: IDR_REQUEST, HEARTBEAT, FACE_DATA, TRANSPORT_FEEDBACK,
+/// CONFIG_UPDATE, DISCONNECT (inbound). Sends: HEARTBEAT_ACK,
+/// CONFIG_UPDATE_ACK, HAPTIC_EVENT, SLEEP_ENTER / SLEEP_EXIT (outbound).
+struct ControlChannel {
+    /// Cancelled when the connection closes or errors, to stop the session.
+    cancel: CancellationToken,
+    /// HEARTBEAT and TRANSPORT_FEEDBACK go to the frame loop.
+    events: mpsc::Sender<ControlEvent>,
+    /// FACE_DATA → VRChat OSC.
+    osc_bridge: crate::face_tracking::osc_bridge::OscBridge,
+    haptic_rx: mpsc::Receiver<HapticEvent>,
+    /// `true` = entering sleep, `false` = waking (from the frame loop).
+    sleep_rx: mpsc::Receiver<bool>,
+}
+
+impl ControlChannel {
+    /// Hand an event to the frame loop without ever blocking the reader.
+    fn forward(&self, event: ControlEvent) {
+        if self.events.try_send(event).is_err() && !self.events.is_closed() {
+            let count = CONTROL_EVENT_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if count % 100 == 1 {
+                log::warn!("Control event dropped: frame loop is behind ({} total)", count);
+            }
+        }
+    }
+}
+
+/// Serve `ctl`'s connection until it closes, cancelling `ctl.cancel` then.
+/// Returns the disconnect reason so the caller can decide whether to hold
+/// state.
 async fn handle_tcp_control(
-    stream: Box<dyn crate::control::tcp_server::AsyncStream>,
-    cancel: tokio_util::sync::CancellationToken,
-    hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
-    osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
-    gcc_estimator: Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>>,
-    sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>>,
-    mut haptic_rx: mpsc::Receiver<HapticEvent>,
-    mut sleep_rx: mpsc::Receiver<bool>,
-    gcc_enabled: bool,
+    ctl: &mut ControlChannel,
+    stream: Box<dyn AsyncStream>,
 ) -> Result<DisconnectReason, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let cancel = ctl.cancel.clone();
 
     const CONFIG_UPDATE_MIN_INTERVAL_MS: u64 = 1000; // Rate limit: 1 update/sec
 
@@ -508,14 +548,12 @@ async fn handle_tcp_control(
                             let avg_decode_us = u32::from_le_bytes([s[8], s[9], s[10], s[11]]);
                             let fps = u16::from_le_bytes([s[12], s[13]]);
 
-                            if let Ok(mut guard) = hmd_stats.lock() {
-                                *guard = Some(HmdStats {
-                                    packets_received,
-                                    packets_lost,
-                                    avg_decode_us,
-                                    fps,
-                                });
-                            }
+                            ctl.forward(ControlEvent::Heartbeat(HmdStats {
+                                packets_received,
+                                packets_lost,
+                                avg_decode_us,
+                                fps,
+                            }));
 
                             // Send HEARTBEAT_ACK with PC-side latency for waterfall overlay
                             let encode_us = PC_ENCODE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
@@ -536,13 +574,8 @@ async fn handle_tcp_control(
                         if let Some((lip_valid, eye_valid, lip, eye)) =
                             crate::face_tracking::osc_bridge::parse_face_data(payload)
                         {
-                            match osc_bridge.try_lock() {
-                                Ok(mut bridge) => {
-                                    log::debug!("engine: forwarding face data to OscBridge (lip_valid={}, eye_valid={})", lip_valid, eye_valid);
-                                    bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
-                                }
-                                Err(_) => log::warn!("engine: FACE_DATA dropped — osc_bridge lock contended"),
-                            }
+                            log::debug!("engine: forwarding face data to OscBridge (lip_valid={}, eye_valid={})", lip_valid, eye_valid);
+                            ctl.osc_bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
                         } else {
                             log::warn!("engine: FACE_DATA parse failed ({}B)", payload.len());
                         }
@@ -551,23 +584,7 @@ async fn handle_tcp_control(
                         let payload = &msg_buf[1..];
                         if let Some(entries) = fvp_common::protocol::parse_transport_feedback(payload) {
                             log::debug!("Received TRANSPORT_FEEDBACK: {} entries", entries.len());
-                            // Enrich feedback entries with PC-side send timestamps
-                            if let Ok(guard) = sent_packet_log.try_lock() {
-                                for entry in &entries {
-                                    if let Some(&send_us) = guard.get(&entry.sequence) {
-                                        log::trace!(
-                                            "FEEDBACK seq={} send_us={} recv_delta_us={}",
-                                            entry.sequence, send_us, entry.recv_delta_us
-                                        );
-                                    }
-                                }
-                            }
-                            // Only feed GCC estimator when delay-based congestion control is enabled
-                            if gcc_enabled {
-                                if let Ok(mut guard) = gcc_estimator.try_lock() {
-                                    guard.process_feedback(&entries);
-                                }
-                            }
+                            ctl.forward(ControlEvent::TransportFeedback(entries));
                         } else {
                             log::warn!("Invalid TRANSPORT_FEEDBACK payload ({}B)", payload.len());
                         }
@@ -646,13 +663,13 @@ async fn handle_tcp_control(
                     }
                 }
             }
-            Some(haptic) = haptic_rx.recv() => {
+            Some(haptic) = ctl.haptic_rx.recv() => {
                 let payload = haptic.to_payload();
                 if let Err(e) = send_msg(&mut writer, fvp_common::protocol::msg_type::HAPTIC_EVENT, &payload).await {
                     log::warn!("Failed to send haptic event: {}", e);
                 }
             }
-            Some(is_sleep) = sleep_rx.recv() => {
+            Some(is_sleep) = ctl.sleep_rx.recv() => {
                 let mt = if is_sleep {
                     fvp_common::protocol::msg_type::SLEEP_ENTER
                 } else {
@@ -873,77 +890,128 @@ fn spawn_audio_pipeline(
 
 }
 
-/// Check HMD-reported stats and adjust bitrate and FEC redundancy accordingly.
-/// Called once per second (every `framerate` frames).
-#[allow(clippy::too_many_arguments)]
-fn update_adaptive_bitrate(
-    frame_count: u64,
-    framerate: u64,
-    hmd_stats: &Arc<StdMutex<Option<HmdStats>>>,
-    gcc_estimator: &Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>>,
-    bw_estimator: &mut crate::adaptive::bandwidth_estimator::BandwidthEstimator,
-    bitrate_ctrl: &mut crate::adaptive::bitrate_controller::BitrateController,
-    mut adaptive_fec: Option<&mut crate::transport::fec::AdaptiveFecController>,
-    fec_encoder: &mut pipeline::FrameFecEncoder,
-    burst_detector: &Arc<StdMutex<crate::adaptive::burst_detector::BurstDetector>>,
+/// Adaptive bitrate + FEC state of one session. Owned by the frame loop and
+/// fed [`ControlEvent`]s from the TCP control task, so it needs no locks.
+struct AdaptiveState {
+    bw_estimator: crate::adaptive::bandwidth_estimator::BandwidthEstimator,
+    bitrate_ctrl: crate::adaptive::bitrate_controller::BitrateController,
+    /// Classifies transient burst loss vs sustained congestion.
+    burst_detector: crate::adaptive::burst_detector::BurstDetector,
+    gcc_estimator: crate::adaptive::gcc_estimator::GccEstimator,
+    /// `network.congestion_control == "gcc"`: feed transport feedback to the
+    /// delay-based estimator. Otherwise ("loss") bitrate follows loss alone.
     gcc_enabled: bool,
-) {
-    if !frame_count.is_multiple_of(framerate) {
-        return;
-    }
+    adaptive_fec: Option<crate::transport::fec::AdaptiveFecController>,
+    sleep_detector: crate::sleep_mode::SleepDetector,
+    /// Newest HEARTBEAT stats not yet used by `tick` (each is used once).
+    pending_stats: Option<HmdStats>,
+    /// Newest HEARTBEAT stats, for the loss figure in status.json.
+    last_stats: Option<HmdStats>,
+}
 
-    // Take the latest HMD stats snapshot; if none, nothing to do this tick.
-    let stats = match hmd_stats.lock() {
-        Ok(mut g) => match g.take() {
-            Some(s) => s,
-            None => return,
-        },
-        Err(_) => return,
-    };
-    bw_estimator.update(stats.packets_received, stats.packets_lost, 0.0);
-
-    if gcc_enabled {
-        // Single critical section: lock burst → gcc (consistent order, deadlock-free),
-        // update + read both, run bitrate adjustment.
-        let mut burst = match burst_detector.lock() { Ok(g) => g, Err(_) => return };
-        burst.record(bw_estimator.loss_rate());
-
-        let gcc = match gcc_estimator.lock() { Ok(g) => g, Err(_) => return };
-        if bitrate_ctrl.adjust(bw_estimator, &gcc, &burst) {
-            notify_bitrate_change(bitrate_ctrl.current_bitrate_bps() as u32);
-        }
-
-        // FEC response to burst. On boost activation, skip the loss-based adjust
-        // below so the boost level wins this tick.
-        if burst.recommend_fec_boost() {
-            if let Some(afec) = adaptive_fec.as_deref_mut() {
-                log::info!("Burst loss: boosting FEC redundancy");
-                afec.activate_boost();
-                fec_encoder.set_redundancy(afec.effective_redundancy());
-                return;
-            }
-        } else if let Some(afec) = adaptive_fec.as_deref_mut() {
-            if afec.effective_redundancy() != afec.current_redundancy() {
-                afec.deactivate_boost();
-                fec_encoder.set_redundancy(afec.effective_redundancy());
-            }
-        }
-        // drop gcc + burst here
-    } else {
-        // Loss-only mode: adjust with neutral GCC + burst defaults.
-        let default_gcc = crate::adaptive::gcc_estimator::GccEstimator::new(
-            bitrate_ctrl.current_bitrate_bps(),
-        );
-        let default_burst = crate::adaptive::burst_detector::BurstDetector::new();
-        if bitrate_ctrl.adjust(bw_estimator, &default_gcc, &default_burst) {
-            notify_bitrate_change(bitrate_ctrl.current_bitrate_bps() as u32);
+impl AdaptiveState {
+    fn new(config: &AppConfig) -> Self {
+        let adaptive_fec = if config.network.adaptive_fec_enabled {
+            Some(crate::transport::fec::AdaptiveFecController::new(
+                config.network.fec_redundancy_min,
+                config.network.fec_redundancy_max,
+                config.network.fec_redundancy,
+            ))
+        } else {
+            log::info!("Adaptive FEC disabled — using fixed redundancy {:.0}%", config.network.fec_redundancy * 100.0);
+            None
+        };
+        Self {
+            bw_estimator: crate::adaptive::bandwidth_estimator::BandwidthEstimator::new(),
+            bitrate_ctrl: crate::adaptive::bitrate_controller::BitrateController::new(
+                config.video.bitrate_mbps,
+            ),
+            burst_detector: crate::adaptive::burst_detector::BurstDetector::new(),
+            gcc_estimator: crate::adaptive::gcc_estimator::GccEstimator::new(
+                config.video.bitrate_mbps as u64 * 1_000_000,
+            ),
+            gcc_enabled: config.network.congestion_control == "gcc",
+            adaptive_fec,
+            sleep_detector: crate::sleep_mode::SleepDetector::new(
+                config.sleep_mode.enabled,
+                config.sleep_mode.motion_threshold,
+                config.sleep_mode.timeout_seconds,
+                config.sleep_mode.sleep_bitrate_mbps,
+            ),
+            pending_stats: None,
+            last_stats: None,
         }
     }
 
-    // Loss-based FEC adjustment (skipped during burst-boost early return above).
-    if let Some(afec) = adaptive_fec {
-        if afec.adjust(bw_estimator.loss_rate()) {
-            fec_encoder.set_redundancy(afec.effective_redundancy());
+    /// Take in an event from the TCP control task. `sent_packet_log` maps
+    /// RTP sequence numbers to our send times, for feedback tracing.
+    fn on_event(&mut self, event: ControlEvent, sent_packet_log: &HashMap<u16, u64>) {
+        match event {
+            ControlEvent::Heartbeat(stats) => {
+                self.pending_stats = Some(stats);
+                self.last_stats = Some(stats);
+            }
+            ControlEvent::TransportFeedback(entries) => {
+                for entry in &entries {
+                    if let Some(&send_us) = sent_packet_log.get(&entry.sequence) {
+                        log::trace!(
+                            "FEEDBACK seq={} send_us={} recv_delta_us={}",
+                            entry.sequence, send_us, entry.recv_delta_us
+                        );
+                    }
+                }
+                // Only feed GCC estimator when delay-based congestion control is enabled
+                if self.gcc_enabled {
+                    self.gcc_estimator.process_feedback(&entries);
+                }
+            }
+        }
+    }
+
+    /// Adjust bitrate and FEC redundancy from the newest HMD stats; nothing
+    /// to do if no heartbeat arrived since the last tick. Called once per
+    /// second (every `framerate` frames).
+    fn tick(&mut self, fec_encoder: &mut pipeline::FrameFecEncoder) {
+        let Some(stats) = self.pending_stats.take() else { return };
+        self.bw_estimator.update(stats.packets_received, stats.packets_lost, 0.0);
+
+        if self.gcc_enabled {
+            self.burst_detector.record(self.bw_estimator.loss_rate());
+            if self.bitrate_ctrl.adjust(&self.bw_estimator, &self.gcc_estimator, &self.burst_detector) {
+                notify_bitrate_change(self.bitrate_ctrl.current_bitrate_bps() as u32);
+            }
+
+            // FEC response to burst. On boost activation, skip the loss-based adjust
+            // below so the boost level wins this tick.
+            if self.burst_detector.recommend_fec_boost() {
+                if let Some(afec) = self.adaptive_fec.as_mut() {
+                    log::info!("Burst loss: boosting FEC redundancy");
+                    afec.activate_boost();
+                    fec_encoder.set_redundancy(afec.effective_redundancy());
+                    return;
+                }
+            } else if let Some(afec) = self.adaptive_fec.as_mut() {
+                if afec.effective_redundancy() != afec.current_redundancy() {
+                    afec.deactivate_boost();
+                    fec_encoder.set_redundancy(afec.effective_redundancy());
+                }
+            }
+        } else {
+            // Loss-only mode: adjust with neutral GCC + burst defaults.
+            let default_gcc = crate::adaptive::gcc_estimator::GccEstimator::new(
+                self.bitrate_ctrl.current_bitrate_bps(),
+            );
+            let default_burst = crate::adaptive::burst_detector::BurstDetector::new();
+            if self.bitrate_ctrl.adjust(&self.bw_estimator, &default_gcc, &default_burst) {
+                notify_bitrate_change(self.bitrate_ctrl.current_bitrate_bps() as u32);
+            }
+        }
+
+        // Loss-based FEC adjustment (skipped during burst-boost early return above).
+        if let Some(afec) = self.adaptive_fec.as_mut() {
+            if afec.adjust(self.bw_estimator.loss_rate()) {
+                fec_encoder.set_redundancy(afec.effective_redundancy());
+            }
         }
     }
 }
@@ -1021,21 +1089,18 @@ fn init_recorder(config: &AppConfig) -> Option<Arc<StdMutex<crate::recording::Re
 
 /// Record the current send timestamp for every packet's RTP seq number,
 /// so GCC / delay estimation can correlate transport feedback back to send time.
-/// Skipped silently if the lock is contended.
 fn record_send_timestamps(
-    sent_packet_log: &Arc<StdMutex<HashMap<u16, u64>>>,
+    sent_packet_log: &mut HashMap<u16, u64>,
     packets: &[crate::transport::rtp::RtpPacket],
 ) {
     let send_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0);
-    if let Ok(mut log_guard) = sent_packet_log.try_lock() {
-        for packet in packets {
-            if packet.data.len() >= 4 {
-                let seq = u16::from_be_bytes([packet.data[2], packet.data[3]]);
-                log_guard.insert(seq, send_us);
-            }
+    for packet in packets {
+        if packet.data.len() >= 4 {
+            let seq = u16::from_be_bytes([packet.data[2], packet.data[3]]);
+            sent_packet_log.insert(seq, send_us);
         }
     }
 }
@@ -1044,7 +1109,7 @@ fn record_send_timestamps(
 /// newest `SENT_LOG_KEEP` entries. Runs every `SENT_LOG_PRUNE_INTERVAL`
 /// frames (~3.3s @ 90fps) to avoid per-frame sort overhead.
 fn prune_sent_packet_log_if_due(
-    sent_packet_log: &Arc<StdMutex<HashMap<u16, u64>>>,
+    sent_packet_log: &mut HashMap<u16, u64>,
     frame_count: u64,
 ) {
     const SENT_LOG_PRUNE_INTERVAL: u64 = 300;
@@ -1053,41 +1118,86 @@ fn prune_sent_packet_log_if_due(
     if !frame_count.is_multiple_of(SENT_LOG_PRUNE_INTERVAL) {
         return;
     }
-    if let Ok(mut log_guard) = sent_packet_log.try_lock() {
-        if log_guard.len() > SENT_LOG_MAX {
-            let mut entries: Vec<(u16, u64)> = log_guard.drain().collect();
-            entries.sort_unstable_by_key(|&(_, ts)| std::cmp::Reverse(ts));
-            entries.truncate(SENT_LOG_KEEP);
-            log_guard.extend(entries);
-        }
+    if sent_packet_log.len() > SENT_LOG_MAX {
+        let mut entries: Vec<(u16, u64)> = sent_packet_log.drain().collect();
+        entries.sort_unstable_by_key(|&(_, ts)| std::cmp::Reverse(ts));
+        entries.truncate(SENT_LOG_KEEP);
+        sent_packet_log.extend(entries);
     }
 }
 
-/// Send one encoded frame: FEC-code it (the encoder picks slice-based or bulk
-/// FEC per frame, see `pipeline::choose_fec_layout`), UDP-send the resulting
-/// packets one code word at a time, and record send timestamps.
-/// Returns after the frame has been dispatched (packets may still be in kernel
-/// queue — the caller's mark_send happens after this).
-async fn send_encoded_frame(
-    frame: &EncodedFrame,
-    timestamp_90khz: u32,
-    packetizer: &mut RtpPacketizer,
-    fec_encoder: &mut pipeline::FrameFecEncoder,
-    udp_sender: &UdpSender,
-    sent_packet_log: &Arc<StdMutex<HashMap<u16, u64>>>,
-) {
-    let batches = fec_encoder.encode(
-        &frame.nal_data,
-        frame.frame_index,
-        timestamp_90khz,
-        frame.is_idr,
-        packetizer,
-    );
-    for packets in &batches {
-        if let Err(e) = udp_sender.send_all(packets).await {
-            log::warn!("UDP send error: {}", e);
+/// The frame loop's per-session video sender: packetization, FEC and UDP,
+/// plus the send-time log that transport feedback is matched against.
+struct VideoSender {
+    udp_sender: UdpSender,
+    packetizer: RtpPacketizer,
+    fec_encoder: pipeline::FrameFecEncoder,
+    /// RTP sequence number → PC-side send timestamp (µs).
+    sent_packet_log: HashMap<u16, u64>,
+    frame_count: u64,
+    latency_skip_count: u64,
+}
+
+impl VideoSender {
+    fn new(config: &AppConfig, udp_sender: UdpSender) -> Self {
+        Self {
+            udp_sender,
+            packetizer: RtpPacketizer::new(0x46565000),
+            fec_encoder: pipeline::FrameFecEncoder::new(
+                config.network.fec_redundancy,
+                config.network.slice_fec_enabled,
+                config.network.slice_count,
+            ),
+            sent_packet_log: HashMap::new(),
+            frame_count: 0,
+            latency_skip_count: 0,
         }
-        record_send_timestamps(sent_packet_log, packets);
+    }
+
+    /// Send one encoded frame: FEC-code it (the encoder picks slice-based or
+    /// bulk FEC per frame, see `pipeline::choose_fec_layout`), UDP-send the
+    /// resulting packets one code word at a time, record send timestamps and
+    /// the frame's latency, and count it.
+    async fn send_frame(
+        &mut self,
+        mut frame: EncodedFrame,
+        framerate: u64,
+        latency_tracker: &Arc<StdMutex<LatencyTracker>>,
+    ) {
+        frame.timestamps.mark_encode_start();
+        frame.timestamps.mark_encode_end();
+
+        // Multiply first to avoid integer division truncation drift (e.g. 90000/96=937.5)
+        let timestamp_90khz = (self.frame_count * fvp_common::RTP_CLOCK_RATE as u64 / framerate) as u32;
+
+        let batches = self.fec_encoder.encode(
+            &frame.nal_data,
+            frame.frame_index,
+            timestamp_90khz,
+            frame.is_idr,
+            &mut self.packetizer,
+        );
+        for packets in &batches {
+            if let Err(e) = self.udp_sender.send_all(packets).await {
+                log::warn!("UDP send error: {}", e);
+            }
+            record_send_timestamps(&mut self.sent_packet_log, packets);
+        }
+        prune_sent_packet_log_if_due(&mut self.sent_packet_log, self.frame_count);
+
+        // Packets may still be in the kernel queue; this marks dispatch.
+        frame.timestamps.mark_send();
+
+        if let Ok(mut tracker) = latency_tracker.try_lock() {
+            tracker.record(frame.timestamps);
+        } else {
+            self.latency_skip_count += 1;
+            if self.latency_skip_count % 90 == 1 {
+                log::debug!("Latency tracker lock contention (skipped {} samples)", self.latency_skip_count);
+            }
+        }
+
+        self.frame_count += 1;
     }
 }
 
@@ -1112,22 +1222,18 @@ fn publish_streaming_status(
     config: &AppConfig,
     bitrate_mbps: u32,
     sleeping: bool,
-    hmd_stats: &Arc<StdMutex<Option<HmdStats>>>,
+    hmd_stats: Option<&HmdStats>,
 ) {
     let latency_us = PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as u64;
     // Loss% from the most recent HEARTBEAT-reported HMD stats, if any.
     let packet_loss_pct = hmd_stats
-        .lock()
-        .ok()
-        .and_then(|g| {
-            g.as_ref().map(|s| {
-                let total = s.packets_received + s.packets_lost;
-                if total == 0 {
-                    0.0
-                } else {
-                    s.packets_lost as f32 / total as f32 * 100.0
-                }
-            })
+        .map(|s| {
+            let total = s.packets_received + s.packets_lost;
+            if total == 0 {
+                0.0
+            } else {
+                s.packets_lost as f32 / total as f32 * 100.0
+            }
         })
         .unwrap_or(0.0);
     let subsystems = crate::SubsystemStatus {
@@ -1225,146 +1331,240 @@ impl Drop for AuthorizedPeerGuard {
 
 async fn run_streaming(
     config: AppConfig,
-    mut frame_rx: mpsc::Receiver<EncodedFrame>,
-    _tracking: Arc<StdMutex<Option<TrackingData>>>,
+    frame_rx: mpsc::Receiver<EncodedFrame>,
+    tracking: Arc<StdMutex<Option<TrackingData>>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
     authorized_peer: AuthorizedPeer,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Reconnect loop: when a session ends (TCP disconnect, Wi-Fi drop),
-    // clean up and re-listen for a new HMD connection.
-    //
-    // Counter rules and exponential backoff live in `control::reconnect`
-    // so they are unit-testable without spinning up the full async loop.
-    // The 2-token (session_cancel + connection_cancel) split that keeps
-    // audio alive across the 5 s hold window is intentionally deferred
-    // to Phase 4.2 — it requires real Wi-Fi drop testing to validate.
-    let mut reconnect_state = crate::control::reconnect::ReconnectState::new();
+    StreamingLoop::new(config, frame_rx, tracking, latency_tracker, authorized_peer, cancel)
+        .run()
+        .await;
+    Ok(())
+}
 
-    // Thermal governor lives for the whole engine — NVML init is non-trivial
-    // (~tens of ms) so we pay it once. `try_create_nvml` returns `None` on
-    // non-NVIDIA hosts and when the `nvml` cargo feature is compiled out,
-    // so every call site treats the governor as opt-in: present → cap by
-    // multiplier, absent → no cap. The base ceiling re-applies each session
-    // because `bitrate_ctrl` is per-session.
-    let mut thermal_gov: Option<crate::thermal::ThermalGovernor> =
-        if config.thermal.enabled {
+/// An authenticated HMD connection and the server (with its PIN) that
+/// accepted it.
+struct Connection {
+    server: TcpControlServer,
+    stream: Box<dyn AsyncStream>,
+    peer: SocketAddr,
+}
+
+enum Accepted {
+    Connected(Box<Connection>),
+    /// Accept failed; try again after the backoff.
+    Retry,
+    /// Engine shutdown, or too many accept failures.
+    Stop,
+}
+
+enum SessionEnd {
+    Disconnected(DisconnectReason),
+    /// The session could not start (UDP sender).
+    SetupFailed,
+    Shutdown,
+}
+
+enum HoldOutcome {
+    Resumed(Box<Connection>),
+    NoReconnect,
+    Shutdown,
+}
+
+/// The engine's accept → session → hold loop, with the state that outlives a
+/// single session.
+struct StreamingLoop {
+    config: AppConfig,
+    frame_rx: mpsc::Receiver<EncodedFrame>,
+    tracking: Arc<StdMutex<Option<TrackingData>>>,
+    latency_tracker: Arc<StdMutex<LatencyTracker>>,
+    authorized_peer: AuthorizedPeer,
+    cancel: CancellationToken,
+    /// Counter rules and exponential backoff live in `control::reconnect`
+    /// so they are unit-testable without spinning up the full async loop.
+    reconnect_state: crate::control::reconnect::ReconnectState,
+    /// Thermal governor lives for the whole engine — NVML init is non-trivial
+    /// (~tens of ms) so we pay it once. `try_create_nvml` returns `None` on
+    /// non-NVIDIA hosts and when the `nvml` cargo feature is compiled out,
+    /// so every call site treats the governor as opt-in: present → cap by
+    /// multiplier, absent → no cap. The base ceiling re-applies each session
+    /// because `bitrate_ctrl` is per-session.
+    thermal_gov: Option<crate::thermal::ThermalGovernor>,
+}
+
+impl StreamingLoop {
+    fn new(
+        config: AppConfig,
+        frame_rx: mpsc::Receiver<EncodedFrame>,
+        tracking: Arc<StdMutex<Option<TrackingData>>>,
+        latency_tracker: Arc<StdMutex<LatencyTracker>>,
+        authorized_peer: AuthorizedPeer,
+        cancel: CancellationToken,
+    ) -> Self {
+        let thermal_gov = if config.thermal.enabled {
             crate::thermal::ThermalGovernor::try_create_nvml(config.thermal.clone())
         } else {
             None
         };
-    if thermal_gov.is_some() {
-        log::info!(
-            "Thermal governor armed (warn={}°C / limit={}°C / emergency={}°C)",
-            config.thermal.warn_celsius,
-            config.thermal.limit_celsius,
-            config.thermal.emergency_celsius,
-        );
+        if thermal_gov.is_some() {
+            log::info!(
+                "Thermal governor armed (warn={}°C / limit={}°C / emergency={}°C)",
+                config.thermal.warn_celsius,
+                config.thermal.limit_celsius,
+                config.thermal.emergency_celsius,
+            );
+        }
+        Self {
+            config,
+            frame_rx,
+            tracking,
+            latency_tracker,
+            authorized_peer,
+            cancel,
+            reconnect_state: crate::control::reconnect::ReconnectState::new(),
+            thermal_gov,
+        }
     }
 
-    // A connection accepted during the previous session's hold window —
-    // already through TLS + PIN with that session's server — to resume on.
-    let mut resumed: Option<(TcpControlServer, Box<dyn AsyncStream>, SocketAddr)> = None;
+    /// Reconnect loop: when a session ends (TCP disconnect, Wi-Fi drop),
+    /// clean up and re-listen for a new HMD connection.
+    ///
+    /// The 2-token (session_cancel + connection_cancel) split that keeps
+    /// audio alive across the 5 s hold window is intentionally deferred
+    /// to Phase 4.2 — it requires real Wi-Fi drop testing to validate.
+    async fn run(mut self) {
+        // A connection accepted during the previous session's hold window —
+        // already through TLS + PIN with that session's server — to resume on.
+        let mut resumed: Option<Box<Connection>> = None;
 
-    loop {
-        if cancel.is_cancelled() { break; }
+        loop {
+            if self.cancel.is_cancelled() { break; }
 
-        let (tcp_server, tcp_control_stream, peer_addr) = match resumed.take() {
-            Some(session) => session,
-            None => {
-                if let Some(delay) = reconnect_state.next_backoff() {
-                    log::info!(
-                        "Retrying accept in {:?} (failure {}/{})",
-                        delay,
-                        reconnect_state.accept_failures(),
-                        crate::control::reconnect::MAX_ACCEPT_FAILURES,
-                    );
-                    // Backoff can last up to 16 s — keep status.json fresh so the
-                    // companion doesn't report the engine as stopped meanwhile.
-                    tokio::select! {
-                        _ = with_heartbeat(tokio::time::sleep(delay), STATUS_HEARTBEAT, || publish_waiting_status(None)) => {}
-                        _ = cancel.cancelled() => { break; }
+            let conn = match resumed.take() {
+                Some(conn) => conn,
+                None => match self.accept().await {
+                    Accepted::Connected(conn) => conn,
+                    Accepted::Retry => continue,
+                    Accepted::Stop => break,
+                },
+            };
+            let Connection { server, stream, peer } = *conn;
+            log::info!("HMD connected from {}, starting video stream", peer);
+            self.reconnect_state.record_accept_success();
+
+            let reason = match self.run_session(stream, peer).await {
+                SessionEnd::Disconnected(reason) => reason,
+                SessionEnd::SetupFailed => {
+                    self.reconnect_state.record_accept_failure();
+                    continue;
+                }
+                SessionEnd::Shutdown => return,
+            };
+
+            match reason {
+                DisconnectReason::ConnectionLost => {
+                    log::info!("Connection lost — listening for reconnection (5s hold)");
+                    self.reconnect_state.record_connection_lost();
+                    if self.reconnect_state.is_reconnect_warning_due() {
+                        log::warn!(
+                            "Wi-Fi reconnect attempts: {}/{} — still accepting connections",
+                            self.reconnect_state.reconnect_attempts(),
+                            crate::control::reconnect::MAX_RECONNECT_ATTEMPTS,
+                        );
+                    }
+                    match self.hold(server).await {
+                        HoldOutcome::Resumed(conn) => {
+                            resumed = Some(conn);
+                            continue; // Skip backoff, go directly to new session
+                        }
+                        HoldOutcome::NoReconnect => {}
+                        HoldOutcome::Shutdown => return,
                     }
                 }
-
-                // Step 1: Wait for HMD to connect via TCP
-                let tcp_server = TcpControlServer::new(config.clone());
-                // Publish the server's PIN to status.json so the companion app
-                // (or the simulator mock-client) can read it, and re-publish it
-                // every STATUS_HEARTBEAT while we wait: the companion judges
-                // engine liveness from the file's mtime, and waiting for the
-                // HMD can take minutes. Each beat reads the PIN afresh — it
-                // rotates when PIN_LIFETIME_SECONDS runs out and on lockout —
-                // with the seconds left, so the companion's "Expires in: M:SS"
-                // countdown follows the real PIN.
-                let mut shown = None;
-                let accept_result = tokio::select! {
-                    r = with_heartbeat(tcp_server.listen_and_accept(), STATUS_HEARTBEAT, || publish_pin_status(&tcp_server, &mut shown)) => r,
-                    _ = cancel.cancelled() => { break; }
-                };
-
-                match accept_result {
-                    Ok((stream, addr)) => (tcp_server, stream, addr),
-                    Err(e) => {
-                        log::error!("TCP accept failed: {}", e);
-                        reconnect_state.record_accept_failure();
-                        if reconnect_state.should_stop_engine() {
-                            log::error!(
-                                "Max accept failures reached ({}) — stopping engine",
-                                reconnect_state.accept_failures(),
-                            );
-                            break;
-                        }
-                        continue;
-                    }
+                DisconnectReason::ClientRequested => {
+                    // Clean disconnect — no hold needed
+                    log::info!("Client requested disconnect — ready for new connection");
+                    self.reconnect_state.record_clean_disconnect();
+                }
+                DisconnectReason::ProtocolError => {
+                    log::warn!("Protocol error — reconnecting");
+                    self.reconnect_state.record_protocol_error();
                 }
             }
+
+            if self.reconnect_state.should_stop_engine() {
+                log::error!(
+                    "Max accept failures reached ({}) — stopping engine",
+                    self.reconnect_state.accept_failures(),
+                );
+                break;
+            }
+        }
+    }
+
+    /// Wait for an HMD to connect and pair, after the backoff for any
+    /// earlier accept failures.
+    async fn accept(&mut self) -> Accepted {
+        if let Some(delay) = self.reconnect_state.next_backoff() {
+            log::info!(
+                "Retrying accept in {:?} (failure {}/{})",
+                delay,
+                self.reconnect_state.accept_failures(),
+                crate::control::reconnect::MAX_ACCEPT_FAILURES,
+            );
+            // Backoff can last up to 16 s — keep status.json fresh so the
+            // companion doesn't report the engine as stopped meanwhile.
+            tokio::select! {
+                _ = with_heartbeat(tokio::time::sleep(delay), STATUS_HEARTBEAT, || publish_waiting_status(None)) => {}
+                _ = self.cancel.cancelled() => return Accepted::Stop,
+            }
+        }
+
+        // Step 1: Wait for HMD to connect via TCP
+        let server = TcpControlServer::new(self.config.clone());
+        // Publish the server's PIN to status.json so the companion app
+        // (or the simulator mock-client) can read it, and re-publish it
+        // every STATUS_HEARTBEAT while we wait: the companion judges
+        // engine liveness from the file's mtime, and waiting for the
+        // HMD can take minutes. Each beat reads the PIN afresh — it
+        // rotates when PIN_LIFETIME_SECONDS runs out and on lockout —
+        // with the seconds left, so the companion's "Expires in: M:SS"
+        // countdown follows the real PIN.
+        let mut shown = None;
+        let accept_result = tokio::select! {
+            r = with_heartbeat(server.listen_and_accept(), STATUS_HEARTBEAT, || publish_pin_status(&server, &mut shown)) => r,
+            _ = self.cancel.cancelled() => return Accepted::Stop,
         };
 
-        log::info!("HMD connected from {}, starting video stream", peer_addr);
-        reconnect_state.record_accept_success();
+        match accept_result {
+            Ok((stream, peer)) => Accepted::Connected(Box::new(Connection { server, stream, peer })),
+            Err(e) => {
+                log::error!("TCP accept failed: {}", e);
+                self.reconnect_state.record_accept_failure();
+                if self.reconnect_state.should_stop_engine() {
+                    log::error!(
+                        "Max accept failures reached ({}) — stopping engine",
+                        self.reconnect_state.accept_failures(),
+                    );
+                    return Accepted::Stop;
+                }
+                Accepted::Retry
+            }
+        }
+    }
+
+    /// Stream to a connected HMD until it disconnects, the frame source
+    /// closes, or the engine shuts down.
+    async fn run_session(&mut self, stream: Box<dyn AsyncStream>, peer: SocketAddr) -> SessionEnd {
+        let config = &self.config;
 
         // Only the HMD that just completed TLS + PIN pairing may feed the
         // tracking port for the lifetime of this session.
-        let peer_guard = AuthorizedPeerGuard::authorize(&authorized_peer, peer_addr.ip());
+        let _peer_guard = AuthorizedPeerGuard::authorize(&self.authorized_peer, peer.ip());
 
         // Per-session cancel: fires when TCP drops or HMD disconnects
         let session_cancel = CancellationToken::new();
-
-        // Shared HMD stats for adaptive bitrate (fed by heartbeat messages)
-        let hmd_stats: Arc<StdMutex<Option<HmdStats>>> = Arc::new(StdMutex::new(None));
-
-        // Burst detector: classifies transient burst loss vs sustained congestion
-        let burst_detector: Arc<StdMutex<crate::adaptive::burst_detector::BurstDetector>> =
-            Arc::new(StdMutex::new(crate::adaptive::burst_detector::BurstDetector::new()));
-
-        // GCC delay-based bandwidth estimator (shared between TCP handler and adaptive loop)
-        // When congestion_control == "loss", GCC feedback is not processed (loss-only mode).
-        let gcc_enabled = config.network.congestion_control == "gcc";
-        let gcc_estimator: Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>> =
-            Arc::new(StdMutex::new(crate::adaptive::gcc_estimator::GccEstimator::new(
-                config.video.bitrate_mbps as u64 * 1_000_000,
-            )));
-
-        // Sent packet log: maps RTP sequence number → PC-side send timestamp (µs)
-        // Shared between the video send loop (writer) and TCP handler (reader)
-        let sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>> =
-            Arc::new(StdMutex::new(HashMap::new()));
-
-        // OSC bridge for face tracking data (HMD → VRChat). Apply
-        // `face_tracking.osc_port` to the bridge target so non-default
-        // ports (used by E2E scenarios that capture OSC on a loopback
-        // receiver) actually take effect instead of being silently
-        // ignored as they were before this hook was added.
-        let osc_bridge = Arc::new(StdMutex::new({
-            let mut b = crate::face_tracking::osc_bridge::OscBridge::with_smoothing(
-                config.face_tracking.smoothing,
-            );
-            let osc_target = format!("127.0.0.1:{}", config.face_tracking.osc_port);
-            log::debug!("OSC bridge target: {}", osc_target);
-            b.set_target(osc_target);
-            b
-        }));
 
         // Haptic event channel (PC driver → TCP → HMD)
         let (haptic_tx, haptic_rx) = mpsc::channel::<HapticEvent>(16);
@@ -1380,29 +1580,43 @@ async fn run_streaming(
         // observable side of an otherwise internal state change.
         let (sleep_tx, sleep_rx) = mpsc::channel::<bool>(8);
 
-        // Spawn TCP control reader/writer. Track disconnect reason for hold logic.
-        let disconnect_reason: Arc<StdMutex<Option<DisconnectReason>>> = Arc::new(StdMutex::new(None));
-        let tcp_session = session_cancel.clone();
-        let stats_clone = hmd_stats.clone();
-        let osc_clone = osc_bridge.clone();
-        let gcc_clone = gcc_estimator.clone();
-        let sent_log_clone = sent_packet_log.clone();
-        let reason_clone = disconnect_reason.clone();
+        // HEARTBEAT stats and transport feedback, TCP control → frame loop.
+        let (events_tx, mut events_rx) = mpsc::channel::<ControlEvent>(CONTROL_EVENT_CAPACITY);
+
+        // OSC bridge for face tracking data (HMD → VRChat). Apply
+        // `face_tracking.osc_port` to the bridge target so non-default
+        // ports (used by E2E scenarios that capture OSC on a loopback
+        // receiver) actually take effect instead of being silently
+        // ignored as they were before this hook was added.
+        let mut osc_bridge = crate::face_tracking::osc_bridge::OscBridge::with_smoothing(
+            config.face_tracking.smoothing,
+        );
+        let osc_target = format!("127.0.0.1:{}", config.face_tracking.osc_port);
+        log::debug!("OSC bridge target: {}", osc_target);
+        osc_bridge.set_target(osc_target);
+
+        // Spawn TCP control reader/writer. It reports the disconnect reason
+        // for the hold logic.
+        let mut control = ControlChannel {
+            cancel: session_cancel.clone(),
+            events: events_tx,
+            osc_bridge,
+            haptic_rx,
+            sleep_rx,
+        };
+        let (reason_tx, mut reason_rx) = tokio::sync::oneshot::channel();
         spawn_named(&tokio::runtime::Handle::current(), "tcp-control", async move {
-            match handle_tcp_control(tcp_control_stream, tcp_session, stats_clone, osc_clone, gcc_clone, sent_log_clone, haptic_rx, sleep_rx, gcc_enabled).await {
+            let reason = match handle_tcp_control(&mut control, stream).await {
                 Ok(reason) => {
-                    if let Ok(mut guard) = reason_clone.lock() {
-                        *guard = Some(reason);
-                    }
                     log::info!("TCP control ended: {:?}", reason);
+                    reason
                 }
                 Err(e) => {
-                    if let Ok(mut guard) = reason_clone.lock() {
-                        *guard = Some(DisconnectReason::ConnectionLost);
-                    }
                     log::warn!("TCP control error: {}", e);
+                    DisconnectReason::ConnectionLost
                 }
-            }
+            };
+            let _ = reason_tx.send(reason);
         });
 
         if config.foveated.enabled {
@@ -1416,22 +1630,21 @@ async fn run_streaming(
         }
 
         // Step 2: Create UDP senders
-        let udp_target: SocketAddr = SocketAddr::new(peer_addr.ip(), config.network.udp_port + fvp_common::VIDEO_PORT_OFFSET);
+        let udp_target: SocketAddr = SocketAddr::new(peer.ip(), config.network.udp_port + fvp_common::VIDEO_PORT_OFFSET);
         let udp_sender = match UdpSender::new(udp_target).await {
             Ok(s) => s,
             Err(e) => {
                 log::error!("UDP sender failed: {}", e);
                 session_cancel.cancel();
-                reconnect_state.record_accept_failure();
-                continue;
+                return SessionEnd::SetupFailed;
             }
         };
 
         // Audio pipeline (per-session)
         let audio_port = config.network.udp_port + fvp_common::AUDIO_PORT_OFFSET;
-        let audio_target: SocketAddr = SocketAddr::new(peer_addr.ip(), audio_port);
+        let audio_target: SocketAddr = SocketAddr::new(peer.ip(), audio_port);
         let audio_recording_dir = if config.recording.enabled {
-            Some(recording_output_dir(&config))
+            Some(recording_output_dir(config))
         } else {
             None
         };
@@ -1442,44 +1655,17 @@ async fn run_streaming(
         }
 
         // Step 3: Process frames with adaptive bitrate + adaptive FEC
-        let mut packetizer = RtpPacketizer::new(0x46565000);
-        let mut fec_encoder = pipeline::FrameFecEncoder::new(
-            config.network.fec_redundancy,
-            config.network.slice_fec_enabled,
-            config.network.slice_count,
-        );
-        let mut frame_count: u64 = 0;
-        let mut latency_skip_count: u64 = 0;
-
-        let mut bw_estimator = crate::adaptive::bandwidth_estimator::BandwidthEstimator::new();
-        let mut bitrate_ctrl = crate::adaptive::bitrate_controller::BitrateController::new(
-            config.video.bitrate_mbps,
-        );
-        let mut adaptive_fec = if config.network.adaptive_fec_enabled {
-            Some(crate::transport::fec::AdaptiveFecController::new(
-                config.network.fec_redundancy_min,
-                config.network.fec_redundancy_max,
-                config.network.fec_redundancy,
-            ))
-        } else {
-            log::info!("Adaptive FEC disabled — using fixed redundancy {:.0}%", config.network.fec_redundancy * 100.0);
-            None
-        };
-        let mut sleep_detector = crate::sleep_mode::SleepDetector::new(
-            config.sleep_mode.enabled,
-            config.sleep_mode.motion_threshold,
-            config.sleep_mode.timeout_seconds,
-            config.sleep_mode.sleep_bitrate_mbps,
-        );
-        let normal_bitrate_mbps = config.video.bitrate_mbps;
+        let mut video = VideoSender::new(config, udp_sender);
+        let mut adaptive = AdaptiveState::new(config);
+        let framerate = config.video.framerate as u64;
 
         // Flip status.json to "streaming" the moment the session is up so the
         // companion shows Connected immediately; refreshed ~1×/sec below.
         publish_streaming_status(
-            &config,
-            bitrate_ctrl.current_bitrate_mbps(),
-            sleep_detector.is_sleeping(),
-            &hmd_stats,
+            config,
+            adaptive.bitrate_ctrl.current_bitrate_mbps(),
+            adaptive.sleep_detector.is_sleeping(),
+            adaptive.last_stats.as_ref(),
         );
 
         // Refresh the live "streaming" snapshot on a wall-clock tick rather
@@ -1490,66 +1676,31 @@ async fn run_streaming(
         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         status_tick.tick().await; // first tick is immediate; we just published
 
+        let mut ended_by_control = false;
         loop {
             tokio::select! {
                 _ = status_tick.tick() => {
                     // `update_latency_atomics` (frame branch) keeps
                     // PC_TOTAL_LATENCY_US current; this reads it.
                     publish_streaming_status(
-                        &config,
-                        bitrate_ctrl.current_bitrate_mbps(),
-                        sleep_detector.is_sleeping(),
-                        &hmd_stats,
+                        config,
+                        adaptive.bitrate_ctrl.current_bitrate_mbps(),
+                        adaptive.sleep_detector.is_sleeping(),
+                        adaptive.last_stats.as_ref(),
                     );
                 }
-                frame_opt = frame_rx.recv() => {
-                    let mut frame = match frame_opt {
-                        Some(f) => f,
-                        None => break, // Channel closed (engine shutdown)
+                Some(event) = events_rx.recv() => {
+                    adaptive.on_event(event, &video.sent_packet_log);
+                }
+                frame_opt = self.frame_rx.recv() => {
+                    let Some(frame) = frame_opt else {
+                        break; // Channel closed (engine shutdown)
                     };
+                    video.send_frame(frame, framerate, &self.latency_tracker).await;
 
-                    frame.timestamps.mark_encode_start();
-                    frame.timestamps.mark_encode_end();
-
-                    let framerate = config.video.framerate as u64;
-                    // Multiply first to avoid integer division truncation drift (e.g. 90000/96=937.5)
-                    let timestamp_90khz = (frame_count * fvp_common::RTP_CLOCK_RATE as u64 / framerate) as u32;
-
-                    send_encoded_frame(
-                        &frame,
-                        timestamp_90khz,
-                        &mut packetizer,
-                        &mut fec_encoder,
-                        &udp_sender,
-                        &sent_packet_log,
-                    ).await;
-
-                    prune_sent_packet_log_if_due(&sent_packet_log, frame_count);
-
-                    // Buffer pool recycle is handled by packetizer internally
-                    // (slice path sends per-slice, bulk path sends all at once)
-
-                    frame.timestamps.mark_send();
-
-                    if let Ok(mut tracker) = latency_tracker.try_lock() {
-                        tracker.record(frame.timestamps);
-                    } else {
-                        latency_skip_count += 1;
-                        if latency_skip_count % 90 == 1 {
-                            log::debug!("Latency tracker lock contention (skipped {} samples)", latency_skip_count);
-                        }
+                    if video.frame_count.is_multiple_of(framerate) {
+                        adaptive.tick(&mut video.fec_encoder);
                     }
-
-                    frame_count += 1;
-
-                    update_adaptive_bitrate(
-                        frame_count, framerate, &hmd_stats,
-                        &gcc_estimator,
-                        &mut bw_estimator, &mut bitrate_ctrl,
-                        adaptive_fec.as_mut(), &mut fec_encoder,
-                        &burst_detector,
-                        gcc_enabled,
-                    );
 
                     // Thermal feedback. The governor internally rate-limits to
                     // `config.thermal.poll_interval_seconds`; calling every
@@ -1557,114 +1708,88 @@ async fn run_streaming(
                     // ticks. `multiplier < 1.0` lowers the bitrate ceiling
                     // until the GPU cools; on non-NVIDIA hosts the governor
                     // is None and the whole block is a no-op.
-                    if let Some(ref mut gov) = thermal_gov {
+                    if let Some(gov) = self.thermal_gov.as_mut() {
                         if let Some(multiplier) = gov.tick() {
                             let base_max_bps = (config.video.bitrate_mbps as u64) * 1_000_000;
                             let ceiling = (base_max_bps as f64 * multiplier) as u64;
-                            bitrate_ctrl.set_thermal_ceiling_bps(ceiling);
+                            adaptive.bitrate_ctrl.set_thermal_ceiling_bps(ceiling);
                         }
                     }
 
-
                     check_sleep_mode(
-                        &_tracking, &mut sleep_detector,
-                        normal_bitrate_mbps, config.sleep_mode.timeout_seconds,
+                        &self.tracking, &mut adaptive.sleep_detector,
+                        config.video.bitrate_mbps, config.sleep_mode.timeout_seconds,
                         &sleep_tx,
                     );
 
-                    update_latency_atomics(&latency_tracker);
+                    update_latency_atomics(&self.latency_tracker);
 
-                    log_periodic_stats(frame_count, framerate);
+                    log_periodic_stats(video.frame_count, framerate);
                 }
                 _ = session_cancel.cancelled() => {
                     log::info!("Session ended — waiting for new connection");
+                    ended_by_control = true;
                     break;
                 }
-                _ = cancel.cancelled() => {
+                _ = self.cancel.cancelled() => {
                     log::info!("Engine shutdown — stopping streaming");
-                    return Ok(());
+                    return SessionEnd::Shutdown;
                 }
             }
         }
 
-        // Session ended — stop accepting tracking from its HMD, then check
-        // disconnect reason for hold logic
-        drop(peer_guard);
-        let reason = disconnect_reason.lock().ok()
-            .and_then(|g| *g)
-            .unwrap_or(DisconnectReason::ConnectionLost);
-
-        match reason {
-            DisconnectReason::ConnectionLost => {
-                log::info!("Connection lost — listening for reconnection (5s hold)");
-                reconnect_state.record_connection_lost();
-                if reconnect_state.is_reconnect_warning_due() {
-                    log::warn!(
-                        "Wi-Fi reconnect attempts: {}/{} — still accepting connections",
-                        reconnect_state.reconnect_attempts(),
-                        crate::control::reconnect::MAX_RECONNECT_ATTEMPTS,
-                    );
-                }
-
-                // Listen again for the hold period with the session's own
-                // server, which accepts the PIN the HMD paired with (still
-                // on the companion's screen) once more, so a Wi-Fi blip
-                // doesn't need a new PIN. Publishing it (and keeping
-                // status.json fresh) also stops the companion showing the
-                // dead session as Connected. After the window, the next
-                // iteration starts over with a new server and PIN.
-                let hold_duration = std::time::Duration::from_secs(5);
-                tcp_server.rearm_for_reconnect(hold_duration).await;
-                let mut shown = None;
-
-                let reconnect_result = tokio::select! {
-                    r = with_heartbeat(tcp_server.listen_and_accept(), STATUS_HEARTBEAT, || publish_pin_status(&tcp_server, &mut shown)) => Some(r),
-                    _ = tokio::time::sleep(hold_duration) => None,
-                    _ = cancel.cancelled() => {
-                        log::info!("Engine shutdown during hold period");
-                        return Ok(());
-                    }
-                };
-
-                match reconnect_result {
-                    Some(Ok((stream, addr))) => {
-                        log::info!("HMD reconnected from {} during hold period — resuming", addr);
-                        // Stream on the connection we just authenticated.
-                        // (It used to be dropped here, and the HMD had to
-                        // pair again with a new PIN.)
-                        resumed = Some((tcp_server, stream, addr));
-                        continue; // Skip backoff, go directly to new session
-                    }
-                    Some(Err(e)) => {
-                        log::warn!("Accept failed during hold: {}", e);
-                        reconnect_state.record_hold_accept_failure();
-                    }
-                    None => {
-                        log::info!("Hold period expired — no reconnection");
-                    }
-                }
-            }
-            DisconnectReason::ClientRequested => {
-                // Clean disconnect — no hold needed
-                log::info!("Client requested disconnect — ready for new connection");
-                reconnect_state.record_clean_disconnect();
-            }
-            DisconnectReason::ProtocolError => {
-                log::warn!("Protocol error — reconnecting");
-                reconnect_state.record_protocol_error();
-            }
-        }
-
-        if reconnect_state.should_stop_engine() {
-            log::error!(
-                "Max accept failures reached ({}) — stopping engine",
-                reconnect_state.accept_failures(),
-            );
-            break;
-        }
+        // The control task cancels the session just before it reports why,
+        // so wait briefly for the reason. If the frame source ended the
+        // session instead, the control task may still be running: count it
+        // as a lost connection.
+        let reason = if ended_by_control {
+            tokio::time::timeout(std::time::Duration::from_secs(1), reason_rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        } else {
+            reason_rx.try_recv().ok()
+        };
+        SessionEnd::Disconnected(reason.unwrap_or(DisconnectReason::ConnectionLost))
     }
 
-    Ok(())
+    /// Listen again for the hold period with the session's own server,
+    /// which accepts the PIN the HMD paired with (still on the companion's
+    /// screen) once more, so a Wi-Fi blip doesn't need a new PIN.
+    /// Publishing it (and keeping status.json fresh) also stops the
+    /// companion showing the dead session as Connected. After the window,
+    /// the next accept starts over with a new server and PIN.
+    async fn hold(&mut self, server: TcpControlServer) -> HoldOutcome {
+        let hold_duration = std::time::Duration::from_secs(5);
+        server.rearm_for_reconnect(hold_duration).await;
+        let mut shown = None;
+
+        let reconnect_result = tokio::select! {
+            r = with_heartbeat(server.listen_and_accept(), STATUS_HEARTBEAT, || publish_pin_status(&server, &mut shown)) => Some(r),
+            _ = tokio::time::sleep(hold_duration) => None,
+            _ = self.cancel.cancelled() => {
+                log::info!("Engine shutdown during hold period");
+                return HoldOutcome::Shutdown;
+            }
+        };
+
+        match reconnect_result {
+            Some(Ok((stream, peer))) => {
+                log::info!("HMD reconnected from {} during hold period — resuming", peer);
+                // Stream on the connection we just authenticated.
+                HoldOutcome::Resumed(Box::new(Connection { server, stream, peer }))
+            }
+            Some(Err(e)) => {
+                log::warn!("Accept failed during hold: {}", e);
+                self.reconnect_state.record_hold_accept_failure();
+                HoldOutcome::NoReconnect
+            }
+            None => {
+                log::info!("Hold period expired — no reconnection");
+                HoldOutcome::NoReconnect
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1891,13 +2016,13 @@ mod tests {
         buf
     }
 
-    /// Helper: create a tcp_test_harness with mock duplex stream
+    /// Helper: run `handle_tcp_control` over a mock duplex stream
     struct TcpTestHarness {
         cancel: CancellationToken,
-        hmd_stats: Arc<StdMutex<Option<HmdStats>>>,
-        osc_bridge: Arc<StdMutex<crate::face_tracking::osc_bridge::OscBridge>>,
-        gcc_estimator: Arc<StdMutex<crate::adaptive::gcc_estimator::GccEstimator>>,
-        sent_packet_log: Arc<StdMutex<HashMap<u16, u64>>>,
+        /// The bridge after the run (FACE_DATA lands here).
+        osc_bridge: Option<crate::face_tracking::osc_bridge::OscBridge>,
+        /// Everything forwarded to the frame loop.
+        events: Vec<ControlEvent>,
         disconnect_reason: Option<DisconnectReason>,
     }
 
@@ -1905,14 +2030,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 cancel: CancellationToken::new(),
-                hmd_stats: Arc::new(StdMutex::new(None)),
-                gcc_estimator: Arc::new(StdMutex::new(
-                    crate::adaptive::gcc_estimator::GccEstimator::new(80_000_000)
-                )),
-                sent_packet_log: Arc::new(StdMutex::new(HashMap::new())),
-                osc_bridge: Arc::new(StdMutex::new(
-                    crate::face_tracking::osc_bridge::OscBridge::with_smoothing(0.5)
-                )),
+                osc_bridge: None,
+                events: Vec::new(),
                 disconnect_reason: None,
             }
         }
@@ -1921,6 +2040,14 @@ mod tests {
             let (client, server) = tokio::io::duplex(4096);
             let (_haptic_tx, haptic_rx) = mpsc::channel::<HapticEvent>(16);
             let (_sleep_tx, sleep_rx) = mpsc::channel::<bool>(8);
+            let (events_tx, mut events_rx) = mpsc::channel::<ControlEvent>(CONTROL_EVENT_CAPACITY);
+            let mut control = ControlChannel {
+                cancel: self.cancel.clone(),
+                events: events_tx,
+                osc_bridge: crate::face_tracking::osc_bridge::OscBridge::with_smoothing(0.5),
+                haptic_rx,
+                sleep_rx,
+            };
 
             // Write input to client side, then close
             let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -1928,19 +2055,19 @@ mod tests {
             client_write.write_all(input).await.unwrap();
             drop(client_write); // Close write side → EOF for server reader
 
-            let cancel = self.cancel.clone();
-            let stats = self.hmd_stats.clone();
-            let osc = self.osc_bridge.clone();
-
             // Run handle_tcp_control (will read until EOF)
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                handle_tcp_control(Box::new(server), cancel, stats, osc, self.gcc_estimator.clone(), self.sent_packet_log.clone(), haptic_rx, sleep_rx, true)
+                handle_tcp_control(&mut control, Box::new(server)),
             ).await;
 
             // Capture disconnect reason
             if let Ok(Ok(reason)) = result {
                 self.disconnect_reason = Some(reason);
+            }
+            self.osc_bridge = Some(control.osc_bridge);
+            while let Ok(event) = events_rx.try_recv() {
+                self.events.push(event);
             }
 
             // Read any response from server (ACK messages)
@@ -2036,9 +2163,10 @@ mod tests {
         let harness = TcpTestHarness::new();
         let harness = harness.run_with_input(&msg).await;
 
-        let stats = harness.hmd_stats.lock().unwrap();
-        assert!(stats.is_some(), "HmdStats should be populated after HEARTBEAT");
-        let s = stats.as_ref().unwrap();
+        let s = match harness.events.as_slice() {
+            [ControlEvent::Heartbeat(s)] => *s,
+            other => panic!("HEARTBEAT must forward its stats to the frame loop, got {other:?}"),
+        };
         assert_eq!(s.packets_received, 1000);
         assert_eq!(s.packets_lost, 5);
         assert_eq!(s.avg_decode_us, 3000);
@@ -2061,7 +2189,7 @@ mod tests {
         let harness = harness.run_with_input(&msg).await;
 
         // Check that osc_bridge was updated (prev_lip[3] should be non-zero)
-        let bridge = harness.osc_bridge.lock().unwrap();
+        let bridge = harness.osc_bridge.as_ref().unwrap();
         // With smoothing=0.5: smoothed = 0.5 * 0.0 + 0.5 * 0.9 = 0.45
         assert!(bridge.prev_lip()[3] > 0.1, "osc_bridge should have received face data");
     }
@@ -2134,6 +2262,10 @@ mod tests {
         let harness = harness.run_with_input(&input).await;
         assert!(harness.cancel.is_cancelled());
         assert_eq!(harness.disconnect_reason, Some(DisconnectReason::ClientRequested));
+        assert!(
+            matches!(harness.events.as_slice(), [ControlEvent::TransportFeedback(e)] if e.len() == 1 && e[0].sequence == 1),
+            "feedback must reach the frame loop, got {:?}", harness.events,
+        );
     }
 
     #[tokio::test]
@@ -2147,6 +2279,28 @@ mod tests {
         // Should warn but continue to DISCONNECT
         assert!(harness.cancel.is_cancelled());
         assert_eq!(harness.disconnect_reason, Some(DisconnectReason::ClientRequested));
+    }
+
+    fn heartbeat(received: u32, lost: u32) -> ControlEvent {
+        ControlEvent::Heartbeat(HmdStats { packets_received: received, packets_lost: lost, avg_decode_us: 0, fps: 90 })
+    }
+
+    #[test]
+    fn test_adaptive_state_uses_each_heartbeat_once_but_keeps_it_for_status() {
+        let mut adaptive = AdaptiveState::new(&AppConfig::default());
+        let mut fec = pipeline::FrameFecEncoder::new(0.2, true, 4);
+        adaptive.on_event(heartbeat(900, 100), &HashMap::new());
+        assert!(adaptive.pending_stats.is_some());
+
+        adaptive.tick(&mut fec);
+        assert!(adaptive.pending_stats.is_none(), "a heartbeat drives one tick only");
+        // The loss figure in status.json keeps showing the last heartbeat
+        // (it used to read 0 % most of the time: the tick had taken it).
+        assert_eq!(adaptive.last_stats.map(|s| s.packets_lost), Some(100));
+
+        let before = adaptive.bw_estimator.loss_rate();
+        adaptive.tick(&mut fec); // no new heartbeat: nothing to learn from
+        assert_eq!(adaptive.bw_estimator.loss_rate(), before);
     }
 
     #[tokio::test]
