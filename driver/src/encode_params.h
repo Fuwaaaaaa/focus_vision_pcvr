@@ -1,29 +1,22 @@
 #pragma once
 
 #include <cstdint>
-#include <cmath>
 
-// Hardware-independent encode-parameter math. The encoded frame dimensions are
-// NOT recomputed here — the driver reads them from FvpConfig.encoded_* (the
-// engine is the single source of truth, so PC encode resolution always matches
-// the STREAM_CONFIG dims sent to the client). Only the bitrate derivation lives
-// driver-side because it is an NVENC rate-control parameter.
+// Hardware-independent encode-parameter helpers. The engine is the single
+// source of truth for encode parameters: the driver reads the encoded frame
+// dimensions (FvpConfig.encoded_*) and the target bitrate
+// (FvpConfig.bitrate_bps, from `[video] bitrate_mbps`) instead of deriving
+// them, so NVENC, STREAM_CONFIG and the adaptive bitrate controller agree.
 namespace fvp_encode {
 
-/// NVENC average/target bitrate in bits per second for an encoded frame size:
-/// bitrate = encoded_w * encoded_h * pixel_factor. The default factor (2.0)
-/// reproduces the historical `width * height * 2` formula; exposing it as a
-/// parameter lets quality at sub-native resolution be tuned without a rebuild.
-inline uint32_t computeBitrateBps(uint32_t encodedW, uint32_t encodedH, float pixelFactor) {
-    const double bits = static_cast<double>(encodedW)
-                      * static_cast<double>(encodedH)
-                      * static_cast<double>(pixelFactor);
-    if (bits <= 0.0) {
-        return 0;
-    }
-    const double maxU32 = static_cast<double>(UINT32_MAX);
-    const double clamped = bits > maxU32 ? maxU32 : bits;
-    return static_cast<uint32_t>(std::llround(clamped));
+/// Bitrate used when the engine config is unavailable. Matches the default
+/// `[video] bitrate_mbps = 80`.
+constexpr uint32_t kDefaultBitrateBps = 80'000'000;
+
+/// NVENC average/target bitrate in bits per second from the engine config.
+/// 0 means the engine did not provide one (older engine, unset struct).
+inline uint32_t targetBitrateBps(uint32_t configuredBps) {
+    return configuredBps != 0 ? configuredBps : kDefaultBitrateBps;
 }
 
 }  // namespace fvp_encode

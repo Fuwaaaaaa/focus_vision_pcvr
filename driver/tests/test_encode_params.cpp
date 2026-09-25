@@ -1,26 +1,20 @@
 #include <gtest/gtest.h>
 #include "../src/encode_params.h"
 
-// Hardware-independent encode-parameter math (NVENC bitrate from the encoded
-// frame size). Encoded dimensions themselves come from the engine
-// (FvpConfig.encoded_*, computed once in Rust) — the driver never recomputes
-// them, so PC encode resolution and STREAM_CONFIG can never disagree.
+// Hardware-independent encode-parameter helpers. The NVENC bitrate comes from
+// the engine (FvpConfig.bitrate_bps = `[video] bitrate_mbps`), like the
+// encoded dimensions (FvpConfig.encoded_*), so the driver never derives its
+// own values that could disagree with STREAM_CONFIG.
 
-TEST(EncodeParams, BitrateMatchesLegacyFormulaAtFactor2) {
-    // Native 1832x1920 with the default factor reproduces width*height*2.
-    EXPECT_EQ(fvp_encode::computeBitrateBps(1832, 1920, 2.0f), 1832u * 1920u * 2u);
+TEST(EncodeParams, UsesTheEngineBitrate) {
+    // REGRESSION: the driver used encoded_w * encoded_h * 2, i.e. ~7 Mbps at
+    // 1832x1920, while bitrate_mbps (sent to the client) said 80.
+    EXPECT_EQ(fvp_encode::targetBitrateBps(80'000'000u), 80'000'000u);
+    EXPECT_EQ(fvp_encode::targetBitrateBps(200'000'000u), 200'000'000u);
+    EXPECT_NE(fvp_encode::targetBitrateBps(80'000'000u), 1832u * 1920u * 2u);
 }
 
-TEST(EncodeParams, BitrateScalesWithEncodedArea) {
-    // Half resolution -> a quarter of the pixels -> a quarter of the bitrate.
-    uint32_t full = fvp_encode::computeBitrateBps(1832, 1920, 2.0f);
-    uint32_t half = fvp_encode::computeBitrateBps(916, 960, 2.0f);
-    EXPECT_EQ(half, full / 4);
-}
-
-TEST(EncodeParams, BitratePixelFactorRaisesBits) {
-    uint32_t f2 = fvp_encode::computeBitrateBps(916, 960, 2.0f);
-    uint32_t f3 = fvp_encode::computeBitrateBps(916, 960, 3.0f);
-    EXPECT_GT(f3, f2);
-    EXPECT_EQ(f3, 916u * 960u * 3u);
+TEST(EncodeParams, MissingBitrateFallsBackToDefault) {
+    EXPECT_EQ(fvp_encode::targetBitrateBps(0), fvp_encode::kDefaultBitrateBps);
+    EXPECT_EQ(fvp_encode::kDefaultBitrateBps, 80'000'000u);
 }

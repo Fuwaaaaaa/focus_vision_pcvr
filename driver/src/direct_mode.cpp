@@ -30,15 +30,14 @@ bool CDirectModeComponent::initEncoder(ID3D11Device* device, uint32_t width, uin
         encConfig.width = fvpCfg.encoded_width;
         encConfig.height = fvpCfg.encoded_height;
         encConfig.fps = (uint32_t)fvpCfg.refresh_rate;
-        encConfig.bitrate_bps = fvp_encode::computeBitrateBps(
-            fvpCfg.encoded_width, fvpCfg.encoded_height, fvpCfg.bitrate_pixel_factor);
+        encConfig.bitrate_bps = fvp_encode::targetBitrateBps(fvpCfg.bitrate_bps);
         encConfig.use_hevc = true;
     } else {
         // Fallback if engine not initialized yet
         encConfig.width = width;
         encConfig.height = height;
         encConfig.fps = 90;
-        encConfig.bitrate_bps = 80'000'000;
+        encConfig.bitrate_bps = fvp_encode::kDefaultBitrateBps;
         encConfig.use_hevc = true;
     }
 
