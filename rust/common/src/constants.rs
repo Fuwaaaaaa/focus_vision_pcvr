@@ -27,8 +27,10 @@ pub const MAX_PIN_ATTEMPTS: u8 = 5;
 /// PIN lockout duration in seconds
 pub const PIN_LOCKOUT_SECONDS: u64 = 300;
 /// Lifetime of a pairing PIN. Engine rotates the PIN once this elapses
-/// without a successful pair, so the companion's countdown to PIN refresh
-/// derives from this constant. Matches PIN_LOCKOUT_SECONDS by design:
+/// without a successful pair and publishes the seconds left as status.json
+/// `pin_expires_in_seconds`, which drives the companion's countdown. (In the
+/// 5 s reconnect hold after a dropped session, the session's PIN is valid
+/// again for just that window.) Matches PIN_LOCKOUT_SECONDS by design:
 /// a brute-force attacker hitting MAX_PIN_ATTEMPTS sees the same wait
 /// regardless of whether they tripped lockout or merely waited for the
 /// next PIN window.

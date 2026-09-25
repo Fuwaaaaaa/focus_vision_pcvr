@@ -105,16 +105,39 @@ impl TcpControlServer {
         &self.cert_fingerprint
     }
 
-    /// Current 6-digit pairing PIN. Surfaces the value the engine should
-    /// publish via status.json so the companion app can render it. The PIN
-    /// rotates every `TcpControlServer::new()` (each accept loop creates
-    /// fresh `PairingState`), so callers should re-read after a reconnect.
+    /// Current 6-digit pairing PIN.
     pub async fn current_pin(&self) -> u32 {
         self.pairing.lock().await.get_pin()
     }
 
+    /// The PIN a client must send now and the whole seconds until it
+    /// rotates, for status.json. Callable from sync code; `None` while a
+    /// handshake briefly holds the pairing lock (keep showing the last value).
+    pub fn pin_status(&self) -> Option<(u32, u32)> {
+        let pairing = self.pairing.try_lock().ok()?;
+        let remaining = u32::try_from(pairing.expires_in().as_secs()).unwrap_or(u32::MAX);
+        Some((pairing.get_pin(), remaining))
+    }
+
+    /// After the paired session drops, accept its PIN again for `window` so
+    /// the HMD can reconnect on the next [`Self::listen_and_accept`] without
+    /// the user entering a new one.
+    pub async fn rearm_for_reconnect(&self, window: Duration) {
+        self.pairing.lock().await.rearm_for_reconnect(window);
+    }
+
+    /// Test-only: shorten the PIN lifetime.
+    #[cfg(test)]
+    pub(crate) async fn set_pin_lifetime(&self, lifetime: Duration) {
+        self.pairing.lock().await.set_lifetime(lifetime);
+    }
+
     /// Start listening. Accepts TLS connection, then runs protocol handshake.
     /// Returns the authenticated stream (TLS-wrapped or plaintext) for post-handshake control.
+    ///
+    /// The PIN is replaced whenever it expires while waiting for a
+    /// connection, and checked again as each connection comes in; a
+    /// handshake in progress keeps the PIN it started with.
     pub async fn listen_and_accept(&self) -> std::io::Result<(Box<dyn AsyncStream>, SocketAddr)> {
         let addr: SocketAddr = format!("0.0.0.0:{}", self.config.network.tcp_port)
             .parse()
@@ -125,7 +148,13 @@ impl TcpControlServer {
         log::info!("Pairing PIN: {:06}", self.pairing.lock().await.get_pin());
 
         loop {
-            let (tcp_stream, peer) = listener.accept().await?;
+            let expires_in = self.pairing.lock().await.expires_in();
+            let accepted = tokio::select! {
+                r = listener.accept() => Some(r?),
+                _ = tokio::time::sleep(expires_in) => None,
+            };
+            self.pairing.lock().await.rotate_if_expired();
+            let Some((tcp_stream, peer)) = accepted else { continue };
             log::info!("TCP connection from {}", peer);
 
             if let Some(ref acceptor) = self.tls_acceptor {
@@ -1036,6 +1065,84 @@ mod tests {
             .unwrap()
             .expect("accept must succeed");
         assert_eq!(peer.port(), hmd_addr.port(), "accepted peer must be the real HMD");
+    }
+
+    /// Plain-TCP client running the whole handshake with `pin`. Returns the
+    /// PIN_RESULT byte (0x01 accepted, 0x00 refused).
+    async fn plain_handshake(target: SocketAddr, pin: u32) -> u8 {
+        let mut c = TcpStream::connect(target).await.unwrap();
+        send_message(&mut c, msg_type::HELLO, &[]).await.unwrap();
+        let _ = read_message(&mut c).await.unwrap(); // HELLO_ACK
+        let _ = read_message(&mut c).await.unwrap(); // PIN_REQUEST
+        send_message(&mut c, msg_type::PIN_RESPONSE, &pin.to_le_bytes()).await.unwrap();
+        let (t, p) = read_message(&mut c).await.unwrap();
+        assert_eq!(t, msg_type::PIN_RESULT);
+        if p[0] == 0x01 {
+            let _ = read_message(&mut c).await.unwrap(); // STREAM_CONFIG
+            send_message(&mut c, msg_type::STREAM_START, &[]).await.unwrap();
+        }
+        p[0]
+    }
+
+    fn plain_server() -> (Arc<TcpControlServer>, SocketAddr) {
+        let mut config = crate::config::AppConfig::default();
+        config.network.tcp_port = free_tcp_port();
+        let target = format!("127.0.0.1:{}", config.network.tcp_port).parse().unwrap();
+        (Arc::new(TcpControlServer::new_without_tls(config).with_timeouts(short_timeouts())), target)
+    }
+
+    #[tokio::test]
+    async fn test_listen_and_accept_rotates_expired_pin() {
+        // REGRESSION: PIN_LIFETIME_SECONDS was shown by the companion as a
+        // countdown but never enforced — a PIN stayed valid until restart.
+        let (server, target) = plain_server();
+        server.set_pin_lifetime(Duration::from_millis(300)).await;
+        let old = server.current_pin().await;
+        let s = Arc::clone(&server);
+        let accept_task = tokio::spawn(async move { s.listen_and_accept().await.map(|(_, peer)| peer) });
+
+        tokio::time::sleep(Duration::from_millis(700)).await; // expires while waiting
+        server.set_pin_lifetime(Duration::from_secs(300)).await; // stop rotating
+        let (new_pin, remaining) = server.pin_status().expect("pairing lock is free");
+        assert_ne!(new_pin, old, "expired PIN must have been replaced");
+        assert!(remaining <= 300);
+
+        assert_eq!(plain_handshake(target, old).await, 0x00, "expired PIN must be refused");
+        assert_eq!(plain_handshake(target, new_pin).await, 0x01, "current PIN must pair");
+        tokio::time::timeout(Duration::from_secs(5), accept_task)
+            .await
+            .expect("accept loop must return")
+            .unwrap()
+            .expect("accept must succeed");
+    }
+
+    #[tokio::test]
+    async fn test_rearmed_server_accepts_only_the_session_pin() {
+        let (server, target) = plain_server();
+        let pin = server.current_pin().await;
+        let s = Arc::clone(&server);
+        let first = tokio::spawn(async move { s.listen_and_accept().await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(100)).await; // let it bind
+        assert_eq!(plain_handshake(target, pin).await, 0x01);
+        first.await.unwrap().expect("first pairing");
+
+        // Session dropped: the same server takes the same PIN back, briefly.
+        server.rearm_for_reconnect(Duration::from_secs(5)).await;
+        let (shown, remaining) = server.pin_status().unwrap();
+        assert_eq!(shown, pin);
+        assert!(remaining <= 5);
+
+        let s = Arc::clone(&server);
+        let second = tokio::spawn(async move { s.listen_and_accept().await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(plain_handshake(target, (pin + 1) % 1_000_000).await, 0x00,
+            "a rearmed server must not accept any PIN");
+        assert_eq!(plain_handshake(target, pin).await, 0x01);
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("accept loop must return")
+            .unwrap()
+            .expect("reconnect must succeed");
     }
 
     #[tokio::test]

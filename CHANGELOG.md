@@ -50,8 +50,26 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   path). Any LAN host could previously inject head/controller poses and the
   foveation gaze point. A transient `recv_from` error no longer ends the
   receiver loop for the rest of the engine's life.
+- **Pairing PINs expire.** `PIN_LIFETIME_SECONDS` (300 s) was only shown as
+  the companion's "Expires in" countdown; the engine never enforced it, so a
+  PIN stayed valid until the next session or restart. The engine now
+  replaces the PIN when it expires while waiting for the HMD (a handshake in
+  progress keeps the PIN it started with), and status.json carries the real
+  seconds left instead of a constant 300. Each heartbeat re-reads the PIN,
+  which also fixes the companion showing a dead PIN after a lockout had
+  replaced it.
 
 ### Fixes
+- **Reconnecting within the 5 s hold works.** When a session dropped
+  without DISCONNECT (Wi-Fi blip), the engine listened for 5 s with a new
+  server and a **new** PIN — which the HMD cannot know — and if a client did
+  get through, it closed that authenticated connection and started over with
+  yet another PIN. The hold now reuses the session's server and accepts the
+  PIN the HMD paired with (full TLS + PIN handshake, attempt limit intact)
+  for just those 5 s, and streaming resumes on the reconnected connection.
+  SECURITY.md's "5 s PIN skip via TLS session resumption" never existed; the
+  threat model now describes this behaviour. The simulator's mock client
+  gained `abrupt_close` to exercise it end to end.
 - **Large IDR frames are no longer lost to slice FEC.** A slice whose data
   shards did not fit one Reed-Solomon code word (a literal cap of 200 data
   shards, or RS's 256 data + parity total, which at 40 % redundancy is only
@@ -84,7 +102,7 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   lists the layers it applied. See `docs/CONFIG.md`.
 - **status.json heartbeat.** The engine now rewrites status.json every second
   while waiting for the HMD, during reconnect backoff, during the 5 s hold
-  period (with the hold server's PIN) and while streaming (wall-clock tick
+  period (with the session's PIN) and while streaming (wall-clock tick
   instead of every Nth frame). Before, the file went untouched while waiting
   or when frames stalled, so the companion's 5 s mtime check showed the red
   "engine stopped" banner for a healthy engine.

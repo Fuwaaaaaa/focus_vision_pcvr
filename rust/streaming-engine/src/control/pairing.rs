@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
-use fvp_common::{MAX_PIN_ATTEMPTS, PIN_LOCKOUT_SECONDS};
+use fvp_common::{MAX_PIN_ATTEMPTS, PIN_LIFETIME_SECONDS, PIN_LOCKOUT_SECONDS};
 
 /// Override for `PIN_LOCKOUT_SECONDS` used by simulator-based tests so a
 /// pin_lockout scenario can verify the full lock → wait → unlock cycle in
@@ -113,11 +113,16 @@ fn now_unix_us() -> u64 {
 /// Lockout state is persisted to `%APPDATA%/FocusVisionPCVR/lockout.json`
 /// (Windows) so a restart of the engine/companion cannot be used to reset
 /// the remaining lockout window.
+///
+/// A PIN is valid for `PIN_LIFETIME_SECONDS` after it was issued; the owner
+/// calls [`Self::rotate_if_expired`] to replace a stale one.
 pub struct PairingState {
     pin: u32,
     attempts: u8,
     lockout_until: Option<Instant>,
     paired: bool,
+    issued_at: Instant,
+    lifetime: Duration,
 }
 
 impl Default for PairingState {
@@ -157,7 +162,47 @@ impl PairingState {
             attempts: 0,
             lockout_until,
             paired: false,
+            issued_at: Instant::now(),
+            lifetime: Duration::from_secs(PIN_LIFETIME_SECONDS.into()),
         }
+    }
+
+    /// Time left before the current PIN expires (zero once it has).
+    pub fn expires_in(&self) -> Duration {
+        self.lifetime.saturating_sub(self.issued_at.elapsed())
+    }
+
+    /// Replace the PIN with a fresh one if it has expired. Returns whether
+    /// it did. `TcpControlServer::listen_and_accept` calls this only between
+    /// connections, so a handshake in progress keeps the PIN it started with.
+    pub fn rotate_if_expired(&mut self) -> bool {
+        if self.expires_in() > Duration::ZERO {
+            return false;
+        }
+        self.rotate_pin();
+        log::info!("Pairing PIN expired. New PIN: {:06}", self.pin);
+        true
+    }
+
+    /// After a paired session drops, accept its PIN once more for `window`
+    /// so the HMD can reconnect without the user entering a new one. The
+    /// attempt limit and lockout still apply.
+    pub fn rearm_for_reconnect(&mut self, window: Duration) {
+        self.paired = false;
+        self.issued_at = Instant::now();
+        self.lifetime = window;
+    }
+
+    /// Test-only: shorten the PIN lifetime.
+    #[cfg(test)]
+    pub(crate) fn set_lifetime(&mut self, lifetime: Duration) {
+        self.lifetime = lifetime;
+    }
+
+    fn rotate_pin(&mut self) {
+        self.pin = generate_pin();
+        self.attempts = 0;
+        self.issued_at = Instant::now();
     }
 
     /// Check if currently locked out.
@@ -197,8 +242,7 @@ impl PairingState {
                 let lockout_secs = effective_lockout_secs();
                 let lockout_duration = Duration::from_secs(lockout_secs);
                 self.lockout_until = Some(Instant::now() + lockout_duration);
-                self.attempts = 0;
-                self.pin = generate_pin();
+                self.rotate_pin();
                 PersistedLockout {
                     lockout_until_unix_us: now_unix_us()
                         .saturating_add(lockout_duration.as_micros() as u64),
@@ -317,6 +361,53 @@ mod tests {
         let pins: Vec<u32> = (0..10).map(|_| generate_pin()).collect();
         let unique: std::collections::HashSet<u32> = pins.into_iter().collect();
         assert!(unique.len() >= 2, "All PINs identical — RNG may be broken");
+    }
+
+    #[test]
+    fn test_pin_rotates_only_once_expired() {
+        let mut state = PairingState::new();
+        assert!(state.expires_in() > Duration::from_secs(u64::from(PIN_LIFETIME_SECONDS) - 10));
+        assert!(!state.rotate_if_expired());
+
+        let old = state.get_pin();
+        let _ = state.verify((old + 1) % 1_000_000); // one miss on the old PIN
+        state.set_lifetime(Duration::ZERO);
+        assert!(state.rotate_if_expired());
+        assert_ne!(state.get_pin(), old, "expired PIN must be replaced");
+        assert_eq!(state.attempts, 0, "misses on the old PIN must not count against the new one");
+    }
+
+    #[test]
+    fn test_lockout_restarts_pin_lifetime() {
+        let mut state = PairingState::new();
+        state.issued_at = Instant::now() - Duration::from_secs(200);
+        let wrong = (state.get_pin() + 1) % 1_000_000;
+        for _ in 0..MAX_PIN_ATTEMPTS {
+            let _ = state.verify(wrong);
+        }
+        assert!(state.is_locked());
+        assert!(state.expires_in() > Duration::from_secs(u64::from(PIN_LIFETIME_SECONDS) - 10),
+            "the PIN issued at lockout gets a full lifetime");
+    }
+
+    #[test]
+    fn test_rearm_accepts_only_the_session_pin() {
+        let mut state = PairingState::new();
+        let pin = state.get_pin();
+        state.verify(pin).unwrap();
+        let wrong = (pin + 1) % 1_000_000;
+        // A paired state accepts anything, which is why rearm must clear it.
+        assert!(state.verify(wrong).is_ok());
+
+        state.rearm_for_reconnect(Duration::from_secs(5));
+        assert!(!state.is_paired());
+        assert_eq!(state.get_pin(), pin, "the HMD reconnects with the PIN it paired with");
+        assert!(state.expires_in() <= Duration::from_secs(5));
+        assert!(matches!(
+            state.verify(wrong),
+            Err(PairingError::WrongPin { remaining }) if remaining == MAX_PIN_ATTEMPTS - 1
+        ));
+        assert!(state.verify(pin).is_ok());
     }
 
     /// Helper: point the persistence layer at a tempdir for one test.

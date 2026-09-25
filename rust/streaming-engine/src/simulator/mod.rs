@@ -80,6 +80,10 @@ pub struct MockClientConfig {
     /// Opus — matching the codebase's "measure transport, not fidelity"
     /// philosophy — only confirm the engine's synthetic audio reaches the wire.
     pub receive_audio: bool,
+    /// When true, end the run by just dropping the connection, without the
+    /// polite DISCONNECT — what a Wi-Fi drop looks like to the engine, so
+    /// it takes the connection-lost path with its reconnect hold window.
+    pub abrupt_close: bool,
 }
 
 impl MockClientConfig {
@@ -104,6 +108,7 @@ impl MockClientConfig {
             capture_sleep_events: false,
             measure_decode_latency: false,
             receive_audio: false,
+            abrupt_close: false,
         }
     }
 }
@@ -675,8 +680,11 @@ where
     }
 
     // Polite DISCONNECT so the engine logs a clean shutdown instead of
-    // counting this against `reconnect_attempts`.
-    let _ = send_message(&mut tcp_write, msg_type::DISCONNECT, &[]).await;
+    // counting this against `reconnect_attempts` — unless the run simulates
+    // a dropped link.
+    if !config.abrupt_close {
+        let _ = send_message(&mut tcp_write, msg_type::DISCONNECT, &[]).await;
+    }
 
     video_handle.abort();
     let _ = video_handle.await;
