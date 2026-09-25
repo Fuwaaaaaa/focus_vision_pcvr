@@ -269,45 +269,39 @@ void OpenXRApp::receiveAndDecodeVideo() {
         int received = m_networkReceiver.receive(m_recvBuffer.data(), (int)m_recvBuffer.size());
         if (received <= 0) break;
 
-        // Parse RTP header to extract FVP fields
-        // RTP header: 12 bytes fixed + FVP header: 10 bytes
-        if (received < 22) continue; // Too short for RTP + FVP header
-
-        // FVP header at offset 12 (all multi-byte fields are little-endian,
-        // matching Rust's to_le_bytes() in pipeline.rs):
-        //   frame_index (u32 LE), shard_index (u16 LE), total_shards (u16 LE),
-        //   flags (u16 LE)
-        const uint8_t* fvp = m_recvBuffer.data() + 12;
-        uint32_t frameIndex = (uint32_t)fvp[0] | ((uint32_t)fvp[1] << 8) |
-                              ((uint32_t)fvp[2] << 16) | ((uint32_t)fvp[3] << 24);
-        uint16_t shardIndex = (uint16_t)fvp[4] | ((uint16_t)fvp[5] << 8);
-        uint16_t totalShards = (uint16_t)fvp[6] | ((uint16_t)fvp[7] << 8);
-        uint16_t flags = (uint16_t)fvp[8] | ((uint16_t)fvp[9] << 8);
-        bool isKeyframe = fvp_flags::isKeyframe(flags);
-        uint8_t sliceIdx = fvp_flags::sliceIndex(flags);
-        uint8_t sliceCnt = fvp_flags::sliceCount(flags);
-        // Sanity check: reject absurd shard counts
-        if (totalShards == 0 || totalShards > 4096 || shardIndex >= totalShards) continue;
+        // Parse + validate the RTP/FVP header (12 + 12 bytes, v4). The header
+        // carries data_shard_count: adaptive FEC changes the parity ratio per
+        // frame, so the data/parity split can't be derived from total_shards
+        // (the old `total / 1.2` guess was only right at 20% redundancy).
+        fvp_client_protocol::FvpHeaderView hdr;
+        if (!fvp_client_protocol::parseFvpHeader(m_recvBuffer.data(), (size_t)received, hdr)) {
+            continue; // too short, or inconsistent shard fields
+        }
+        const uint32_t frameIndex = hdr.frameIndex;
+        const uint16_t shardIndex = hdr.shardIndex;
+        const uint16_t totalShards = hdr.totalShards;
+        const uint16_t dataShards = hdr.dataShards;
+        bool isKeyframe = fvp_flags::isKeyframe(hdr.flags);
+        uint8_t sliceIdx = fvp_flags::sliceIndex(hdr.flags);
+        uint8_t sliceCnt = fvp_flags::sliceCount(hdr.flags);
 
         // Record packet for stats reporting to PC
         m_stats.onPacketReceived();
         m_lastPacketTime = std::chrono::steady_clock::now();
         m_streamingActive = true;
-        // Derive data shard count from total shards and FEC redundancy (20%).
-        uint16_t dataShards = (uint16_t)(totalShards / 1.2f);
 
-        const uint8_t* payload = m_recvBuffer.data() + 22;
-        int payloadSize = received - 22;
+        const uint8_t* payload = m_recvBuffer.data() + fvp_client_protocol::PACKET_HEADER_LEN;
+        int payloadSize = received - (int)fvp_client_protocol::PACKET_HEADER_LEN;
 
         if (sliceCnt > 0) {
             // --- Slice FEC path ---
             // New frame? Try to decode or timeout the previous sliced frame.
-            if (frameIndex != m_slicedDecoder.currentFrameIndex()) {
+            if (!m_slicedDecoder.isActiveFor(frameIndex)) {
                 auto prevFrame = m_slicedDecoder.tryDecode();
                 if (prevFrame.has_value()) {
                     submitDecodedFrame(prevFrame->data.data(), (int)prevFrame->data.size(),
                                        prevFrame->frameIndex);
-                } else if (m_slicedDecoder.isTimedOut()) {
+                } else if (m_slicedDecoder.isActive() && m_slicedDecoder.isTimedOut()) {
                     LOGW("Slice FEC: frame %u timed out (%u/%u slices), requesting IDR",
                          m_slicedDecoder.currentFrameIndex(),
                          __builtin_popcount(m_slicedDecoder.isComplete() ? 0xFFFF : 0),
@@ -320,7 +314,7 @@ void OpenXRApp::receiveAndDecodeVideo() {
                                      payload, payloadSize);
         } else {
             // --- Bulk FEC path (legacy, slice_count=0) ---
-            if (frameIndex != m_fecDecoder.currentFrameIndex()) {
+            if (!m_fecDecoder.isActiveFor(frameIndex)) {
                 auto prevFrame = m_fecDecoder.tryDecode();
                 if (prevFrame.has_value()) {
                     submitDecodedFrame(prevFrame->data.data(), (int)prevFrame->data.size(),
@@ -347,11 +341,14 @@ void OpenXRApp::receiveAndDecodeVideo() {
                                lastFrame->frameIndex);
         }
     }
-    // Slice timeout check: if sliced frame started but isn't complete after 100ms
-    if (m_slicedDecoder.sliceCount() > 0 && !m_slicedDecoder.isComplete()
+    // Slice timeout check: if sliced frame started but isn't complete after 100ms.
+    // Abandon it after one IDR request — otherwise, while only bulk frames
+    // follow, this would re-request an IDR on every render loop.
+    if (m_slicedDecoder.isActive() && !m_slicedDecoder.isComplete()
         && m_slicedDecoder.isTimedOut()) {
         LOGW("Slice FEC: frame %u timed out, requesting IDR", m_slicedDecoder.currentFrameIndex());
         m_tcpClient.requestIdr();
+        m_slicedDecoder.abandon();
     }
 }
 

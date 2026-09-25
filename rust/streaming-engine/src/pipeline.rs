@@ -1,7 +1,8 @@
 use crate::transport::fec::{FecDecoder, FecEncoder};
-use crate::transport::rtp::{RtpPacket, RtpPacketizer};
+use crate::transport::rtp::{read_fvp_header, ReassembledFrame, RtpPacket, RtpPacketizer};
 use crate::transport::slice::SliceSplitter;
-use fvp_common::FEC_SHARD_SIZE;
+use fvp_common::protocol::fvp_flags;
+use fvp_common::{FEC_SHARD_SIZE, MAX_FRAME_SHARDS, PACKET_HEADER_LEN};
 
 /// Encode a frame into FEC-protected RTP packets ready for UDP transmission.
 pub fn encode_frame_to_packets(
@@ -42,6 +43,7 @@ pub fn encode_frame_to_packets_with_fec(
     if data_shards.is_empty() {
         return vec![];
     }
+    let data_count = data_shards.len();
 
     // Step 2: FEC encode (add parity shards, RS instance cached in FecEncoder)
     // data_shards ownership is moved into encode() to avoid cloning.
@@ -49,7 +51,9 @@ pub fn encode_frame_to_packets_with_fec(
         Ok(shards) => shards,
         Err(e) => {
             log::warn!("FEC encode failed: {e}, sending without FEC");
-            // Rebuild minimal shards for fallback (rare error path)
+            // Rebuild minimal shards for fallback (rare error path). The
+            // header still reports data_count == total, so the receiver
+            // knows there is no parity to wait for.
             frame_data
                 .chunks(shard_size)
                 .map(|chunk| {
@@ -62,26 +66,41 @@ pub fn encode_frame_to_packets_with_fec(
     };
 
     // Step 3: Each shard becomes an RTP packet payload.
-    // Buffer pool in packetizer avoids per-frame allocation after the first frame.
+    let flags = fvp_flags::encode_simple(is_keyframe);
+    shards_to_packets(&all_shards, data_count, frame_index, timestamp_90khz, flags, packetizer)
+}
+
+/// Wrap each shard in RTP + FVP headers. `data_count` is written into every
+/// packet's `data_shard_count` so the receiver never has to guess the
+/// data/parity split — adaptive FEC changes it from frame to frame.
+/// Buffer pool in packetizer avoids per-frame allocation after the first frame.
+fn shards_to_packets(
+    all_shards: &[Vec<u8>],
+    data_count: usize,
+    frame_index: u32,
+    timestamp_90khz: u32,
+    flags: u16,
+    packetizer: &mut RtpPacketizer,
+) -> Vec<RtpPacket> {
     let total_shards = all_shards.len();
     if total_shards > u16::MAX as usize {
         log::error!("Frame too large: {} shards exceeds u16 max. Dropping frame.", total_shards);
         return vec![];
     }
+    debug_assert!(data_count > 0 && data_count <= total_shards);
     let mut packets = Vec::with_capacity(total_shards);
 
     for (i, shard) in all_shards.iter().enumerate() {
         let is_last = i == total_shards - 1;
         let seq = packetizer.next_sequence();
 
-        let mut buf = packetizer.take_buf(12 + 10 + shard.len());
+        let mut buf = packetizer.take_buf(PACKET_HEADER_LEN + shard.len());
 
         crate::transport::rtp::write_rtp_header(
             &mut buf, fvp_common::RTP_PT_H265, is_last, seq, timestamp_90khz, 0x42,
         );
-        let flags = fvp_common::protocol::fvp_flags::encode_simple(is_keyframe);
         crate::transport::rtp::write_fvp_header(
-            &mut buf, frame_index, i as u16, total_shards as u16, flags,
+            &mut buf, frame_index, i as u16, total_shards as u16, flags, data_count as u16,
         );
 
         buf.extend_from_slice(shard);
@@ -145,6 +164,7 @@ pub fn encode_frame_sliced(
             continue;
         }
 
+        let data_count = data_shards.len();
         let fec = &mut fec_encoders[slice_idx];
         let all_shards = match fec.encode(data_shards) {
             Ok(shards) => shards,
@@ -155,30 +175,10 @@ pub fn encode_frame_sliced(
             }
         };
 
-        let total_shards = all_shards.len();
-        let mut packets = Vec::with_capacity(total_shards);
-        let flags = fvp_common::protocol::fvp_flags::encode(
-            is_keyframe, slice_idx as u8, slice_count, 0,
-        );
-
-        for (i, shard) in all_shards.iter().enumerate() {
-            let is_last = i == total_shards - 1;
-            let seq = packetizer.next_sequence();
-
-            let mut buf = packetizer.take_buf(12 + 10 + shard.len());
-
-            crate::transport::rtp::write_rtp_header(
-                &mut buf, fvp_common::RTP_PT_H265, is_last, seq, timestamp_90khz, 0x42,
-            );
-            crate::transport::rtp::write_fvp_header(
-                &mut buf, frame_index, i as u16, total_shards as u16, flags,
-            );
-
-            buf.extend_from_slice(shard);
-            packets.push(RtpPacket { data: buf });
-        }
-
-        all_packets.push(packets);
+        let flags = fvp_flags::encode(is_keyframe, slice_idx as u8, slice_count, 0);
+        all_packets.push(shards_to_packets(
+            &all_shards, data_count, frame_index, timestamp_90khz, flags, packetizer,
+        ));
     }
 
     all_packets
@@ -188,6 +188,10 @@ pub fn encode_frame_sliced(
 /// `packets`: received RTP packets for one frame (some may be missing).
 /// `data_shard_count`: number of original data shards.
 /// Returns the reassembled frame data.
+///
+/// Low-level helper for callers that already know the shard counts; live
+/// receivers should use [`FecFrameReassembler`], which reads them from each
+/// packet's FVP header.
 pub fn decode_packets_to_frame(
     packets: &[&[u8]],
     data_shard_count: usize,
@@ -195,8 +199,11 @@ pub fn decode_packets_to_frame(
     original_frame_len: usize,
 ) -> Result<Vec<u8>, String> {
     // Sanity check: reject absurd shard counts
-    const MAX_SHARDS: usize = 4096;
-    if total_shard_count == 0 || total_shard_count > MAX_SHARDS || data_shard_count > total_shard_count {
+    if total_shard_count == 0
+        || total_shard_count > MAX_FRAME_SHARDS
+        || data_shard_count == 0
+        || data_shard_count > total_shard_count
+    {
         return Err("Invalid shard counts".into());
     }
 
@@ -204,11 +211,9 @@ pub fn decode_packets_to_frame(
     let mut shards: Vec<Option<Vec<u8>>> = vec![None; total_shard_count];
 
     for pkt in packets {
-        if pkt.len() < 22 {
-            continue;
-        }
-        let shard_index = u16::from_le_bytes([pkt[16], pkt[17]]) as usize;
-        let payload = &pkt[22..];
+        let Some(hdr) = read_fvp_header(pkt) else { continue };
+        let shard_index = hdr.shard_index as usize;
+        let payload = &pkt[PACKET_HEADER_LEN..];
         if shard_index < total_shard_count {
             shards[shard_index] = Some(payload.to_vec());
         }
@@ -223,6 +228,175 @@ pub fn decode_packets_to_frame(
     frame_data.truncate(original_frame_len);
 
     Ok(frame_data)
+}
+
+/// Receiver-side FEC reassembly driven entirely by the FVP header.
+///
+/// Mirrors the Android client's `FecFrameDecoder` / `SlicedFecFrameDecoder`:
+/// every packet carries `shard_count` and `data_shard_count`, so frames are
+/// rebuilt correctly whatever parity ratio adaptive FEC chose for them. A
+/// frame (or each slice of a sliced frame) completes as soon as
+/// `data_shard_count` shards have arrived; missing data shards are
+/// Reed-Solomon reconstructed from parity. Late parity packets for a frame
+/// that was already emitted are ignored, so each frame is produced once.
+///
+/// Bulk frames come back zero-padded to a whole number of shards (the bulk
+/// path carries no length), exactly as the client hands them to its video
+/// decoder. Sliced frames have each slice's u32 length prefix stripped.
+#[derive(Default)]
+pub struct FecFrameReassembler {
+    frame: Option<PendingFrame>,
+}
+
+struct PendingFrame {
+    frame_index: u32,
+    is_keyframe: bool,
+    /// 0 = bulk (one RS group); otherwise the number of independently
+    /// FEC-coded slices, each with its own shard numbering.
+    slice_count: u8,
+    groups: Vec<ShardGroup>,
+    delivered: bool,
+}
+
+/// One Reed-Solomon group: the whole frame (bulk) or one slice.
+#[derive(Default)]
+struct ShardGroup {
+    shard_count: usize,
+    data_shard_count: usize,
+    shard_len: usize,
+    shards: Vec<Option<Vec<u8>>>,
+    received: usize,
+    decoded: Option<Vec<u8>>,
+    failed: bool,
+}
+
+impl ShardGroup {
+    /// Store one shard. Returns false for packets that do not fit the group:
+    /// counts that disagree with its first packet, a payload size different
+    /// from the other shards, or a duplicate index.
+    fn accept(&mut self, shard_index: usize, shard_count: usize, data_count: usize, payload: &[u8]) -> bool {
+        if self.shard_count == 0 {
+            self.shard_count = shard_count;
+            self.data_shard_count = data_count;
+            self.shard_len = payload.len();
+            self.shards = vec![None; shard_count];
+        } else if self.shard_count != shard_count
+            || self.data_shard_count != data_count
+            || self.shard_len != payload.len()
+        {
+            return false;
+        }
+        if self.shards[shard_index].is_some() {
+            return false;
+        }
+        self.shards[shard_index] = Some(payload.to_vec());
+        self.received += 1;
+        true
+    }
+
+    /// Rebuild the group's data once `data_shard_count` shards are present:
+    /// the concatenated data shards, with the slice length prefix stripped
+    /// when `has_len_prefix`. None if RS fails or the prefix is out of range.
+    fn reconstruct(&mut self, has_len_prefix: bool) -> Option<Vec<u8>> {
+        let d = self.data_shard_count;
+        let data_shards: Vec<Vec<u8>> = if self.shards[..d].iter().all(Option::is_some) {
+            self.shards[..d].iter_mut().map(|s| s.take().unwrap_or_default()).collect()
+        } else {
+            FecDecoder::decode(&mut self.shards, d).ok()?
+        };
+        self.shards = Vec::new();
+        let mut data: Vec<u8> = data_shards.into_iter().flatten().collect();
+        if has_len_prefix {
+            if data.len() < 4 {
+                return None;
+            }
+            let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if len > data.len() - 4 {
+                return None;
+            }
+            data.truncate(4 + len);
+            data.drain(..4);
+        }
+        Some(data)
+    }
+}
+
+impl FecFrameReassembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one received packet. Returns the frame once it is complete.
+    /// Malformed or inconsistent packets are dropped.
+    pub fn feed(&mut self, packet: &[u8]) -> Option<ReassembledFrame> {
+        let hdr = read_fvp_header(packet)?;
+        if !hdr.is_valid() {
+            return None;
+        }
+        let payload = &packet[PACKET_HEADER_LEN..];
+        if payload.is_empty() {
+            return None;
+        }
+        let slice_count = fvp_flags::slice_count(hdr.flags);
+        let slice_index = fvp_flags::slice_index(hdr.flags);
+        if slice_count > 0 && slice_index >= slice_count {
+            return None;
+        }
+
+        // A new frame index abandons whatever the previous frame had not
+        // completed (the client does the same, then requests an IDR).
+        if self.frame.as_ref().map(|f| f.frame_index) != Some(hdr.frame_index) {
+            self.frame = Some(PendingFrame {
+                frame_index: hdr.frame_index,
+                is_keyframe: hdr.is_keyframe(),
+                slice_count,
+                groups: (0..slice_count.max(1)).map(|_| ShardGroup::default()).collect(),
+                delivered: false,
+            });
+        }
+        let frame = self.frame.as_mut()?;
+        if frame.delivered || frame.slice_count != slice_count {
+            return None;
+        }
+
+        let group_idx = if slice_count == 0 { 0 } else { slice_index as usize };
+        let group = &mut frame.groups[group_idx];
+        if group.decoded.is_some() || group.failed {
+            return None;
+        }
+        if !group.accept(
+            hdr.shard_index as usize,
+            hdr.shard_count as usize,
+            hdr.data_shard_count as usize,
+            payload,
+        ) {
+            return None;
+        }
+        if group.received >= group.data_shard_count {
+            match group.reconstruct(slice_count > 0) {
+                Some(data) => group.decoded = Some(data),
+                None => {
+                    group.failed = true;
+                    return None;
+                }
+            }
+        }
+
+        if frame.groups.iter().all(|g| g.decoded.is_some()) {
+            frame.delivered = true;
+            let data = frame
+                .groups
+                .iter_mut()
+                .flat_map(|g| g.decoded.take().unwrap_or_default())
+                .collect();
+            return Some(ReassembledFrame {
+                frame_index: frame.frame_index,
+                is_keyframe: frame.is_keyframe,
+                data,
+            });
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -254,9 +428,9 @@ mod tests {
         // 1 data shard + 1 parity shard = 2 packets
         assert_eq!(packets.len(), 2);
 
-        // Each packet should be: 12 (RTP) + 10 (FVP) + FEC_SHARD_SIZE bytes
+        // Each packet should be: 12 (RTP) + 12 (FVP) + FEC_SHARD_SIZE bytes
         for p in &packets {
-            assert_eq!(p.data.len(), 12 + 10 + FEC_SHARD_SIZE);
+            assert_eq!(p.data.len(), PACKET_HEADER_LEN + FEC_SHARD_SIZE);
         }
     }
 
@@ -462,8 +636,8 @@ mod tests {
         // Each slice's first data shard should start with u32 length prefix
         for (i, batch) in batches.iter().enumerate() {
             if batch.is_empty() { continue; }
-            // Extract payload from first packet (after 12B RTP + 10B FVP header)
-            let payload = &batch[0].data[22..];
+            // Extract payload from first packet (after 12B RTP + 12B FVP header)
+            let payload = &batch[0].data[PACKET_HEADER_LEN..];
             let prefix_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
             // Each slice of 20000/4 = 5000 bytes
             assert_eq!(prefix_len, 5000, "Slice {} payload len prefix mismatch", i);
@@ -525,5 +699,239 @@ mod tests {
         assert!(fvp_common::protocol::fvp_flags::is_keyframe(flags));
         assert_eq!(fvp_common::protocol::fvp_flags::slice_index(flags), 0);
         assert_eq!(fvp_common::protocol::fvp_flags::slice_count(flags), 0);
+    }
+
+    // --- data_shard_count in the FVP header (protocol v4) ---
+
+    use crate::transport::rtp::{read_fvp_header, write_fvp_header, write_rtp_header, FvpHeader};
+
+    fn header_of(p: &RtpPacket) -> FvpHeader {
+        read_fvp_header(&p.data).expect("packet must carry a full header")
+    }
+
+    /// Frame spanning exactly `data_shards` FEC shards (last one partial).
+    fn frame_of(data_shards: usize, seed: u8) -> Vec<u8> {
+        let len = FEC_SHARD_SIZE * (data_shards - 1) + 7;
+        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    }
+
+    /// The pre-v4 client guess this header field replaces.
+    fn legacy_heuristic(total: u16) -> u16 {
+        (total as f32 / 1.2) as u16
+    }
+
+    /// Feed `packets` minus the indices in `drop` and return every frame the
+    /// reassembler produced.
+    fn reassemble(r: &mut FecFrameReassembler, packets: &[RtpPacket], drop: &[usize]) -> Vec<ReassembledFrame> {
+        packets
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !drop.contains(i))
+            .filter_map(|(_, p)| r.feed(&p.data))
+            .collect()
+    }
+
+    fn assert_bulk_frame_eq(frame: &ReassembledFrame, original: &[u8]) {
+        // Bulk frames come back padded to whole shards with zeros.
+        assert_eq!(&frame.data[..original.len()], original);
+        assert!(frame.data[original.len()..].iter().all(|&b| b == 0));
+        assert_eq!(frame.data.len() % FEC_SHARD_SIZE, 0);
+    }
+
+    #[test]
+    fn test_every_packet_carries_data_shard_count() {
+        for redundancy in [0.05f32, 0.2, 0.4, 1.0] {
+            let frame = frame_of(11, 1);
+            let packets = encode_frame_to_packets(&frame, 3, 0, false, redundancy, &mut make_packetizer());
+            let parity = ((11.0 * redundancy).ceil() as usize).max(1);
+            assert_eq!(packets.len(), 11 + parity, "redundancy {redundancy}");
+            for (i, p) in packets.iter().enumerate() {
+                let h = header_of(p);
+                assert_eq!(h.shard_index as usize, i);
+                assert_eq!(h.shard_count as usize, 11 + parity);
+                assert_eq!(h.data_shard_count, 11, "redundancy {redundancy}, shard {i}");
+                assert!(h.is_valid());
+            }
+        }
+    }
+
+    #[test]
+    fn test_legacy_total_div_1_2_heuristic_is_wrong_under_adaptive_fec() {
+        // REGRESSION: the client used to guess data = total / 1.2, which is
+        // only right near 20% redundancy. Adaptive FEC ranges 5%..40% (and
+        // config allows up to 100%):
+        //   - 5%: the guess is too LOW → RS runs on the wrong code and
+        //     "recovers" garbage;
+        //   - 40% / 100%: the guess is too HIGH → the receiver waits for more
+        //     shards than needed and drops frames FEC could have recovered.
+        // Each case loses exactly `parity` data shards — the most RS can
+        // recover with the true split, which the header now carries.
+        let original = frame_of(10, 9);
+        for (redundancy, total) in [(0.05f32, 11u16), (0.4, 14), (1.0, 20)] {
+            let packets = encode_frame_to_packets(&original, 0, 0, false, redundancy, &mut make_packetizer());
+            let h = header_of(&packets[0]);
+            assert_eq!(h.shard_count, total);
+            assert_eq!(h.data_shard_count, 10);
+            let guess = legacy_heuristic(total);
+            assert_ne!(guess, 10, "heuristic happened to be right for {redundancy}");
+
+            let parity = total as usize - 10;
+            let lost: Vec<usize> = (0..parity).collect();
+            let refs: Vec<&[u8]> = packets[parity..].iter().map(|p| p.data.as_slice()).collect();
+            let guessed = decode_packets_to_frame(&refs, guess as usize, total as usize, original.len());
+            assert_ne!(guessed.ok().as_deref(), Some(original.as_slice()),
+                "guessed split {guess}/{total} must not recover the frame");
+
+            let frames = reassemble(&mut FecFrameReassembler::new(), &packets, &lost);
+            assert_eq!(frames.len(), 1, "header split recovers at {redundancy}");
+            assert_bulk_frame_eq(&frames[0], &original);
+        }
+    }
+
+    #[test]
+    fn test_reassembler_recovers_max_loss_at_each_redundancy() {
+        for redundancy in [0.05f32, 0.2, 0.4, 1.0] {
+            let original = frame_of(12, 3);
+            let packets = encode_frame_to_packets(&original, 5, 0, true, redundancy, &mut make_packetizer());
+            let parity = packets.len() - 12;
+            // Lose as many data shards as there are parity shards — the
+            // most RS can recover.
+            let lost: Vec<usize> = (0..parity).map(|k| (k * 5) % 12).collect();
+            let lost: Vec<usize> = {
+                let mut v = lost;
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            let frames = reassemble(&mut FecFrameReassembler::new(), &packets, &lost);
+            assert_eq!(frames.len(), 1, "redundancy {redundancy}, lost {lost:?}");
+            assert_eq!(frames[0].frame_index, 5);
+            assert!(frames[0].is_keyframe);
+            assert_bulk_frame_eq(&frames[0], &original);
+        }
+    }
+
+    #[test]
+    fn test_reassembler_follows_redundancy_changes_between_frames() {
+        // One encoder + one reassembler across frames, redundancy changing
+        // per frame as AdaptiveFecController would drive it.
+        let mut enc = FecEncoder::new(0.05);
+        let mut pkt = make_packetizer();
+        let mut r = FecFrameReassembler::new();
+        for (idx, redundancy) in [0.05f32, 0.4, 0.15, 1.0, 0.25].into_iter().enumerate() {
+            enc.set_redundancy(redundancy);
+            let original = frame_of(10, idx as u8);
+            let packets = encode_frame_to_packets_with_fec(
+                &original, idx as u32, 0, false, &mut enc, &mut pkt,
+            );
+            let frames = reassemble(&mut r, &packets, &[1]); // lose data shard 1
+            assert_eq!(frames.len(), 1, "frame {idx} (redundancy {redundancy})");
+            assert_eq!(frames[0].frame_index, idx as u32);
+            assert_bulk_frame_eq(&frames[0], &original);
+            pkt.recycle(packets);
+        }
+    }
+
+    #[test]
+    fn test_reassembler_emits_each_frame_once() {
+        // Late parity packets after the data shards completed the frame must
+        // not produce a second copy.
+        let original = frame_of(4, 2);
+        let packets = encode_frame_to_packets(&original, 1, 0, false, 0.5, &mut make_packetizer());
+        let frames = reassemble(&mut FecFrameReassembler::new(), &packets, &[]);
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn test_reassembler_unrecoverable_frame_then_next_frame_ok() {
+        let mut r = FecFrameReassembler::new();
+        let first = frame_of(6, 4);
+        let packets = encode_frame_to_packets(&first, 0, 0, false, 0.2, &mut make_packetizer());
+        let parity = packets.len() - 6;
+        let lost: Vec<usize> = (0..=parity).collect(); // one more than recoverable
+        assert!(reassemble(&mut r, &packets, &lost).is_empty());
+
+        let second = frame_of(6, 5);
+        let packets = encode_frame_to_packets(&second, 1, 0, false, 0.2, &mut make_packetizer());
+        let frames = reassemble(&mut r, &packets, &[]);
+        assert_eq!(frames.len(), 1);
+        assert_bulk_frame_eq(&frames[0], &second);
+    }
+
+    #[test]
+    fn test_reassembler_sliced_frame_with_loss() {
+        let original: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let mut encs: Vec<FecEncoder> = (0..4).map(|_| FecEncoder::new(0.2)).collect();
+        let batches = encode_frame_sliced(&original, 8, 0, true, 4, &mut encs, &mut make_packetizer());
+        let mut r = FecFrameReassembler::new();
+        let mut frames = Vec::new();
+        for batch in &batches {
+            let data_count = header_of(&batch[0]).data_shard_count;
+            assert!(data_count > 0 && (data_count as usize) < batch.len());
+            // Lose the first data shard of every slice (carries the length
+            // prefix, so recovery must go through RS).
+            frames.extend(reassemble(&mut r, batch, &[0]));
+        }
+        assert_eq!(frames.len(), 1, "all slices recovered → exactly one frame");
+        assert_eq!(frames[0].frame_index, 8);
+        assert_eq!(frames[0].data, original, "slice prefixes stripped, no padding");
+    }
+
+    #[test]
+    fn test_bulk_fallback_without_fec_reports_all_shards_as_data() {
+        // RS(GF(2^8)) caps data+parity at 256; a bigger frame falls back to
+        // sending data shards only. The header must then say data == total
+        // (the old /1.2 guess would have expected parity that never comes).
+        let original = frame_of(240, 6); // 240 data + 48 parity > 256
+        let packets = encode_frame_to_packets(&original, 2, 0, true, 0.2, &mut make_packetizer());
+        assert_eq!(packets.len(), 240);
+        for p in &packets {
+            let h = header_of(p);
+            assert_eq!(h.data_shard_count, h.shard_count);
+        }
+        let frames = reassemble(&mut FecFrameReassembler::new(), &packets, &[]);
+        assert_eq!(frames.len(), 1);
+        assert_bulk_frame_eq(&frames[0], &original);
+    }
+
+    #[test]
+    fn test_reassembler_drops_invalid_headers() {
+        let raw = |shard_index: u16, shard_count: u16, data: u16| {
+            let mut buf = Vec::new();
+            write_rtp_header(&mut buf, 97, false, 0, 0, 0);
+            write_fvp_header(&mut buf, 0, shard_index, shard_count, 0, data);
+            buf.extend_from_slice(&[0xEE; FEC_SHARD_SIZE]);
+            buf
+        };
+        let mut r = FecFrameReassembler::new();
+        assert!(r.feed(&raw(0, 1, 0)).is_none(), "data=0");
+        assert!(r.feed(&raw(0, 2, 3)).is_none(), "data>total");
+        assert!(r.feed(&raw(2, 2, 1)).is_none(), "index>=total");
+        assert!(r.feed(&raw(0, (MAX_FRAME_SHARDS + 1) as u16, 1)).is_none(), "total>MAX");
+        assert!(r.feed(&[0u8; PACKET_HEADER_LEN - 1]).is_none(), "short packet");
+        assert!(r.feed(&raw(0, 1, 1)[..PACKET_HEADER_LEN]).is_none(), "empty payload");
+
+        // None of the garbage above poisons a following valid frame.
+        let original = frame_of(3, 7);
+        let packets = encode_frame_to_packets(&original, 0, 0, false, 0.4, &mut make_packetizer());
+        let frames = reassemble(&mut r, &packets, &[2]);
+        assert_eq!(frames.len(), 1);
+        assert_bulk_frame_eq(&frames[0], &original);
+    }
+
+    #[test]
+    fn test_reassembler_ignores_shards_with_conflicting_counts() {
+        // A packet claiming a different data/total split for a frame already
+        // in progress (forged or corrupt) is ignored rather than mixed in.
+        let original = frame_of(4, 8);
+        let packets = encode_frame_to_packets(&original, 0, 0, false, 0.5, &mut make_packetizer());
+        let mut r = FecFrameReassembler::new();
+        assert!(r.feed(&packets[0].data).is_none());
+        let mut forged = packets[1].data.clone();
+        forged[22..24].copy_from_slice(&5u16.to_le_bytes()); // data 4 → 5
+        assert!(r.feed(&forged).is_none());
+        let frames: Vec<_> = packets[1..].iter().filter_map(|p| r.feed(&p.data)).collect();
+        assert_eq!(frames.len(), 1);
+        assert_bulk_frame_eq(&frames[0], &original);
     }
 }

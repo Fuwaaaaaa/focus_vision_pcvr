@@ -104,18 +104,17 @@ impl CompanionApp {
                 ui.label(egui::RichText::new("WASAPI loopback — no virtual device needed").size(11.0).color(text_muted));
             }
 
-            // Persist on change. Engine reads bitrate at startup, so a manual
-            // engine restart is needed to pick up new values — the hint below
-            // makes that explicit instead of leaving the user guessing why
-            // the slider movement seems to do nothing in real time.
+            // Persist on change (debounced — see `mark_config_dirty`). Engine
+            // reads bitrate at startup, so a manual engine restart is needed
+            // to pick up new values — the log line makes that explicit
+            // instead of leaving the user guessing why the slider movement
+            // seems to do nothing in real time.
             if self.audio_enabled != prev_audio_enabled || self.audio_bitrate_kbps != prev_audio_bitrate {
                 self.local_config.audio.enabled = self.audio_enabled;
                 self.local_config.audio.bitrate_kbps = self.audio_bitrate_kbps;
-                match self.local_config.save() {
-                    Ok(()) => self.log(&format!("Audio: {} ({} kbps) — restart engine to apply",
-                        if self.audio_enabled { "enabled" } else { "disabled" }, self.audio_bitrate_kbps)),
-                    Err(e) => self.log(&format!("Failed to save audio config: {e}")),
-                }
+                let note = format!("Audio: {} ({} kbps) — restart engine to apply",
+                    if self.audio_enabled { "enabled" } else { "disabled" }, self.audio_bitrate_kbps);
+                self.mark_config_dirty("audio", note);
             }
         });
 
@@ -141,11 +140,9 @@ impl CompanionApp {
             if self.sleep_enabled != prev_enabled || self.sleep_timeout != prev_timeout {
                 self.local_config.sleep_mode.enabled = self.sleep_enabled;
                 self.local_config.sleep_mode.timeout_seconds = self.sleep_timeout;
-                match self.local_config.save() {
-                    Ok(()) => self.log(&format!("Sleep mode: {} (timeout {}s)",
-                        if self.sleep_enabled { "enabled" } else { "disabled" }, self.sleep_timeout)),
-                    Err(e) => self.log(&format!("Failed to save config: {e}")),
-                }
+                let note = format!("Sleep mode: {} (timeout {}s)",
+                    if self.sleep_enabled { "enabled" } else { "disabled" }, self.sleep_timeout);
+                self.mark_config_dirty("sleep_mode", note);
             }
         });
 
@@ -170,11 +167,9 @@ impl CompanionApp {
             if self.ft_enabled != prev_enabled || (self.ft_smoothing - prev_smoothing).abs() > 0.001 {
                 self.local_config.face_tracking.enabled = self.ft_enabled;
                 self.local_config.face_tracking.smoothing = self.ft_smoothing;
-                match self.local_config.save() {
-                    Ok(()) => self.log(&format!("Face tracking: {} (smoothing {:.2})",
-                        if self.ft_enabled { "enabled" } else { "disabled" }, self.ft_smoothing)),
-                    Err(e) => self.log(&format!("Failed to save config: {e}")),
-                }
+                let note = format!("Face tracking: {} (smoothing {:.2})",
+                    if self.ft_enabled { "enabled" } else { "disabled" }, self.ft_smoothing);
+                self.mark_config_dirty("face_tracking", note);
             }
         });
 
@@ -224,12 +219,10 @@ impl CompanionApp {
             if self.recording_enabled != prev_rec_enabled || self.recording_output_dir != prev_rec_dir {
                 self.local_config.recording.enabled = self.recording_enabled;
                 self.local_config.recording.output_dir = self.recording_output_dir.clone();
-                match self.local_config.save() {
-                    Ok(()) => self.log(&format!("Recording: {} (dir: {})",
-                        if self.recording_enabled { "enabled" } else { "disabled" },
-                        if self.recording_output_dir.is_empty() { "<default>" } else { &self.recording_output_dir })),
-                    Err(e) => self.log(&format!("Failed to save config: {e}")),
-                }
+                let note = format!("Recording: {} (dir: {})",
+                    if self.recording_enabled { "enabled" } else { "disabled" },
+                    if self.recording_output_dir.is_empty() { "<default>" } else { &self.recording_output_dir });
+                self.mark_config_dirty("recording", note);
             }
         });
 
@@ -257,10 +250,8 @@ impl CompanionApp {
             ui.radio_value(&mut self.selected_codec, "h264".to_string(), "H.264 — lower latency (2-5ms)");
             if self.selected_codec != prev {
                 self.local_config.video.codec = self.selected_codec.clone();
-                match self.local_config.save() {
-                    Ok(()) => self.log(&format!("Codec set to {}. Restart engine to apply.", self.selected_codec)),
-                    Err(e) => self.log(&format!("Failed to save config: {e}")),
-                }
+                let note = format!("Codec set to {}. Restart engine to apply.", self.selected_codec);
+                self.mark_config_dirty("video", note);
             }
         });
 
@@ -367,10 +358,13 @@ impl CompanionApp {
 
     /// Wipe LocalConfig back to defaults, persist, and re-sync every UI
     /// shadow field so the on-screen sliders/toggles match what was saved.
+    /// Saved immediately (not debounced) and supersedes any pending change.
     /// Failure to save is non-fatal: we log it but still apply the in-memory
     /// reset, so the user at least gets immediate visual feedback.
     pub(crate) fn reset_to_defaults(&mut self) {
         self.local_config = config::LocalConfig::default();
+        self.config_dirty_since = None;
+        self.pending_save_notes.clear();
 
         self.selected_codec = self.local_config.video.codec.clone();
         self.sleep_enabled = self.local_config.sleep_mode.enabled;

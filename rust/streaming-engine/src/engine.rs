@@ -9,7 +9,7 @@ use crate::config::AppConfig;
 use crate::control::tcp_server::TcpControlServer;
 use crate::metrics::latency::{FrameTimestamps, LatencyTracker};
 use crate::pipeline;
-use crate::tracking::receiver::TrackingReceiver;
+use crate::tracking::receiver::{AuthorizedPeer, TrackingReceiver};
 use crate::transport::rtp::RtpPacketizer;
 use crate::transport::udp::UdpSender;
 use fvp_common::protocol::{ControllerState, TrackingData};
@@ -245,13 +245,17 @@ impl StreamingEngine {
         let tracking_clone = latest_tracking.clone();
         let tracker_clone = latency_tracker.clone();
         let config_clone = config.clone();
+        // Paired HMD address: written by the session loop, read by the
+        // tracking receiver to reject datagrams from any other source.
+        let authorized_peer: AuthorizedPeer = Arc::new(std::sync::RwLock::new(None));
+        let session_peer = authorized_peer.clone();
 
         // Spawn the main streaming task
         let cancel = cancel_token.clone();
         let stream_cancel = cancel_token.clone();
         spawn_named(runtime.handle(), "streaming", async move {
             tokio::select! {
-                result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone, stream_cancel) => {
+                result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone, session_peer, stream_cancel) => {
                     if let Err(e) = result {
                         log::error!("Streaming engine error: {}", e);
                     }
@@ -268,7 +272,7 @@ impl StreamingEngine {
         let tracking_port = config.network.udp_port + fvp_common::TRACKING_PORT_OFFSET;
         let cancel = cancel_token.clone();
         spawn_named(runtime.handle(), "tracking-receiver", async move {
-            let receiver = TrackingReceiver::new(tracking_head, tracking_ctrl);
+            let receiver = TrackingReceiver::new(tracking_head, tracking_ctrl, authorized_peer);
             let addr: SocketAddr = match format!("0.0.0.0:{}", tracking_port).parse() {
                 Ok(a) => a,
                 Err(e) => {
@@ -1122,11 +1126,11 @@ fn log_periodic_stats(frame_count: u64, framerate: u64) {
 
 /// Publish a live `"streaming"` status.json snapshot so the companion app shows
 /// Connected with live latency/fps/bitrate and subsystem indicators while a
-/// session is active. Written once on connect and refreshed ~1×/sec from the
-/// frame loop; the accept loop reverts to `"waiting"` on its next iteration
-/// after a disconnect. This is the real-data source the `--demo` mode fakes —
-/// without it the companion would stay on "WaitingForPin" for the entire
-/// session, even with real hardware.
+/// session is active. Written once on connect and refreshed every
+/// `STATUS_HEARTBEAT` by the session loop (independent of frame flow); the
+/// accept loop reverts to `"waiting"` after a disconnect. This is the
+/// real-data source the `--demo` mode fakes — without it the companion would
+/// stay on "WaitingForPin" for the entire session, even with real hardware.
 fn publish_streaming_status(
     config: &AppConfig,
     bitrate_mbps: u32,
@@ -1166,11 +1170,77 @@ fn publish_streaming_status(
     );
 }
 
+/// How often status.json is rewritten while the engine is alive. The
+/// companion treats a file older than 5 s as "engine stopped", so every
+/// engine state — waiting for the HMD, reconnect backoff, streaming — must
+/// refresh it well inside that window.
+const STATUS_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Drive `fut` to completion, calling `beat` immediately and then every
+/// `period` until it finishes. Used to keep status.json fresh while the
+/// engine is parked on a long await (TCP accept, reconnect backoff) that
+/// would otherwise leave the file untouched for minutes.
+async fn with_heartbeat<F: std::future::Future>(
+    fut: F,
+    period: std::time::Duration,
+    mut beat: impl FnMut(),
+) -> F::Output {
+    tokio::pin!(fut);
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            out = &mut fut => return out,
+            _ = ticker.tick() => beat(),
+        }
+    }
+}
+
+/// `"waiting"` status: with the pairing PIN while a TCP server is listening,
+/// or `None` (rendered as "------", i.e. not yet pairable) during backoff.
+fn publish_waiting_status(pin: Option<u32>) {
+    crate::write_status_file(
+        "waiting",
+        pin,
+        None,
+        None,
+        None,
+        None,
+        pin.map(|_| fvp_common::PIN_LIFETIME_SECONDS),
+    );
+}
+
+/// Marks `ip` as the paired HMD for the tracking receiver's source check
+/// while alive, and revokes it on drop — so every way a session can end
+/// (clean break, `continue`, early `return`) closes the tracking port to
+/// that address again.
+struct AuthorizedPeerGuard {
+    peer: AuthorizedPeer,
+}
+
+impl AuthorizedPeerGuard {
+    fn authorize(peer: &AuthorizedPeer, ip: std::net::IpAddr) -> Self {
+        if let Ok(mut guard) = peer.write() {
+            *guard = Some(ip);
+        }
+        Self { peer: peer.clone() }
+    }
+}
+
+impl Drop for AuthorizedPeerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.peer.write() {
+            *guard = None;
+        }
+    }
+}
+
 async fn run_streaming(
     config: AppConfig,
     mut frame_rx: mpsc::Receiver<EncodedFrame>,
     _tracking: Arc<StdMutex<Option<TrackingData>>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
+    authorized_peer: AuthorizedPeer,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Reconnect loop: when a session ends (TCP disconnect, Wi-Fi drop),
@@ -1214,8 +1284,10 @@ async fn run_streaming(
                 reconnect_state.accept_failures(),
                 crate::control::reconnect::MAX_ACCEPT_FAILURES,
             );
+            // Backoff can last up to 16 s — keep status.json fresh so the
+            // companion doesn't report the engine as stopped meanwhile.
             tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
+                _ = with_heartbeat(tokio::time::sleep(delay), STATUS_HEARTBEAT, || publish_waiting_status(None)) => {}
                 _ = cancel.cancelled() => { break; }
             }
         }
@@ -1223,27 +1295,18 @@ async fn run_streaming(
         // Step 1: Wait for HMD to connect via TCP
         let tcp_server = TcpControlServer::new(config.clone());
         // Publish the freshly-generated PIN to status.json so the companion
-        // app (or the simulator mock-client) can read it. Prior to this
-        // line the field was always "------" — companion app PIN display
-        // was a dead code path. The PIN rotates each time we re-enter this
-        // loop after a disconnect, so the write must repeat per iteration.
+        // app (or the simulator mock-client) can read it. The PIN rotates
+        // each time we re-enter this loop after a disconnect, so the write
+        // must repeat per iteration.
         //
-        // We also publish PIN_LIFETIME_SECONDS so the companion can render
-        // a live "Expires in: M:SS" countdown. The companion counts down
-        // locally from the moment it observes the value — the engine
-        // doesn't need to re-emit the file every second.
+        // The same payload is re-emitted every STATUS_HEARTBEAT while we
+        // wait: the companion judges engine liveness from the file's mtime,
+        // and waiting for the HMD can take minutes. PIN_LIFETIME_SECONDS
+        // stays constant across the re-emits, so the companion keeps its
+        // own local "Expires in: M:SS" countdown running.
         let pin_to_publish = tcp_server.current_pin().await;
-        crate::write_status_file(
-            "waiting",
-            Some(pin_to_publish),
-            None,
-            None,
-            None,
-            None,
-            Some(fvp_common::PIN_LIFETIME_SECONDS),
-        );
         let accept_result = tokio::select! {
-            r = tcp_server.listen_and_accept() => r,
+            r = with_heartbeat(tcp_server.listen_and_accept(), STATUS_HEARTBEAT, || publish_waiting_status(Some(pin_to_publish))) => r,
             _ = cancel.cancelled() => { break; }
         };
 
@@ -1265,6 +1328,10 @@ async fn run_streaming(
 
         log::info!("HMD connected from {}, starting video stream", peer_addr);
         reconnect_state.record_accept_success();
+
+        // Only the HMD that just completed TLS + PIN pairing may feed the
+        // tracking port for the lifetime of this session.
+        let peer_guard = AuthorizedPeerGuard::authorize(&authorized_peer, peer_addr.ip());
 
         // Per-session cancel: fires when TCP drops or HMD disconnects
         let session_cancel = CancellationToken::new();
@@ -1421,8 +1488,26 @@ async fn run_streaming(
             &hmd_stats,
         );
 
+        // Refresh the live "streaming" snapshot on a wall-clock tick rather
+        // than every Nth frame: if SteamVR stops submitting frames (game
+        // paused, loading screen) the session is still up and status.json
+        // must stay fresh, or the companion flags the engine as stopped.
+        let mut status_tick = tokio::time::interval(STATUS_HEARTBEAT);
+        status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        status_tick.tick().await; // first tick is immediate; we just published
+
         loop {
             tokio::select! {
+                _ = status_tick.tick() => {
+                    // `update_latency_atomics` (frame branch) keeps
+                    // PC_TOTAL_LATENCY_US current; this reads it.
+                    publish_streaming_status(
+                        &config,
+                        bitrate_ctrl.current_bitrate_mbps(),
+                        sleep_detector.is_sleeping(),
+                        &hmd_stats,
+                    );
+                }
                 frame_opt = frame_rx.recv() => {
                     let mut frame = match frame_opt {
                         Some(f) => f,
@@ -1506,19 +1591,6 @@ async fn run_streaming(
                     update_latency_atomics(&latency_tracker);
 
                     log_periodic_stats(frame_count, framerate);
-
-                    // Refresh the live "streaming" snapshot ~1×/sec so the
-                    // companion's stats sparklines and subsystem indicators
-                    // track the session. `update_latency_atomics` above just
-                    // refreshed PC_TOTAL_LATENCY_US, which this reads.
-                    if frame_count.is_multiple_of(framerate) {
-                        publish_streaming_status(
-                            &config,
-                            bitrate_ctrl.current_bitrate_mbps(),
-                            sleep_detector.is_sleeping(),
-                            &hmd_stats,
-                        );
-                    }
                 }
                 _ = session_cancel.cancelled() => {
                     log::info!("Session ended — waiting for new connection");
@@ -1531,7 +1603,9 @@ async fn run_streaming(
             }
         }
 
-        // Session ended — check disconnect reason for hold logic
+        // Session ended — stop accepting tracking from its HMD, then check
+        // disconnect reason for hold logic
+        drop(peer_guard);
         let reason = disconnect_reason.lock().ok()
             .and_then(|g| *g)
             .unwrap_or(DisconnectReason::ConnectionLost);
@@ -1548,12 +1622,15 @@ async fn run_streaming(
                     );
                 }
 
-                // Re-create TCP server and listen during hold period
+                // Re-create TCP server and listen during hold period. Publish
+                // its PIN (and keep status.json fresh) so the companion
+                // stops showing the dead session as Connected.
                 let tcp_server = TcpControlServer::new(config.clone());
+                let hold_pin = tcp_server.current_pin().await;
                 let hold_duration = std::time::Duration::from_secs(5);
 
                 let reconnect_result = tokio::select! {
-                    r = tcp_server.listen_and_accept() => Some(r),
+                    r = with_heartbeat(tcp_server.listen_and_accept(), STATUS_HEARTBEAT, || publish_waiting_status(Some(hold_pin))) => Some(r),
                     _ = tokio::time::sleep(hold_duration) => None,
                     _ = cancel.cancelled() => {
                         log::info!("Engine shutdown during hold period");
@@ -2081,5 +2158,45 @@ mod tests {
         // Should warn but continue to DISCONNECT
         assert!(harness.cancel.is_cancelled());
         assert_eq!(harness.disconnect_reason, Some(DisconnectReason::ClientRequested));
+    }
+
+    #[tokio::test]
+    async fn test_with_heartbeat_beats_while_future_pending() {
+        // status.json liveness: the accept loop parks on listen_and_accept
+        // for minutes; the heartbeat must keep firing until it resolves.
+        let mut beats = 0u32;
+        let out = with_heartbeat(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+                42
+            },
+            std::time::Duration::from_millis(50),
+            || beats += 1,
+        )
+        .await;
+        assert_eq!(out, 42);
+        assert!(beats >= 3, "expected repeated beats while pending, got {beats}");
+    }
+
+    #[tokio::test]
+    async fn test_with_heartbeat_returns_ready_future_output() {
+        let mut beats = 0u32;
+        let out = with_heartbeat(async { 7 }, std::time::Duration::from_secs(60), || beats += 1).await;
+        assert_eq!(out, 7);
+        assert!(beats <= 1, "at most the immediate first beat, got {beats}");
+    }
+
+    #[test]
+    fn test_authorized_peer_guard_revokes_on_drop() {
+        use crate::tracking::receiver::is_authorized_source;
+        let peer: AuthorizedPeer = Arc::new(std::sync::RwLock::new(None));
+        let hmd = std::net::IpAddr::from([192, 168, 1, 50]);
+        assert!(!is_authorized_source(&peer, hmd), "nothing authorized before a session");
+        {
+            let _session = AuthorizedPeerGuard::authorize(&peer, hmd);
+            assert!(is_authorized_source(&peer, hmd));
+            assert!(!is_authorized_source(&peer, std::net::IpAddr::from([192, 168, 1, 99])));
+        }
+        assert!(!is_authorized_source(&peer, hmd), "session end must revoke the HMD");
     }
 }

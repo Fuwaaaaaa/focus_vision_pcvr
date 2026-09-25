@@ -2,6 +2,83 @@
 
 All notable changes to Focus Vision PCVR will be documented in this file.
 
+## [Unreleased]
+
+### Protocol (breaking: v4)
+- **FVP header carries `data_shard_count` (FEC fix).** The HMD derived the
+  data/parity split as `total_shards / 1.2`, which is only right at exactly
+  20 % redundancy — adaptive FEC moves between 5 % and 40 %, so frames were
+  mis-split (too few data shards → corrupt frame; too many → a recoverable
+  frame discarded). The FVP header grows 10 → 12 bytes with
+  `data_shard_count: u16 LE` appended after `flags` (bytes 22..24; older
+  fields keep their offsets, payload now starts at byte 24).
+  `PROTOCOL_VERSION` is 4 on both sides; the server logs a warning for older
+  clients. Receivers validate `0 < data <= total <= 4096` and
+  `shard_index < total` before sizing or indexing buffers (a forged
+  `data > total` previously read past the end of the C++ decoder's arrays).
+- New `pipeline::FecFrameReassembler` (Rust receive side, bulk + sliced,
+  header-driven RS recovery) now used by the simulator's mock client, and a
+  dependency-free `parseFvpHeader()` in the Android client.
+- Client receive-path fixes found on the way: the sliced decoder reported
+  "complete" before its first frame (pushing an empty frame — IDR request +
+  decoder flush — every render loop), completed frames were re-submitted
+  every loop until the next frame arrived, frame index 0 never started, and a
+  timed-out slice re-requested an IDR on every loop.
+- Tests: redundancy 0.05 / 0.2 / 0.4 / 1.0 recovery at maximum loss,
+  per-frame redundancy changes, regression tests for the old `/1.2` guess,
+  cross-language golden RS vectors shared by `fec.rs` and
+  `client/tests/test_fec_decoder.cpp` (host-built via `client/tests/shim/`),
+  forged-header fuzz cases.
+
+### Security
+- **Persistent TLS identity (fixes TOFU re-connect failure).** The engine
+  minted a new self-signed certificate on every `TcpControlServer::new()` —
+  i.e. on every accept-loop iteration and hold period — while the HMD pins
+  the first certificate's SHA-256 and refuses any other. Once paired, every
+  reconnect and engine restart failed. The certificate + key now live in
+  `%APPDATA%/FocusVisionPCVR/tls_identity.bin` (atomic write, SHA-256
+  checksum, cached per process); a corrupt file is moved to `.bak` and
+  regenerated with a loud re-pair warning.
+- **Handshake timeouts.** TLS handshake 10 s, HELLO / STREAM_START 10 s each,
+  PIN_RESPONSE 30 s. Previously one client that connected and stayed silent
+  blocked the sequential accept loop indefinitely, locking the real HMD out.
+  Clients advertising a protocol version older than the server's now log a
+  compatibility warning.
+- **Tracking UDP source check.** The tracking receiver only accepts datagrams
+  from the IP of the HMD that completed TLS + PIN pairing, and only while
+  that session is up (`AuthorizedPeerGuard` revokes it on every session exit
+  path). Any LAN host could previously inject head/controller poses and the
+  foveation gaze point. A transient `recv_from` error no longer ends the
+  receiver loop for the rest of the engine's life.
+
+### Fixes
+- **status.json heartbeat.** The engine now rewrites status.json every second
+  while waiting for the HMD, during reconnect backoff, during the 5 s hold
+  period (with the hold server's PIN) and while streaming (wall-clock tick
+  instead of every Nth frame). Before, the file went untouched while waiting
+  or when frames stalled, so the companion's 5 s mtime check showed the red
+  "engine stopped" banner for a healthy engine.
+- **Companion: stale status is no longer shown as live.** A missing or stale
+  status.json (engine crashed) used to keep the last payload on screen —
+  Connected, frozen stats, an old PIN. It now shows Disconnected and clears
+  the PIN and its countdown. A slightly-future mtime (coarse FS timestamps,
+  clock step) no longer reads as "engine stopped", and a rotated PIN restarts
+  the "Expires in" countdown.
+- **Companion: settings persistence.** `local.toml` moves to
+  `%APPDATA%/FocusVisionPCVR/config/local.toml` (the path USER_GUIDE already
+  documented; the old exe/CWD-relative path under Program Files was not
+  user-writable and was wiped by the installer on reinstall). The legacy file
+  is migrated on first load. Writes are atomic and merge only the keys the
+  companion manages, so hand-written keys survive; an unparsable file is
+  backed up to `local.toml.bak` before being replaced. Saves are debounced
+  (500 ms, flushed on exit) instead of written every frame of a slider drag.
+- **Companion: diagnostics PII masking.** The sanitizer converted input byte
+  by byte, garbling all non-ASCII text (Japanese log lines) in exported logs,
+  and let a sentence-ending IP (`192.168.1.5.`) through. It is now UTF-8 safe
+  and masks SSIDs, the pairing PIN, user names in profile paths, e-mail, MAC,
+  IPv4 (octets 0–255) and IPv6 addresses, without touching version strings,
+  C++ `Class::method` scopes or clock times.
+
 ## [3.0.0] - 2026-06-01
 
 General availability. Promotes rc3 to the stable 3.0.0 release and turns the

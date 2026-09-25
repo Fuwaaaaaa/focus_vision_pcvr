@@ -104,6 +104,14 @@ pub(crate) struct CompanionApp {
     pub(crate) selected_codec: String,
     pub(crate) local_config: config::LocalConfig,
 
+    // Debounced persistence of `local_config`. UI handlers call
+    // `mark_config_dirty()` instead of saving directly, so a slider drag or a
+    // typed path writes the file once after the input settles rather than on
+    // every frame. `pending_save_notes` holds one user-facing log line per
+    // settings group (keyed by group), emitted when the save lands.
+    config_dirty_since: Option<Instant>,
+    pending_save_notes: Vec<(&'static str, String)>,
+
     // v1.1: Stats history for sparkline graphs
     pub(crate) stats_history: stats_history::StatsHistory,
 
@@ -155,9 +163,9 @@ pub(crate) struct CompanionApp {
     // on Some(_) so old engines don't show a stuck "Expires in: 0:00".
     //
     // We additionally track when we last observed a new value, so the
-    // Home tab can render a live local countdown even when the engine
-    // only emits the field once per PIN issuance (which is the case
-    // today — the engine doesn't repaint status.json once a second).
+    // Home tab can render a smooth local countdown. The engine re-publishes
+    // status.json every second as a liveness heartbeat but re-emits the same
+    // expiry value for a given PIN, so the countdown itself is derived here.
     pub(crate) pin_expires_in_seconds: Option<u32>,
     pub(crate) pin_expires_observed_at: Option<Instant>,
 
@@ -173,11 +181,20 @@ pub(crate) struct CompanionApp {
 }
 
 /// status.json is considered stale (engine probably died) once its mtime
-/// is older than this. The engine rewrites the file on every meaningful
-/// event (PIN issued, session started, frame stats updated). 5 s is
-/// generous enough to avoid false positives on a busy host but short
+/// is older than this. The engine rewrites the file at least once a second
+/// in every state (waiting for the HMD, reconnect backoff, streaming), so
+/// 5 s is generous enough to avoid false positives on a busy host but short
 /// enough that a real crash is surfaced quickly.
 const ENGINE_STALE_THRESHOLD: Duration = Duration::from_secs(5);
+
+/// How long settings must stay unchanged before `local.toml` is written.
+const CONFIG_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Whether a debounced save is due: something changed and the last change is
+/// at least `CONFIG_SAVE_DEBOUNCE` old.
+fn config_save_due(dirty_since: Option<Instant>, now: Instant) -> bool {
+    dirty_since.is_some_and(|t| now.saturating_duration_since(t) >= CONFIG_SAVE_DEBOUNCE)
+}
 
 #[derive(PartialEq, Clone, Copy)]
 pub(crate) enum Tab {
@@ -188,68 +205,34 @@ pub(crate) enum Tab {
 
 impl CompanionApp {
     fn new(cc: &eframe::CreationContext, demo_mode: bool, simulate: bool) -> Self {
-        // Load custom fonts from DESIGN.md: Instrument Serif (brand) + Geist (UI)
-        let mut fonts = egui::FontDefinitions::default();
+        install_fonts(&cc.egui_ctx);
 
-        // Instrument Serif for brand/display text
-        if let Ok(data) = std::fs::read("fonts/InstrumentSerif-Regular.ttf") {
-            fonts.font_data.insert(
-                "InstrumentSerif".to_string(),
-                egui::FontData::from_owned(data).into(),
-            );
-            fonts.families.entry(egui::FontFamily::Name("Brand".into()))
-                .or_default()
-                .insert(0, "InstrumentSerif".to_string());
-        }
+        let mut app = Self::with_config(demo_mode, simulate, config::LocalConfig::load());
 
-        // Geist for UI body text
-        if let Ok(data) = std::fs::read("fonts/Geist-Regular.ttf") {
-            fonts.font_data.insert(
-                "Geist".to_string(),
-                egui::FontData::from_owned(data).into(),
-            );
-            // Set as default proportional font
-            fonts.families.entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "Geist".to_string());
-        }
-
-        // Geist Mono for stats/data
-        if let Ok(data) = std::fs::read("fonts/GeistMono-Regular.ttf") {
-            fonts.font_data.insert(
-                "GeistMono".to_string(),
-                egui::FontData::from_owned(data).into(),
-            );
-            fonts.families.entry(egui::FontFamily::Monospace)
-                .or_default()
-                .insert(0, "GeistMono".to_string());
-        }
-
-        cc.egui_ctx.set_fonts(fonts);
-        let steamvr_dir = driver::find_steamvr_drivers_dir();
-        let driver_installed = steamvr_dir.as_ref()
+        app.steamvr_dir = driver::find_steamvr_drivers_dir();
+        app.driver_installed = app.steamvr_dir.as_ref()
             .map(|d| driver::is_driver_installed(d))
             .unwrap_or(false);
-
-        let adb_path = adb::find_adb();
-        let driver_status = if steamvr_dir.is_none() {
+        app.driver_status = if app.steamvr_dir.is_none() {
             "SteamVR not found".to_string()
-        } else if driver_installed {
+        } else if app.driver_installed {
             "Driver installed".to_string()
         } else {
             "Driver not installed".to_string()
         };
+        app.adb_path = adb::find_adb();
+        app
+    }
 
-        // Load the persisted config once and hand its fields out to the
-        // shadow UI state. Holding `local_config` last means the move into
-        // the struct ends the load() lifetimes cleanly.
-        let cfg = config::LocalConfig::load();
-
+    /// Build the app state from a loaded config without touching the host
+    /// environment (no SteamVR / ADB probing, no egui context). `new()`
+    /// layers the environment detection on top; unit tests use this directly.
+    fn with_config(demo_mode: bool, simulate: bool, cfg: config::LocalConfig) -> Self {
         Self {
-            steamvr_dir,
-            driver_installed,
-            driver_status,
-            adb_path,
+            steamvr_dir: None,
+            driver_installed: false,
+            driver_status: "SteamVR not found".to_string(),
+            adb_path: None,
             devices: Vec::new(),
             apk_path: cfg.deploy.apk_path.clone(),
             deploy_status: String::new(),
@@ -267,6 +250,8 @@ impl CompanionApp {
             active_tab: Tab::Home,
             status_log: Arc::new(Mutex::new(Vec::new())),
             selected_codec: cfg.video.codec.clone(),
+            config_dirty_since: None,
+            pending_save_notes: Vec::new(),
             stats_history: stats_history::StatsHistory::new(),
             export_in_progress: false,
             export_result: Arc::new(Mutex::new(None)),
@@ -297,10 +282,87 @@ impl CompanionApp {
             // Demo wins over simulate (already enforced in parse_flags), so a
             // demo launch never autostarts a real engine.
             sim_autostart: simulate && !demo_mode,
+            // Moved last so the clones above can still borrow `cfg`.
             local_config: cfg,
         }
     }
 
+    /// Record that `local_config` changed. The file is written by
+    /// `flush_config_if_due()` once the input has settled; `note` is logged
+    /// then (the latest note per `group` wins, so a slider drag logs once).
+    pub(crate) fn mark_config_dirty(&mut self, group: &'static str, note: String) {
+        self.config_dirty_since = Some(Instant::now());
+        self.pending_save_notes.retain(|(g, _)| *g != group);
+        self.pending_save_notes.push((group, note));
+    }
+
+    fn flush_config_if_due(&mut self) {
+        if config_save_due(self.config_dirty_since, Instant::now()) {
+            self.flush_config();
+        }
+    }
+
+    /// Write pending settings now (debounce elapsed, app exit, or an action
+    /// that must persist immediately). No-op when nothing is pending.
+    pub(crate) fn flush_config(&mut self) {
+        if self.config_dirty_since.take().is_none() {
+            return;
+        }
+        let notes = std::mem::take(&mut self.pending_save_notes);
+        match self.local_config.save() {
+            Ok(()) => {
+                for (_, note) in notes {
+                    self.log(&note);
+                }
+            }
+            Err(e) => self.log(&format!("Failed to save config: {e}")),
+        }
+    }
+}
+
+/// Load custom fonts from DESIGN.md: Instrument Serif (brand) + Geist (UI)
+/// + Geist Mono (stats/data). Missing font files fall back to egui defaults.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Instrument Serif for brand/display text
+    if let Ok(data) = std::fs::read("fonts/InstrumentSerif-Regular.ttf") {
+        fonts.font_data.insert(
+            "InstrumentSerif".to_string(),
+            egui::FontData::from_owned(data).into(),
+        );
+        fonts.families.entry(egui::FontFamily::Name("Brand".into()))
+            .or_default()
+            .insert(0, "InstrumentSerif".to_string());
+    }
+
+    // Geist for UI body text
+    if let Ok(data) = std::fs::read("fonts/Geist-Regular.ttf") {
+        fonts.font_data.insert(
+            "Geist".to_string(),
+            egui::FontData::from_owned(data).into(),
+        );
+        // Set as default proportional font
+        fonts.families.entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "Geist".to_string());
+    }
+
+    // Geist Mono for stats/data
+    if let Ok(data) = std::fs::read("fonts/GeistMono-Regular.ttf") {
+        fonts.font_data.insert(
+            "GeistMono".to_string(),
+            egui::FontData::from_owned(data).into(),
+        );
+        fonts.families.entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "GeistMono".to_string());
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+impl CompanionApp {
     /// Start the in-process simulation. No-op stub when the `simulator`
     /// feature is not compiled in.
     #[cfg(feature = "simulator")]
@@ -411,17 +473,19 @@ impl CompanionApp {
 
         // Engine liveness from file mtime. If the file is missing or older
         // than ENGINE_STALE_THRESHOLD, the engine has either not started or
-        // died. Read this BEFORE parsing so a stale-but-readable payload
-        // doesn't accidentally show "connected".
-        self.engine_alive = match std::fs::metadata(&path) {
-            Ok(meta) => meta
-                .modified()
-                .ok()
-                .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
-                .map(|age| age < ENGINE_STALE_THRESHOLD)
-                .unwrap_or(false),
-            Err(_) => false,
-        };
+        // died. Checked BEFORE parsing: a stale-but-readable payload (e.g.
+        // "streaming" left behind by a crashed engine) must not be shown as
+        // a live connection with frozen stats and an old PIN.
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        self.engine_alive = status_parser::is_status_fresh(
+            mtime,
+            std::time::SystemTime::now(),
+            ENGINE_STALE_THRESHOLD,
+        );
+        if !self.engine_alive {
+            self.apply_stale_status();
+            return;
+        }
 
         let contents = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -455,12 +519,13 @@ impl CompanionApp {
         self.connection_status = parsed.connection;
         // Pin expiry: when the engine emits a fresh value, snapshot it
         // along with the wall-clock time we received it, so the UI can
-        // count down locally even though status.json isn't rewritten
-        // every second. A change of more than 1s OR moving from None
-        // counts as "fresh" — without this we'd reset the countdown
-        // every poll cycle.
+        // count down locally. The engine re-emits the same value on every
+        // heartbeat write, so a change of more than 1s, moving from None, or
+        // a different PIN counts as "fresh" — without this we'd reset the
+        // countdown every poll cycle (or keep counting down a rotated PIN).
+        let pin_changed = parsed.connection == CS::WaitingForPin && parsed.pin != self.pin_code;
         match (parsed.pin_expires_in_seconds, self.pin_expires_in_seconds) {
-            (Some(new), Some(old)) if (new as i64 - old as i64).abs() <= 1 => {
+            (Some(new), Some(old)) if !pin_changed && (new as i64 - old as i64).abs() <= 1 => {
                 // No-op: engine re-emitted same value, keep our running countdown.
             }
             (Some(new), _) => {
@@ -493,6 +558,16 @@ impl CompanionApp {
                 self.stats_history.push(self.latency_ms, self.fps as f32, self.sub_packet_loss);
             }
         }
+    }
+
+    /// status.json is missing or stale: the engine is not running, so
+    /// nothing in the last payload can be trusted. Show Disconnected, drop
+    /// the old PIN and its countdown instead of freezing the last state.
+    fn apply_stale_status(&mut self) {
+        self.connection_status = ConnectionStatus::Disconnected;
+        self.pin_code = "----".to_string();
+        self.pin_expires_in_seconds = None;
+        self.pin_expires_observed_at = None;
     }
 
     fn check_deploy_result(&mut self) {
@@ -539,6 +614,14 @@ impl eframe::App for CompanionApp {
 
         // Request repaint every second for live stats
         ctx.request_repaint_after(Duration::from_secs(1));
+
+        // Debounced settings save. While a change is pending, wake up again
+        // once the debounce window closes so the write doesn't wait for the
+        // next 1 s stats repaint.
+        self.flush_config_if_due();
+        if self.config_dirty_since.is_some() {
+            ctx.request_repaint_after(CONFIG_SAVE_DEBOUNCE);
+        }
 
         // Color scheme matching DESIGN.md
         let mut style = (*ctx.style()).clone();
@@ -622,6 +705,13 @@ impl eframe::App for CompanionApp {
                 Tab::Settings => self.render_settings(ui, accent, text_muted),
             }
         });
+    }
+
+    /// Persist a change made within the last debounce window before the
+    /// window closes, so closing the app right after moving a slider still
+    /// saves it.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flush_config();
     }
 }
 
@@ -736,5 +826,107 @@ mod tests {
     #[test]
     fn parse_flags_order_independent() {
         assert_eq!(flags(&["foo", "--simulate", "bar"]), (false, true));
+    }
+
+    // --- status state machine (no filesystem, no egui context) ---
+
+    use super::{config, config_save_due, CompanionApp, CONFIG_SAVE_DEBOUNCE};
+    use crate::status_parser::{parse_status_json, ConnectionStatus};
+    use std::time::{Duration, Instant};
+
+    fn app() -> CompanionApp {
+        CompanionApp::with_config(false, false, config::LocalConfig::default())
+    }
+
+    fn waiting(pin: &str) -> crate::status_parser::ParsedStatus {
+        parse_status_json(&format!(
+            r#"{{"status":"waiting","pin":"{pin}","pin_expires_in_seconds":300}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn stale_status_drops_connected_state() {
+        // Regression: a "streaming" payload left behind by a crashed engine
+        // kept the UI on Connected with frozen stats.
+        let mut a = app();
+        a.apply_parsed_status(
+            parse_status_json(r#"{"status":"streaming","pin":"123456","fps":90}"#).unwrap(),
+        );
+        assert_eq!(a.connection_status, ConnectionStatus::Connected);
+
+        a.apply_stale_status();
+        assert_eq!(a.connection_status, ConnectionStatus::Disconnected);
+        assert_eq!(a.pin_code, "----");
+    }
+
+    #[test]
+    fn stale_status_clears_pin_and_countdown() {
+        let mut a = app();
+        a.apply_parsed_status(waiting("048217"));
+        assert_eq!(a.connection_status, ConnectionStatus::WaitingForPin);
+        assert_eq!(a.pin_expires_in_seconds, Some(300));
+
+        a.apply_stale_status();
+        assert_eq!(a.connection_status, ConnectionStatus::Disconnected);
+        assert_eq!(a.pin_code, "----");
+        assert_eq!(a.pin_expires_in_seconds, None);
+        assert!(a.pin_expires_observed_at.is_none());
+    }
+
+    #[test]
+    fn heartbeat_rewrite_of_same_pin_keeps_countdown() {
+        // The engine re-publishes status.json every second with the same
+        // expiry value; that must not restart the countdown.
+        let mut a = app();
+        a.apply_parsed_status(waiting("048217"));
+        let earlier = Instant::now() - Duration::from_secs(100);
+        a.pin_expires_observed_at = Some(earlier);
+
+        a.apply_parsed_status(waiting("048217"));
+        assert_eq!(a.pin_expires_observed_at, Some(earlier));
+    }
+
+    #[test]
+    fn rotated_pin_restarts_countdown() {
+        let mut a = app();
+        a.apply_parsed_status(waiting("048217"));
+        let earlier = Instant::now() - Duration::from_secs(100);
+        a.pin_expires_observed_at = Some(earlier);
+
+        a.apply_parsed_status(waiting("731904"));
+        assert_eq!(a.pin_code, "731904");
+        assert!(a.pin_expires_observed_at.unwrap() > earlier, "new PIN must restart the countdown");
+    }
+
+    // --- debounced settings save ---
+
+    #[test]
+    fn config_save_due_waits_for_debounce_window() {
+        let now = Instant::now();
+        assert!(!config_save_due(None, now), "nothing pending");
+        assert!(!config_save_due(Some(now), now), "change just happened");
+        assert!(config_save_due(Some(now - CONFIG_SAVE_DEBOUNCE), now));
+    }
+
+    #[test]
+    fn mark_config_dirty_keeps_latest_note_per_group() {
+        // A slider drag marks the same group every frame; only one log line
+        // per group may come out when the save lands.
+        let mut a = app();
+        a.mark_config_dirty("audio", "Audio: 64".to_string());
+        a.mark_config_dirty("audio", "Audio: 96".to_string());
+        a.mark_config_dirty("video", "Codec h264".to_string());
+        assert!(a.config_dirty_since.is_some());
+        let notes: Vec<&str> = a.pending_save_notes.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(notes, vec!["Audio: 96", "Codec h264"]);
+    }
+
+    #[test]
+    fn flush_config_without_pending_change_is_noop() {
+        let mut a = app();
+        a.flush_config();
+        assert!(a.config_dirty_since.is_none());
+        assert!(a.status_log.lock().unwrap().is_empty());
     }
 }

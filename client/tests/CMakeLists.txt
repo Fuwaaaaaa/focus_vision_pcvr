@@ -27,10 +27,17 @@ enable_testing()
 add_executable(client_tests
     test_client_protocol.cpp
     test_client_session.cpp
+    test_fec_decoder.cpp
+    # FEC decoder under test — NDK source compiled for the host. Its only
+    # platform dependencies (logging, XrResult via xr_utils.h) are stubbed in
+    # shim/ below.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/cpp/fec_decoder.cpp
 )
-# Pure, host-buildable client logic lives alongside the NDK sources.
+# Pure, host-buildable client logic lives alongside the NDK sources. shim/
+# provides host stand-ins for <android/log.h> and <openxr/openxr.h>.
 target_include_directories(client_tests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/shim)
 target_link_libraries(client_tests PRIVATE GTest::gtest_main)
 if(MSVC)
     target_compile_options(client_tests PRIVATE /utf-8)

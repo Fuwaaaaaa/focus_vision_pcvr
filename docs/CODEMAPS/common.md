@@ -25,12 +25,12 @@ Small pure-data crate with 3 files. No I/O, no threads. All types are
 | Type | Used for |
 |---|---|
 | `RtpHeader` | 12-byte RTP header fields (V/P/X/CC/M/PT/seq/ts/SSRC) |
-| `FvpHeader` | 10-byte FVP header (frame_index, shard_index, shard_count, flags) |
+| `FvpHeader` | 12-byte FVP header (frame_index, shard_index, shard_count, flags, data_shard_count) — layout in ARCHITECTURE.md "Video Packet Header" |
 | `TrackingData` | HMD pose + eye gaze (produced on HMD, consumed by C++ driver) |
 | `ControllerState` | Per-controller input state (pose / buttons / thumbstick / battery) |
 
 ### Protocol versioning
-- `PROTOCOL_VERSION: u16 = 3`
+- `PROTOCOL_VERSION: u16 = 4` (v4: FVP header 10 → 12 bytes, `data_shard_count` appended; payload at byte 24)
 - `parse_hello_version(payload) -> u16` — parses HELLO/HELLO_ACK version header (defaults to 1 on missing)
 - `encode_version(v) -> [u8; 2]` — LE encoding for HELLO payload
 
@@ -64,6 +64,8 @@ different direction), `FACE_DATA = 0x35`, `HAPTIC_EVENT = 0x38`,
 ## constants.rs — key items
 
 - `MTU_SIZE = 1400` — conservative IPv4 payload limit for Wi-Fi
+- `RTP_HEADER_LEN = 12`, `FVP_HEADER_LEN = 12`, `PACKET_HEADER_LEN = 24` — video packet header sizes (payload offset)
+- `MAX_FRAME_SHARDS = 4096` — receiver cap on `shard_count` (forged-header allocation bound)
 - `DEFAULT_TCP_PORT = 9944`, `DEFAULT_UDP_PORT = 9945`
 - Port offsets: `VIDEO_PORT_OFFSET = 1`, `TRACKING_PORT_OFFSET = 2`, `AUDIO_PORT_OFFSET = 3`
 - `RTP_PT_H265 = 96`, `RTP_CLOCK_RATE = 90_000`

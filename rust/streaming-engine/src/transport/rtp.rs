@@ -1,7 +1,7 @@
-use fvp_common::{MTU_SIZE, RTP_PT_H265};
+use fvp_common::{MAX_FRAME_SHARDS, MTU_SIZE, PACKET_HEADER_LEN, RTP_HEADER_LEN, RTP_PT_H265};
 
-/// Maximum payload per RTP packet (MTU minus RTP header 12B minus FVP header 10B)
-const MAX_PAYLOAD: usize = MTU_SIZE - 12 - 10;
+/// Maximum payload per RTP packet (MTU minus RTP header 12B minus FVP header 12B)
+const MAX_PAYLOAD: usize = MTU_SIZE - PACKET_HEADER_LEN;
 
 /// Append a 12-byte RTP header to `buf`.
 /// Format: V=2, P=0, X=0, CC=0 | M,PT | seq(BE) | timestamp(BE) | SSRC(BE).
@@ -21,19 +21,25 @@ pub fn write_rtp_header(
     buf.extend_from_slice(&ssrc.to_be_bytes());
 }
 
-/// Append the 10-byte FVP header that follows the RTP header.
-/// Layout: frame_index u32 LE | shard_index u16 LE | shard_count u16 LE | flags u16 LE.
+/// Append the 12-byte FVP header that follows the RTP header.
+/// Layout: frame_index u32 LE | shard_index u16 LE | shard_count u16 LE |
+/// flags u16 LE | data_shard_count u16 LE.
+///
+/// `data_shard_count` (protocol v4) is appended after `flags` so the older
+/// fields keep their offsets; the payload starts at `PACKET_HEADER_LEN` (24).
 pub fn write_fvp_header(
     buf: &mut Vec<u8>,
     frame_index: u32,
     shard_index: u16,
     shard_count: u16,
     flags: u16,
+    data_shard_count: u16,
 ) {
     buf.extend_from_slice(&frame_index.to_le_bytes());
     buf.extend_from_slice(&shard_index.to_le_bytes());
     buf.extend_from_slice(&shard_count.to_le_bytes());
     buf.extend_from_slice(&flags.to_le_bytes());
+    buf.extend_from_slice(&data_shard_count.to_le_bytes());
 }
 
 /// Parsed FVP header.
@@ -41,25 +47,46 @@ pub fn write_fvp_header(
 pub struct FvpHeader {
     pub frame_index: u32,
     pub shard_index: u16,
+    /// Total shards (data + parity) in the frame, or in the slice when
+    /// `fvp_flags::slice_count(flags) > 0`.
     pub shard_count: u16,
     pub flags: u16,
+    /// How many of `shard_count` are data shards (the rest are RS parity).
+    pub data_shard_count: u16,
 }
 
 impl FvpHeader {
     pub fn is_keyframe(self) -> bool { (self.flags & 1) != 0 }
+
+    /// Structural validity of the shard fields. Receivers must drop packets
+    /// that fail this: the counts size receive buffers and index them, so a
+    /// forged header (data > total, index >= total, huge total) would
+    /// otherwise drive out-of-range access or unbounded allocation.
+    pub fn is_valid(self) -> bool {
+        let total = self.shard_count as usize;
+        total > 0
+            && total <= MAX_FRAME_SHARDS
+            && self.shard_index < self.shard_count
+            && self.data_shard_count > 0
+            && self.data_shard_count <= self.shard_count
+    }
 }
 
-/// Parse the 10-byte FVP header from a packet.
-/// Returns None if the packet is shorter than 22 bytes (12 RTP + 10 FVP).
+/// Parse the 12-byte FVP header from a packet.
+/// Returns None if the packet is shorter than `PACKET_HEADER_LEN` (12 RTP +
+/// 12 FVP). Field values are returned as-is — call `FvpHeader::is_valid`
+/// before trusting the shard counts.
 pub fn read_fvp_header(packet: &[u8]) -> Option<FvpHeader> {
-    if packet.len() < 22 {
+    if packet.len() < PACKET_HEADER_LEN {
         return None;
     }
+    let f = &packet[RTP_HEADER_LEN..PACKET_HEADER_LEN];
     Some(FvpHeader {
-        frame_index: u32::from_le_bytes([packet[12], packet[13], packet[14], packet[15]]),
-        shard_index: u16::from_le_bytes([packet[16], packet[17]]),
-        shard_count: u16::from_le_bytes([packet[18], packet[19]]),
-        flags: u16::from_le_bytes([packet[20], packet[21]]),
+        frame_index: u32::from_le_bytes([f[0], f[1], f[2], f[3]]),
+        shard_index: u16::from_le_bytes([f[4], f[5]]),
+        shard_count: u16::from_le_bytes([f[6], f[7]]),
+        flags: u16::from_le_bytes([f[8], f[9]]),
+        data_shard_count: u16::from_le_bytes([f[10], f[11]]),
     })
 }
 
@@ -129,14 +156,17 @@ impl RtpPacketizer {
             let is_last = i == total_chunks - 1;
             let seq = self.next_sequence();
 
-            let mut buf = self.take_buf(12 + 10 + chunk.len());
+            let mut buf = self.take_buf(PACKET_HEADER_LEN + chunk.len());
 
             // RTP header (12 bytes)
             write_rtp_header(&mut buf, RTP_PT_H265, is_last, seq, timestamp_90khz, self.ssrc);
 
-            // FVP header (10 bytes) — shard fields are u16 to support large keyframes
+            // FVP header (12 bytes) — shard fields are u16 to support large keyframes.
+            // No FEC on this path, so every shard is a data shard.
             let flags: u16 = if is_keyframe { 1 } else { 0 };
-            write_fvp_header(&mut buf, frame_index, i as u16, total_chunks as u16, flags);
+            write_fvp_header(
+                &mut buf, frame_index, i as u16, total_chunks as u16, flags, total_chunks as u16,
+            );
 
             // Payload
             buf.extend_from_slice(chunk);
@@ -188,12 +218,11 @@ impl RtpDepacketizer {
         let shard_count = hdr.shard_count as usize;
         let is_keyframe = hdr.is_keyframe();
 
-        // Payload starts at byte 22
-        let payload = &packet[22..];
+        let payload = &packet[PACKET_HEADER_LEN..];
 
-        // Sanity check: reject absurd shard counts to prevent memory exhaustion
-        const MAX_SHARDS: usize = 4096; // ~5MB at 1200B/shard — far beyond any real frame
-        if shard_count == 0 || shard_count > MAX_SHARDS || shard_index >= shard_count {
+        // Sanity check: reject absurd / inconsistent shard counts to prevent
+        // memory exhaustion and out-of-range indexing.
+        if !hdr.is_valid() {
             return None;
         }
 
@@ -275,20 +304,67 @@ mod tests {
     fn test_read_fvp_header_roundtrip() {
         let mut buf = Vec::new();
         write_rtp_header(&mut buf, 96, true, 0, 0, 0);
-        write_fvp_header(&mut buf, 0xDEAD_BEEF, 7, 42, 0b11);
+        write_fvp_header(&mut buf, 0xDEAD_BEEF, 7, 42, 0b11, 35);
+        assert_eq!(buf.len(), PACKET_HEADER_LEN);
         let hdr = read_fvp_header(&buf).unwrap();
         assert_eq!(hdr.frame_index, 0xDEAD_BEEF);
         assert_eq!(hdr.shard_index, 7);
         assert_eq!(hdr.shard_count, 42);
         assert_eq!(hdr.flags, 0b11);
+        assert_eq!(hdr.data_shard_count, 35);
         assert!(hdr.is_keyframe());
+        assert!(hdr.is_valid());
+    }
+
+    #[test]
+    fn test_fvp_header_byte_layout() {
+        // Wire contract shared with the C++ client (client_protocol.h
+        // parseFvpHeader): v3 fields keep their offsets, data_shard_count is
+        // appended at [22..24], payload starts at 24.
+        let mut buf = Vec::new();
+        write_rtp_header(&mut buf, 97, false, 0, 0, 0);
+        write_fvp_header(&mut buf, 0x0403_0201, 0x0605, 0x0807, 0x0A09, 0x0C0B);
+        assert_eq!(&buf[12..16], &[0x01, 0x02, 0x03, 0x04]); // frame_index LE
+        assert_eq!(&buf[16..18], &[0x05, 0x06]); // shard_index LE
+        assert_eq!(&buf[18..20], &[0x07, 0x08]); // shard_count LE
+        assert_eq!(&buf[20..22], &[0x09, 0x0A]); // flags LE
+        assert_eq!(&buf[22..24], &[0x0B, 0x0C]); // data_shard_count LE
     }
 
     #[test]
     fn test_read_fvp_header_too_short() {
         assert!(read_fvp_header(&[]).is_none());
-        assert!(read_fvp_header(&[0u8; 21]).is_none());
-        assert!(read_fvp_header(&[0u8; 22]).is_some());
+        // A v3-sized (22-byte) header no longer carries enough bytes.
+        assert!(read_fvp_header(&[0u8; 22]).is_none());
+        assert!(read_fvp_header(&[0u8; PACKET_HEADER_LEN - 1]).is_none());
+        assert!(read_fvp_header(&[0u8; PACKET_HEADER_LEN]).is_some());
+    }
+
+    fn header(shard_index: u16, shard_count: u16, data_shard_count: u16) -> FvpHeader {
+        FvpHeader { frame_index: 0, shard_index, shard_count, flags: 0, data_shard_count }
+    }
+
+    #[test]
+    fn test_fvp_header_validation() {
+        assert!(header(0, 1, 1).is_valid());
+        assert!(header(13, 14, 10).is_valid());
+        assert!(header(0, MAX_FRAME_SHARDS as u16, 1).is_valid());
+        // data_shard_count must be in 1..=shard_count
+        assert!(!header(0, 14, 0).is_valid(), "data=0 must be rejected");
+        assert!(!header(0, 14, 15).is_valid(), "data>total must be rejected");
+        // shard_index must be < shard_count, shard_count in 1..=MAX
+        assert!(!header(14, 14, 10).is_valid());
+        assert!(!header(0, 0, 0).is_valid());
+        assert!(!header(0, MAX_FRAME_SHARDS as u16 + 1, 1).is_valid());
+    }
+
+    #[test]
+    fn test_depacketizer_rejects_invalid_data_shard_count() {
+        let mut buf = Vec::new();
+        write_rtp_header(&mut buf, 97, true, 0, 0, 0);
+        write_fvp_header(&mut buf, 0, 0, 1, 0, 0); // data=0
+        buf.extend_from_slice(&[1, 2, 3]);
+        assert!(RtpDepacketizer::new().feed(&buf).is_none());
     }
 
     #[test]
@@ -297,7 +373,10 @@ mod tests {
         let frame = vec![0xAA; 100]; // Small frame, fits in 1 packet
         let packets = pkt.packetize(&frame, 0, 0, true);
         assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].data.len(), 12 + 10 + 100);
+        assert_eq!(packets[0].data.len(), PACKET_HEADER_LEN + 100);
+        let hdr = read_fvp_header(&packets[0].data).unwrap();
+        // No FEC on this path: every shard is a data shard.
+        assert_eq!(hdr.data_shard_count, hdr.shard_count);
         // Marker bit should be set on the only packet
         assert_ne!(packets[0].data[1] & 0x80, 0);
     }

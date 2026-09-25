@@ -77,11 +77,11 @@ impl CompanionApp {
                 }
             });
 
+            // Debounced: typing a path saves once the input settles, not on
+            // every keystroke.
             if self.apk_path != prev_apk {
                 self.local_config.deploy.apk_path = self.apk_path.clone();
-                if let Err(e) = self.local_config.save() {
-                    self.log(&format!("Failed to save APK path: {e}"));
-                }
+                self.mark_config_dirty("deploy", format!("APK path saved: {}", self.apk_path));
             }
         });
 

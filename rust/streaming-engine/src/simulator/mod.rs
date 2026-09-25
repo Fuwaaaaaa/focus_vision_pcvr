@@ -6,8 +6,9 @@
 //!
 //! The mock client speaks the same protocol as the production Android
 //! receiver: TCP+TLS handshake (HELLO → PIN → STREAM_CONFIG → STREAM_START),
-//! UDP receive of RTP packets, RtpDepacketizer reassembly, optional FEC
-//! decode, periodic HEARTBEAT_ACK back over TCP. Synthetic tracking data
+//! UDP receive of RTP packets, header-driven FEC reassembly
+//! (`pipeline::FecFrameReassembler`, the Rust twin of the client's
+//! FecFrameDecoder), periodic HEARTBEAT_ACK back over TCP. Synthetic tracking data
 //! flows over UDP to the tracking port. Stats are aggregated and returned
 //! when the run completes so tests can assert on them.
 
@@ -26,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
-use crate::transport::rtp::RtpDepacketizer;
+use crate::pipeline::FecFrameReassembler;
 use crate::transport::udp::UdpReceiver;
 
 use self::face_sender::{encode_face_data, next_face_sample, FaceMode};
@@ -110,7 +111,8 @@ impl MockClientConfig {
 /// What a run measured. Tests assert on these.
 #[derive(Debug, Default, Clone)]
 pub struct MockClientStats {
-    /// Frames fully reassembled by the depacketizer.
+    /// Frames reassembled by the FEC reassembler — with lost data shards
+    /// Reed-Solomon recovered from parity, as the HMD would.
     pub frames_decoded: u64,
     /// IDR frames seen (subset of frames_decoded).
     pub idr_frames_seen: u64,
@@ -465,25 +467,31 @@ where
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let decode_samples_recv = Arc::clone(&decode_samples);
     let video_handle = tokio::spawn(async move {
-        let mut depacketizer = RtpDepacketizer::new();
+        let mut reassembler = FecFrameReassembler::new();
         let mut buf = [0u8; 2048];
-        // Track when the first packet of the in-flight frame arrived. The
-        // depacketizer does not expose its frame boundary directly; we
-        // approximate "first packet of a frame" as "the packet immediately
-        // after a frame completion". This matches what the production
-        // Android client measures.
+        // Track when the first packet of the in-flight frame arrived: the
+        // first packet after a completion whose frame index differs from the
+        // completed frame. The index check matters with FEC — a frame
+        // completes once its data shards arrive, so its trailing parity
+        // packets must not be mistaken for the start of the next frame.
         let mut frame_start: Option<Instant> = None;
+        let mut last_completed: Option<u32> = None;
         while !video_cancel.is_cancelled() {
             tokio::select! {
                 r = receiver.recv(&mut buf) => match r {
                     Ok((n, _peer)) => {
                         if measure_latency && frame_start.is_none() {
-                            frame_start = Some(Instant::now());
+                            let idx = crate::transport::rtp::read_fvp_header(&buf[..n])
+                                .map(|h| h.frame_index);
+                            if idx.is_some() && idx != last_completed {
+                                frame_start = Some(Instant::now());
+                            }
                         }
                         let mut s = stats_video.lock().unwrap();
                         s.video_packets_received += 1;
                         s.video_bytes_received += n as u64;
-                        if let Some(frame) = depacketizer.feed(&buf[..n]) {
+                        if let Some(frame) = reassembler.feed(&buf[..n]) {
+                            last_completed = Some(frame.frame_index);
                             s.frames_decoded += 1;
                             if frame.is_keyframe {
                                 s.idr_frames_seen += 1;

@@ -21,7 +21,7 @@ Key modules in streaming-engine:
 - `face_tracking/profiles.rs` — Per-avatar expression profiles (51 blendshape weights, JSON)
 - `face_tracking/calibration.rs` — Guided auto-calibration (min/max → weight computation)
 - `config.rs` — TOML config with validation (structured ConfigError, range checks, NaN rejection)
-- `transport/` — RTP packetization, FEC (adaptive + fixed + slice), UDP with buffer pool
+- `transport/` — RTP packetization, FEC (adaptive + fixed + slice), UDP with buffer pool. Video packet = 12 B RTP + 12 B FVP header (protocol v4: `data_shard_count` at bytes 22..24, payload from byte 24)
 - `transport/slice.rs` — SliceSplitter: NAL → N slices at byte boundaries
 - `adaptive/` — Bandwidth estimation, bitrate controller, GCC delay estimator, burst detector
 - `control/` — TCP server with TLS, PIN pairing, CONFIG_UPDATE protocol (`0x03` video, `0x05` audio)
@@ -46,7 +46,7 @@ cargo test --workspace                              # 500+ Rust tests
 ```bash
 cargo test --workspace                              # All Rust tests (500+ unit + integration)
 cargo test -p streaming-engine                      # Engine: 380+ tests + integration
-cargo test -p focus-vision-companion --bins         # Companion: 60 tests (config, ADB, export, status_parser, demo, svg_export, ui/settings validator)
+cargo test -p focus-vision-companion --bins         # Companion: 97 tests (config, ADB, export/PII mask, status_parser, status state machine, demo, svg_export, ui/settings validator)
 cargo test -p fvp-common                            # Common: protocol structs / flags / versioning
 cargo bench -p streaming-engine                     # Criterion benchmarks
 cargo clippy --workspace --all-features --all-targets -- -D warnings  # CI clippy gate, fully clean
@@ -60,7 +60,7 @@ cd driver/build && cmake --build . --config Release
 ctest --test-dir driver/build --build-config Release --output-on-failure  # 36 gtest cases
 # Android client host tests (hardware-independent logic, no NDK — host toolchain):
 cmake -S client/tests -B client/tests/build && cmake --build client/tests/build --config Release
-ctest --test-dir client/tests/build --build-config Release --output-on-failure  # client_protocol gtest
+ctest --test-dir client/tests/build --build-config Release --output-on-failure  # 40 gtest cases: client_protocol (incl. FVP header parse), session, fec_decoder (golden RS vectors; host shims in client/tests/shim/)
 ```
 
 ## Companion App
@@ -91,8 +91,13 @@ Tabs (file-per-tab under `rust/companion-app/src/ui/`):
 
 ## Config
 `config/default.toml` — override with `config/local.toml` (gitignored).
-Companion app additionally writes a `local.toml` for its UI-side overrides
-(`[video] [sleep_mode] [face_tracking] [recording] [audio] [deploy]`).
+Companion app writes its UI-side overrides
+(`[video] [sleep_mode] [face_tracking] [recording] [audio] [deploy]`) to
+`%APPDATA%/FocusVisionPCVR/config/local.toml` — debounced, atomic, merging only
+its own keys (other keys are preserved; an unparsable file is backed up to
+`local.toml.bak`). A legacy exe/CWD-relative `config/local.toml` is migrated on
+first load. Note: the engine does not read `local.toml` yet (it loads only
+`config/default.toml`).
 Config values are validated on startup (range checks, NaN rejection, port conflict detection).
 
 ## Release / Signing
@@ -105,7 +110,9 @@ Config values are validated on startup (range checks, NaN rejection, port confli
 ## Security
 - TCP control channel encrypted with TLS 1.3 (rustls server, MbedTLS client)
 - 6-digit PIN with cryptographic RNG (1M combinations, 5 attempts then 300s lockout)
-- TOFU certificate pinning (SHA-256 fingerprint)
+- TOFU certificate pinning (SHA-256 fingerprint); server identity persisted in `%APPDATA%/FocusVisionPCVR/tls_identity.bin` (`control/tls.rs`) so the pin survives reconnects/restarts
+- Handshake phases time-bounded (TLS 10 s, steps 10 s, PIN 30 s) so a silent client can't block the accept loop
+- Tracking UDP accepted only from the paired HMD's IP during its session (`tracking/receiver.rs` `AuthorizedPeer`)
 - CONFIG_UPDATE messages validated (range checks, rate limiting)
 - See `SECURITY.md` for threat model.
 
