@@ -52,6 +52,19 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   receiver loop for the rest of the engine's life.
 
 ### Fixes
+- **The engine reads its config in a real install, and applies `local.toml`.**
+  `fvp_init` loaded `config/default.toml` relative to the working directory —
+  inside SteamVR that is `vrserver.exe`'s folder, so the installed file was
+  never found and the engine silently ran on built-in defaults. No override
+  file was read at all, so settings saved in the companion (and the
+  `local.toml` that USER_GUIDE tells users to create) had no effect. The
+  engine now finds `config/default.toml` by walking up from the driver DLL
+  (falling back to the working directory) and deep-merges, key by key and
+  lowest precedence first: `local.toml` next to that `default.toml` (dev
+  checkouts), then `%APPDATA%\FocusVisionPCVR\config\local.toml` (written by
+  the companion). An unparsable layer is skipped with a warning; overrides
+  with a wrong value type fall back to `default.toml` alone. The engine log
+  lists the layers it applied. See `docs/CONFIG.md`.
 - **status.json heartbeat.** The engine now rewrites status.json every second
   while waiting for the HMD, during reconnect backoff, during the 5 s hold
   period (with the hold server's PIN) and while streaming (wall-clock tick
