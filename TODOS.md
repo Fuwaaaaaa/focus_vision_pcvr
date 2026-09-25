@@ -284,8 +284,8 @@
 - PR #29, #30: pipeline.rs / depacketizer を write_rtp_header + write_fvp_header + read_fvp_header に統一
 
 ### 次フェーズ候補（未着手、実機待ちではない）
-- engine.rs run_streaming() 分割（373 LoC → session_loop / frame_loop / reconnection）
-- engine.rs adaptive bitrate lock 整理（AdaptiveState struct 化）
+- ~~engine.rs run_streaming() 分割（373 LoC → session_loop / frame_loop / reconnection）~~ (2026-09-25 完了: `StreamingLoop::{run, accept, run_session, hold}`)
+- ~~engine.rs adaptive bitrate lock 整理（AdaptiveState struct 化）~~ (2026-09-25 完了: frame loop が持つ `AdaptiveState`、TCP 制御からは `ControlEvent` の mpsc)
 - FFI 型重複解消（TrackingData / ControllerState を common に統合）
 - CompanionApp 責務分離（tab ごとに別モジュール）
 - Dynamic Resolution Scaling (DRS) - adaptive bitrate の延長
@@ -375,7 +375,6 @@
 - **MediaCodec に渡る順番が入れ替わる:** 完成したフレームは、同じ decoder が次のフレームを見たときか flush のときにしか渡されず、flush は bulk → sliced の順。bulk と sliced が混ざると N+1 が N より先に（IDR より先に P が）渡ることがある。
 - **RS の行列をほぼ毎フレーム作り直している:** `FecEncoder` のキャッシュはデータ shard 数が前回と同じときしか効かず、実際のエンコーダ出力はフレームごとにサイズが変わる。IDR 級のスライス（約 180 shard）では行列の作成が重い。スライスをまたいで共有する `ReedSolomon` の LRU があるとよい。
 - **bitrate を変える経路がばらばら:** adaptive controller、sleep（起きると controller の値ではなく `bitrate_mbps` に戻る）、CONFIG_UPDATE 0x01（controller を通らない）、thermal（`notify` しない）がそれぞれ別に動いている。1 つの実効値（min(controller, sleep, thermal, user)）にまとめたい。`GccEstimator::set_current_bitrate` はどこからも呼ばれていない。
-- **status の packet loss がほぼ 0:** `update_adaptive_bitrate` が `hmd_stats` を `take()` するので、1 秒ごとの status 出力のときには空になっていることが多い。
 - **`config.pairing.max_attempts` / `lockout_seconds` が使われていない:** `PairingState` は定数を直接使う。
-- **tcp-control タスクが cancel されない / `HAPTIC_TX` が残る:** UDP sender の作成失敗などでセッションを抜けても、`handle_tcp_control` は HMD が TCP を切るまで動き続ける。セッション終了後も `HAPTIC_TX` に古い sender が残る。
+- **tcp-control タスクが cancel されない / `HAPTIC_TX` が残る:** UDP sender の作成失敗やフレームの供給元が閉じたことでセッションを抜けても、`handle_tcp_control` は HMD が TCP を切るまで動き続ける (その場合の切断理由は ConnectionLost 扱い)。セッション終了後も `HAPTIC_TX` に古い sender が残る。
 - **UDP のパケットごとの認証がない:** tracking の送信元チェックは IP だけ（SECURITY.md の Known Limitations に記載済み）。

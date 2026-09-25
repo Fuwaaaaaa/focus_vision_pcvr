@@ -136,6 +136,22 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   IPv4 (octets 0–255) and IPv6 addresses, without touching version strings,
   C++ `Class::method` scopes or clock times.
 
+### Internal
+- **`run_streaming` split, adaptive state without locks.** The ~440-line
+  loop is now `StreamingLoop::{run, accept, run_session, hold}`. The TCP
+  control task no longer shares `Arc<Mutex<…>>` state with the frame loop:
+  HEARTBEAT stats and TRANSPORT_FEEDBACK reach it as events over an mpsc
+  channel (feedback used to be dropped whenever `try_lock` found the GCC
+  estimator busy), and the bandwidth/bitrate/burst/GCC/adaptive-FEC/sleep
+  state lives in one frame-loop-owned `AdaptiveState`. `handle_tcp_control`
+  takes a `ControlChannel` instead of nine arguments. Two small behaviour
+  changes: status.json's packet-loss figure now shows the latest heartbeat
+  (it read 0 % most of the time because the bitrate tick had consumed the
+  stats), and after a session ends the engine waits up to 1 s for the
+  control task's disconnect reason, so a clean DISCONNECT that races the
+  frame loop is no longer mistaken for a dropped link (which started a
+  needless 5 s hold).
+
 ### Known issues
 - **The SteamVR driver never initializes NVENC, so the real VR path sends no
   video.** Nothing calls `CDirectModeComponent::initEncoder`, the driver

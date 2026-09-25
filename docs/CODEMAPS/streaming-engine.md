@@ -27,14 +27,25 @@ Module declarations: `src/lib.rs:1-14` (14 modules).
 
 ## Core
 
-### `src/engine.rs` (~1100 LoC)
+### `src/engine.rs` (~1800 LoC + tests)
 - `StreamingEngine` — owner of tokio runtime, frame channel, tracking state,
   latency tracker, cancel token, optional recording Arc<Mutex<Recorder>>
 - `EncodedFrame` / `HmdStats` / `HapticEvent`
-- `run_streaming()` (session loop, L-sized; extraction candidate)
-- `handle_tcp_control()` — TCP control handler (heartbeat, face data,
-  transport feedback, disconnect)
-- `update_adaptive_bitrate()` — per-second bitrate/FEC adjustment
+- `run_streaming()` → `StreamingLoop` (engine-lifetime state: reconnect
+  counters, thermal governor, frame receiver):
+  - `run()` — accept → session → hold loop, disconnect-reason bookkeeping
+  - `accept()` — backoff + `TcpControlServer::listen_and_accept` with the PIN heartbeat
+  - `run_session()` — per-session setup (tracking peer, control task, UDP,
+    audio) and the frame loop
+  - `hold()` — 5 s reconnect window on the session's server/PIN; a reconnect
+    comes back as the next session
+- `ControlChannel` + `handle_tcp_control()` — TCP control task (heartbeat,
+  face data, transport feedback, CONFIG_UPDATE, disconnect; haptic/sleep out).
+  HEARTBEAT stats and TRANSPORT_FEEDBACK go to the frame loop as
+  `ControlEvent`s over an mpsc channel — no shared locks
+- `AdaptiveState` — frame-loop-owned bandwidth/bitrate/burst/GCC/adaptive-FEC/
+  sleep state; `on_event()` and a per-second `tick()`
+- `VideoSender` — packetizer + `FrameFecEncoder` + UDP + send-time log
 - `check_sleep_mode()` / `update_latency_atomics()` / `log_periodic_stats()`
 - `spawn_audio_pipeline()` — audio capture→Opus→RTP UDP
 - `init_recorder()` / `recording_output_dir()` — Session Recording setup
@@ -188,6 +199,6 @@ All `fvp_*` functions use `#[no_mangle] pub extern "C"`.
 
 | File | LoC | Notes |
 |---|---|---|
-| `src/engine.rs` | ~1100 | `run_streaming()` ~373 LoC; session_loop / frame_loop / reconnection 分割候補 |
+| `src/engine.rs` | ~1800 + tests | `run_streaming` は `StreamingLoop::{run, accept, run_session, hold}` に分割済み (2026-09)。`run_session` (~200 LoC) はさらに分けられる |
 | `src/config.rs` | ~820 | Default impl boilerplate 残存（意図的：明示的な Rust 値として保持、整合性はテストで担保） |
 | `src/pipeline.rs` | ~550 | encode variants ×3 は責務分離済み |
