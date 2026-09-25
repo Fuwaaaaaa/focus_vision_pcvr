@@ -91,13 +91,16 @@ Tabs (file-per-tab under `rust/companion-app/src/ui/`):
 
 ## Config
 `config/default.toml` — override with `config/local.toml` (gitignored).
+The engine (`config::runtime_config_sources()` + `AppConfig::load_layered()`)
+finds `config/default.toml` by walking up from the driver DLL (CWD fallback)
+and deep-merges, lowest precedence first: `default.toml` → `local.toml` next to
+it → `%APPDATA%/FocusVisionPCVR/config/local.toml`. Unknown keys are ignored.
 Companion app writes its UI-side overrides
 (`[video] [sleep_mode] [face_tracking] [recording] [audio] [deploy]`) to
 `%APPDATA%/FocusVisionPCVR/config/local.toml` — debounced, atomic, merging only
 its own keys (other keys are preserved; an unparsable file is backed up to
 `local.toml.bak`). A legacy exe/CWD-relative `config/local.toml` is migrated on
-first load. Note: the engine does not read `local.toml` yet (it loads only
-`config/default.toml`).
+first load. Changes apply on the next SteamVR start (no hot reload).
 Config values are validated on startup (range checks, NaN rejection, port conflict detection).
 
 ## Release / Signing

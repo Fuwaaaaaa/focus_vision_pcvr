@@ -4,7 +4,8 @@
 
 Single-binary Windows GUI (egui / eframe) that sits alongside the SteamVR driver
 and talks to the streaming engine through `%APPDATA%/FocusVisionPCVR/status.json`
-(read-only) and `config/local.toml` (write). Does not link against
+(read-only) and `%APPDATA%/FocusVisionPCVR/config/local.toml` (write; the
+engine reads it as its top config layer). Does not link against
 `streaming-engine` — the engine runs in the driver DLL, not here.
 
 ---
@@ -14,7 +15,7 @@ and talks to the streaming engine through `%APPDATA%/FocusVisionPCVR/status.json
 | Path | Purpose | LoC |
 |---|---|---|
 | `src/main.rs` | `CompanionApp` struct, `eframe::App` impl, 3-tab UI (Home / Deploy / Settings) | 921 |
-| `src/config.rs` | `LocalConfig` (video / sleep_mode / face_tracking / recording overrides). Persists to `config/local.toml` | 194 |
+| `src/config.rs` | `LocalConfig` (video / sleep_mode / face_tracking / recording overrides). Persists to `%APPDATA%/FocusVisionPCVR/config/local.toml` | 194 |
 | `src/driver.rs` | SteamVR driver install / uninstall. Detects SteamVR via registry lookup | 115 |
 | `src/adb.rs` | `AdbDevice`, `list_devices` / `install_apk` / `dump_logcat` / `launch_app` (blocking `Command::new("adb")`) | 209 |
 | `src/export.rs` | `export_logs()` — zip PC log + ADB logcat + system info, sanitize IP/PII | 178 |
@@ -42,9 +43,10 @@ CompanionApp (25+ fields)
     └── Session Recording (enabled + output_dir)
 ```
 
-Persistence: every checkbox / slider change writes `LocalConfig` immediately
-to `config/local.toml`. Engine picks up changes on next restart (no hot-reload
-currently).
+Persistence: checkbox / slider changes are saved to
+`%APPDATA%/FocusVisionPCVR/config/local.toml` after a 500 ms debounce (flushed
+on exit), atomically, merging only the companion's own keys. The engine picks
+up changes on the next SteamVR start (no hot-reload currently).
 
 ---
 
@@ -56,7 +58,9 @@ currently).
 - `FaceTrackingOverride { enabled, smoothing }`
 - `RecordingOverride { enabled, output_dir }` — Session Recording
 - Parse failure → `log::warn!` + defaults (see `load()`)
-- Path: `exe_dir/../../config/local.toml` (dev layout) fallback to `config/local.toml` (CWD)
+- Path: `%APPDATA%/FocusVisionPCVR/config/local.toml`; a legacy
+  `exe_dir/../../config/local.toml` or CWD `config/local.toml` is migrated on
+  first load. An unparsable file is backed up to `local.toml.bak`.
 
 ### `AdbDevice` (adb.rs)
 - `serial: String`, `status: String`

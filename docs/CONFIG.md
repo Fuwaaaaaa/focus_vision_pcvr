@@ -1,6 +1,7 @@
 # Focus Vision PCVR — Configuration Reference
 
-Config file: `config/default.toml` (override with `config/local.toml`, gitignored).
+Config file: `config/default.toml`, overridden by `local.toml` files (see the
+load order below).
 All values are validated on startup. Invalid values are clamped to defaults with a warning.
 
 ## Where the engine reads its config
