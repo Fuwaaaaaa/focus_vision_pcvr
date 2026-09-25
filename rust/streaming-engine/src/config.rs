@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 use fvp_common::protocol::VideoCodec;
 
@@ -423,10 +425,190 @@ impl Default for AudioConfig {
     }
 }
 
+/// Where the engine reads its configuration from, lowest precedence first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSources {
+    /// The shipped `default.toml`, if one was found.
+    pub base: Option<PathBuf>,
+    /// User override files layered on top, in precedence order (later wins).
+    /// Paths are listed whether or not they exist; missing ones are skipped.
+    pub overlays: Vec<PathBuf>,
+}
+
+/// How many parent directories of the driver module to search for
+/// `config/default.toml`. The installed DLL lives at
+/// `<INSTDIR>/driver/focus_vision_pcvr/bin/win64` (config is 4 levels up); a
+/// dev build at `<repo>/driver/build/focus_vision_pcvr/bin/win64` (5 up).
+const CONFIG_SEARCH_DEPTH: usize = 6;
+
+/// Resolve the runtime config files.
+///
+/// The engine runs inside vrserver.exe, whose working directory is SteamVR's,
+/// so a CWD-relative `config/default.toml` is not found in an installed setup.
+/// Instead the base file is located by walking up from the directory of the
+/// module the engine is linked into (the driver DLL), falling back to the
+/// CWD (dev runs, tests). Overlays, lowest precedence first:
+/// 1. `local.toml` next to the base file (dev checkouts; gitignored),
+/// 2. `<data_dir>/FocusVisionPCVR/config/local.toml` — per-user overrides
+///    written by the companion app and documented in USER_GUIDE.
+pub fn runtime_config_sources(
+    module_dir: Option<&Path>,
+    cwd: &Path,
+    data_dir: Option<&Path>,
+) -> ConfigSources {
+    let from_module = module_dir.and_then(|dir| {
+        dir.ancestors()
+            .take(CONFIG_SEARCH_DEPTH)
+            .map(|d| d.join("config").join("default.toml"))
+            .find(|p| p.is_file())
+    });
+    let base = from_module.or_else(|| {
+        let p = cwd.join("config").join("default.toml");
+        p.is_file().then_some(p)
+    });
+
+    let mut overlays = Vec::new();
+    if let Some(dir) = base.as_deref().and_then(Path::parent) {
+        overlays.push(dir.join("local.toml"));
+    }
+    if let Some(data) = data_dir {
+        overlays.push(data.join("FocusVisionPCVR").join("config").join("local.toml"));
+    }
+    ConfigSources { base, overlays }
+}
+
+/// Directory of the module (DLL or EXE) this code is linked into. For the
+/// SteamVR driver that is the driver DLL's folder — not vrserver.exe's.
+#[cfg(windows)]
+pub fn module_dir() -> Option<PathBuf> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStringExt;
+
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
+    const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x2;
+    extern "system" {
+        fn GetModuleHandleExW(flags: u32, module_name: *const u16, module: *mut *mut c_void) -> i32;
+        fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
+    }
+
+    let mut module: *mut c_void = std::ptr::null_mut();
+    // SAFETY: FROM_ADDRESS treats `module_name` as an address inside the
+    // module to look up; this function's own address is always valid.
+    // UNCHANGED_REFCOUNT means there is no handle to release afterwards.
+    let ok = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            module_dir as *const () as *const u16,
+            &mut module,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; 32_768]; // max extended-length path
+    // SAFETY: `buf` is valid for `buf.len()` u16s; the return value is the
+    // number of characters written (0 on failure, len on truncation).
+    let len = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if len == 0 || len >= buf.len() {
+        return None;
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]));
+    path.parent().map(Path::to_path_buf)
+}
+
+/// Directory of the running executable (non-Windows builds: tests, fuzz).
+#[cfg(not(windows))]
+pub fn module_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
+}
+
+/// Recursively overlay `overlay` onto `base`: tables merge key by key, any
+/// other value (scalar, array) replaces the existing one.
+fn merge_toml_tables(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                merge_toml_tables(existing, incoming);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+/// Read one config layer. `Ok(None)` when the file does not exist.
+fn read_toml_layer(path: &Path) -> Result<Option<toml::Table>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => content.parse::<toml::Table>().map(Some).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 impl AppConfig {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&content)?)
+    }
+
+    /// Load `base` and deep-merge each existing overlay on top of it (later
+    /// overlays win, key by key), then deserialize. Missing files are
+    /// skipped. A layer that cannot be read or parsed is skipped with a
+    /// warning, so one broken override file cannot discard the others — and
+    /// if the merged result still fails to deserialize (e.g. a wrong value
+    /// type in an override), the base file alone is used, then defaults.
+    ///
+    /// Unknown keys are ignored, so a companion-written `local.toml` that
+    /// also carries UI-only sections such as `[deploy]` is accepted.
+    /// Returns the config and the files that were actually applied.
+    pub fn load_layered(base: Option<&Path>, overlays: &[PathBuf]) -> (Self, Vec<PathBuf>) {
+        let mut merged = toml::Table::new();
+        let mut applied = Vec::new();
+        let mut base_only = None;
+
+        if let Some(path) = base {
+            match read_toml_layer(path) {
+                Ok(Some(table)) => {
+                    base_only = Some(table.clone());
+                    merge_toml_tables(&mut merged, table);
+                    applied.push(path.to_path_buf());
+                }
+                Ok(None) => {}
+                Err(e) => log::warn!("Config: cannot use {}: {} — skipping", path.display(), e),
+            }
+        }
+        for path in overlays {
+            match read_toml_layer(path) {
+                Ok(Some(table)) => {
+                    merge_toml_tables(&mut merged, table);
+                    applied.push(path.clone());
+                }
+                Ok(None) => {}
+                Err(e) => log::warn!(
+                    "Config: cannot use override {}: {} — skipping it",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+
+        match AppConfig::deserialize(toml::Value::Table(merged)) {
+            Ok(config) => (config, applied),
+            Err(e) => {
+                log::warn!(
+                    "Config: overrides do not form a valid config ({}); using {} only",
+                    e,
+                    if base_only.is_some() { "the base file" } else { "defaults" }
+                );
+                let fallback = base_only
+                    .and_then(|table| AppConfig::deserialize(toml::Value::Table(table)).ok());
+                match (fallback, base) {
+                    (Some(config), Some(path)) => (config, vec![path.to_path_buf()]),
+                    _ => (AppConfig::default(), Vec::new()),
+                }
+            }
+        }
     }
 
     /// Validate config values, returning structured errors for any corrected fields.
@@ -1142,5 +1324,169 @@ mod tests {
         let errors = cfg.validate();
         assert!(errors.iter().any(|e| e.field == "thermal.warn_celsius"));
         assert!(cfg.thermal.warn_celsius <= 100);
+    }
+
+    // -- Runtime config resolution + layering --
+
+    fn write_file(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn default_toml(dir: &Path) -> PathBuf {
+        dir.join("config").join("default.toml")
+    }
+
+    fn appdata_local_toml(data: &Path) -> PathBuf {
+        data.join("FocusVisionPCVR").join("config").join("local.toml")
+    }
+
+    #[test]
+    fn test_sources_find_installed_layout_from_driver_dll_dir() {
+        // REGRESSION: the engine runs inside vrserver.exe, whose CWD has no
+        // config/ — the old CWD-relative load silently fell back to defaults.
+        let inst = tempfile::tempdir().unwrap();
+        write_file(&default_toml(inst.path()), "");
+        let dll_dir = inst.path().join("driver").join("focus_vision_pcvr").join("bin").join("win64");
+        std::fs::create_dir_all(&dll_dir).unwrap();
+        let steamvr_cwd = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+
+        let s = runtime_config_sources(Some(&dll_dir), steamvr_cwd.path(), Some(data.path()));
+        assert_eq!(s.base, Some(default_toml(inst.path())));
+        assert_eq!(
+            s.overlays,
+            vec![inst.path().join("config").join("local.toml"), appdata_local_toml(data.path())],
+            "dev local.toml first, then the companion's per-user file (wins)"
+        );
+    }
+
+    #[test]
+    fn test_sources_find_dev_build_layout() {
+        let repo = tempfile::tempdir().unwrap();
+        write_file(&default_toml(repo.path()), "");
+        let dll_dir = repo.path().join("driver").join("build").join("focus_vision_pcvr").join("bin").join("win64");
+        std::fs::create_dir_all(&dll_dir).unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+
+        let s = runtime_config_sources(Some(&dll_dir), cwd.path(), None);
+        assert_eq!(s.base, Some(default_toml(repo.path())));
+    }
+
+    #[test]
+    fn test_sources_fall_back_to_cwd_then_none() {
+        let module = tempfile::tempdir().unwrap(); // nothing near the module
+        let cwd = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+
+        let none = runtime_config_sources(Some(module.path()), cwd.path(), Some(data.path()));
+        assert_eq!(none.base, None);
+        assert_eq!(none.overlays, vec![appdata_local_toml(data.path())],
+            "per-user overrides still apply without a base file");
+
+        write_file(&default_toml(cwd.path()), "");
+        let from_cwd = runtime_config_sources(Some(module.path()), cwd.path(), None);
+        assert_eq!(from_cwd.base, Some(default_toml(cwd.path())));
+    }
+
+    #[test]
+    fn test_load_layered_overlays_win_key_by_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("default.toml");
+        let dev = dir.path().join("dev-local.toml");
+        let user = dir.path().join("user-local.toml");
+        write_file(&base, "[video]\ncodec = \"h265\"\nbitrate_mbps = 80\n[audio]\nbitrate_kbps = 128\n");
+        write_file(&dev, "[video]\nbitrate_mbps = 100\ncodec = \"h265\"\n");
+        write_file(&user, "[video]\ncodec = \"h264\"\n");
+
+        let (cfg, applied) = AppConfig::load_layered(Some(&base), &[dev.clone(), user.clone()]);
+        assert_eq!(cfg.video.codec, VideoCodec::H264, "later overlay wins");
+        assert_eq!(cfg.video.bitrate_mbps, 100, "keys absent from later layers survive");
+        assert_eq!(cfg.audio.bitrate_kbps, 128, "base-only sections survive");
+        assert_eq!(applied, vec![base, dev, user]);
+    }
+
+    #[test]
+    fn test_load_layered_accepts_companion_local_toml() {
+        // The exact sections the companion writes, including its UI-only
+        // [deploy] section, must be accepted and applied.
+        let dir = tempfile::tempdir().unwrap();
+        let user = appdata_local_toml(dir.path());
+        write_file(&user, r#"
+[video]
+codec = "h264"
+
+[sleep_mode]
+enabled = false
+timeout_seconds = 120
+
+[face_tracking]
+enabled = false
+smoothing = 0.3
+
+[recording]
+enabled = true
+output_dir = "D:/captures"
+
+[audio]
+enabled = false
+bitrate_kbps = 96
+
+[deploy]
+apk_path = "C:/builds/client.apk"
+"#);
+        let (cfg, applied) = AppConfig::load_layered(None, std::slice::from_ref(&user));
+        assert_eq!(applied, vec![user]);
+        assert_eq!(cfg.video.codec, VideoCodec::H264);
+        assert!(!cfg.sleep_mode.enabled);
+        assert_eq!(cfg.sleep_mode.timeout_seconds, 120);
+        assert!(!cfg.face_tracking.enabled);
+        assert!((cfg.face_tracking.smoothing - 0.3).abs() < 1e-6);
+        assert!(cfg.recording.enabled);
+        assert_eq!(cfg.recording.output_dir, "D:/captures");
+        assert!(!cfg.audio.enabled);
+        assert_eq!(cfg.audio.bitrate_kbps, 96);
+        // Untouched fields keep their defaults.
+        assert_eq!(cfg.network.tcp_port, AppConfig::default().network.tcp_port);
+    }
+
+    #[test]
+    fn test_load_layered_skips_unparsable_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("default.toml");
+        let broken = dir.path().join("local.toml");
+        write_file(&base, "[video]\nbitrate_mbps = 70\n");
+        write_file(&broken, "[video\nbitrate_mbps = 150\n");
+
+        let (cfg, applied) = AppConfig::load_layered(Some(&base), std::slice::from_ref(&broken));
+        assert_eq!(cfg.video.bitrate_mbps, 70, "a syntax error in an override must not drop the base");
+        assert_eq!(applied, vec![base]);
+    }
+
+    #[test]
+    fn test_load_layered_type_error_falls_back_to_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("default.toml");
+        let bad = dir.path().join("local.toml");
+        write_file(&base, "[video]\nbitrate_mbps = 70\n");
+        write_file(&bad, "[video]\nbitrate_mbps = \"fast\"\n");
+
+        let (cfg, applied) = AppConfig::load_layered(Some(&base), std::slice::from_ref(&bad));
+        assert_eq!(cfg.video.bitrate_mbps, 70);
+        assert_eq!(applied, vec![base]);
+    }
+
+    #[test]
+    fn test_load_layered_without_any_file_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, applied) = AppConfig::load_layered(None, &[dir.path().join("missing.toml")]);
+        assert!(applied.is_empty());
+        assert_eq!(cfg.video.bitrate_mbps, AppConfig::default().video.bitrate_mbps);
+    }
+
+    #[test]
+    fn test_module_dir_is_an_existing_directory() {
+        let dir = module_dir().expect("module dir must resolve");
+        assert!(dir.is_dir(), "{} is not a directory", dir.display());
     }
 }

@@ -203,10 +203,20 @@ pub extern "C" fn fvp_init() -> i32 {
         INIT.call_once(|| { env_logger::init(); });
         log::info!("Focus Vision PCVR Streaming Engine initializing...");
 
-        let mut config = config::AppConfig::load("config/default.toml").unwrap_or_else(|e| {
-            log::warn!("Failed to load config, using defaults: {}", e);
-            config::AppConfig::default()
-        });
+        // vrserver.exe's working directory is SteamVR's, so the config is
+        // located relative to the driver DLL instead, with the per-user
+        // override written by the companion app layered on top.
+        let sources = config::runtime_config_sources(
+            config::module_dir().as_deref(),
+            &std::env::current_dir().unwrap_or_default(),
+            dirs_next::data_dir().as_deref(),
+        );
+        let (mut config, applied) =
+            config::AppConfig::load_layered(sources.base.as_deref(), &sources.overlays);
+        if sources.base.is_none() {
+            log::warn!("config/default.toml not found near the driver or in the CWD — using built-in defaults");
+        }
+        log::info!("Config layers applied (lowest precedence first): {:?}", applied);
 
         // Validate and fix invalid config values (graceful: clamp + warn)
         let errors = config.validate();
