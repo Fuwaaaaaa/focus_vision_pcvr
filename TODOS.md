@@ -376,5 +376,5 @@
 - **RS の行列をほぼ毎フレーム作り直している:** `FecEncoder` のキャッシュはデータ shard 数が前回と同じときしか効かず、実際のエンコーダ出力はフレームごとにサイズが変わる。IDR 級のスライス（約 180 shard）では行列の作成が重い。スライスをまたいで共有する `ReedSolomon` の LRU があるとよい。
 - **bitrate を変える経路がばらばら:** adaptive controller、sleep（起きると controller の値ではなく `bitrate_mbps` に戻る）、CONFIG_UPDATE 0x01（controller を通らない）、thermal（`notify` しない）がそれぞれ別に動いている。1 つの実効値（min(controller, sleep, thermal, user)）にまとめたい。`GccEstimator::set_current_bitrate` はどこからも呼ばれていない。
 - **`config.pairing.max_attempts` / `lockout_seconds` が使われていない:** `PairingState` は定数を直接使う。
-- **tcp-control タスクが cancel されない / `HAPTIC_TX` が残る:** UDP sender の作成失敗やフレームの供給元が閉じたことでセッションを抜けても、`handle_tcp_control` は HMD が TCP を切るまで動き続ける (その場合の切断理由は ConnectionLost 扱い)。セッション終了後も `HAPTIC_TX` に古い sender が残る。
+- ~~**tcp-control タスクが cancel されない / `HAPTIC_TX` が残る:** UDP sender の作成失敗やフレームの供給元が閉じたことでセッションを抜けても、`handle_tcp_control` は HMD が TCP を切るまで動き続ける (その場合の切断理由は ConnectionLost 扱い)。セッション終了後も `HAPTIC_TX` に古い sender が残る。~~ (2026-09-25 修正): `run_session` を抜けると、どの経路でもセッションの cancel が発火し (drop guard)、tcp-control タスクは接続を閉じて終わる (`spawn_control_task`)。`HAPTIC_TX` は `HapticRoute` がセッションの間だけ設定する。フレームの供給元が閉じたときは、ConnectionLost ではなく engine の停止として扱う。
 - **UDP のパケットごとの認証がない:** tracking の送信元チェックは IP だけ（SECURITY.md の Known Limitations に記載済み）。
