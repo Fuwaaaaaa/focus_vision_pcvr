@@ -30,6 +30,27 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   `client/tests/test_fec_decoder.cpp` (host-built via `client/tests/shim/`),
   forged-header fuzz cases.
 
+### Security
+- **Persistent TLS identity (fixes TOFU re-connect failure).** The engine
+  minted a new self-signed certificate on every `TcpControlServer::new()` —
+  i.e. on every accept-loop iteration and hold period — while the HMD pins
+  the first certificate's SHA-256 and refuses any other. Once paired, every
+  reconnect and engine restart failed. The certificate + key now live in
+  `%APPDATA%/FocusVisionPCVR/tls_identity.bin` (atomic write, SHA-256
+  checksum, cached per process); a corrupt file is moved to `.bak` and
+  regenerated with a loud re-pair warning.
+- **Handshake timeouts.** TLS handshake 10 s, HELLO / STREAM_START 10 s each,
+  PIN_RESPONSE 30 s. Previously one client that connected and stayed silent
+  blocked the sequential accept loop indefinitely, locking the real HMD out.
+  Clients advertising a protocol version older than the server's now log a
+  compatibility warning.
+- **Tracking UDP source check.** The tracking receiver only accepts datagrams
+  from the IP of the HMD that completed TLS + PIN pairing, and only while
+  that session is up (`AuthorizedPeerGuard` revokes it on every session exit
+  path). Any LAN host could previously inject head/controller poses and the
+  foveation gaze point. A transient `recv_from` error no longer ends the
+  receiver loop for the rest of the engine's life.
+
 ## [3.0.0] - 2026-06-01
 
 General availability. Promotes rc3 to the stable 3.0.0 release and turns the

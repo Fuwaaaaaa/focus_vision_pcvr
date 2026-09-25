@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -11,9 +12,36 @@ use crate::control::pairing::PairingState;
 use crate::control::tls;
 
 /// Combined async read+write trait for boxed TLS or plain TCP streams.
-/// Combined async read+write trait for boxed TLS or plain TCP streams.
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+
+/// Upper bounds on each phase of an incoming connection's handshake.
+///
+/// `listen_and_accept` serves one connection at a time, so without these a
+/// single client that connects and then goes silent — before the TLS
+/// ClientHello or at any protocol step — stalls the accept loop forever and
+/// the real HMD can never get in (a one-socket LAN DoS).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HandshakeTimeouts {
+    /// TLS 1.3 handshake, TCP accept → Finished.
+    pub tls: Duration,
+    /// Each protocol message the server waits for (HELLO, STREAM_START).
+    pub step: Duration,
+    /// PIN_RESPONSE. The client sends the PIN it was given right after
+    /// PIN_REQUEST (no interactive entry on this path), so this only needs
+    /// slack for a slow link.
+    pub pin_response: Duration,
+}
+
+impl Default for HandshakeTimeouts {
+    fn default() -> Self {
+        Self {
+            tls: Duration::from_secs(10),
+            step: Duration::from_secs(10),
+            pin_response: Duration::from_secs(30),
+        }
+    }
+}
 
 /// TCP control channel server with TLS.
 /// Handles: TLS handshake, connection handshake, PIN pairing, stream config, heartbeat.
@@ -23,12 +51,15 @@ pub struct TcpControlServer {
     connected: Arc<Mutex<bool>>,
     tls_acceptor: Option<TlsAcceptor>,
     cert_fingerprint: String,
+    timeouts: HandshakeTimeouts,
 }
 
 impl TcpControlServer {
     pub fn new(config: AppConfig) -> Self {
-        // Generate ephemeral TLS certificate
-        let (tls_acceptor, cert_fingerprint) = match tls::create_tls_acceptor() {
+        // Engine-wide persisted identity: the HMD pins this certificate on
+        // first pairing, so it must be the same on every accept-loop
+        // iteration and across engine restarts.
+        let (tls_acceptor, cert_fingerprint) = match tls::shared_tls_acceptor() {
             Ok((acceptor, fp)) => {
                 log::info!("TLS enabled. Cert fingerprint: {}", fp);
                 (Some(acceptor), fp)
@@ -45,6 +76,7 @@ impl TcpControlServer {
             connected: Arc::new(Mutex::new(false)),
             tls_acceptor,
             cert_fingerprint,
+            timeouts: HandshakeTimeouts::default(),
         }
     }
 
@@ -57,7 +89,15 @@ impl TcpControlServer {
             connected: Arc::new(Mutex::new(false)),
             tls_acceptor: None,
             cert_fingerprint: String::new(),
+            timeouts: HandshakeTimeouts::default(),
         }
+    }
+
+    /// Shorten the handshake timeouts so tests can exercise them quickly.
+    #[cfg(test)]
+    pub(crate) fn with_timeouts(mut self, timeouts: HandshakeTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// Get the TLS certificate fingerprint (SHA-256 hex) for TOFU pinning.
@@ -90,8 +130,8 @@ impl TcpControlServer {
 
             if let Some(ref acceptor) = self.tls_acceptor {
                 // TLS path
-                match acceptor.accept(tcp_stream).await {
-                    Ok(tls_stream) => {
+                match tokio::time::timeout(self.timeouts.tls, acceptor.accept(tcp_stream)).await {
+                    Ok(Ok(tls_stream)) => {
                         match self.handle_handshake_generic(tls_stream).await {
                             Ok(stream) => {
                                 *self.connected.lock().await = true;
@@ -104,8 +144,15 @@ impl TcpControlServer {
                             }
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log::warn!("TLS handshake failed from {}: {}", peer, e);
+                        continue;
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "TLS handshake from {} timed out after {:?} — dropping",
+                            peer, self.timeouts.tls,
+                        );
                         continue;
                     }
                 }
@@ -132,10 +179,10 @@ impl TcpControlServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let client_caps = step_hello_exchange(&mut stream).await?;
+        let client_caps = step_hello_exchange(&mut stream, self.timeouts.step).await?;
         self.step_pin_pairing(&mut stream).await?;
         step_stream_config(&mut stream, &self.encode_stream_config(client_caps)).await?;
-        step_stream_start(&mut stream).await?;
+        step_stream_start(&mut stream, self.timeouts.step).await?;
         log::info!("Handshake complete, streaming ready");
         Ok(stream)
     }
@@ -152,8 +199,7 @@ impl TcpControlServer {
             .map_err(|e| format!("step PIN_REQUEST send failed: {e}"))?;
 
         log::debug!("handshake step: PIN_RESPONSE (awaiting)");
-        let msg = read_message_generic(stream).await
-            .map_err(|e| format!("step PIN_RESPONSE read failed: {e}"))?;
+        let msg = read_step_message(stream, self.timeouts.pin_response, "PIN_RESPONSE").await?;
         if msg.0 != msg_type::PIN_RESPONSE || msg.1.len() < 4 {
             return Err("Expected PIN_RESPONSE (4 bytes)".into());
         }
@@ -228,20 +274,27 @@ impl TcpControlServer {
 /// Step 1-2: Receive HELLO and reply with HELLO_ACK carrying our protocol
 /// version. Returns the client's advertised capability flags (0 for legacy
 /// clients that send no caps byte).
-async fn step_hello_exchange<S>(stream: &mut S)
+async fn step_hello_exchange<S>(stream: &mut S, limit: Duration)
     -> Result<u8, Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     log::debug!("handshake step: HELLO (awaiting)");
-    let msg = read_message_generic(stream).await
-        .map_err(|e| format!("step HELLO read failed: {e}"))?;
+    let msg = read_step_message(stream, limit, "HELLO").await?;
     if msg.0 != msg_type::HELLO {
         return Err(format!("Expected HELLO, got msg_type {}", msg.0).into());
     }
     let client_version = fvp_common::protocol::parse_hello_version(&msg.1);
     let client_caps = fvp_common::protocol::parse_hello_caps(&msg.1);
     log::info!("Received HELLO from client (protocol v{}, caps 0x{:02x})", client_version, client_caps);
+    if client_version < fvp_common::protocol::PROTOCOL_VERSION {
+        log::warn!(
+            "Client speaks protocol v{} but this server is v{} — the video packet format \
+             may be incompatible. Update the headset app.",
+            client_version,
+            fvp_common::protocol::PROTOCOL_VERSION,
+        );
+    }
 
     log::debug!("handshake step: HELLO_ACK");
     let version_payload = fvp_common::protocol::encode_version(fvp_common::protocol::PROTOCOL_VERSION);
@@ -262,18 +315,31 @@ where
 }
 
 /// Step 7: Wait for client STREAM_START.
-async fn step_stream_start<S>(stream: &mut S)
+async fn step_stream_start<S>(stream: &mut S, limit: Duration)
     -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     log::debug!("handshake step: STREAM_START (awaiting)");
-    let msg = read_message_generic(stream).await
-        .map_err(|e| format!("step STREAM_START read failed: {e}"))?;
+    let msg = read_step_message(stream, limit, "STREAM_START").await?;
     if msg.0 != msg_type::STREAM_START {
         return Err(format!("Expected STREAM_START, got msg_type {}", msg.0).into());
     }
     Ok(())
+}
+
+/// Read one handshake message, giving up after `limit`. The deadline covers
+/// the whole frame, so a client trickling a large length-prefixed message
+/// one byte at a time can't hold the accept loop either.
+async fn read_step_message<S>(stream: &mut S, limit: Duration, step: &str)
+    -> Result<(u8, Vec<u8>), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + Unpin,
+{
+    match tokio::time::timeout(limit, read_message_generic(stream)).await {
+        Ok(result) => result.map_err(|e| format!("step {step} read failed: {e}").into()),
+        Err(_) => Err(format!("step {step} timed out after {limit:?}").into()),
+    }
 }
 
 /// Read a framed message from any async stream.
@@ -852,6 +918,136 @@ mod tests {
         let bytes = server.encode_stream_config(0); // no caps
         assert_eq!(&bytes[17..21], &1832u32.to_le_bytes(), "must stay native");
         assert_eq!(&bytes[21..25], &1920u32.to_le_bytes(), "must stay native");
+    }
+
+    // -- Handshake timeouts + persistent certificate --
+
+    fn short_timeouts() -> HandshakeTimeouts {
+        HandshakeTimeouts {
+            tls: Duration::from_millis(200),
+            step: Duration::from_millis(200),
+            pin_response: Duration::from_millis(200),
+        }
+    }
+
+    /// Reserve a free TCP port for `listen_and_accept`, which binds
+    /// 0.0.0.0:<config port> itself.
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn test_handshake_times_out_on_silent_client() {
+        let server = TcpControlServer::new_without_tls(crate::config::AppConfig::default())
+            .with_timeouts(short_timeouts());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            server.handle_handshake_generic(stream).await
+        });
+
+        // Connect and never send HELLO.
+        let _silent = TcpStream::connect(addr).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("handshake must give up on its own, not hang")
+            .unwrap();
+        let err = result.expect_err("silent client must fail the handshake").to_string();
+        assert!(err.contains("HELLO timed out"), "wrong error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_handshake_times_out_waiting_for_pin_response() {
+        let server = TcpControlServer::new_without_tls(crate::config::AppConfig::default())
+            .with_timeouts(short_timeouts());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            server.handle_handshake_generic(stream).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        send_message(&mut client, msg_type::HELLO, &[]).await.unwrap();
+        let _ = read_message(&mut client).await.unwrap(); // HELLO_ACK
+        let _ = read_message(&mut client).await.unwrap(); // PIN_REQUEST — then go quiet
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("PIN step must time out, not hang")
+            .unwrap();
+        let err = result.expect_err("stalled PIN step must fail").to_string();
+        assert!(err.contains("PIN_RESPONSE timed out"), "wrong error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_silent_client_does_not_block_accept_loop() {
+        // REGRESSION (DoS): one client that opens a TCP connection and never
+        // starts TLS used to hold listen_and_accept forever. With the TLS
+        // handshake timeout, the loop drops it and serves the real HMD.
+        use tokio_rustls::TlsConnector;
+        use rustls::ClientConfig;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut config = crate::config::AppConfig::default();
+        config.network.tcp_port = free_tcp_port();
+        let port = config.network.tcp_port;
+        let server = TcpControlServer::new(config).with_timeouts(short_timeouts());
+        let pin = server.current_pin().await;
+
+        let accept_task = tokio::spawn(async move {
+            server.listen_and_accept().await.map(|(_stream, peer)| peer)
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await; // let it bind
+
+        let target: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let _silent = TcpStream::connect(target).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await; // accepted first
+
+        let client_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let hmd = async {
+            let tcp = TcpStream::connect(target).await.unwrap();
+            let hmd_addr = tcp.local_addr().unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            let mut tls = connector.connect(name, tcp).await.unwrap();
+            send_message_generic(&mut tls, msg_type::HELLO, &[]).await.unwrap();
+            let _ = read_message_generic(&mut tls).await.unwrap(); // HELLO_ACK
+            let _ = read_message_generic(&mut tls).await.unwrap(); // PIN_REQUEST
+            send_message_generic(&mut tls, msg_type::PIN_RESPONSE, &pin.to_le_bytes()).await.unwrap();
+            let (t, p) = read_message_generic(&mut tls).await.unwrap();
+            assert_eq!((t, p[0]), (msg_type::PIN_RESULT, 0x01));
+            let _ = read_message_generic(&mut tls).await.unwrap(); // STREAM_CONFIG
+            send_message_generic(&mut tls, msg_type::STREAM_START, &[]).await.unwrap();
+            (hmd_addr, tls)
+        };
+        let (hmd_addr, _tls) = tokio::time::timeout(Duration::from_secs(10), hmd)
+            .await
+            .expect("real HMD must get through while the silent client is pending");
+
+        let peer = tokio::time::timeout(Duration::from_secs(5), accept_task)
+            .await
+            .expect("accept loop must return")
+            .unwrap()
+            .expect("accept must succeed");
+        assert_eq!(peer.port(), hmd_addr.port(), "accepted peer must be the real HMD");
+    }
+
+    #[tokio::test]
+    async fn test_rebuilt_servers_present_same_certificate() {
+        // REGRESSION (TOFU): the engine builds a fresh TcpControlServer on
+        // every accept-loop iteration. The HMD pins the first fingerprint and
+        // refuses any other, so all servers must present the same cert.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let a = TcpControlServer::new(crate::config::AppConfig::default());
+        let b = TcpControlServer::new(crate::config::AppConfig::default());
+        assert!(!a.cert_fingerprint().is_empty());
+        assert_eq!(a.cert_fingerprint(), b.cert_fingerprint());
     }
 
 

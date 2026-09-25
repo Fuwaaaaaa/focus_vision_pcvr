@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::UdpSocket;
 
 use fvp_common::protocol::{TrackingData, ControllerState};
@@ -8,20 +8,43 @@ use fvp_common::protocol::{TrackingData, ControllerState};
 const PACKET_HEAD_POSE: u8 = 0x01;
 const PACKET_CONTROLLER: u8 = 0x02;
 
+/// IP address of the HMD that completed TLS + PIN pairing on the control
+/// channel, or `None` while no session is up. The engine sets it when a
+/// session starts and clears it when the session ends.
+pub type AuthorizedPeer = Arc<RwLock<Option<IpAddr>>>;
+
+/// Whether a tracking datagram from `src` should be accepted: only the
+/// paired HMD's address, compared in canonical form so an IPv4-mapped IPv6
+/// source (`::ffff:a.b.c.d`) matches its IPv4 control-channel peer.
+pub fn is_authorized_source(authorized: &AuthorizedPeer, src: IpAddr) -> bool {
+    match authorized.read() {
+        Ok(guard) => guard.is_some_and(|ip| ip.to_canonical() == src.to_canonical()),
+        Err(_) => false,
+    }
+}
+
 /// Receives tracking data (6DoF poses) and controller state from HMD via UDP.
+///
+/// UDP carries no authentication, so the source address is checked against
+/// the paired HMD before a packet is parsed. Without this, anyone on the LAN
+/// could spray the tracking port and drive the head pose, controllers and
+/// the foveation gaze point that SteamVR sees.
 pub struct TrackingReceiver {
     latest_head: Arc<Mutex<Option<TrackingData>>>,
     latest_controllers: Arc<Mutex<[Option<ControllerState>; 2]>>,
+    authorized_peer: AuthorizedPeer,
 }
 
 impl TrackingReceiver {
     pub fn new(
         latest_head: Arc<Mutex<Option<TrackingData>>>,
         latest_controllers: Arc<Mutex<[Option<ControllerState>; 2]>>,
+        authorized_peer: AuthorizedPeer,
     ) -> Self {
         Self {
             latest_head,
             latest_controllers,
+            authorized_peer,
         }
     }
 
@@ -31,9 +54,31 @@ impl TrackingReceiver {
         log::info!("Tracking receiver listening on {}", bind_addr);
 
         let mut buf = [0u8; 256]; // Tracking packets are small (<100 bytes)
+        let mut rejected: u64 = 0;
 
         loop {
-            let (len, _peer) = socket.recv_from(&mut buf).await?;
+            let (len, peer) = match socket.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // A transient socket error (e.g. WSAECONNRESET surfacing
+                    // on Windows) must not kill tracking for the rest of the
+                    // engine's life — skip it and keep receiving.
+                    log::warn!("Tracking recv error (continuing): {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    continue;
+                }
+            };
+            if !is_authorized_source(&self.authorized_peer, peer.ip()) {
+                rejected += 1;
+                // Log the 1st, 2nd, 4th, 8th… drop so a flood can't spam the log.
+                if rejected.is_power_of_two() {
+                    log::warn!(
+                        "Dropped tracking packet from unpaired source {} ({} dropped so far)",
+                        peer, rejected,
+                    );
+                }
+                continue;
+            }
             if len < 1 {
                 continue;
             }
@@ -154,6 +199,12 @@ fn parse_controller(data: &[u8]) -> Option<ControllerState> {
 mod tests {
     use super::*;
 
+    /// Session paired with an HMD on loopback — the address the test
+    /// senders below transmit from.
+    fn loopback_peer() -> AuthorizedPeer {
+        Arc::new(RwLock::new(Some(IpAddr::from([127, 0, 0, 1]))))
+    }
+
     fn make_head_pose_packet(ts: u64, x: f32, y: f32, z: f32) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(PACKET_HEAD_POSE);
@@ -271,7 +322,7 @@ mod tests {
         let head2 = head.clone();
         let controllers2 = controllers.clone();
         let recv_handle = tokio::spawn(async move {
-            let r = TrackingReceiver::new(head2, controllers2);
+            let r = TrackingReceiver::new(head2, controllers2, loopback_peer());
             r.run(recv_addr).await.ok();
         });
 
@@ -342,7 +393,7 @@ mod tests {
         let head2 = head.clone();
         let controllers2 = controllers.clone();
         let recv_handle = tokio::spawn(async move {
-            let r = TrackingReceiver::new(head2, controllers2);
+            let r = TrackingReceiver::new(head2, controllers2, loopback_peer());
             r.run(recv_addr).await.ok();
         });
 
@@ -376,7 +427,7 @@ mod tests {
         let head2 = head.clone();
         let controllers2 = controllers.clone();
         let recv_handle = tokio::spawn(async move {
-            let r = TrackingReceiver::new(head2, controllers2);
+            let r = TrackingReceiver::new(head2, controllers2, loopback_peer());
             r.run(recv_addr).await.ok();
         });
 
@@ -395,5 +446,68 @@ mod tests {
         assert!(ctrls[1].is_none());
 
         recv_handle.abort();
+    }
+
+    #[test]
+    fn test_is_authorized_source() {
+        let peer = loopback_peer();
+        assert!(is_authorized_source(&peer, IpAddr::from([127, 0, 0, 1])));
+        assert!(!is_authorized_source(&peer, IpAddr::from([192, 168, 1, 50])));
+        // IPv4-mapped IPv6 form of the paired address is the same host.
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(is_authorized_source(&peer, mapped));
+        // No session → nothing is authorized.
+        let none: AuthorizedPeer = Arc::new(RwLock::new(None));
+        assert!(!is_authorized_source(&none, IpAddr::from([127, 0, 0, 1])));
+    }
+
+    /// Run a receiver with `authorized`, send one head pose + one controller
+    /// packet from loopback, and return whether either was accepted.
+    async fn loopback_packets_accepted(authorized: AuthorizedPeer) -> bool {
+        let head = Arc::new(Mutex::new(None));
+        let controllers = Arc::new(Mutex::new([None, None]));
+
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = tmp.local_addr().unwrap();
+        drop(tmp);
+
+        let head2 = head.clone();
+        let controllers2 = controllers.clone();
+        let recv_handle = tokio::spawn(async move {
+            let r = TrackingReceiver::new(head2, controllers2, authorized);
+            r.run(recv_addr).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&make_head_pose_packet(1, 9.0, 9.0, 9.0), recv_addr).await.unwrap();
+        sender.send_to(&make_controller_packet(0, 1.0), recv_addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        recv_handle.abort();
+        let head_seen = head.lock().unwrap().is_some();
+        let controller_seen = controllers.lock().unwrap()[0].is_some();
+        head_seen || controller_seen
+    }
+
+    #[tokio::test]
+    async fn test_tracking_from_unpaired_source_is_dropped() {
+        // REGRESSION (spoofing): a LAN host that isn't the paired HMD must
+        // not be able to inject poses. Paired HMD is 192.168.1.50; the
+        // packets come from 127.0.0.1.
+        let other_hmd: AuthorizedPeer = Arc::new(RwLock::new(Some(IpAddr::from([192, 168, 1, 50]))));
+        assert!(!loopback_packets_accepted(other_hmd).await);
+    }
+
+    #[tokio::test]
+    async fn test_tracking_without_session_is_dropped() {
+        let no_session: AuthorizedPeer = Arc::new(RwLock::new(None));
+        assert!(!loopback_packets_accepted(no_session).await);
+    }
+
+    #[tokio::test]
+    async fn test_tracking_from_paired_source_is_accepted() {
+        // Positive control for the two rejection tests above.
+        assert!(loopback_packets_accepted(loopback_peer()).await);
     }
 }

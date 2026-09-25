@@ -9,7 +9,7 @@ use crate::config::AppConfig;
 use crate::control::tcp_server::TcpControlServer;
 use crate::metrics::latency::{FrameTimestamps, LatencyTracker};
 use crate::pipeline;
-use crate::tracking::receiver::TrackingReceiver;
+use crate::tracking::receiver::{AuthorizedPeer, TrackingReceiver};
 use crate::transport::rtp::RtpPacketizer;
 use crate::transport::udp::UdpSender;
 use fvp_common::protocol::{ControllerState, TrackingData};
@@ -245,13 +245,17 @@ impl StreamingEngine {
         let tracking_clone = latest_tracking.clone();
         let tracker_clone = latency_tracker.clone();
         let config_clone = config.clone();
+        // Paired HMD address: written by the session loop, read by the
+        // tracking receiver to reject datagrams from any other source.
+        let authorized_peer: AuthorizedPeer = Arc::new(std::sync::RwLock::new(None));
+        let session_peer = authorized_peer.clone();
 
         // Spawn the main streaming task
         let cancel = cancel_token.clone();
         let stream_cancel = cancel_token.clone();
         spawn_named(runtime.handle(), "streaming", async move {
             tokio::select! {
-                result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone, stream_cancel) => {
+                result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone, session_peer, stream_cancel) => {
                     if let Err(e) = result {
                         log::error!("Streaming engine error: {}", e);
                     }
@@ -268,7 +272,7 @@ impl StreamingEngine {
         let tracking_port = config.network.udp_port + fvp_common::TRACKING_PORT_OFFSET;
         let cancel = cancel_token.clone();
         spawn_named(runtime.handle(), "tracking-receiver", async move {
-            let receiver = TrackingReceiver::new(tracking_head, tracking_ctrl);
+            let receiver = TrackingReceiver::new(tracking_head, tracking_ctrl, authorized_peer);
             let addr: SocketAddr = match format!("0.0.0.0:{}", tracking_port).parse() {
                 Ok(a) => a,
                 Err(e) => {
@@ -1166,11 +1170,37 @@ fn publish_streaming_status(
     );
 }
 
+/// Marks `ip` as the paired HMD for the tracking receiver's source check
+/// while alive, and revokes it on drop — so every way a session can end
+/// (clean break, `continue`, early `return`) closes the tracking port to
+/// that address again.
+struct AuthorizedPeerGuard {
+    peer: AuthorizedPeer,
+}
+
+impl AuthorizedPeerGuard {
+    fn authorize(peer: &AuthorizedPeer, ip: std::net::IpAddr) -> Self {
+        if let Ok(mut guard) = peer.write() {
+            *guard = Some(ip);
+        }
+        Self { peer: peer.clone() }
+    }
+}
+
+impl Drop for AuthorizedPeerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.peer.write() {
+            *guard = None;
+        }
+    }
+}
+
 async fn run_streaming(
     config: AppConfig,
     mut frame_rx: mpsc::Receiver<EncodedFrame>,
     _tracking: Arc<StdMutex<Option<TrackingData>>>,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
+    authorized_peer: AuthorizedPeer,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Reconnect loop: when a session ends (TCP disconnect, Wi-Fi drop),
@@ -1265,6 +1295,10 @@ async fn run_streaming(
 
         log::info!("HMD connected from {}, starting video stream", peer_addr);
         reconnect_state.record_accept_success();
+
+        // Only the HMD that just completed TLS + PIN pairing may feed the
+        // tracking port for the lifetime of this session.
+        let peer_guard = AuthorizedPeerGuard::authorize(&authorized_peer, peer_addr.ip());
 
         // Per-session cancel: fires when TCP drops or HMD disconnects
         let session_cancel = CancellationToken::new();
@@ -1531,7 +1565,9 @@ async fn run_streaming(
             }
         }
 
-        // Session ended — check disconnect reason for hold logic
+        // Session ended — stop accepting tracking from its HMD, then check
+        // disconnect reason for hold logic
+        drop(peer_guard);
         let reason = disconnect_reason.lock().ok()
             .and_then(|g| *g)
             .unwrap_or(DisconnectReason::ConnectionLost);
@@ -2081,5 +2117,19 @@ mod tests {
         // Should warn but continue to DISCONNECT
         assert!(harness.cancel.is_cancelled());
         assert_eq!(harness.disconnect_reason, Some(DisconnectReason::ClientRequested));
+    }
+
+    #[test]
+    fn test_authorized_peer_guard_revokes_on_drop() {
+        use crate::tracking::receiver::is_authorized_source;
+        let peer: AuthorizedPeer = Arc::new(std::sync::RwLock::new(None));
+        let hmd = std::net::IpAddr::from([192, 168, 1, 50]);
+        assert!(!is_authorized_source(&peer, hmd), "nothing authorized before a session");
+        {
+            let _session = AuthorizedPeerGuard::authorize(&peer, hmd);
+            assert!(is_authorized_source(&peer, hmd));
+            assert!(!is_authorized_source(&peer, std::net::IpAddr::from([192, 168, 1, 99])));
+        }
+        assert!(!is_authorized_source(&peer, hmd), "session end must revoke the HMD");
     }
 }
