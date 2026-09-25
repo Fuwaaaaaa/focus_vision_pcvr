@@ -52,6 +52,23 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   receiver loop for the rest of the engine's life.
 
 ### Fixes
+- **Large IDR frames are no longer lost to slice FEC.** A slice whose data
+  shards did not fit one Reed-Solomon code word (a literal cap of 200 data
+  shards, or RS's 256 data + parity total, which at 40 % redundancy is only
+  182 data shards) was sent as an empty batch while the other slices went
+  out, so the receiver could never complete the frame. With the default 4
+  slices that hit IDRs from ~0.87 MB (40 %) / ~0.96 MB (20 %) — the size the
+  simulator itself calls realistic. The engine now picks the slice count per
+  frame: the configured `slice_count`, raised up to 15 (the 4-bit header
+  limit) until every slice fits. Frames are encoded all-or-nothing, never
+  with an empty slice. With `slice_fec_enabled = false`, a frame too big for
+  one bulk code word (> ~255 KB) is sliced too instead of losing its parity;
+  only a frame too big for 15 slices (> ~3.3 MB) goes out unprotected, with a
+  rate-limited warning, and one over `MAX_FRAME_SHARDS` is dropped rather
+  than sent for every receiver to reject. No protocol change: both receivers
+  already read the slice count per frame (new client test for 2 → 15 → 3).
+  Dev/test builds now optimize `reed-solomon-erasure` so full-size-IDR tests
+  stay fast.
 - **The engine reads its config in a real install, and applies `local.toml`.**
   `fvp_init` loaded `config/default.toml` relative to the working directory —
   inside SteamVR that is `vrserver.exe`'s folder, so the installed file was

@@ -52,7 +52,12 @@ Module declarations: `src/lib.rs:1-14` (14 modules).
 ### `src/pipeline.rs` (~550 LoC)
 - `encode_frame_to_packets` — fallback (no FEC)
 - `encode_frame_to_packets_with_fec` — bulk FEC path
-- `encode_frame_sliced` — slice-based FEC (4 slices, frames ≥ `MIN_SLICE_SIZE` = 16 KB)
+- `encode_frame_sliced` — slice-based FEC (all slices or nothing; never an empty slice)
+- `choose_fec_layout` / `FecLayout` — per frame: bulk, sliced(n) or unprotected. Slices for
+  frames ≥ `MIN_SLICE_SIZE` = 16 KB, count raised from `slice_count` up to 15 until each slice
+  fits one RS code word; an over-limit bulk frame is sliced too
+- `FrameFecEncoder` — the engine's per-session sender: bulk + 15 slice `FecEncoder`s at one
+  redundancy, `encode()` returns one packet batch per code word
 - `decode_packets_to_frame` — low-level decode with caller-supplied shard counts (integration tests)
 - `FecFrameReassembler` — header-driven receiver (bulk + sliced, RS recovery, emits each frame once); the simulator mock HMD's video path
 - All paths write `data_shard_count` into every packet's FVP header (v4) via the shared `shards_to_packets`
@@ -65,7 +70,7 @@ Module declarations: `src/lib.rs:1-14` (14 modules).
 | File | Key items | Tests |
 |---|---|---|
 | `rtp.rs` | `write_rtp_header`, `write_fvp_header`, `read_fvp_header`, `FvpHeader` (12 B, `is_valid`), `RtpPacketizer`, `RtpDepacketizer`, `ReassembledFrame` | 14 |
-| `fec.rs` | `FecEncoder`, `FecDecoder`, `AdaptiveFecController` (burst-boost aware, rate-limited), `FecError`; cross-language golden parity vectors shared with `client/tests/test_fec_decoder.cpp` | 16 |
+| `fec.rs` | `FecEncoder` (`parity_for`, `max_data_shards` = RS limit at the current redundancy), `FecDecoder`, `AdaptiveFecController` (burst-boost aware, rate-limited), `FecError`, `RS_MAX_TOTAL_SHARDS`; cross-language golden parity vectors shared with `client/tests/test_fec_decoder.cpp` | 20 |
 | `slice.rs` | `SliceSplitter` (NAL → N byte-aligned slices) | 8 |
 | `udp.rs` | `UdpSender` / `UdpReceiver` (SO_RCVBUF/SNDBUF 2 MB, DSCP EF) | 2 |
 

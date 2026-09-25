@@ -884,7 +884,7 @@ fn update_adaptive_bitrate(
     bw_estimator: &mut crate::adaptive::bandwidth_estimator::BandwidthEstimator,
     bitrate_ctrl: &mut crate::adaptive::bitrate_controller::BitrateController,
     mut adaptive_fec: Option<&mut crate::transport::fec::AdaptiveFecController>,
-    fec_encoder: &mut crate::transport::fec::FecEncoder,
+    fec_encoder: &mut pipeline::FrameFecEncoder,
     burst_detector: &Arc<StdMutex<crate::adaptive::burst_detector::BurstDetector>>,
     gcc_enabled: bool,
 ) {
@@ -1063,54 +1063,31 @@ fn prune_sent_packet_log_if_due(
     }
 }
 
-/// Send one encoded frame: choose slice-based or bulk FEC based on size and
-/// config, UDP-send the resulting packets, and record send timestamps.
+/// Send one encoded frame: FEC-code it (the encoder picks slice-based or bulk
+/// FEC per frame, see `pipeline::choose_fec_layout`), UDP-send the resulting
+/// packets one code word at a time, and record send timestamps.
 /// Returns after the frame has been dispatched (packets may still be in kernel
 /// queue — the caller's mark_send happens after this).
-#[allow(clippy::too_many_arguments)]
 async fn send_encoded_frame(
     frame: &EncodedFrame,
     timestamp_90khz: u32,
-    slice_fec_enabled: bool,
-    slice_count: u8,
     packetizer: &mut RtpPacketizer,
-    fec_encoder: &mut crate::transport::fec::FecEncoder,
-    slice_fec_encoders: &mut [crate::transport::fec::FecEncoder],
+    fec_encoder: &mut pipeline::FrameFecEncoder,
     udp_sender: &UdpSender,
     sent_packet_log: &Arc<StdMutex<HashMap<u16, u64>>>,
 ) {
-    let use_slice_fec = slice_fec_enabled && frame.nal_data.len() >= pipeline::MIN_SLICE_SIZE;
-
-    if use_slice_fec {
-        let slice_batches = pipeline::encode_frame_sliced(
-            &frame.nal_data,
-            frame.frame_index,
-            timestamp_90khz,
-            frame.is_idr,
-            slice_count,
-            slice_fec_encoders,
-            packetizer,
-        );
-        for slice_packets in &slice_batches {
-            if slice_packets.is_empty() { continue; }
-            if let Err(e) = udp_sender.send_all(slice_packets).await {
-                log::warn!("UDP send error (slice FEC): {}", e);
-            }
-            record_send_timestamps(sent_packet_log, slice_packets);
-        }
-    } else {
-        let packets = pipeline::encode_frame_to_packets_with_fec(
-            &frame.nal_data,
-            frame.frame_index,
-            timestamp_90khz,
-            frame.is_idr,
-            fec_encoder,
-            packetizer,
-        );
-        if let Err(e) = udp_sender.send_all(&packets).await {
+    let batches = fec_encoder.encode(
+        &frame.nal_data,
+        frame.frame_index,
+        timestamp_90khz,
+        frame.is_idr,
+        packetizer,
+    );
+    for packets in &batches {
+        if let Err(e) = udp_sender.send_all(packets).await {
             log::warn!("UDP send error: {}", e);
         }
-        record_send_timestamps(sent_packet_log, &packets);
+        record_send_timestamps(sent_packet_log, packets);
     }
 }
 
@@ -1448,12 +1425,11 @@ async fn run_streaming(
 
         // Step 3: Process frames with adaptive bitrate + adaptive FEC
         let mut packetizer = RtpPacketizer::new(0x46565000);
-        let mut fec_encoder = crate::transport::fec::FecEncoder::new(config.network.fec_redundancy);
-        let slice_count = config.network.slice_count;
-        let slice_fec_enabled = config.network.slice_fec_enabled;
-        let mut slice_fec_encoders: Vec<crate::transport::fec::FecEncoder> = (0..slice_count)
-            .map(|_| crate::transport::fec::FecEncoder::new(config.network.fec_redundancy))
-            .collect();
+        let mut fec_encoder = pipeline::FrameFecEncoder::new(
+            config.network.fec_redundancy,
+            config.network.slice_fec_enabled,
+            config.network.slice_count,
+        );
         let mut frame_count: u64 = 0;
         let mut latency_skip_count: u64 = 0;
 
@@ -1524,11 +1500,8 @@ async fn run_streaming(
                     send_encoded_frame(
                         &frame,
                         timestamp_90khz,
-                        slice_fec_enabled,
-                        slice_count,
                         &mut packetizer,
                         &mut fec_encoder,
-                        &mut slice_fec_encoders,
                         &udp_sender,
                         &sent_packet_log,
                     ).await;
@@ -1574,13 +1547,6 @@ async fn run_streaming(
                         }
                     }
 
-                    // Sync slice FEC encoders with current redundancy
-                    if slice_fec_enabled {
-                        let r = fec_encoder.redundancy();
-                        for se in &mut slice_fec_encoders {
-                            se.set_redundancy(r);
-                        }
-                    }
 
                     check_sleep_mode(
                         &_tracking, &mut sleep_detector,

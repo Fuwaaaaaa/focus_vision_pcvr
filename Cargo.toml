@@ -28,3 +28,9 @@ panic = "abort"
 # profile) is unaffected.
 [profile.dev]
 debug = "line-tables-only"
+
+# Unoptimized Reed-Solomon (GF(2^8) matrix inversion + encode) is tens of
+# times slower, which made tests that push full-size ~1 MB IDRs through FEC
+# take tens of seconds each. Optimize just that crate in dev/test builds.
+[profile.dev.package.reed-solomon-erasure]
+opt-level = 3

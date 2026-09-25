@@ -219,6 +219,34 @@ TEST(SlicedFecFrameDecoder, AssemblesSlicesStripsPrefixAndDeliversOnce) {
     EXPECT_FALSE(dec.tryDecode().has_value()) << "frame must be delivered once";
 }
 
+TEST(SlicedFecFrameDecoder, SliceCountChangesBetweenFrames) {
+    // The server picks the slice count per frame: a large IDR gets more
+    // slices than the configured count so each slice fits one RS code word,
+    // up to the 4-bit maximum of 15. One decoder must follow 2 → 15 → 3.
+    SlicedFecFrameDecoder dec;
+    uint32_t frameIndex = 0;
+    for (int slices : {2, SlicedFecFrameDecoder::MAX_SLICES, 3}) {
+        dec.beginFrame(frameIndex, static_cast<uint8_t>(slices), false);
+        std::vector<uint8_t> expected;
+        for (int s = 0; s < slices; s++) {
+            // 5 bytes + 4-byte prefix → 2 data shards of 8; parity never sent.
+            std::vector<uint8_t> payload(5, static_cast<uint8_t>(frameIndex * 16 + s));
+            auto shards = sliceShards(payload, 8);
+            ASSERT_EQ(shards.size(), 2u);
+            for (uint16_t i = 0; i < 2; i++) {
+                dec.addShard(static_cast<uint8_t>(s), i, 3, 2, shards[i].data(), 8);
+            }
+            expected.insert(expected.end(), payload.begin(), payload.end());
+        }
+        ASSERT_TRUE(dec.isComplete()) << slices << " slices";
+        auto frame = dec.tryDecode();
+        ASSERT_TRUE(frame.has_value()) << slices << " slices";
+        EXPECT_EQ(frame->frameIndex, frameIndex);
+        EXPECT_EQ(frame->data, expected) << slices << " slices";
+        frameIndex++;
+    }
+}
+
 TEST(SlicedFecFrameDecoder, RejectsSliceWithInvalidCounts) {
     const std::vector<uint8_t> a = {1, 2, 3};
     auto sa = sliceShards(a, 8);

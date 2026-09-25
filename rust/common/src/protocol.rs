@@ -158,6 +158,9 @@ pub mod fvp_flags {
     pub const SLICE_COUNT_MASK: u16  = 0b1111 << 5;   // bits 5-8
     pub const STREAM_ID_SHIFT: u32   = 9;
     pub const STREAM_ID_MASK: u16    = 0b11 << 9;     // bits 9-10
+    /// Most slices one frame can be split into (the 4-bit `slice_count`
+    /// field; a larger value would wrap to 0 = bulk).
+    pub const MAX_SLICE_COUNT: u8 = 15;
 
     /// Encode flags for a single-slice, single-stream packet (v2 compatible).
     pub fn encode_simple(is_keyframe: bool) -> u16 {

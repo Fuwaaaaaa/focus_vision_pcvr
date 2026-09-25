@@ -249,6 +249,11 @@ focus_vision_psvr/
   └────────────────────────────┘              └──────────────────────────────┘
 
   NAL < 16KB: uses existing bulk FEC (single RS context, no slicing overhead).
+  Slice count is chosen per frame (pipeline::choose_fec_layout): the
+  configured count, raised up to 15 until every slice fits one RS code word
+  (data + parity <= 256 shards; ~0.9-1 MB IDRs need 5). A frame too big even
+  for 15 slices is sent without parity. With slicing off, a frame too big for
+  one bulk code word is still sliced so it keeps its FEC.
   Backward compat: slice_count=0 in fvp_flags → legacy FecFrameDecoder.
   IDR_REQUEST rate limited to max 2/sec (500ms debounce).
 ```

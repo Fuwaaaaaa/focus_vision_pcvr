@@ -17,7 +17,7 @@ use fvp_common::protocol::VideoCodec;
 use streaming_engine::config::AppConfig;
 use streaming_engine::engine::{EncodedFrame, StreamingEngine};
 use streaming_engine::metrics::latency::FrameTimestamps;
-use streaming_engine::simulator::{run as run_mock_client, MockClientConfig};
+use streaming_engine::simulator::{run as run_mock_client, MockClientConfig, MockClientStats};
 // Shared with sim.rs and the scenario runner. Reserves a contiguous,
 // non-ephemeral port block so the engine's ephemeral sender sockets can't
 // collide with the mock client's fixed video/audio receiver ports (see the
@@ -208,23 +208,26 @@ fn headless_e2e_basic_video_flow() {
         "engine should accept some submitted frames once the channel drains");
 }
 
-/// Run the full headless pipeline at a given `resolution_scale`, feeding
-/// synthetic NALs whose size scales with the encoded area, and return
-/// `(video_bytes_received, frames_decoded)` measured by the mock client.
-fn run_pipeline_video_bytes(resolution_scale: f32) -> (u64, u64) {
+/// Run the full headless pipeline for `duration` at 60 fps with the engine
+/// config adjusted by `configure`, feeding `stream`, and return the mock
+/// client's stats.
+fn run_pipeline(
+    configure: impl FnOnce(&mut AppConfig),
+    mut stream: SyntheticNalStream,
+    duration: Duration,
+) -> MockClientStats {
     delete_stale_status();
     let (tcp_port, udp_port) = pick_free_ports();
     let mut config = sim_test_config(tcp_port, udp_port);
     config.video.framerate = 60;
-    config.video.resolution_scale = resolution_scale;
-    let render = config.video.resolution_per_eye;
+    configure(&mut config);
 
     let engine = StreamingEngine::new(config.clone()).expect("engine new");
     let pin = wait_for_pin(Duration::from_secs(3)).expect("engine never published a PIN");
 
     let server_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut client_config = MockClientConfig::from_ports(server_ip, tcp_port, udp_port, pin);
-    client_config.duration = Some(Duration::from_secs(2));
+    client_config.duration = Some(duration);
     let cancel = CancellationToken::new();
     let cancel_for_client = cancel.clone();
     let client_thread = std::thread::spawn(move || {
@@ -233,12 +236,10 @@ fn run_pipeline_video_bytes(resolution_scale: f32) -> (u64, u64) {
         rt.block_on(run_mock_client(client_config, cancel_for_client))
     });
 
-    let mut stream = SyntheticNalStream::new(VideoCodec::H265, 60)
-        .with_resolution(render[0], render[1], resolution_scale);
     let frame_period = Duration::from_secs_f64(1.0 / 60.0);
     let start = Instant::now();
     let mut next_tick = start;
-    while start.elapsed() < Duration::from_millis(2200) {
+    while start.elapsed() < duration + Duration::from_millis(200) {
         let synth = stream.next_frame();
         let frame = EncodedFrame {
             frame_index: synth.frame_index,
@@ -254,7 +255,50 @@ fn run_pipeline_video_bytes(resolution_scale: f32) -> (u64, u64) {
     cancel.cancel();
     let stats = client_thread.join().expect("client thread join").expect("mock-client run");
     engine.shutdown();
+    stats
+}
+
+/// Run the pipeline at a given `resolution_scale`, feeding synthetic NALs
+/// whose size scales with the encoded area, and return
+/// `(video_bytes_received, frames_decoded)` measured by the mock client.
+fn run_pipeline_video_bytes(resolution_scale: f32) -> (u64, u64) {
+    let render = AppConfig::default().video.resolution_per_eye;
+    let stream = SyntheticNalStream::new(VideoCodec::H265, 60)
+        .with_resolution(render[0], render[1], resolution_scale);
+    let stats = run_pipeline(
+        |c| c.video.resolution_scale = resolution_scale, stream, Duration::from_secs(2),
+    );
     (stats.video_bytes_received, stats.frames_decoded)
+}
+
+/// REGRESSION: an IDR whose slices were too big for one Reed-Solomon code
+/// word went out with some slices empty, so it never reassembled. At 100 %
+/// redundancy one code word holds 128 data shards, so this 320 KB IDR needs
+/// 3 slices instead of the configured 2. (Real IDRs hit the same limit at
+/// ~0.9-1.1 MB with 4 slices and the default 20-40 % redundancy; small code
+/// words keep the engine's first encode — building the Reed-Solomon
+/// matrices is slow without optimization — well inside the run.)
+#[test]
+fn headless_e2e_large_idr_is_delivered() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .is_test(true).try_init();
+
+    let stream = SyntheticNalStream::new(VideoCodec::H265, 30).with_sizes(320_000, 4 * 1024);
+    let stats = run_pipeline(
+        |c| {
+            c.network.fec_redundancy = 1.0;
+            c.network.fec_redundancy_max = 1.0;
+            c.network.adaptive_fec_enabled = false;
+            c.network.slice_count = 2;
+        },
+        stream,
+        Duration::from_secs(3),
+    );
+    eprintln!("large IDR: frames={} IDR={} packets={}",
+        stats.frames_decoded, stats.idr_frames_seen, stats.video_packets_received);
+    assert!(stats.idr_frames_seen >= 1,
+        "a 320 KB IDR must reassemble, got {} IDRs of {} frames",
+        stats.idr_frames_seen, stats.frames_decoded);
 }
 
 /// The verifiable core of Phase 0: a half-resolution encode genuinely puts fewer

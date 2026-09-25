@@ -1,6 +1,10 @@
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::time::{Duration, Instant};
 
+/// Reed-Solomon over GF(2^8) allows at most this many data + parity shards
+/// in one code word (`reed_solomon_erasure` rejects more with `TooManyShards`).
+pub const RS_MAX_TOTAL_SHARDS: usize = 256;
+
 /// Forward Error Correction encoder using Reed-Solomon.
 ///
 /// Caches the ReedSolomon instance across frames to avoid repeated
@@ -32,7 +36,7 @@ impl FecEncoder {
         }
 
         let data_count = data_shards.len();
-        let parity_count = ((data_count as f32 * self.redundancy).ceil() as usize).max(1);
+        let parity_count = self.parity_for(data_count);
         let shard_len = data_shards[0].len();
 
         // Ensure all shards are equal length
@@ -113,6 +117,22 @@ impl FecEncoder {
     }
 
     pub fn redundancy(&self) -> f32 { self.redundancy }
+
+    /// Parity shards `encode` adds to `data_count` data shards at the
+    /// current redundancy (always at least one).
+    pub fn parity_for(&self, data_count: usize) -> usize {
+        ((data_count as f32 * self.redundancy).ceil() as usize).max(1)
+    }
+
+    /// Largest number of data shards one `encode` call can take at the
+    /// current redundancy: data + parity must fit in one RS code word.
+    /// 213 at 20 %, 182 at 40 %, 128 at 100 %.
+    pub fn max_data_shards(&self) -> usize {
+        (1..RS_MAX_TOTAL_SHARDS)
+            .rev()
+            .find(|&d| d + self.parity_for(d) <= RS_MAX_TOTAL_SHARDS)
+            .unwrap_or(0)
+    }
 }
 
 /// Adaptive FEC controller that adjusts redundancy based on observed packet loss.
@@ -297,6 +317,24 @@ mod tests {
         assert!((enc.redundancy() - 0.2).abs() < 0.01);
         enc.set_redundancy(0.4);
         assert!((enc.redundancy() - 0.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_max_data_shards_is_the_rs_limit() {
+        let shards = |n: usize| (0..n).map(|i| vec![i as u8; 4]).collect::<Vec<_>>();
+        for (redundancy, expected) in [(0.0f32, 255usize), (0.05, 243), (0.2, 213), (0.4, 182), (1.0, 128)] {
+            let mut enc = FecEncoder::new(redundancy);
+            let max = enc.max_data_shards();
+            assert_eq!(max, expected, "redundancy {redundancy}");
+            assert!(max + enc.parity_for(max) <= RS_MAX_TOTAL_SHARDS);
+            // RS rejects the count before building any matrix, so this is cheap.
+            assert!(enc.encode(shards(max + 1)).is_err(), "one more must exceed RS (redundancy {redundancy})");
+        }
+        // One real encode at the limit (the smallest matrix, to keep it fast
+        // in unoptimized test builds).
+        let mut enc = FecEncoder::new(1.0);
+        let encoded = enc.encode(shards(128)).expect("max data shards must encode");
+        assert_eq!(encoded.len(), RS_MAX_TOTAL_SHARDS);
     }
 
     #[test]
