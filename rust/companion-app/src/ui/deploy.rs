@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::{adb, rfd_pick_file, CompanionApp};
+use crate::{adb, headset_link, rfd_pick_file, CompanionApp};
 
 impl CompanionApp {
     pub(crate) fn render_deploy(&mut self, ui: &mut egui::Ui, accent: egui::Color32, text_muted: egui::Color32) {
@@ -110,6 +110,10 @@ impl CompanionApp {
                 let apk = self.apk_path.clone();
                 let devices: Vec<_> = self.devices.iter().map(|d| d.serial.clone()).collect();
                 let result = self.deploy_result.clone();
+                // With the engine waiting for a PIN, start the app pointed at
+                // this PC right away; otherwise just start it.
+                let pin = self.pin_code.clone();
+                let ports = self.engine_ports;
 
                 thread::Builder::new()
                     .name("fvp-deploy".into())
@@ -118,8 +122,15 @@ impl CompanionApp {
                         for serial in &devices {
                             match adb::install_apk(&adb, serial, &apk) {
                                 Ok(_) => {
-                                    let _ = adb::launch_app(&adb, serial, "com.focusvision.pcvr");
-                                    outcomes.push(format!("OK: {}", serial));
+                                    let launched = if headset_link::is_pin(&pin) {
+                                        headset_link::send_to_headset(&adb, serial, &pin, ports)
+                                    } else {
+                                        adb::launch_app(&adb, serial, headset_link::CLIENT_PACKAGE)
+                                    };
+                                    outcomes.push(match launched {
+                                        Ok(_) => format!("OK: {}", serial),
+                                        Err(e) => format!("Installed on {}, but: {}", serial, e),
+                                    });
                                 }
                                 Err(e) => {
                                     outcomes.push(format!("FAIL {}: {}", serial, e));

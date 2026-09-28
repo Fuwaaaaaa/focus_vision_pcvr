@@ -75,6 +75,9 @@ pub struct ParsedStatus {
     /// (pre-v3 payloads, or status types where the PIN isn't active).
     /// The Home tab uses this to render an `Expires in: M:SS` countdown.
     pub pin_expires_in_seconds: Option<u32>,
+    /// The engine's (control TCP port, UDP base port) — where the headset
+    /// connects. `None` from an engine that does not publish them.
+    pub engine_ports: Option<(u16, u16)>,
 }
 
 impl Default for ParsedStatus {
@@ -88,6 +91,7 @@ impl Default for ParsedStatus {
             bitrate_mbps: 0.0,
             subsystems: Subsystems::default(),
             pin_expires_in_seconds: None,
+            engine_ports: None,
         }
     }
 }
@@ -145,6 +149,14 @@ pub fn parse_status_json(content: &str) -> Option<ParsedStatus> {
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
 
+    let port = |key: &str| {
+        val.get(key)
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+            .filter(|&p| p != 0)
+    };
+    let engine_ports = port("tcp_port").zip(port("udp_port"));
+
     Some(ParsedStatus {
         schema_version,
         connection,
@@ -154,6 +166,7 @@ pub fn parse_status_json(content: &str) -> Option<ParsedStatus> {
         bitrate_mbps,
         subsystems,
         pin_expires_in_seconds,
+        engine_ports,
     })
 }
 
@@ -414,5 +427,24 @@ mod tests {
         assert_eq!(parsed.fps, 96);
         assert!((parsed.latency_ms - 9.5).abs() < 1e-3);
         assert_eq!(parsed.subsystems.audio_enabled, Some(true));
+    }
+
+    #[test]
+    fn engine_ports_are_parsed_when_published() {
+        let parsed = parse_status_json(
+            r#"{"status":"waiting","pin":"123456","tcp_port":9950,"udp_port":9955}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.engine_ports, Some((9950, 9955)));
+
+        // An older engine publishes none; a half or out-of-range pair is ignored.
+        for json in [
+            r#"{"status":"waiting","pin":"123456"}"#,
+            r#"{"status":"waiting","pin":"123456","tcp_port":9950}"#,
+            r#"{"status":"waiting","pin":"123456","tcp_port":70000,"udp_port":9955}"#,
+            r#"{"status":"waiting","pin":"123456","tcp_port":0,"udp_port":9955}"#,
+        ] {
+            assert_eq!(parse_status_json(json).unwrap().engine_ports, None, "{json}");
+        }
     }
 }

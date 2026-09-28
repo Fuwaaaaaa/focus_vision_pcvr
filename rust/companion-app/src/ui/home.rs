@@ -147,7 +147,7 @@ impl CompanionApp {
             if self.devices.is_empty() {
                 Some("Next: Connect Focus Vision via USB and deploy the APK (Deploy tab)")
             } else {
-                Some("Next: Start SteamVR, then enter the PIN on your headset")
+                Some("Next: Start SteamVR, then send the PIN to the headset (below)")
             }
         } else {
             None
@@ -182,7 +182,19 @@ impl CompanionApp {
             );
 
             if self.connection_status == ConnectionStatus::WaitingForPin {
-                ui.label(egui::RichText::new("Enter this PIN on your headset").size(12.0).color(text_muted));
+                // The headset app has no PIN entry screen yet: the PIN (and
+                // this PC's address) go over USB with the app launch.
+                ui.label(egui::RichText::new("Send this PIN to the headset over USB").size(12.0).color(text_muted));
+                if self.adb_path.is_some() && !self.devices.is_empty() {
+                    ui.add_space(4.0);
+                    let label = if self.pairing_in_progress { "Sending..." } else { "Send PIN to headset" };
+                    if ui.add_enabled(!self.pairing_in_progress, egui::Button::new(label)).clicked() {
+                        self.send_pin_to_headset();
+                    }
+                } else {
+                    ui.label(egui::RichText::new("Connect the headset by USB (Deploy tab lists it)")
+                        .size(11.0).color(text_muted));
+                }
 
                 // Live countdown — locally derived so we don't depend on
                 // the engine rewriting status.json every second. Only
@@ -209,6 +221,9 @@ impl CompanionApp {
                             .monospace(),
                     );
                 }
+            }
+            if !self.pairing_status.is_empty() {
+                ui.label(egui::RichText::new(&self.pairing_status).size(11.0).color(text_muted));
             }
         });
 
