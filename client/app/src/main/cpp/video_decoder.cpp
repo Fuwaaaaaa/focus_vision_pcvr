@@ -199,6 +199,7 @@ bool VideoDecoder::getDecodedFrame() {
             m_submitTimes.pop_front();
             uint32_t latencyUs = (uint32_t)std::chrono::duration_cast<
                 std::chrono::microseconds>(latency).count();
+            m_lastDecodeUs = latencyUs;
             m_totalDecodeUs += latencyUs;
             m_decodeCount++;
             m_avgDecodeUs = (uint32_t)(m_totalDecodeUs / m_decodeCount);

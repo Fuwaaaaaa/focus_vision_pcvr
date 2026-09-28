@@ -48,6 +48,11 @@ public:
     /// Take the oldest complete frame. Render thread.
     bool popFrame(FrameAssembler::Frame& out);
 
+    /// The decoder lost a frame (or was not fed for a while): drop the
+    /// queued frames, which reference it, and restart at the next keyframe
+    /// (requested now).
+    void requireKeyframe();
+
     /// When the last packet of the current session arrived (or when it
     /// began, before any packet).
     Clock::time_point lastPacketTime() const {

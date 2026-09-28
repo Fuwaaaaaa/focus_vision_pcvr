@@ -13,7 +13,8 @@ C++; Kotlin only inherits `NativeActivity` and loads the `.so`.
 
 | Path | Purpose |
 |---|---|
-| `kotlin/com/focusvision/pcvr/MainActivity.kt` | `class MainActivity : NativeActivity()` — 9 LoC, loads `libfvp_client.so` |
+| `kotlin/com/focusvision/pcvr/MainActivity.kt` | `class MainActivity : NativeActivity()` — loads `libfocusvision_native.so`; writes the launch extras (`fvp_server`, `fvp_pin`, `fvp_udp_port`) to `launch_request.txt` in app-private storage (onCreate / onNewIntent) |
+| `cpp/launch_request.h` | Parses that file (pure, host-tested); `OpenXRApp::checkLaunchRequest` reads and deletes it at start and every second, then (re)starts `StreamSession` |
 | `cpp/main.cpp` | `android_main()` entry, global `static OpenXRApp* g_app`, `handleAppCmd` dispatcher | 55 |
 
 ---

@@ -5,9 +5,11 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
-#include <cstring>
-#include <thread>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <thread>
 
 /// Read HMD battery level from Android sysfs (0-100, or -1 on failure).
 static int readBatteryLevel() {
@@ -41,51 +43,177 @@ void OpenXRApp::initialize(android_app* app) {
     m_overlay.init();
     m_facialTracker.init(m_instance, m_session);
 
-    // TOFU pinning store: app-private, app-uninstall removes it.
+    // App-private storage (uninstalling or clearing the app's data removes
+    // it): the TOFU pin of the paired PC, and the launch request with the
+    // PC's address and PIN that MainActivity writes.
     if (app->activity && app->activity->internalDataPath) {
-        m_tcpClient.setFingerprintStorePath(
-            std::string(app->activity->internalDataPath) + "/server_fingerprint.hex");
+        const std::string dataDir = app->activity->internalDataPath;
+        m_fingerprintPath = dataDir + "/server_fingerprint.hex";
+        m_launchRequestPath = dataDir + "/" + fvp_launch::LAUNCH_REQUEST_FILE;
     } else {
-        LOGE("internalDataPath unavailable — TLS pairing will refuse to connect");
+        LOGE("internalDataPath unavailable — pairing will refuse to connect");
     }
 
-    // Initialize video decoder with JNI for zero-copy SurfaceTexture output.
-    // EGL context is current at this point (initEGL called above).
-    //
-    // JNI attach/detach: follow the pattern used in video_decoder.cpp so we
-    // only Detach if we actually attached the thread here. Without this
-    // balance, the thread leaks a reference to the VM and logs a warning
-    // at exit on some Android versions.
-    JavaVM* vm = app->activity->vm;
+    // The decoder starts at the native per-eye size; STREAM_CONFIG may
+    // change the codec or size (resolution_scale) when a session starts.
+    TcpControlClient::StreamConfig native;
+    native.width = native.encodedWidth = 1832;
+    native.height = native.encodedHeight = 1920;
+    native.codec = 1;
+    configureDecoder(native);
+
+    // Video is received on its own thread, bound once; each session points
+    // it at the server before STREAM_START so the first packets are kept.
+    m_videoReceiver.start(m_udpBasePort + fvp_client_protocol::VIDEO_PORT_OFFSET,
+                          &m_stream.stats(), [this] { m_stream.requestIdr(); });
+    m_stream.setStreamStartHook(
+        [this](const TcpControlClient::StreamConfig&, const std::string& serverIp) {
+            m_videoReceiver.beginSession(serverIp);
+        });
+    m_stream.setStreamEndHook([this] { m_videoReceiver.endSession(); });
+
+    checkLaunchRequest();
+    LOGI("OpenXR app initialized successfully");
+}
+
+void OpenXRApp::withJni(const std::function<void(JNIEnv*)>& fn) {
+    // Detach only if attached here: an unbalanced attach leaks a VM
+    // reference and logs a warning at exit on some Android versions.
+    JavaVM* vm = m_androidApp->activity->vm;
     JNIEnv* env = nullptr;
     bool didAttach = false;
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_EDETACHED) {
         if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            LOGE("AttachCurrentThread failed; skipping video decoder JNI init");
+            LOGE("AttachCurrentThread failed");
             env = nullptr;
         } else {
             didAttach = true;
         }
     }
-    if (env) {
-        // Native per-eye resolution (decoder fallback before STREAM_CONFIG). The
-        // decoder is initialised at app startup, before the control handshake, so
-        // encoded dims are 0 here and we fall back to native — MediaCodec also
-        // re-derives the true resolution from the stream SPS. Once the control
-        // channel is wired (see TODOS: client TCP control connect/handshake
-        // unwired), re-running this with getStreamConfig().encoded* sizes the
-        // decoder to the downscaled stream.
-        constexpr uint32_t kNativeWidthPerEye = 1832;
-        constexpr uint32_t kNativeHeightPerEye = 1920;
-        const auto& sc = m_tcpClient.getStreamConfig();
-        auto dims = fvp_client_protocol::decoderInitDims(
-            kNativeWidthPerEye, kNativeHeightPerEye, sc.encodedWidth, sc.encodedHeight);
-        m_videoDecoder.init(env, static_cast<int>(dims.width), static_cast<int>(dims.height));
+    fn(env);
+    if (didAttach) vm->DetachCurrentThread();
+}
+
+void OpenXRApp::configureDecoder(const TcpControlClient::StreamConfig& config) {
+    auto dims = fvp_client_protocol::decoderInitDims(
+        config.width, config.height, config.encodedWidth, config.encodedHeight);
+    if (dims.width == 0 || dims.height == 0) dims = {1832, 1920};
+    const uint8_t codec = config.codec == 0 ? 0 : 1;
+    if (m_videoDecoder.isInitialized() && codec == m_decoderCodec &&
+        dims.width == m_decoderWidth && dims.height == m_decoderHeight) {
+        m_videoDecoder.flush(); // a new session starts from a keyframe
+        return;
     }
-    if (didAttach) {
-        vm->DetachCurrentThread();
+    // Needs the EGL context, current on this (render) thread since initEGL.
+    // A null JNIEnv makes the decoder fall back to buffer output.
+    const char* mime = codec == 0 ? "video/avc" : "video/hevc";
+    withJni([&](JNIEnv* env) {
+        m_videoDecoder.shutdown();
+        m_hasDecodedFrame = false;
+        m_lastDecodedTexture = 0;
+        if (m_videoDecoder.init(env, static_cast<int>(dims.width), static_cast<int>(dims.height), mime)) {
+            m_decoderCodec = codec;
+            m_decoderWidth = dims.width;
+            m_decoderHeight = dims.height;
+        }
+    });
+}
+
+void OpenXRApp::checkLaunchRequest() {
+    m_lastLaunchCheck = std::chrono::steady_clock::now();
+    if (m_launchRequestPath.empty()) return;
+    std::ifstream in(m_launchRequestPath);
+    if (!in.good()) return;
+    std::stringstream text;
+    text << in.rdbuf();
+    in.close();
+    // Used once: a stale PIN would cost an attempt against the engine's lockout.
+    std::remove(m_launchRequestPath.c_str());
+
+    fvp_launch::LaunchRequest request;
+    if (!fvp_launch::parseLaunchRequest(text.str(), request)) {
+        LOGE("Ignoring a malformed launch request");
+        return;
     }
-    LOGI("OpenXR app initialized successfully");
+    startStreamSession(request);
+}
+
+void OpenXRApp::startStreamSession(const fvp_launch::LaunchRequest& request) {
+    LOGI("Connecting to %s:%u (UDP base %u)", request.server.ip.c_str(), request.server.port,
+         request.udpBasePort);
+    m_stream.stop(); // leaves a previous PC with DISCONNECT
+    m_trackingSender.shutdown();
+    if (request.udpBasePort != m_udpBasePort) {
+        m_udpBasePort = request.udpBasePort;
+        m_videoReceiver.start(m_udpBasePort + fvp_client_protocol::VIDEO_PORT_OFFSET,
+                              &m_stream.stats(), [this] { m_stream.requestIdr(); });
+        m_audioReceiver.shutdown();
+    }
+    m_serverIp = request.server.ip;
+
+    SessionSettings settings;
+    settings.serverIp = request.server.ip;
+    settings.controlPort = request.server.port;
+    settings.pin = request.pin;
+    settings.fingerprintStorePath = m_fingerprintPath;
+    m_pairingState = PairingState::Searching;
+    m_stream.start(settings);
+}
+
+void OpenXRApp::handleStreamEvents() {
+    ServerEvent e;
+    while (m_stream.pollEvent(e)) {
+        switch (e.type) {
+        case ServerEvent::Type::Streaming: {
+            const auto config = m_stream.streamConfig();
+            configureDecoder(config);
+            m_frameDurationUs = config.framerate > 0 ? 1000000 / config.framerate : 11111;
+            m_dashboardBitrate = config.bitrateMbps;
+            m_dashboardCodecH265 = config.codec != 0;
+            m_trackingSender.shutdown();
+            m_trackingSender.init(m_serverIp.c_str(),
+                                  m_udpBasePort + fvp_client_protocol::TRACKING_PORT_OFFSET);
+            if (!m_audioReceiver.isInitialized()) {
+                m_audioReceiver.init("0.0.0.0", m_udpBasePort + fvp_client_protocol::AUDIO_PORT_OFFSET);
+            }
+            if (!m_audioPlayer.isInitialized()) m_audioPlayer.init();
+            m_sleeping = false;
+            m_pairingState = PairingState::Connected;
+            LOGI("Streaming from %s", m_serverIp.c_str());
+            break;
+        }
+        case ServerEvent::Type::Disconnected:
+            // StreamSession reconnects on its own; the engine takes the same
+            // PIN for 5 s after a drop.
+            m_trackingSender.shutdown();
+            m_pairingState = PairingState::Disconnected;
+            break;
+        case ServerEvent::Type::PinRejected:
+            m_pairingState = PairingState::Failed;
+            m_pairingMessage = "PIN rejected: send a new one from the companion app";
+            LOGE("%s", m_pairingMessage.c_str());
+            break;
+        case ServerEvent::Type::Haptic:
+            // Needs the controller action set (ControllerPoller::init);
+            // until then applyHaptic does nothing.
+            m_controllerPoller.applyHaptic(m_session, e.haptic.controllerId,
+                                           e.haptic.durationMs / 1000.0f,
+                                           e.haptic.frequency, e.haptic.amplitude);
+            break;
+        case ServerEvent::Type::SleepEnter:
+            m_sleeping = true;
+            break;
+        case ServerEvent::Type::SleepExit:
+            m_sleeping = false;
+            break;
+        case ServerEvent::Type::HeartbeatAck:
+            m_pcLatency = e.heartbeatAck;
+            break;
+        case ServerEvent::Type::ConfigUpdateAck:
+            LOGI("CONFIG_UPDATE 0x%02x %s", e.configKey, e.configAccepted ? "accepted" : "rejected");
+            break;
+        }
+    }
 }
 
 void OpenXRApp::createInstance(android_app* app) {
@@ -256,7 +384,6 @@ void OpenXRApp::createSwapchains() {
 }
 
 void OpenXRApp::mainLoop() {
-    m_recvBuffer.resize(2048); // Max RTP packet size
     uint32_t frameCount = 0;
 
     while (m_running) {
@@ -267,9 +394,24 @@ void OpenXRApp::mainLoop() {
         if (!m_running) break;
         pollEvents();
 
+        // A new launch from the companion (onNewIntent) replaces the connection.
+        if (std::chrono::steady_clock::now() - m_lastLaunchCheck > std::chrono::seconds(1)) {
+            checkLaunchRequest();
+        }
+        handleStreamEvents();
+
         if (!m_sessionReady) {
+            // Not rendering: keep the frame queue from filling up. Decoding
+            // resumes at a keyframe (requireKeyframe below).
+            FrameAssembler::Frame skipped;
+            while (m_videoReceiver.popFrame(skipped)) {}
+            m_rendering = false;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
+        }
+        if (!m_rendering) {
+            m_videoReceiver.requireKeyframe();
+            m_rendering = true;
         }
 
         // Update HMD battery level every ~30 seconds (2700 frames at 90fps)
@@ -280,101 +422,36 @@ void OpenXRApp::mainLoop() {
             }
         }
 
-        // Receive and decode video packets before rendering
+        // Feed the decoder before rendering
         receiveAndDecodeVideo();
+        receiveAudio();
         renderFrame();
         frameCount++;
     }
 }
 
+void OpenXRApp::receiveAudio() {
+    if (!m_audioReceiver.isInitialized() || !m_audioPlayer.isInitialized()) return;
+    // Opus over RTP from the engine: a 12-byte RTP header, then one 10 ms
+    // Opus packet. A few arrive per rendered frame.
+    constexpr int kRtpHeader = 12;
+    m_audioBuffer.resize(2048);
+    for (;;) {
+        const int n = m_audioReceiver.receive(m_audioBuffer.data(), static_cast<int>(m_audioBuffer.size()));
+        if (n <= 0) break;
+        if (n > kRtpHeader) {
+            m_audioPlayer.submitOpusPacket(m_audioBuffer.data() + kRtpHeader, n - kRtpHeader);
+        }
+    }
+    m_audioPlayer.pump();
+}
+
 void OpenXRApp::receiveAndDecodeVideo() {
-    if (!m_networkReceiver.isInitialized()) return;
-
-    // Drain all available UDP packets (non-blocking)
-    for (int i = 0; i < 64; i++) { // Process up to 64 packets per frame
-        int received = m_networkReceiver.receive(m_recvBuffer.data(), (int)m_recvBuffer.size());
-        if (received <= 0) break;
-
-        // Parse + validate the RTP/FVP header (12 + 12 bytes, v4). The header
-        // carries data_shard_count: adaptive FEC changes the parity ratio per
-        // frame, so the data/parity split can't be derived from total_shards
-        // (the old `total / 1.2` guess was only right at 20% redundancy).
-        fvp_client_protocol::FvpHeaderView hdr;
-        if (!fvp_client_protocol::parseFvpHeader(m_recvBuffer.data(), (size_t)received, hdr)) {
-            continue; // too short, or inconsistent shard fields
-        }
-        const uint32_t frameIndex = hdr.frameIndex;
-        const uint16_t shardIndex = hdr.shardIndex;
-        const uint16_t totalShards = hdr.totalShards;
-        const uint16_t dataShards = hdr.dataShards;
-        bool isKeyframe = fvp_flags::isKeyframe(hdr.flags);
-        uint8_t sliceIdx = fvp_flags::sliceIndex(hdr.flags);
-        uint8_t sliceCnt = fvp_flags::sliceCount(hdr.flags);
-
-        // Record packet for stats reporting to PC
-        m_stats.onPacketReceived();
-        m_lastPacketTime = std::chrono::steady_clock::now();
-        m_streamingActive = true;
-
-        const uint8_t* payload = m_recvBuffer.data() + fvp_client_protocol::PACKET_HEADER_LEN;
-        int payloadSize = received - (int)fvp_client_protocol::PACKET_HEADER_LEN;
-
-        if (sliceCnt > 0) {
-            // --- Slice FEC path ---
-            // New frame? Try to decode or timeout the previous sliced frame.
-            if (!m_slicedDecoder.isActiveFor(frameIndex)) {
-                auto prevFrame = m_slicedDecoder.tryDecode();
-                if (prevFrame.has_value()) {
-                    submitDecodedFrame(prevFrame->data.data(), (int)prevFrame->data.size(),
-                                       prevFrame->frameIndex);
-                } else if (m_slicedDecoder.isActive() && m_slicedDecoder.isTimedOut()) {
-                    LOGW("Slice FEC: frame %u timed out (%u/%u slices), requesting IDR",
-                         m_slicedDecoder.currentFrameIndex(),
-                         __builtin_popcount(m_slicedDecoder.isComplete() ? 0xFFFF : 0),
-                         m_slicedDecoder.sliceCount());
-                    m_tcpClient.requestIdr();
-                }
-                m_slicedDecoder.beginFrame(frameIndex, sliceCnt, isKeyframe);
-            }
-            m_slicedDecoder.addShard(sliceIdx, shardIndex, totalShards, dataShards,
-                                     payload, payloadSize);
-        } else {
-            // --- Bulk FEC path (legacy, slice_count=0) ---
-            if (!m_fecDecoder.isActiveFor(frameIndex)) {
-                auto prevFrame = m_fecDecoder.tryDecode();
-                if (prevFrame.has_value()) {
-                    submitDecodedFrame(prevFrame->data.data(), (int)prevFrame->data.size(),
-                                       prevFrame->frameIndex);
-                }
-                m_fecDecoder.beginFrame(frameIndex, totalShards, dataShards, isKeyframe);
-            }
-            m_fecDecoder.addShard(shardIndex, payload, payloadSize);
-        }
-    }
-
-    // Flush: decode complete frames that haven't been triggered by a new frame arrival.
-    if (m_fecDecoder.isComplete()) {
-        auto lastFrame = m_fecDecoder.tryDecode();
-        if (lastFrame.has_value()) {
-            submitDecodedFrame(lastFrame->data.data(), (int)lastFrame->data.size(),
-                               lastFrame->frameIndex);
-        }
-    }
-    if (m_slicedDecoder.isComplete()) {
-        auto lastFrame = m_slicedDecoder.tryDecode();
-        if (lastFrame.has_value()) {
-            submitDecodedFrame(lastFrame->data.data(), (int)lastFrame->data.size(),
-                               lastFrame->frameIndex);
-        }
-    }
-    // Slice timeout check: if sliced frame started but isn't complete after 100ms.
-    // Abandon it after one IDR request — otherwise, while only bulk frames
-    // follow, this would re-request an IDR on every render loop.
-    if (m_slicedDecoder.isActive() && !m_slicedDecoder.isComplete()
-        && m_slicedDecoder.isTimedOut()) {
-        LOGW("Slice FEC: frame %u timed out, requesting IDR", m_slicedDecoder.currentFrameIndex());
-        m_tcpClient.requestIdr();
-        m_slicedDecoder.abandon();
+    // VideoReceiver's thread receives the packets and rebuilds the frames;
+    // they arrive complete, in order, starting at a keyframe.
+    FrameAssembler::Frame frame;
+    while (m_videoReceiver.popFrame(frame)) {
+        submitDecodedFrame(frame.data.data(), static_cast<int>(frame.data.size()), frame.frameIndex);
     }
 }
 
@@ -391,14 +468,23 @@ void OpenXRApp::submitDecodedFrame(const uint8_t* nalData, int nalSize, uint32_t
         nalLen = nalSize - 3;
     }
 
-    auto result = NalValidator::validate(nalStart, nalLen);
-    if (result == NalValidator::Result::Valid) {
-        int64_t timestampUs = (int64_t)frameIndex * 11111;
-        m_videoDecoder.submitPacket(nalData, nalSize, timestampUs);
-    } else {
-        LOGW("NAL validation failed for frame %u, requesting IDR", frameIndex);
-        m_tcpClient.requestIdr();
+    // NalValidator knows the HEVC NAL header; an H.264 header has a
+    // different layout, so only its forbidden_zero_bit is checked.
+    const bool valid = m_decoderCodec == 1
+        ? NalValidator::validate(nalStart, nalLen) == NalValidator::Result::Valid
+        : nalLen >= 1 && (nalStart[0] & 0x80) == 0;
+    if (!valid) {
+        LOGW("NAL validation failed for frame %u, waiting for a keyframe", frameIndex);
         m_videoDecoder.flush();
+        m_videoReceiver.requireKeyframe();
+        return;
+    }
+    const int64_t timestampUs = static_cast<int64_t>(frameIndex) * m_frameDurationUs;
+    if (!m_videoDecoder.submitPacket(nalData, nalSize, timestampUs)) {
+        // No decoder input buffer: this frame is lost, and so are the ones
+        // that reference it.
+        LOGW("Decoder input full — frame %u dropped, waiting for a keyframe", frameIndex);
+        m_videoReceiver.requireKeyframe();
     }
 }
 
@@ -487,7 +573,7 @@ void OpenXRApp::renderFrame() {
             frameState.predictedDisplayTime, m_trackingSender);
 
         // Poll face tracking and send blendshapes to PC via TCP (msg 0x35)
-        if (m_facialTracker.isAvailable() && m_tcpClient.isConnected()) {
+        if (m_facialTracker.isAvailable() && m_stream.isStreaming()) {
             auto face = m_facialTracker.poll();
             if (face.lipValid || face.eyeValid) {
                 // Pack: [lip_valid:1B][eye_valid:1B][lip:37*4B][eye:14*4B] = 206 bytes
@@ -497,9 +583,18 @@ void OpenXRApp::renderFrame() {
                 buf[off++] = face.eyeValid ? 1 : 0;
                 memcpy(buf + off, face.lip.data(), 37 * 4); off += 37 * 4;
                 memcpy(buf + off, face.eye.data(), 14 * 4); off += 14 * 4;
-                m_tcpClient.sendMessage(0x35, buf, off); // MSG_FACE_DATA
+                m_stream.send(fvp_client_protocol::msg::FACE_DATA, buf, static_cast<size_t>(off));
             }
         }
+
+        // Connection loss: a stream was shown, and now the session is down
+        // or no video packet came for DISCONNECT_TIMEOUT_MS.
+        const bool streaming = m_stream.isStreaming();
+        const bool connectionLost = m_hasDecodedFrame &&
+            (!streaming ||
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - m_videoReceiver.lastPacketTime()).count()
+                 > DISCONNECT_TIMEOUT_MS);
 
         // Render each eye
         for (uint32_t eye = 0; eye < 2; eye++) {
@@ -510,11 +605,6 @@ void OpenXRApp::renderFrame() {
             GLuint framebuffer = m_swapchains[eye].getFramebuffer(imgIndex);
             uint32_t width = m_swapchains[eye].getWidth();
             uint32_t height = m_swapchains[eye].getHeight();
-
-            // Check for connection loss (no packets for 2s)
-            bool connectionLost = m_streamingActive &&
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - m_lastPacketTime).count() > DISCONNECT_TIMEOUT_MS;
 
             if (connectionLost) {
                 // Show dark overlay with reconnect indication.
@@ -540,6 +630,7 @@ void OpenXRApp::renderFrame() {
 
             if (hasNewFrame) {
                 m_lastDecodedTexture = m_videoDecoder.getOutputTexture();
+                m_stream.stats().onFrameDecoded(m_videoDecoder.lastDecodeLatencyUs());
             }
 
             if (hasNewFrame && m_lastDecodedTexture != 0) {
@@ -569,10 +660,17 @@ void OpenXRApp::renderFrame() {
                     0.05f, 0.05f, 0.2f);
             }
 
+            // The PC paused the stream for user inactivity (SLEEP_ENTER).
+            if (m_sleeping) {
+                m_overlay.renderSleepDimming(framebuffer, width, height, 0.7f);
+            }
+
             // Connection quality overlay (signal bars)
-            if (m_streamingActive) {
-                float loss = (float)m_stats.packetsLost() /
-                    std::max(1u, m_stats.packetsReceived() + m_stats.packetsLost());
+            if (streaming) {
+                // Counters since the last heartbeat (500 ms).
+                StatsReporter& stats = m_stream.stats();
+                float loss = (float)stats.packetsLost() /
+                    std::max(1u, stats.packetsReceived() + stats.packetsLost());
                 float quality = 1.0f - std::min(1.0f, loss * 10.0f); // 10% loss = 0 quality
                 m_overlay.render(framebuffer, width, height,
                                   quality, loss * 100.0f, m_videoDecoder.avgDecodeLatencyUs() / 1000.0f);
@@ -626,6 +724,16 @@ void OpenXRApp::shutdown() {
     // Runs up to three times (APP_CMD_DESTROY, end of android_main, the
     // destructor), so every handle is reset once released.
     m_running = false;
+
+    // Leave the PC with DISCONNECT (the engine then ends the session instead
+    // of holding it for a reconnect), then stop the receive threads.
+    m_stream.stop();
+    m_videoReceiver.stop();
+    m_trackingSender.shutdown();
+    m_audioReceiver.shutdown();
+    if (m_audioPlayer.isInitialized()) m_audioPlayer.shutdown();
+    // Before EGL goes away: the decoder owns a GL texture.
+    if (m_eglDisplay != EGL_NO_DISPLAY) m_videoDecoder.shutdown();
     if (m_stageSpace != XR_NULL_HANDLE) {
         xrDestroySpace(m_stageSpace);
         m_stageSpace = XR_NULL_HANDLE;

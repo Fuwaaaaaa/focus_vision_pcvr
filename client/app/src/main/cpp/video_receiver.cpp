@@ -105,6 +105,20 @@ bool VideoReceiver::popFrame(FrameAssembler::Frame& out) {
     return true;
 }
 
+void VideoReceiver::requireKeyframe() {
+    FrameAssembler::Output out;
+    {
+        std::lock_guard<std::mutex> lock(m_assemblyMutex);
+        if (!m_sessionActive) return;
+        m_assembler.requireKeyframe(Clock::now(), out);
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_frames.clear();
+    }
+    if (out.requestIdr && m_onIdrNeeded) m_onIdrNeeded();
+}
+
 uint64_t VideoReceiver::framesDelivered() const {
     std::lock_guard<std::mutex> lock(m_assemblyMutex);
     return m_assembler.framesDelivered();

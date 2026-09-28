@@ -319,7 +319,8 @@
   - ②**オーケストレーション・ポリシー**: `client_session.h` の `ClientSession` 状態機械(Disconnected→Connecting→Pairing→Configuring→Streaming→Reconnecting、PIN拒否は再接続しない、指数backoff base1s×2 cap16s = engine reconnect.rs と一致)。client gtest 9件。
   - ①**サーバアドレス検証**: `client_session.h` の `parse_server_endpoint("ip"/"ip:port")`(IPv4 4オクテット + port 1-65535 検証、default 9944 = engine と一致)。client gtest 5件。アドレス文字列の**供給元**(config ファイル読込 or UI)は別途。
   - ~~**残り(実機検証が要る部分)**: 状態機械を**実I/O(connect/handshake/receiver init)に配線**~~ (2026-09-28): `StreamSession`(接続・ペアリング・ハートビート・サーバから届くメッセージ・再接続を専用スレッドで回す) と `VideoReceiver`(UDP 受信スレッド + `FrameAssembler`) を追加した。C++ クライアントを本物のエンジン(ヘッドレス版)につなぐ E2E テスト `client/tests/test_session_e2e.cpp` で、TLS 1.3・PIN・映像の受信・誤った PIN・hold 内の再接続・証明書の不一致を確かめた(CI の `client-e2e` ジョブ)。
-  - **残り**: `openxr_app` への組み込み(受け取ったフレームを MediaCodec へ、ハプティクス・スリープの処理、tracking sender の起動)、アドレスと PIN の供給(まずはコンパニオンが adb で起動するときに渡す)、VR 内の PIN 入力 UI。デコードと描画は実機でしか確かめられない。
+  - ~~`openxr_app` への組み込み~~ (2026-09-28): 起動時のアドレスと PIN(`am start --es fvp_server … --es fvp_pin …` → MainActivity がファイルに書き、ネイティブ側が読んで消す)、MediaCodec へのフレーム投入(codec・サイズの変更で作り直し)、tracking sender、音声の受信と再生、スリープの減光、終了時の DISCONNECT。APK のビルドまで確認。
+  - **残り**: コンパニオンが adb で起動するときにアドレスと PIN を渡すこと、VR 内の PIN 入力 UI(無線のみで再ペアリングするときに要る)、コントローラ入力の初期化(ハプティクスはそれまで効かない)。デコードと描画は実機でしか確かめられない。
 - **resolution_scale への影響:** PC側(Rust+driver)は機能的。クライアント T8-T10 は正しいが、このセッション統合が無いため inert。
 - **Priority:** P0 (クライアント実機動作の前提・Phase 1 より上流)
 - **Depends on:** 実機(検証に必須) + UX設計
