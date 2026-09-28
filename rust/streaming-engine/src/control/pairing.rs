@@ -215,10 +215,11 @@ impl PairingState {
     }
 
     /// Attempt to verify a PIN. Returns Ok(()) on success, Err(reason) on failure.
+    ///
+    /// Every call checks the PIN, even after an earlier success: a handshake
+    /// can fail after the PIN step, and the next connection on the same
+    /// server must prove the PIN again.
     pub fn verify(&mut self, submitted_pin: u32) -> Result<(), PairingError> {
-        if self.paired {
-            return Ok(());
-        }
         if self.is_locked() {
             return Err(PairingError::LockedOut);
         }
@@ -391,13 +392,27 @@ mod tests {
     }
 
     #[test]
+    fn test_paired_state_still_checks_the_pin() {
+        // REGRESSION (security): verify() returned Ok for any PIN once the
+        // state was paired, so a handshake that failed after the PIN step let
+        // the next LAN client pair with any PIN.
+        let mut state = PairingState::new();
+        let pin = state.get_pin();
+        state.verify(pin).unwrap();
+        let wrong = (pin + 1) % 1_000_000;
+        assert!(matches!(
+            state.verify(wrong),
+            Err(PairingError::WrongPin { remaining }) if remaining == MAX_PIN_ATTEMPTS - 1
+        ));
+        assert!(state.verify(pin).is_ok());
+    }
+
+    #[test]
     fn test_rearm_accepts_only_the_session_pin() {
         let mut state = PairingState::new();
         let pin = state.get_pin();
         state.verify(pin).unwrap();
         let wrong = (pin + 1) % 1_000_000;
-        // A paired state accepts anything, which is why rearm must clear it.
-        assert!(state.verify(wrong).is_ok());
 
         state.rearm_for_reconnect(Duration::from_secs(5));
         assert!(!state.is_paired());

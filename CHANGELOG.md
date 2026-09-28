@@ -31,6 +31,23 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   forged-header fuzz cases.
 
 ### Security
+- **Any PIN paired after an unfinished handshake.** `PairingState::verify`
+  returned Ok for any PIN once the state was paired, and a handshake that
+  failed after the PIN step (the client dropped or timed out before
+  STREAM_START) left it paired. The accept loop kept the same state, so the
+  next LAN client paired with any PIN — ignoring lockout and PIN rotation —
+  and became the authorized peer (video, pose and controller input).
+  `verify` now always checks the PIN.
+- **Dependency advisories.** rustls 0.23.37 → 0.23.45 (RUSTSEC-2026-0285,
+  TLS 1.3 handshake messages accepted across encryption levels),
+  rustls-webpki → 0.103.15, crossbeam-epoch → 0.9.21, quick-xml → 0.41.0
+  (build-time only, via wayland-scanner), webbrowser → 1.2.4, anyhow →
+  1.0.104, memmap2 → 0.9.11. `cargo audit` now reports no vulnerabilities;
+  the remaining warnings are unmaintained crates and the `lru` / `spin`
+  notices from reed-solomon-erasure 6.0.0 (its latest release).
+- **CI security audit actually runs.** The step ran in pwsh, where
+  `2>/dev/null` fails, and `continue-on-error` hid it, so `cargo audit` never
+  ran. It now runs in bash and fails the job on a known vulnerability.
 - **Persistent TLS identity (fixes TOFU re-connect failure).** The engine
   minted a new self-signed certificate on every `TcpControlServer::new()` —
   i.e. on every accept-loop iteration and hold period — while the HMD pins

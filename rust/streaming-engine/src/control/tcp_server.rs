@@ -1146,6 +1146,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unfinished_handshake_does_not_leave_the_server_paired() {
+        // REGRESSION (security): a client that passed the PIN step and then
+        // dropped before STREAM_START left the pairing state "paired", and
+        // the accept loop let the next client in with any PIN.
+        let (server, target) = plain_server();
+        let pin = server.current_pin().await;
+        let s = Arc::clone(&server);
+        let accept_task = tokio::spawn(async move { s.listen_and_accept().await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(100)).await; // let it bind
+
+        let mut c = TcpStream::connect(target).await.unwrap();
+        send_message(&mut c, msg_type::HELLO, &[]).await.unwrap();
+        let _ = read_message(&mut c).await.unwrap(); // HELLO_ACK
+        let _ = read_message(&mut c).await.unwrap(); // PIN_REQUEST
+        send_message(&mut c, msg_type::PIN_RESPONSE, &pin.to_le_bytes()).await.unwrap();
+        let (_, p) = read_message(&mut c).await.unwrap();
+        assert_eq!(p[0], 0x01);
+        let _ = read_message(&mut c).await.unwrap(); // STREAM_CONFIG
+        drop(c); // gone before STREAM_START
+
+        assert_eq!(plain_handshake(target, (pin + 1) % 1_000_000).await, 0x00,
+            "a wrong PIN must be refused after an unfinished handshake");
+        assert_eq!(plain_handshake(target, pin).await, 0x01);
+        tokio::time::timeout(Duration::from_secs(5), accept_task)
+            .await
+            .expect("accept loop must return")
+            .unwrap()
+            .expect("accept must succeed");
+    }
+
+    #[tokio::test]
     async fn test_rebuilt_servers_present_same_certificate() {
         // REGRESSION (TOFU): the engine builds a fresh TcpControlServer on
         // every accept-loop iteration. The HMD pins the first fingerprint and
