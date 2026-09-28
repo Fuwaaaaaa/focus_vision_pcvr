@@ -94,6 +94,32 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     commands, so pause/resume blocked (ANR) and a destroy was never seen.
     It now handles them every iteration.
   - `shutdown()` can safely run more than once.
+- **Installed packages work.** The installer and the release zips had
+  two problems, each enough to break an install.
+  - The driver DLL was built into `bin/win64/Release/`, because the
+    Visual Studio generator appends a per-config folder. SteamVR loads
+    `<driver>/bin/win64/`, so a registered driver had no DLL. The output
+    path now uses a generator expression, and CI checks the layout.
+  - The companion crashed at every launch. Both Geist font URLs return
+    404, and `curl -sL … || true` saved GitHub's error page as `.ttf`,
+    which egui panics on. The URLs are now pinned to the v1.7.2 tag.
+    `curl -f` and a TrueType signature check fail the build instead of
+    shipping a broken file. The companion also skips any font file it
+    cannot parse, and looks in `fonts/` next to the exe before the
+    working directory.
+- **The companion sees the driver the installer registered.**
+  - The companion only looked in SteamVR's own `drivers` folder. The
+    installer registers the driver in place with `vrpathreg`, so Home
+    said "Not installed" after every install.
+  - It now also reads `external_drivers` from
+    `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`. For a registered driver,
+    Settings shows the path in place of an Uninstall button that could
+    not remove it.
+  - "Install Driver" reads the DLL from the build layout (`bin/win64/`).
+- **NSIS stack use.** Driver registration used `nsExec::ExecToStack`, which
+  pushes the output as well as the exit code, and returned early without
+  restoring the registers. It now uses `ExecToLog`, which also puts the
+  vrpathreg output in the install log, and always restores them.
 - **The encoder bitrate is `bitrate_mbps`.** The driver set NVENC's target
   to `encoded_w * encoded_h * bitrate_pixel_factor` — about 7 Mbps at the
   native 1832×1920 — while `bitrate_mbps = 80` was sent to the HMD in

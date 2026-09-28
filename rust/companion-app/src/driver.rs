@@ -108,14 +108,41 @@ pub fn find_steamvr_drivers_dir() -> Option<PathBuf> {
     None
 }
 
+const DRIVER_DLL: &str = "driver_focus_vision_pcvr.dll";
+
+/// Whether `driver_dir` holds our driver the way SteamVR loads it.
+fn has_driver_dll(driver_dir: &Path) -> bool {
+    driver_dir.join("bin").join("win64").join(DRIVER_DLL).exists()
+}
+
 /// Check if our driver is already installed.
 pub fn is_driver_installed(drivers_dir: &Path) -> bool {
-    let our_dir = drivers_dir.join("focus_vision_pcvr");
-    our_dir.exists() && our_dir.join("bin").join("win64").join("driver_focus_vision_pcvr.dll").exists()
+    has_driver_dll(&drivers_dir.join("focus_vision_pcvr"))
+}
+
+/// The directory of our driver if it is registered with SteamVR through
+/// `vrpathreg adddriver` — what the installer does, instead of copying it
+/// into SteamVR's `drivers` folder. SteamVR lists those directories under
+/// `external_drivers` in `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`.
+pub fn find_registered_driver() -> Option<PathBuf> {
+    let path = dirs_next::cache_dir()?.join("openvr").join("openvrpaths.vrpath");
+    registered_driver_in(&fs::read_to_string(path).ok()?)
+}
+
+fn registered_driver_in(vrpath_json: &str) -> Option<PathBuf> {
+    let paths: serde_json::Value =
+        serde_json::from_str(vrpath_json.trim_start_matches('\u{feff}')).ok()?;
+    paths.get("external_drivers")?
+        .as_array()?
+        .iter()
+        .filter_map(|d| d.as_str())
+        .map(PathBuf::from)
+        .find(|d| has_driver_dll(d))
 }
 
 /// Install our driver into SteamVR's drivers directory.
-/// `driver_source`: directory containing our built driver files.
+/// `driver_source`: our built driver directory (`driver.vrdrivermanifest`,
+/// `bin/win64/`, `resources/`).
 pub fn install_driver(drivers_dir: &Path, driver_source: &Path) -> Result<(), String> {
     let target = drivers_dir.join("focus_vision_pcvr");
 
@@ -124,8 +151,8 @@ pub fn install_driver(drivers_dir: &Path, driver_source: &Path) -> Result<(), St
         .map_err(|e| format!("Failed to create driver directory: {e}"))?;
 
     // Copy DLL
-    let dll_name = "driver_focus_vision_pcvr.dll";
-    let src_dll = driver_source.join(dll_name);
+    let dll_name = DRIVER_DLL;
+    let src_dll = driver_source.join("bin").join("win64").join(dll_name);
     if !src_dll.exists() {
         return Err(format!("Driver DLL not found: {}", src_dll.display()));
     }
@@ -173,4 +200,72 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch driver directory, removed on drop.
+    struct TempDriverDir(PathBuf);
+    impl TempDriverDir {
+        fn new(name: &str, with_dll: bool) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("fv-driver-test-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("bin").join("win64")).unwrap();
+            if with_dll {
+                fs::write(dir.join("bin").join("win64").join(DRIVER_DLL), b"").unwrap();
+            }
+            Self(dir)
+        }
+    }
+    impl Drop for TempDriverDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn vrpath(dirs: &[&Path]) -> String {
+        serde_json::json!({
+            "config": [r"C:\Steam\config"],
+            "external_drivers": dirs.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>(),
+            "jsonid": "vrpathreg",
+            "version": 1,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn finds_the_registered_directory_that_holds_our_dll() {
+        let other = TempDriverDir::new("other", false);
+        let ours = TempDriverDir::new("ours", true);
+        let json = vrpath(&[&other.0, &ours.0]);
+        assert_eq!(registered_driver_in(&json), Some(ours.0.clone()));
+        // SteamVR may write the file with a UTF-8 BOM.
+        assert_eq!(registered_driver_in(&format!("\u{feff}{json}")), Some(ours.0.clone()));
+    }
+
+    #[test]
+    fn a_registration_without_the_dll_does_not_count() {
+        let stale = TempDriverDir::new("stale", false);
+        assert_eq!(registered_driver_in(&vrpath(&[&stale.0])), None);
+    }
+
+    #[test]
+    fn missing_or_malformed_external_drivers_is_none() {
+        assert_eq!(registered_driver_in(r#"{"external_drivers": null, "version": 1}"#), None);
+        assert_eq!(registered_driver_in(r#"{"version": 1}"#), None);
+        assert_eq!(registered_driver_in("not json"), None);
+    }
+
+    #[test]
+    fn install_copies_the_dll_from_the_build_layout() {
+        let source = TempDriverDir::new("source", true);
+        fs::write(source.0.join("driver.vrdrivermanifest"), b"{}").unwrap();
+        let steamvr = TempDriverDir::new("steamvr-drivers", false);
+        install_driver(&steamvr.0, &source.0).unwrap();
+        assert!(is_driver_installed(&steamvr.0));
+        assert!(steamvr.0.join("focus_vision_pcvr").join("driver.vrdrivermanifest").exists());
+    }
 }

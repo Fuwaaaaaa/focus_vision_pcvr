@@ -238,11 +238,13 @@ Function RegisterSteamVRDriver
     ${IfNot} ${FileExists} "$1"
         DetailPrint "vrpathreg が見つかりません: $1"
         DetailPrint "SteamVR をインストール後、手動で driver/install.bat を実行してください"
-        Return
+        Goto done  ; not Return: the registers pushed above must be restored
     ${EndIf}
 
     DetailPrint "ドライバを登録しています: $1"
-    nsExec::ExecToStack '"$1" adddriver "$INSTDIR\driver\${DRIVER_DIRNAME}"'
+    ; ExecToLog pushes only the exit code (ExecToStack also pushes the
+    ; output, which was left on the stack and popped into $2/$1/$0 below).
+    nsExec::ExecToLog '"$1" adddriver "$INSTDIR\driver\${DRIVER_DIRNAME}"'
     Pop $2  ; exit code
     ${If} $2 == 0
         DetailPrint "SteamVR ドライバ登録成功 — SteamVR を再起動してください"
@@ -250,6 +252,7 @@ Function RegisterSteamVRDriver
         DetailPrint "ドライバ登録失敗 (exit $2) — 手動で driver/install.bat を実行してください"
     ${EndIf}
 
+  done:
     Pop $2
     Pop $1
     Pop $0
@@ -275,7 +278,7 @@ Function un.UnregisterSteamVRDriver
     StrCpy $1 "$0\steamapps\common\SteamVR\bin\win64\vrpathreg.exe"
     ${If} ${FileExists} "$1"
         DetailPrint "SteamVR ドライバ登録を解除しています"
-        nsExec::ExecToStack '"$1" removedriver "$INSTDIR\driver\${DRIVER_DIRNAME}"'
+        nsExec::ExecToLog '"$1" removedriver "$INSTDIR\driver\${DRIVER_DIRNAME}"'
         Pop $2
         DetailPrint "vrpathreg removedriver exit: $2"
     ${EndIf}
