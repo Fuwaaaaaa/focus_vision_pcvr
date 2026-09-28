@@ -76,6 +76,52 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   which also fixes the companion showing a dead PIN after a lockout had
   replaced it.
 
+### Android client
+- **A connection layer, tested against the real engine.** The client had
+  the pieces (TLS client, FEC decoder, a session state machine), but
+  nothing ran them, and they had never talked to the engine. New portable
+  C++, built for Android and for the host tests:
+  - `StreamSession` does connect → TLS → PIN → STREAM_CONFIG →
+    STREAM_START, then streams and reconnects after a drop. It uses the
+    `ClientSession` policy: exponential backoff, and no retry after a
+    rejected PIN, which would only walk into the lockout.
+    - It runs on its own thread, the only one touching the TLS
+      connection. Other threads queue messages, and the server's
+      messages (HEARTBEAT_ACK, HAPTIC_EVENT, SLEEP_ENTER/EXIT,
+      CONFIG_UPDATE_ACK) come back as events.
+    - Every 500 ms it sends a HEARTBEAT with real statistics, and it
+      treats the link as dead after 3 s of silence.
+  - `VideoReceiver` receives video on its own thread and accepts packets
+    only from the server. The render loop used to read at most 64 packets
+    per frame, below what 80 Mbps needs.
+  - `FrameAssembler` hands each frame over as soon as it can be rebuilt,
+    bulk or sliced, so frames leave in send order.
+    - A lost frame (missing shards, a frame index that never came, or a
+      100 ms stall) triggers an IDR request, and non-key frames are
+      skipped until a keyframe arrives, also at session start.
+    - A late packet of a finished frame is ignored.
+    - RTP sequence gaps are counted as lost packets. HEARTBEAT reported
+      zero loss before, which walked adaptive FEC down to 5 %.
+  - `TcpControlClient`:
+    - Portable sockets (`net_compat.h`: POSIX or Winsock).
+    - `psa_crypto_init()`.
+    - Timeouts on connect, the TLS handshake, every pairing step and
+      writes, via a non-blocking socket and `mbedtls_net_poll`.
+    - Framing that survives split reads, and one TLS record per message.
+    - The server certificate is pinned only after pairing succeeds.
+    - `disconnect()` no longer frees uninitialised MbedTLS contexts or
+      closes the socket twice.
+  - `client/tests/test_session_e2e.cpp` starts the headless engine and
+    runs these classes against it. Checked: TLS 1.3, pairing, 60 fps of
+    sliced and bulk frames in order from a keyframe, HEARTBEAT_ACK, a
+    wrong PIN rejected and not retried, reconnecting within the engine's
+    5 s hold with the same PIN, and a server that does not match the
+    pinned certificate is refused before the PIN is sent. New CI job
+    `client-e2e` (Windows, against the simulator binary from rust-build).
+  - Not wired into `openxr_app` yet (decoder, haptics, sleep dimming,
+    tracking sender, and how the app gets the address and PIN). That
+    comes next.
+
 ### Fixes
 - **The Android client starts.** Found by reading the code; not yet run on
   the headset.

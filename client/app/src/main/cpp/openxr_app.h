@@ -21,7 +21,6 @@
 #include "audio_player.h"
 #include "eye_tracker.h"
 #include "hmd_profile.h"
-#include "heartbeat_client.h"
 #include "stats_reporter.h"
 
 #include <vector>
@@ -125,8 +124,7 @@ private:
     FacialTracker m_facialTracker;
     PoseHistory m_poseHistory;
 
-    // Heartbeat + stats
-    HeartbeatClient m_heartbeat;
+    // Stats (reported to the PC in the session heartbeat)
     StatsReporter m_stats;
 
     // State: last decoded frame

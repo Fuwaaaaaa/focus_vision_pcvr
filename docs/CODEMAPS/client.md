@@ -55,10 +55,13 @@ tracker, pose history, pairing state, dashboard state.
 ### Networking
 | File | Class | Role |
 |---|---|---|
-| `tcp_client.h/.cpp` | `TcpControlClient` | MbedTLS TCP control channel, HELLO/PIN/STREAM_START/IDR_REQUEST/CONFIG_UPDATE |
-| `network_receiver.h/.cpp` | `NetworkReceiver` | Non-blocking UDP recv (used for both video and audio ports) |
-| `heartbeat_client.h` | `HeartbeatClient` | 500 ms heartbeat → PC, reads StatsReporter |
-| `stats_reporter.h` | `StatsReporter` | Packet loss / RTT / frame count tracking |
+| `stream_session.h/.cpp` | `StreamSession` | The connection, on its own thread: connect → TLS → PIN → STREAM_CONFIG → STREAM_START → stream (500 ms HEARTBEAT, server messages as `ServerEvent`s, liveness) → reconnect with backoff (`ClientSession` policy). The only thread touching the TLS connection; others queue with `send()` |
+| `tcp_client.h/.cpp` | `TcpControlClient` | MbedTLS TLS 1.3 control channel: connect/handshake with timeouts (non-blocking socket + `mbedtls_net_poll`), framing, TOFU pin after pairing. Owned by `StreamSession` |
+| `video_receiver.h/.cpp` | `VideoReceiver` | UDP video receive thread (server address only) → `FrameAssembler` → ordered frame queue for the render thread |
+| `frame_assembler.h/.cpp` | `FrameAssembler` | Packets → complete frames in send order (bulk + sliced), IDR request + skip to keyframe on loss, RTP-gap loss stats. No sockets: unit-tested |
+| `net_compat.h` | `fvp_net::` | POSIX / Winsock socket portability (the host tests build the client networking with MSVC) |
+| `network_receiver.h/.cpp` | `NetworkReceiver` | Non-blocking UDP recv (audio port) |
+| `stats_reporter.h` | `StatsReporter` | Packets received / lost, decoded frames → HEARTBEAT stats |
 | `tracking_sender.h/.cpp` | `TrackingSender` | UDP head pose + eye gaze to PC, 90 Hz |
 
 ### Video pipeline
@@ -119,16 +122,23 @@ composition stack.
 ## Tests
 
 Host-built GoogleTest suite in `client/tests/` (desktop toolchain, no NDK):
-- `test_client_protocol.cpp` — HELLO / STREAM_CONFIG / FVP header parsing
+- `test_client_protocol.cpp` — HELLO / STREAM_CONFIG / FVP header parsing,
+  HEARTBEAT payload, HEARTBEAT_ACK / HAPTIC_EVENT parsing
 - `test_client_session.cpp` — session state machine, server endpoint parsing
 - `test_fec_decoder.cpp` — `fec_decoder.cpp` compiled for the host against
   `client/tests/shim/` (stub `android/log.h`, `openxr/openxr.h`). RS recovery
   uses cross-language golden parity vectors pinned on the Rust side by
   `transport/fec.rs` `test_fec_golden_parity_matches_client_fixture`.
+- `test_frame_assembler.cpp` — frame order across bulk / sliced, loss → IDR
+  + skip to keyframe, late packets, timeouts, RTP-gap loss counting
+- `test_session_e2e.cpp` — `StreamSession` + `VideoReceiver` against the real
+  engine (`focus-vision-headless`, started as a child process; its PIN is
+  read from its log): pairing, streaming, wrong PIN, reconnect within the
+  hold, certificate mismatch. Skipped unless `FVP_HEADLESS_BIN` is set; CI
+  job `client-e2e`. `FVP_TEST_LOG=1` prints the client's log.
 
 Remaining untested targets:
 - `nal_validator.cpp` — rejection of malformed NAL headers
-- sliced FEC timeout path (wall-clock dependent)
 - `PoseHistory` ring buffer behavior (deterministic, no external deps)
 
 ---

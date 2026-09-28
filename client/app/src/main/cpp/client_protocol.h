@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace fvp_client_protocol {
 
@@ -14,6 +15,76 @@ namespace fvp_client_protocol {
 // v4 wire format: v3 FVP slice/stream flags (see fec_decoder.h fvp_flags) plus
 // the 12-byte FVP header carrying data_shard_count (parseFvpHeader below).
 inline constexpr uint16_t PROTOCOL_VERSION = 4;
+
+// Control message types — must match Rust protocol::msg_type.
+namespace msg {
+    inline constexpr uint8_t HELLO = 0x01;
+    inline constexpr uint8_t HELLO_ACK = 0x02;
+    inline constexpr uint8_t PIN_REQUEST = 0x03;
+    inline constexpr uint8_t PIN_RESPONSE = 0x04;
+    inline constexpr uint8_t PIN_RESULT = 0x05;
+    inline constexpr uint8_t STREAM_CONFIG = 0x06;
+    inline constexpr uint8_t STREAM_START = 0x07;
+    inline constexpr uint8_t HEARTBEAT = 0x10;
+    inline constexpr uint8_t HEARTBEAT_ACK = 0x11;
+    inline constexpr uint8_t IDR_REQUEST = 0x30;
+    inline constexpr uint8_t FACE_DATA = 0x35;
+    inline constexpr uint8_t HAPTIC_EVENT = 0x38;
+    inline constexpr uint8_t SLEEP_ENTER = 0x50;
+    inline constexpr uint8_t SLEEP_EXIT = 0x51;
+    inline constexpr uint8_t CONFIG_UPDATE = 0x55;
+    inline constexpr uint8_t CONFIG_UPDATE_ACK = 0x56;
+    inline constexpr uint8_t DISCONNECT = 0xFF;
+}  // namespace msg
+
+// Largest [type + payload] the client accepts from the server; its control
+// messages are a few bytes each.
+inline constexpr uint32_t MAX_CONTROL_MESSAGE_LEN = 64 * 1024;
+
+// Default UDP base port — must match Rust DEFAULT_UDP_PORT. The engine sends
+// video to base+1 and audio to base+3, and receives tracking on base+2.
+inline constexpr uint16_t DEFAULT_UDP_BASE_PORT = 9945;
+inline constexpr uint16_t VIDEO_PORT_OFFSET = 1;
+inline constexpr uint16_t TRACKING_PORT_OFFSET = 2;
+inline constexpr uint16_t AUDIO_PORT_OFFSET = 3;
+
+inline void writeU16Le(uint8_t* p, uint16_t v) {
+    p[0] = static_cast<uint8_t>(v);
+    p[1] = static_cast<uint8_t>(v >> 8);
+}
+
+inline void writeU32Le(uint8_t* p, uint32_t v) {
+    for (int i = 0; i < 4; i++) p[i] = static_cast<uint8_t>(v >> (8 * i));
+}
+
+inline void writeU64Le(uint8_t* p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = static_cast<uint8_t>(v >> (8 * i));
+}
+
+// HMD statistics carried in every HEARTBEAT, for one report interval.
+struct HeartbeatStats {
+    uint32_t packetsReceived = 0;
+    uint32_t packetsLost = 0;
+    uint32_t avgDecodeUs = 0;
+    uint16_t fps = 0;
+};
+
+inline constexpr size_t HEARTBEAT_PAYLOAD_LEN = 26;
+
+// HEARTBEAT payload: [sequence u32][timestamp_ms u64][received u32][lost u32]
+// [avg_decode_us u32][fps u16], little-endian. The engine reads the stats at
+// offset 12 (engine.rs handle_tcp_control) and answers with HEARTBEAT_ACK.
+inline std::array<uint8_t, HEARTBEAT_PAYLOAD_LEN> buildHeartbeatPayload(
+        uint32_t sequence, uint64_t timestampMs, const HeartbeatStats& s) {
+    std::array<uint8_t, HEARTBEAT_PAYLOAD_LEN> p{};
+    writeU32Le(p.data() + 0, sequence);
+    writeU64Le(p.data() + 4, timestampMs);
+    writeU32Le(p.data() + 12, s.packetsReceived);
+    writeU32Le(p.data() + 16, s.packetsLost);
+    writeU32Le(p.data() + 20, s.avgDecodeUs);
+    writeU16Le(p.data() + 24, s.fps);
+    return p;
+}
 
 // HELLO capability flags — must match Rust protocol::hello_caps. An absent caps
 // byte (legacy / version-only HELLO) means no capabilities.
@@ -131,6 +202,52 @@ inline bool parseFvpHeader(const uint8_t* packet, size_t len, FvpHeaderView& out
     if (h.shardIndex >= h.totalShards) return false;
     if (h.dataShards == 0 || h.dataShards > h.totalShards) return false;
     out = h;
+    return true;
+}
+
+// RTP sequence number of a received video packet (bytes 2..4, big-endian).
+// The engine numbers every packet of a session consecutively, so a gap is
+// packet loss. Callers check the length with parseFvpHeader first.
+inline uint16_t rtpSequence(const uint8_t* packet) {
+    return static_cast<uint16_t>((packet[2] << 8) | packet[3]);
+}
+
+// HAPTIC_EVENT payload — Rust engine::HapticEvent::to_payload():
+// [controller_id u8][duration_ms u16][frequency f32][amplitude f32], LE.
+struct HapticEvent {
+    uint8_t controllerId = 0;
+    uint16_t durationMs = 0;
+    float frequency = 0.0f;
+    float amplitude = 0.0f;
+};
+
+inline float readF32Le(const uint8_t* p) {
+    const uint32_t bits = readU32Le(p);
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+inline bool parseHapticEvent(const uint8_t* payload, size_t len, HapticEvent& out) {
+    if (payload == nullptr || len < 11) return false;
+    out.controllerId = payload[0];
+    out.durationMs = readU16Le(payload + 1);
+    out.frequency = readF32Le(payload + 3);
+    out.amplitude = readF32Le(payload + 7);
+    return true;
+}
+
+// HEARTBEAT_ACK payload: the PC's encode and total latency in µs (u32 LE
+// each), shown in the HMD's latency overlay.
+struct HeartbeatAck {
+    uint32_t pcEncodeUs = 0;
+    uint32_t pcTotalUs = 0;
+};
+
+inline bool parseHeartbeatAck(const uint8_t* payload, size_t len, HeartbeatAck& out) {
+    if (payload == nullptr || len < 8) return false;
+    out.pcEncodeUs = readU32Le(payload);
+    out.pcTotalUs = readU32Le(payload + 4);
     return true;
 }
 
