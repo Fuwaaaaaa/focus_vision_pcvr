@@ -118,9 +118,39 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     5 s hold with the same PIN, and a server that does not match the
     pinned certificate is refused before the PIN is sent. New CI job
     `client-e2e` (Windows, against the simulator binary from rust-build).
-  - Not wired into `openxr_app` yet (decoder, haptics, sleep dimming,
-    tracking sender, and how the app gets the address and PIN). That
-    comes next.
+- **The app uses it.** `openxr_app` now runs `StreamSession` and
+  `VideoReceiver` instead of the unused `TcpControlClient`,
+  `NetworkReceiver` and FEC decoders it held.
+  - **Address and PIN at launch.** `am start … --es fvp_server <ip[:port]>
+    --es fvp_pin <6 digits> [--es fvp_udp_port <base>]`, the form the
+    companion will send over adb.
+    - MainActivity writes the extras to a file in app-private storage.
+      The native loop reads and deletes it (`launch_request.h`, tested),
+      and checks again every second for a new launch (`onNewIntent`).
+    - The PIN is handed over once. A recreated activity does not replay
+      it, since a stale PIN costs an attempt against the lockout.
+    - To pair with another PC, clear the app's data (`adb shell pm clear
+      com.focusvision.pcvr`); there is no re-pair extra an app on the
+      headset could send.
+  - **Video.** Frames from `VideoReceiver` go to MediaCodec in order. The
+    decoder is recreated when STREAM_CONFIG's codec (H.264 / HEVC) or
+    encoded size changes, and flushed for a new session.
+    - A frame the decoder cannot take (no input buffer), a failed NAL
+      check, or a pause in rendering makes the receiver drop what is
+      queued and wait for a keyframe (an IDR is requested).
+    - The HEVC NAL check is no longer applied to H.264 streams, where it
+      rejected about one frame in eight.
+    - Decoded frames feed the HEARTBEAT's fps and decode latency.
+  - **Per session.** The tracking sender is started toward the server,
+    and Opus audio is received on base+3 (RTP header stripped) and played
+    through `AudioPlayer`.
+  - **Server messages.** SLEEP_ENTER / EXIT dim the view. HAPTIC_EVENT
+    goes to `ControllerPoller::applyHaptic`, which does nothing until
+    controller input is initialised (not yet). FACE_DATA is queued on the
+    session.
+  - **On exit** the app sends DISCONNECT, so the engine ends the session
+    instead of holding it.
+  - Checked: the APK builds (NDK 26.1). Not run on the headset.
 
 ### Fixes
 - **The Android client starts.** Found by reading the code; not yet run on

@@ -9,7 +9,6 @@
 #include "renderer.h"
 #include "network_receiver.h"
 #include "video_decoder.h"
-#include "fec_decoder.h"
 #include "nal_validator.h"
 #include "timewarp.h"
 #include "overlay_renderer.h"
@@ -17,19 +16,22 @@
 #include "pose_history.h"
 #include "tracking_sender.h"
 #include "controller_poller.h"
-#include "tcp_client.h"
 #include "audio_player.h"
 #include "eye_tracker.h"
 #include "hmd_profile.h"
-#include "stats_reporter.h"
+#include "launch_request.h"
+#include "stream_session.h"
+#include "video_receiver.h"
 
-#include <vector>
 #include <array>
+#include <chrono>
+#include <functional>
 #include <string>
+#include <vector>
 
 /// Pairing flow states for HMD UI overlay
 enum class PairingState {
-    Idle,           // Not started
+    Idle,           // No PC address / PIN yet (waiting for the companion)
     Searching,      // Looking for PC server (TCP connect)
     PinEntry,       // Waiting for user to enter PIN
     Verifying,      // PIN submitted, waiting for result
@@ -64,9 +66,21 @@ private:
     void pollAndroidEvents(android_app* app);
     void renderFrame();
     void receiveAndDecodeVideo();
+    void receiveAudio();
 
     void handleSessionStateChange(XrSessionState newState);
     void submitDecodedFrame(const uint8_t* nalData, int nalSize, uint32_t frameIndex);
+
+    /// Pick up a launch request (PC address + PIN from the companion) and
+    /// (re)start the connection with it.
+    void checkLaunchRequest();
+    void startStreamSession(const fvp_launch::LaunchRequest& request);
+    /// React to what the server / the link did (render thread).
+    void handleStreamEvents();
+    /// (Re)create the decoder when the stream's codec or size changes.
+    void configureDecoder(const TcpControlClient::StreamConfig& config);
+    /// Run `fn` with a JNIEnv for this thread, attaching it if needed.
+    void withJni(const std::function<void(JNIEnv*)>& fn);
 
     // Android app reference (for JNI access)
     android_app* m_androidApp = nullptr;
@@ -98,19 +112,29 @@ private:
     // Renderer
     Renderer m_renderer;
 
-    // Network + decode pipeline
-    NetworkReceiver m_networkReceiver;
-    FecFrameDecoder m_fecDecoder;          // bulk FEC (slice_count=0)
-    SlicedFecFrameDecoder m_slicedDecoder; // slice FEC (slice_count>0)
-    VideoDecoder m_videoDecoder;
-    TcpControlClient m_tcpClient;
+    // Connection to the PC: control session (own thread) + video receive
+    // thread. Files in app-private storage: the TOFU pin and the launch
+    // request MainActivity writes.
+    StreamSession m_stream;
+    VideoReceiver m_videoReceiver;
+    std::string m_fingerprintPath;
+    std::string m_launchRequestPath;
+    std::string m_serverIp;
+    uint16_t m_udpBasePort = fvp_client_protocol::DEFAULT_UDP_BASE_PORT;
+    std::chrono::steady_clock::time_point m_lastLaunchCheck;
 
-    // Video receive buffer
-    std::vector<uint8_t> m_recvBuffer;
+    // Decode pipeline (render thread)
+    VideoDecoder m_videoDecoder;
+    uint8_t m_decoderCodec = 1; // what m_videoDecoder was created for
+    uint32_t m_decoderWidth = 0;
+    uint32_t m_decoderHeight = 0;
+    uint32_t m_frameDurationUs = 11111; // presentation timestamps, from STREAM_CONFIG fps
+    bool m_rendering = false;           // frames were fed to the decoder last loop
 
     // Audio
     AudioPlayer m_audioPlayer;
     NetworkReceiver m_audioReceiver;
+    std::vector<uint8_t> m_audioBuffer;
 
     // Tracking + controllers + eye tracking
     TrackingSender m_trackingSender;
@@ -124,9 +148,6 @@ private:
     FacialTracker m_facialTracker;
     PoseHistory m_poseHistory;
 
-    // Stats (reported to the PC in the session heartbeat)
-    StatsReporter m_stats;
-
     // State: last decoded frame
     GLuint m_lastDecodedTexture = 0;
     uint32_t m_lastFrameIndex = 0;
@@ -136,8 +157,8 @@ private:
     PairingState m_pairingState = PairingState::Idle;
     uint8_t m_pinAttemptsRemaining = 3;
     std::string m_pairingMessage;
-    bool m_streamingActive = false;
-    std::chrono::steady_clock::time_point m_lastPacketTime;
+    bool m_sleeping = false; // the PC put the stream to sleep (SLEEP_ENTER)
+    fvp_client_protocol::HeartbeatAck m_pcLatency{};
     static constexpr int DISCONNECT_TIMEOUT_MS = 2000; // 2s without packets = disconnected
 
     // HMD dashboard state

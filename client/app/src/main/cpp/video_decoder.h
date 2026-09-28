@@ -39,6 +39,9 @@ public:
     /// Get the rolling average decode latency in microseconds.
     uint32_t avgDecodeLatencyUs() const { return m_avgDecodeUs; }
 
+    /// Decode latency of the frame getDecodedFrame() last returned.
+    uint32_t lastDecodeLatencyUs() const { return m_lastDecodeUs; }
+
 private:
     void cleanupSurfaceResources(JNIEnv* env);
 
@@ -63,6 +66,7 @@ private:
     // Decode latency measurement (submit-to-output wall time)
     std::deque<std::chrono::steady_clock::time_point> m_submitTimes;
     uint32_t m_avgDecodeUs = 0;
+    uint32_t m_lastDecodeUs = 0;
     uint32_t m_decodeCount = 0;
     uint64_t m_totalDecodeUs = 0;
 };
