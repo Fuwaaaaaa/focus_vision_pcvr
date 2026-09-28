@@ -247,7 +247,24 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   frame loop is no longer mistaken for a dropped link (which started a
   needless 5 s hold).
 
+### Docs
+- **The project status is stated honestly.** The v3.0.0 release notes
+  called the release "General Availability", and README and USER_GUIDE
+  described a working headset product. Neither P0 below was disclosed.
+  - The release notes now say "development preview", with a dated
+    correction listing what does not work.
+  - README and USER_GUIDE open with the same notice.
+  - USER_GUIDE lists the NVIDIA driver this build needs (551.76+, NVENC
+    API 12.2).
+  - TODOS.md records the open findings of the 2026-09-28 code audit.
+
 ### Known issues
+- **The Android client never connects to the PC.** There is no source for
+  the server address, no PIN entry, and nothing calls the TCP connect /
+  handshake, the UDP receiver or the tracking sender, so the app renders
+  nothing but its idle loop. The session state machine
+  (`client_session.h`) is tested but not wired to real I/O. Tracked as P0
+  in TODOS.md.
 - **The SteamVR driver never initializes NVENC, so the real VR path sends no
   video.** Nothing calls `CDirectModeComponent::initEncoder`, the driver
   creates no D3D11 device, and the swap-texture "shared handles" are

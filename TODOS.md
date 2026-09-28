@@ -378,3 +378,51 @@
 - **`config.pairing.max_attempts` / `lockout_seconds` が使われていない:** `PairingState` は定数を直接使う。
 - ~~**tcp-control タスクが cancel されない / `HAPTIC_TX` が残る:** UDP sender の作成失敗やフレームの供給元が閉じたことでセッションを抜けても、`handle_tcp_control` は HMD が TCP を切るまで動き続ける (その場合の切断理由は ConnectionLost 扱い)。セッション終了後も `HAPTIC_TX` に古い sender が残る。~~ (2026-09-25 修正): `run_session` を抜けると、どの経路でもセッションの cancel が発火し (drop guard)、tcp-control タスクは接続を閉じて終わる (`spawn_control_task`)。`HAPTIC_TX` は `HapticRoute` がセッションの間だけ設定する。フレームの供給元が閉じたときは、ConnectionLost ではなく engine の停止として扱う。
 - **UDP のパケットごとの認証がない:** tracking の送信元チェックは IP だけ（SECURITY.md の Known Limitations に記載済み）。
+
+## 2026-09-28 監査で見つかった問題（未対応）
+（コードを読んで見つけたもの。実機では確認していない。同じ監査で見つかったもののうち、PIN の回避、依存の脆弱性と CI の監査、Android アプリの起動時クラッシュ、インストーラの DLL 配置とフォント、NVENC の定義は修正済み。CHANGELOG [Unreleased] を参照）
+
+### ドライバ（上の P0 に加えて、映像を出すまでに要るもの）
+- **P0: 表示コンポーネントがない。** HMD は DirectMode コンポーネントしか返さず（`hmd_device.cpp` `GetComponent`）、`IVRDisplayComponent` がない。投影・レンダーターゲットの大きさ・目ごとのビューポートを compositor が得られない。
+- **P0: フレームコピーが何もしない。** `FrameCopy` は `R8G8B8A8_UNORM`、NVENC の入力は `B8G8R8A8_UNORM` で、形式グループが違う `CopyResource` は D3D11 が無視する。compositor の `nFormat` との一致も要る。
+- **P1: 左目しか送らない**（`direct_mode.cpp` `Present`）。立体視にならない。
+- **P1: `syncTexture` を使っていない。** keyed mutex の取得も vsync イベントもないので、描画途中のフレームを読む可能性がある（実機で確認が要る）。
+- **P1: NVENC が使えないとき、黙ってダミー NAL（IDR ヘッダ + `0xAB`）を流す。** `init()` は true を返し、失敗は `OutputDebugStringA` にしか出ない（vrserver.txt に残らない）。失敗として扱い、`VRDriverLog` に出すべき。
+- **P1: コントローラの入力プロファイルがない。** `{focus_vision_pcvr}/input/controller_profile.json` が存在せず、`Prop_ControllerType_String` も未設定なので、SteamVR 側にボタン割り当てがない。
+- **P1: 終了時の use-after-free。** `server_driver.cpp` `Cleanup` がデバイスを破棄してから `fvp_shutdown()` を呼ぶため、tracking タスクの gaze / IDR コールバックが破棄済みの `m_hmdDevice` を触りうる。`fvp_shutdown` を先に呼ぶ。
+- P2: `DestroySwapTextureSet` がセットの 3 枚のうち 1 枚しか消さない。`initEncoder` が `full_range` と foveation の設定を無視する。head pose が一度来ると以後ずっと「有効」、速度が未設定、`GetPose` が同期なしで読む。CONFIG_UPDATE の codec 変更 (0x02) は受理を返すが何もしない。
+
+### Android クライアント（上の P0 のセッション配線に加えて）
+- **P1: サーバから届くメッセージを読まない。** `recvMessage` は handshake でしか使われず、HEARTBEAT_ACK / HAPTIC_EVENT / SLEEP_ENTER・EXIT / CONFIG_UPDATE_ACK が溜まる。受信バッファが埋まるとサーバの送信が止まり、クライアントの `mbedtls_ssl_write` が描画スレッドを止める。
+- **P1: HEARTBEAT のロス統計が常に 0。** `StatsReporter::onPacketLost` / `onFrameDecoded` を誰も呼ばず、TRANSPORT_FEEDBACK (0x12) も送らない。サーバの適応 FEC は 5% まで下がり、ビットレートは 200 Mbps まで上がり続ける（GCC は入力なし）。
+- **P1: STREAM_CONFIG の codec を無視する。** デコーダは常に `video/hevc` で、handshake より前に作られる。
+- **P1: 描画の問題。** 右目が上下逆になる（Renderer は V を反転、Timewarp はしない）。Timewarp の行列を転置なしで渡し、+Z を前方とし、頂点ごとに透視除算している。フレームとそれを描いたときの頭の姿勢を結びつける手段がプロトコルにない。
+- **P1: 復元できないフレームを黙って捨て、IDR を要求しない**（bulk / sliced とも）。次の定期 IDR まで壊れた参照から予測し続ける。
+- **P1: OpenXR 拡張を有効にしていない。** instance は 2 つの拡張しか有効にしないので、`vive_focus3_controller`・facial tracking・eye gaze が使えない。eye tracker と controller poller がそれぞれ `xrAttachSessionActionSets` を呼ぶ（セッションで 1 回しか許されない）。
+- **P1: 音声を受信・再生する処理が配線されていない**（RTP の除去も `pump()` の呼び出しもない）。
+- P1（要確認）: FEC の復元を描画スレッドで O(n²·1200) で行う。約 200 shard のスライスで 100 ms 以上止まる可能性。
+- P2: MediaCodec の入力バッファがないと黙ってフレームを捨てる。`releaseOutputBuffer` の直後に `updateTexImage` を呼ぶ。SurfaceTexture の変換行列を無視する。sRGB swapchain にガンマ済みの映像を書く（二重ガンマ）。前のフレームの遅れた 1 パケットで進行中のフレームを捨てる。映像 UDP の送信元を確認しない。送る head pose が左目の pose。
+- P2（TLS）: PIN 認証の前に fingerprint を保存する（最初に別の IP へつないだら永久にそれを信用する）。connect / handshake にタイムアウトがない。connect 失敗後の `disconnect()` が未初期化の mbedtls 構造体を解放する。fd を二重に close する。`psa_crypto_init()` を呼んでいない（MbedTLS 3.6 の TLS 1.3 で要るか要確認）。
+
+### エンジン
+- **P1: 制御チャネルに生存確認がない。** `HEARTBEAT_MAX_MISSES` は未使用、TCP keepalive もない。Wi-Fi が黙って切れると、エンジンは「配信中」のまま HMD の再接続を拒み続ける。
+- **P1: セッション終了後も tracking / コントローラの状態が残る。** 切断時にスティックを倒していると、SteamVR では倒したままになる。
+- **P1: `accept()` のエラーでエンジンが止まる。** 接続単位のエラーも数えるため、LAN の誰かが接続→RST を 6 回繰り返すと SteamVR の再起動まで止まる。
+- **P1: 音声キャプチャが 48 kHz ステレオ決め打ち。** 44.1 / 96 kHz の機器では cpal がループバックを開けず無音。5.1 / 7.1 はダウンミックスしない。
+- **P1: フェイストラッキングの OSC 名の並びが `XrEyeExpressionHTC` と違う**（例: index 2 は RIGHT_BLINK なのに `EyeLeftRight` で送る）。舌の並びも違う。キャリブレーションの重みが min を引かない（安静時に 1.0 が出る）。`face_tracking.enabled` を無視する。`+Inf` が NaN ガードを通る。`smoothing = 0` だと 0 に戻らない。
+- **P1: 適応ビットレートの上限が 200 Mbps 決め打ちで、`bitrate_mbps` は初期値にすぎない。**
+- **P1（テストの穴）: モッククライアントは HEARTBEAT ではなく中身ゼロの HEARTBEAT_ACK を送る。** E2E は個数しか見ないため、適応制御の経路が試されていない。
+- P2: バースト検出器に EWMA 済みのロスを渡している。ロス報告の半分を捨てる。エンコード時間が常に約 0、status.json の fps は設定値。LowDelay の Opus では in-band FEC が効かない。録音の WAV ヘッダがクラッシュ時に 0、同じ秒の再接続でファイルが上書きされる。音声デバイスの切り替えを追わない。sleep 中のビットレートが次のセッションに残る。再接続の最初の 4 フレームが古く、セッション開始時に IDR を出さない。256 B を超える datagram でログがあふれる。tracking の bind を再試行しない。`set_nodelay` がなく、1 メッセージが 3 つの TLS レコードになる。
+- P2（設定）: `sleep_bitrate_mbps` 未検証（0 可、4294 超で overflow）。`udp_port` が 65533 以上で u16 の足し算が overflow。`resolution_per_eye` / `ipd` が NaN や 0 を通す。効かない設定: `face_tracking.enabled`、`active_profile`、`audio.bitrate_kbps`（128k 固定）、`[memory_monitor]`、SessionLogger（本番で作られない）。TLS の初期化に失敗すると黙って平文になる。
+- P2: バッファプールを補充しない（毎パケット確保）。fuzz が本番の経路（FEC 付き packetize、`encode_frame_sliced`、`parse_face_data`、HEARTBEAT、CONFIG_UPDATE）を通っていない。
+
+### コンパニオン・インストーラ・CI
+- **P1: 日本語が表示されない**（CJK フォントを読み込んでいない。エンジン停止バナーなどが豆腐になる）。
+- **P1: Settings にスクロールがなく、既定の 480×640 では Codec・Export Logs・Reset が見えない。**
+- **P1: コンソールウィンドウが開く**（`windows_subsystem` なし。閉じると最後の設定保存が飛ぶ）。
+- **P1: 診断 zip に PC のログがほぼ入らない。** エンジンの `log::` 出力はどこにも記録されず、vrserver.txt も集めない。`wmic` は Windows 11 24H2 以降にない。
+- **P1: ファイル選択で日本語のパスが化ける**（PowerShell 5.1 の出力は OEM コードページ）。選択ダイアログが UI スレッドで動く。
+- **P1: インストーラは Steam のルートにある SteamVR しか探さない。** 別ライブラリの場合に案内する `driver/install.bat` は同梱されていない。
+- **P1: 署名。** リリースジョブは署名なしでも公開する。ドライバ DLL とアンインストーラは署名しない。Android の keystore が未設定だと毎回一時鍵で署名され、`adb install -r` が更新に失敗する。
+- P2: スライダーが範囲外の正しい値を丸めて保存する（sleep 30–900 など）。保存のたびに全キーを書く。保存失敗を再試行しない。`adb devices` を 3 秒ごとに UI スレッドで実行する。シミュレーション停止の join が UI スレッドで最大 5 秒。Deploy が全 adb デバイス（スマホも）に入れ、タイムアウトがない。デモモードでも Install / Uninstall が動く。「Install Driver」は作業ディレクトリ相対で、管理者権限が要る。`build.bat` の `%ERRORLEVEL%` がブロック内で展開される。fuzz / long-run / coverage が continue-on-error。SteamVR 実行中の上書きインストールを確認しない。DESIGN.md との差（Instrument Serif 未使用、text-muted の色、型スケール外のサイズ、ステータスドットの点滅なし）。
+- P2（ドキュメント）: USER_GUIDE / TROUBLESHOOTING が存在しない UI を案内している（APK のドラッグ&ドロップ、「Deploy」ボタン、「Reinstall driver」、`logs\engine.log`、ビットレートグラフ）。FAQ の「約 30% の帯域削減」は NVENC が動いていないので実測できていない。
