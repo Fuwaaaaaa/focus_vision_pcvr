@@ -105,7 +105,8 @@ focus_vision_psvr/
 │   └── src/
 │       ├── direct_mode.cpp   SteamVR DirectMode component
 │       ├── nvenc_encoder.cpp NVENC H.265/H.264 + foveated QP
-│       └── nvenc_encoder.h   Inline NVENC API structs
+│       ├── nvenc_encoder.h   NvencEncoder class
+│       └── nvenc_config.h    Encoder settings on the NVENC preset (third_party/nvenc/nvEncodeAPI.h)
 │
 ├── client/                   Android OpenXR client
 │   └── app/src/main/

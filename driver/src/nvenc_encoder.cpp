@@ -73,6 +73,7 @@ void NvencEncoder::shutdown() {
 
     m_bitstreamBuffer = nullptr;
     m_registeredResource = nullptr;
+    m_qpMapActive = false;
 
     if (m_nvencLib) {
         FreeLibrary(static_cast<HMODULE>(m_nvencLib));
@@ -117,7 +118,7 @@ bool NvencEncoder::encode(ID3D11Texture2D* srcTexture,
 
         // Map the registered resource
         NV_ENC_MAP_INPUT_RESOURCE mapInput = {};
-        mapInput.version = NVENCAPI_STRUCT_VERSION(NV_ENC_MAP_INPUT_RESOURCE, 4);
+        mapInput.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
         mapInput.registeredResource = m_registeredResource;
         NVENCSTATUS st = m_nvencFns.nvEncMapInputResource(m_encoder, &mapInput);
         if (st != NV_ENC_SUCCESS) {
@@ -125,26 +126,24 @@ bool NvencEncoder::encode(ID3D11Texture2D* srcTexture,
             return false;
         }
 
-        // Encode
+        // Encode. enablePTD is on, so NVENC picks the picture type; an IDR
+        // is requested through encodePicFlags.
         NV_ENC_PIC_PARAMS picParams = {};
-        picParams.version = NVENCAPI_STRUCT_VERSION(NV_ENC_PIC_PARAMS, 6);
+        picParams.version = NV_ENC_PIC_PARAMS_VER;
         picParams.inputWidth = m_config.width;
         picParams.inputHeight = m_config.height;
         picParams.inputPitch = m_config.width;
         picParams.inputBuffer = mapInput.mappedResource;
         picParams.outputBitstream = m_bitstreamBuffer;
-        picParams.bufferFmt = NV_ENC_BUFFER_FORMAT_ARGB;
-        picParams.pictureStruct = 1; // Frame
+        picParams.bufferFmt = mapInput.mappedBufferFmt;
+        picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
         picParams.frameIdx = m_frameCount - 1;
         picParams.inputTimeStamp = m_frameCount - 1;
+        picParams.encodePicFlags = fvp_nvenc::picFlagsFor(isIdr);
 
-        if (isIdr) {
-            picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
-            picParams.pictureType = NV_ENC_PIC_TYPE_IDR;
-        }
-
-        // Apply foveated QP delta map if computed
-        if (m_foveatedEnabled && !m_qpDeltaMap.empty()) {
+        // Apply the foveated QP delta map. NVENC expects it only when the
+        // session was created with qpMapMode = NV_ENC_QP_MAP_DELTA.
+        if (m_qpMapActive && m_foveatedEnabled && !m_qpDeltaMap.empty()) {
             picParams.qpDeltaMap = m_qpDeltaMap.data();
             picParams.qpDeltaMapSize = static_cast<uint32_t>(m_qpDeltaMap.size());
         }
@@ -170,7 +169,7 @@ bool NvencEncoder::encode(ID3D11Texture2D* srcTexture,
 
         // Lock bitstream and copy NAL data
         NV_ENC_LOCK_BITSTREAM lockBitstream = {};
-        lockBitstream.version = NVENCAPI_STRUCT_VERSION(NV_ENC_LOCK_BITSTREAM, 2);
+        lockBitstream.version = NV_ENC_LOCK_BITSTREAM_VER;
         lockBitstream.outputBitstream = m_bitstreamBuffer;
         st = m_nvencFns.nvEncLockBitstream(m_encoder, &lockBitstream);
         if (st != NV_ENC_SUCCESS) {
@@ -204,7 +203,7 @@ void NvencEncoder::setGaze(float gazeX, float gazeY, bool valid) {
 }
 
 void NvencEncoder::computeQpDeltaMap(float gazeX, float gazeY) {
-    const uint32_t ctuSize = m_config.use_hevc ? 64 : 16;
+    const uint32_t ctuSize = fvp_nvenc::qpMapBlockSize(m_config.use_hevc);
     computeCtuGrid(m_config.width, m_config.height, ctuSize, m_ctuCols, m_ctuRows);
 
     // Use preset offsets from config (default: balanced = +5/+15)
@@ -220,16 +219,33 @@ bool NvencEncoder::loadNvencApi() {
     if (!lib) return false;
     m_nvencLib = lib;
 
-    auto createInstance = (PFN_NvEncodeAPICreateInstance)
-        GetProcAddress(lib, "NvEncodeAPICreateInstance");
-    if (!createInstance) {
-        OutputDebugStringA("NvencEncoder: NvEncodeAPICreateInstance not found\n");
-        FreeLibrary(lib);
-        m_nvencLib = nullptr;
+    // The driver must support the API version the header was written for,
+    // or every call fails with NV_ENC_ERR_INVALID_VERSION.
+    using GetMaxSupportedVersionFn = NVENCSTATUS (NVENCAPI*)(uint32_t*);
+    auto getMaxVersion = reinterpret_cast<GetMaxSupportedVersionFn>(
+        GetProcAddress(lib, "NvEncodeAPIGetMaxSupportedVersion"));
+    uint32_t maxVersion = 0;
+    if (!getMaxVersion || getMaxVersion(&maxVersion) != NV_ENC_SUCCESS
+            || !fvp_nvenc::driverSupportsApi(maxVersion)) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+            "NvencEncoder: the NVIDIA driver supports NVENC API %u.%u, need %u.%u. "
+            "Update the NVIDIA driver.\n",
+            maxVersion >> 4, maxVersion & 0xF,
+            NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION);
+        OutputDebugStringA(buf);
         return false;
     }
 
-    m_nvencFns.version = NVENCAPI_STRUCT_VERSION(NV_ENCODE_API_FUNCTION_LIST, 2);
+    using CreateInstanceFn = NVENCSTATUS (NVENCAPI*)(NV_ENCODE_API_FUNCTION_LIST*);
+    auto createInstance = reinterpret_cast<CreateInstanceFn>(
+        GetProcAddress(lib, "NvEncodeAPICreateInstance"));
+    if (!createInstance) {
+        OutputDebugStringA("NvencEncoder: NvEncodeAPICreateInstance not found\n");
+        return false;
+    }
+
+    m_nvencFns.version = NV_ENCODE_API_FUNCTION_LIST_VER;
     NVENCSTATUS st = createInstance(&m_nvencFns);
     if (st != NV_ENC_SUCCESS) {
         char buf[128];
@@ -246,7 +262,7 @@ bool NvencEncoder::createEncoderSession() {
     if (!m_nvencFns.nvEncOpenEncodeSessionEx) return false;
 
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS sessionParams = {};
-    sessionParams.version = NVENCAPI_STRUCT_VERSION(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, 1);
+    sessionParams.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
     sessionParams.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
     sessionParams.device = m_device.Get();
     sessionParams.apiVersion = NVENCAPI_VERSION;
@@ -261,42 +277,48 @@ bool NvencEncoder::createEncoderSession() {
         return false;
     }
 
-    // Configure encoder
-    NV_ENC_CONFIG encConfig = {};
-    encConfig.version = NVENCAPI_STRUCT_VERSION(NV_ENC_CONFIG, 8);
-    encConfig.gopLength = m_idrInterval;
-    encConfig.frameIntervalP = 1; // No B-frames (low latency)
-    encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR_LOWDELAY_HQ;
-    encConfig.rcParams.averageBitRate = m_config.bitrate_bps;
-    encConfig.rcParams.maxBitRate = m_config.bitrate_bps;
-    if (m_foveatedEnabled) {
-        encConfig.rcParams.qpMapMode = NV_ENC_QP_MAP_DELTA;
+    // Start from NVIDIA's preset for this codec and tuning, then apply the
+    // streaming settings. A zeroed NV_ENC_CONFIG is not a valid config.
+    const GUID codecGuid = m_config.use_hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
+    const GUID presetGuid = NV_ENC_PRESET_P4_GUID;
+    const NV_ENC_TUNING_INFO tuning = NV_ENC_TUNING_INFO_LOW_LATENCY;
+
+    NV_ENC_PRESET_CONFIG presetConfig = {};
+    presetConfig.version = NV_ENC_PRESET_CONFIG_VER;
+    presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
+    st = m_nvencFns.nvEncGetEncodePresetConfigEx(m_encoder, codecGuid, presetGuid, tuning,
+                                                 &presetConfig);
+    if (st != NV_ENC_SUCCESS) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "NvencEncoder: nvEncGetEncodePresetConfigEx failed: %d\n", st);
+        OutputDebugStringA(buf);
+        return false;
     }
 
-    // Set VUI (Video Usability Information) parameters for color space signaling.
-    // This tells the decoder whether the stream is full range (0-255) or limited (16-235).
-    // Body extracted to `applyVuiFromConfig` so the unit tests can drive
-    // it directly without spinning up a real NVENC encoder.
-    if (m_config.use_hevc) {
-        applyVuiFromConfig(encConfig.encodeCodecConfig.hevcConfig.hevcVUIParameters,
-                           m_config.full_range);
-    } else {
-        applyVuiFromConfig(encConfig.encodeCodecConfig.h264Config.h264VUIParameters,
-                           m_config.full_range);
-    }
+    NV_ENC_CONFIG encConfig = presetConfig.presetCfg;
+    fvp_nvenc::StreamSettings settings;
+    settings.hevc = m_config.use_hevc;
+    settings.bitrate_bps = m_config.bitrate_bps;
+    settings.fps = m_config.fps;
+    settings.full_range = m_config.full_range;
+    settings.qp_delta_map = m_foveatedEnabled;
+    fvp_nvenc::applyStreamSettings(encConfig, settings);
 
     NV_ENC_INITIALIZE_PARAMS initParams = {};
-    initParams.version = NVENCAPI_STRUCT_VERSION(NV_ENC_INITIALIZE_PARAMS, 5);
-    initParams.encodeGUID = m_config.use_hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
-    initParams.presetGUID = NV_ENC_PRESET_P4_GUID;
+    initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
+    initParams.encodeGUID = codecGuid;
+    initParams.presetGUID = presetGuid;
+    initParams.tuningInfo = tuning;
     initParams.encodeWidth = m_config.width;
     initParams.encodeHeight = m_config.height;
     initParams.darWidth = m_config.width;
     initParams.darHeight = m_config.height;
+    initParams.maxEncodeWidth = m_config.width;
+    initParams.maxEncodeHeight = m_config.height;
     initParams.frameRateNum = m_config.fps;
     initParams.frameRateDen = 1;
     initParams.enablePTD = 1; // Picture type decision by encoder
-    initParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
     initParams.encodeConfig = &encConfig;
 
     st = m_nvencFns.nvEncInitializeEncoder(m_encoder, &initParams);
@@ -308,6 +330,7 @@ bool NvencEncoder::createEncoderSession() {
         return false;
     }
 
+    m_qpMapActive = settings.qp_delta_map;
     return true;
 }
 
@@ -333,14 +356,16 @@ bool NvencEncoder::createResources() {
     }
 
     // Register the D3D11 texture with NVENC
+    // NV_ENC_BUFFER_FORMAT_ARGB is word-ordered A8R8G8B8, i.e. the byte
+    // order of DXGI_FORMAT_B8G8R8A8_UNORM.
     NV_ENC_REGISTER_RESOURCE regResource = {};
-    regResource.version = NVENCAPI_STRUCT_VERSION(NV_ENC_REGISTER_RESOURCE, 3);
+    regResource.version = NV_ENC_REGISTER_RESOURCE_VER;
     regResource.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
     regResource.width = m_config.width;
     regResource.height = m_config.height;
     regResource.resourceToRegister = m_inputTexture.Get();
     regResource.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
-    regResource.bufferUsage = 0; // encoder input
+    regResource.bufferUsage = NV_ENC_INPUT_IMAGE;
 
     NVENCSTATUS st = m_nvencFns.nvEncRegisterResource(m_encoder, &regResource);
     if (st != NV_ENC_SUCCESS) {
@@ -354,7 +379,7 @@ bool NvencEncoder::createResources() {
 
     // Create output bitstream buffer
     NV_ENC_CREATE_BITSTREAM_BUFFER createBitstream = {};
-    createBitstream.version = NVENCAPI_STRUCT_VERSION(NV_ENC_CREATE_BITSTREAM_BUFFER, 1);
+    createBitstream.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
 
     st = m_nvencFns.nvEncCreateBitstreamBuffer(m_encoder, &createBitstream);
     if (st != NV_ENC_SUCCESS) {

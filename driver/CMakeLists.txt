@@ -6,13 +6,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(OPENVR_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../third_party/openvr/headers")
 set(RUST_TARGET_DIR "${CMAKE_SOURCE_DIR}/../target/release")
 set(RUST_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../rust/streaming-engine/include")
+# Official NVENC API header (nv-codec-headers n12.2.72.0, MIT).
+set(NVENC_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../third_party/nvenc")
 
 file(GLOB DRIVER_SOURCES "src/*.cpp")
 
 if(DRIVER_SOURCES)
     add_library(driver_focus_vision_pcvr SHARED ${DRIVER_SOURCES})
     target_include_directories(driver_focus_vision_pcvr PRIVATE
-        ${OPENVR_INCLUDE_DIR} ${RUST_INCLUDE_DIR} src)
+        ${OPENVR_INCLUDE_DIR} ${RUST_INCLUDE_DIR} ${NVENC_INCLUDE_DIR} src)
     if(MSVC)
         target_compile_options(driver_focus_vision_pcvr PRIVATE /utf-8)
     endif()
@@ -55,9 +57,10 @@ enable_testing()
 add_executable(driver_tests
     tests/test_qp_map.cpp
     tests/test_nvenc_vui.cpp
+    tests/test_nvenc_config.cpp
     tests/test_encode_params.cpp
 )
-target_include_directories(driver_tests PRIVATE src)
+target_include_directories(driver_tests PRIVATE src ${NVENC_INCLUDE_DIR})
 target_link_libraries(driver_tests PRIVATE GTest::gtest_main)
 if(MSVC)
     target_compile_options(driver_tests PRIVATE /utf-8)
