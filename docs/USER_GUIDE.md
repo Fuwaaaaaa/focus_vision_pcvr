@@ -2,6 +2,12 @@
 
 VIVE Focus Vision を Wi-Fi 経由で PC につなぎ、SteamVR ゲームをワイヤレスでプレイするためのセットアップガイドです。
 
+> **注意（2026-09-28）: 現在は開発プレビューで、ヘッドセットではまだ動作しません。**
+> SteamVR ドライバはまだ映像をエンコードしません。Android アプリには、PC のアドレスと PIN を入力して接続する処理がまだありません。
+> このガイドの手順 5 以降（PIN 入力 → 接続 → プレイ）は、完成したときの手順です。
+> 今の時点で試せるのは、コンパニオンの `focus-vision.exe --simulate`（ヘッドセットなしで PC 側のパイプラインを動かす）と `--demo` です。
+> 残りの作業は [TODOS.md](../TODOS.md) にあります。
+
 技術的な説明より「動かすまでの最短手順」を重視しています。詳しい仕様は [`ARCHITECTURE.md`](../ARCHITECTURE.md)、トラブル対処は [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)、よくある質問は [`FAQ.md`](FAQ.md) を参照してください。
 
 ---
@@ -13,7 +19,7 @@ VIVE Focus Vision を Wi-Fi 経由で PC につなぎ、SteamVR ゲームをワ�
 | **PC** | Windows 10 (1909+) / Windows 11 | 32-bit Windows は非対応 |
 | **VC++ ランタイム** | Microsoft Visual C++ 2015-2022 Redistributable (x64) | インストーラ起動時に未検出なら案内・中止。最新版を [aka.ms/vs/17/release/vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe) から取得可能 |
 | **GPU** | NVIDIA GeForce GTX 1060 6GB 以上 | NVENC ハードウェアエンコード必須。AMD / Intel GPU は非対応 |
-| **GPU ドライバ** | NVIDIA Game Ready Driver 528 以上 | 古いドライバは NVENC 構造体が異なり起動に失敗します |
+| **GPU ドライバ** | NVENC API 12.2 に対応した NVIDIA ドライバ（551.76 以上） | ドライバは NVENC API 12.2（Video Codec SDK 12.2）の構造体を使います。それより古いドライバでは、エンコーダを起動しません |
 | **SteamVR** | 最新安定版 | Steam クライアントから自動更新 |
 | **HMD** | VIVE Focus Vision | Quest など他機種は非対応 |
 | **Wi-Fi** | Wi-Fi 5 (5GHz) 以上、PC と HMD が同じネットワーク | Wi-Fi 6E 推奨。2.4GHz は遅延が大きすぎて非推奨 |
