@@ -2,17 +2,17 @@
 #include "../src/qp_map.h"
 #include "../src/nvenc_encoder.h"
 
-// Frame: 1832x1920, HEVC CTU=64 → 29 cols x 30 rows
+// Frame: 1832x1920, HEVC CTB=32 (the only size NVENC supports) → 58 cols x 60 rows
 static constexpr uint32_t FRAME_W = 1832;
 static constexpr uint32_t FRAME_H = 1920;
-static constexpr uint32_t CTU_HEVC = 64;
-static constexpr uint32_t CTU_H264 = 16;
+static constexpr uint32_t CTU_HEVC = fvp_nvenc::qpMapBlockSize(true);
+static constexpr uint32_t CTU_H264 = fvp_nvenc::qpMapBlockSize(false);
 
 TEST(QpMap, CtuGridHevc) {
     uint32_t cols, rows;
     computeCtuGrid(FRAME_W, FRAME_H, CTU_HEVC, cols, rows);
-    EXPECT_EQ(cols, 29u); // ceil(1832/64)
-    EXPECT_EQ(rows, 30u); // ceil(1920/64)
+    EXPECT_EQ(cols, 58u); // ceil(1832/32)
+    EXPECT_EQ(rows, 60u); // ceil(1920/32)
 }
 
 TEST(QpMap, CtuGridH264) {
@@ -87,7 +87,7 @@ TEST(QpMap, PresetLookup) {
 }
 
 TEST(QpMap, MapSizeMatchesGrid) {
-    for (uint32_t ctu : {16u, 64u}) {
+    for (uint32_t ctu : {CTU_H264, CTU_HEVC}) {
         uint32_t cols, rows;
         computeCtuGrid(FRAME_W, FRAME_H, ctu, cols, rows);
         std::vector<int8_t> map;
@@ -100,52 +100,16 @@ TEST(QpMap, MapSizeMatchesGrid) {
 // VUI Parameter Tests
 // ============================================================
 
-TEST(VuiConfig, HevcVuiFieldsAccessible) {
-    NV_ENC_CONFIG_HEVC hevc = {};
-    hevc.hevcVUIParameters.videoFullRangeFlag = 1;
-    hevc.hevcVUIParameters.colourPrimaries = 1;
-    hevc.hevcVUIParameters.transferCharacteristics = 1;
-    hevc.hevcVUIParameters.matrixCoeffs = 1;
-    hevc.hevcVUIParameters.videoSignalTypePresentFlag = 1;
-    hevc.hevcVUIParameters.colourDescriptionPresentFlag = 1;
-
-    EXPECT_EQ(hevc.hevcVUIParameters.videoFullRangeFlag, 1u);
-    EXPECT_EQ(hevc.hevcVUIParameters.colourPrimaries, 1u);
-    EXPECT_EQ(hevc.hevcVUIParameters.transferCharacteristics, 1u);
-    EXPECT_EQ(hevc.hevcVUIParameters.matrixCoeffs, 1u);
-}
-
-TEST(VuiConfig, H264VuiFieldsAccessible) {
-    NV_ENC_CONFIG_H264 h264 = {};
-    h264.h264VUIParameters.videoFullRangeFlag = 1;
-    h264.h264VUIParameters.colourPrimaries = 1;
-    h264.h264VUIParameters.transferCharacteristics = 1;
-    h264.h264VUIParameters.matrixCoeffs = 1;
-
-    EXPECT_EQ(h264.h264VUIParameters.videoFullRangeFlag, 1u);
-    EXPECT_EQ(h264.h264VUIParameters.colourPrimaries, 1u);
-}
-
 TEST(VuiConfig, FullRangeVsLimited) {
-    // Full range: videoFullRangeFlag = 1
     NV_ENC_CONFIG config_full = {};
-    config_full.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoFullRangeFlag = 1;
+    fvp_nvenc::applyVuiFromConfig(
+        config_full.encodeCodecConfig.hevcConfig.hevcVUIParameters, true);
     EXPECT_EQ(config_full.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoFullRangeFlag, 1u);
 
-    // Limited range: videoFullRangeFlag = 0
     NV_ENC_CONFIG config_limited = {};
-    config_limited.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoFullRangeFlag = 0;
+    fvp_nvenc::applyVuiFromConfig(
+        config_limited.encodeCodecConfig.hevcConfig.hevcVUIParameters, false);
     EXPECT_EQ(config_limited.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoFullRangeFlag, 0u);
-}
-
-TEST(VuiConfig, CodecConfigUnionLayout) {
-    // Verify HEVC and H264 share the same union space
-    NV_ENC_CODEC_CONFIG codec = {};
-    codec.hevcConfig.hevcVUIParameters.videoFullRangeFlag = 42;
-
-    // Access via union — same memory, different interpretation
-    // This verifies the union layout is correct
-    EXPECT_EQ(sizeof(codec.hevcConfig), sizeof(codec.h264Config));
 }
 
 // ============================================================
@@ -183,34 +147,26 @@ TEST(RoiFallback, QpDeltaMapAlwaysAvailable) {
 }
 
 TEST(VuiConfig, NvencConfigFullRangePropagation) {
-    // Simulate the full config path: Config.full_range → NV_ENC_CONFIG VUI
+    // The full config path: Config.full_range → StreamSettings → NV_ENC_CONFIG VUI
     NvencEncoder::Config appConfig;
     appConfig.use_hevc = true;
     appConfig.full_range = true;
 
+    fvp_nvenc::StreamSettings settings;
+    settings.hevc = appConfig.use_hevc;
+    settings.full_range = appConfig.full_range;
     NV_ENC_CONFIG encConfig = {};
-    if (appConfig.use_hevc) {
-        auto& vui = encConfig.encodeCodecConfig.hevcConfig.hevcVUIParameters;
-        vui.videoSignalTypePresentFlag = 1;
-        vui.videoFormat = 5;
-        vui.videoFullRangeFlag = appConfig.full_range ? 1 : 0;
-        vui.colourDescriptionPresentFlag = 1;
-        vui.colourPrimaries = 1;
-        vui.transferCharacteristics = 1;
-        vui.matrixCoeffs = 1;
-    }
+    fvp_nvenc::applyStreamSettings(encConfig, settings);
 
     auto& vui = encConfig.encodeCodecConfig.hevcConfig.hevcVUIParameters;
     EXPECT_EQ(vui.videoFullRangeFlag, 1u);
     EXPECT_EQ(vui.videoSignalTypePresentFlag, 1u);
-    EXPECT_EQ(vui.colourPrimaries, 1u); // BT.709
+    EXPECT_EQ(vui.colourPrimaries, NV_ENC_VUI_COLOR_PRIMARIES_BT709);
 
-    // Now test limited range
-    appConfig.full_range = false;
+    settings.full_range = false;
     encConfig = {};
-    auto& vui2 = encConfig.encodeCodecConfig.hevcConfig.hevcVUIParameters;
-    vui2.videoFullRangeFlag = appConfig.full_range ? 1 : 0;
-    EXPECT_EQ(vui2.videoFullRangeFlag, 0u);
+    fvp_nvenc::applyStreamSettings(encConfig, settings);
+    EXPECT_EQ(encConfig.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoFullRangeFlag, 0u);
 }
 
 // ============================================================
@@ -317,11 +273,11 @@ TEST(QpMap, TinyFrameCtuGridRoundsUp) {
 }
 
 TEST(QpMap, FrameNotDivisibleByCtuRoundsUp) {
-    // 1833x1921 with CTU=64 yields ceil(1833/64)=29, ceil(1921/64)=31
+    // 1833x1921 with CTU=32 yields ceil(1833/32)=58, ceil(1921/32)=61
     uint32_t cols, rows;
-    computeCtuGrid(1833, 1921, 64, cols, rows);
-    EXPECT_EQ(cols, 29u);
-    EXPECT_EQ(rows, 31u);
+    computeCtuGrid(1833, 1921, 32, cols, rows);
+    EXPECT_EQ(cols, 58u);
+    EXPECT_EQ(rows, 61u);
 }
 
 // ============================================================
@@ -371,35 +327,5 @@ TEST(FoveatedPreset, PartialMatchReturnsNull) {
     EXPECT_EQ(findFoveatedPreset("balancedXY"), nullptr);
 }
 
-// ============================================================
-// NVENC ABI / struct layout assertions
-// ============================================================
-
-TEST(NvencAbi, HevcAndH264ConfigsShareUnionSize) {
-    // The NV_ENC_CODEC_CONFIG union is the largest of its members.
-    // If the SDK changes one struct without updating the union footprint,
-    // we want to know at test time, not at runtime. Bind to locals because
-    // EXPECT_EQ takes a macro-comma-separated arg list and the comma in
-    // std::max<…>(…, …) confuses the preprocessor.
-    const size_t unionSize = sizeof(NV_ENC_CODEC_CONFIG);
-    const size_t hevcSize = sizeof(NV_ENC_CONFIG_HEVC);
-    const size_t h264Size = sizeof(NV_ENC_CONFIG_H264);
-    // `(std::max)(...)` — extra parens prevent Windows.h's `max` macro
-    // from clobbering the std:: name when the test transitively pulls
-    // <windows.h> via nvenc_encoder.h.
-    const size_t maxMemberSize = (hevcSize > h264Size) ? hevcSize : h264Size;
-    EXPECT_EQ(unionSize, maxMemberSize);
-}
-
-TEST(NvencAbi, StructVersionMacroProducesNonZero) {
-    // NVENCAPI_STRUCT_VERSION encodes (sizeof | ver_idx<<16 | apiVersion<<24)
-    // into a u32 that nvEncInitializeEncoder validates at runtime. A version
-    // of 0 would silently fail with NV_ENC_ERR_INVALID_VERSION — guard
-    // against the inline type definitions regressing.
-    constexpr uint32_t hevcConfigVer = NVENCAPI_STRUCT_VERSION(NV_ENC_CONFIG_HEVC, 1);
-    constexpr uint32_t h264ConfigVer = NVENCAPI_STRUCT_VERSION(NV_ENC_CONFIG_H264, 1);
-    EXPECT_GT(hevcConfigVer, 0u);
-    EXPECT_GT(h264ConfigVer, 0u);
-    // Major version (low byte of the apiVersion field) must be 12.
-    EXPECT_EQ(NVENCAPI_MAJOR_VERSION, 12);
-}
+// NVENC struct versions and constants: see test_nvenc_config.cpp (the
+// driver now uses the official nvEncodeAPI.h instead of hand-written types).

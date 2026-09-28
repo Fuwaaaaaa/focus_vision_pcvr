@@ -364,7 +364,7 @@
 - **同じ経路のほかの問題:**
   - driver は D3D11 デバイスを作っていない。`CreateSwapTextureSet` は `m_encoder.getDevice()`（初期化前は null）を使うので、スワップテクスチャも作れない。
   - `rSharedTextureHandles` に入れているのは `m_nextHandle++` の連番で、DXGI の本物の共有ハンドル（`IDXGIResource::GetSharedHandle`）ではない。SteamVR の compositor はこれを開けない。
-  - `nvenc_encoder.h` の手書きの NVENC 関数テーブルの並びが、公式の `nvEncodeAPI.h`（`NV_ENCODE_API_FUNCTION_LIST`）と合っていない疑いがある（例: 先頭が `nvEncOpenEncodeSessionEx`）。SDK のヘッダと突き合わせが要る。
+  - ~~`nvenc_encoder.h` の手書きの NVENC 関数テーブルの並びが、公式の `nvEncodeAPI.h`（`NV_ENCODE_API_FUNCTION_LIST`）と合っていない疑いがある~~ (2026-09-28 修正): 疑いどおりだった。関数テーブルに加えて、構造体バージョンの作り方、`NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS` / `NV_ENC_INITIALIZE_PARAMS` / `NV_ENC_LOCK_BITSTREAM` / `NV_ENC_RC_PARAMS` / `NV_ENC_PIC_PARAMS` のレイアウト、`NV_ENC_BUFFER_FORMAT_ARGB`（0x20 → 正しくは 0x01000000）、`NV_ENC_PIC_FLAG_FORCEIDR`（4 → 正しくは 2）も違っていた。公式ヘッダ（`third_party/nvenc`、SDK 12.2）に置き換え、preset config を `nvEncGetEncodePresetConfigEx` で取得して設定を上書きする形にした（`driver/src/nvenc_config.h`）。HEVC の QP delta map は 32x32 CTB 単位に直した（64 は NVENC が対応していない）。実機で NVENC が動くかはまだ確認していない。
   - `fvp_set_bitrate_callback` を driver が登録しておらず、`NvencEncoder` に reconfigure（`nvEncReconfigureEncoder`）の経路もない。adaptive bitrate の変更は NVENC に届かない。
 - **直すのに必要なこと:** D3D11 デバイスの作成（SteamVR が使うアダプタ）、本物の共有テクスチャ、`initEncoder` の呼び出し、関数テーブルの検証、bitrate callback と reconfigure（Present スレッドで適用する atomic な保留値）。
 - **Priority:** P0（実機での映像の前提）

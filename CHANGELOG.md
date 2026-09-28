@@ -120,6 +120,31 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   pushes the output as well as the exit code, and returned early without
   restoring the registers. It now uses `ExecToLog`, which also puts the
   vrpathreg output in the install log, and always restores them.
+- **The driver uses the official NVENC header.** `nvenc_encoder.h` mirrored
+  `nvEncodeAPI.h` by hand, and got it wrong in ways that would make every
+  NVENC call fail or read the wrong fields:
+  - Struct versions were built as `sizeof | ver<<16 | API<<24` instead of
+    `API | ver<<16 | 7<<28`, so `NvEncodeAPICreateInstance` would reject
+    the call.
+  - The function table started with `nvEncOpenEncodeSessionEx`, which
+    shifted every slot after it.
+  - The OPEN_ENCODE_SESSION_EX, INITIALIZE_PARAMS, LOCK_BITSTREAM,
+    RC_PARAMS and PIC_PARAMS layouts were off.
+  - `NV_ENC_BUFFER_FORMAT_ARGB` was `0x20` (officially `0x01000000`).
+  - `NV_ENC_PIC_FLAG_FORCEIDR` was `4`, which is OUTPUT_SPSPPS, so IDR
+    requests never produced an IDR.
+
+  The header now comes from `third_party/nvenc` (nv-codec-headers
+  n12.2.72.0, MIT). The encoder starts from NVIDIA's preset config
+  (`nvEncGetEncodePresetConfigEx`); a zeroed config is not valid. On top
+  of it, `driver/src/nvenc_config.h` applies low-latency CBR with a
+  one-frame VBV, IPP only, and forced IDRs that carry the parameter sets.
+  It also refuses an NVIDIA driver whose NVENC API is older than 12.2.
+  The HEVC QP delta map now uses 32x32 CTBs, the only size NVENC
+  supports; it used 64, so the map was a quarter of the expected size.
+  The map is passed only when the session was created with
+  `NV_ENC_QP_MAP_DELTA`. Driver gtests: 44. Not yet run on an NVIDIA GPU;
+  the driver still never calls `initEncoder` (see Known issues).
 - **The encoder bitrate is `bitrate_mbps`.** The driver set NVENC's target
   to `encoded_w * encoded_h * bitrate_pixel_factor` — about 7 Mbps at the
   native 1832×1920 — while `bitrate_mbps = 80` was sent to the HMD in

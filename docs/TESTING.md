@@ -161,7 +161,7 @@ H.264:
 ## 6. Foveated Encoding テスト
 
 ### 前提条件
-- NVENC SDK構造体オフセットの検証が必要（`nvenc_encoder.h`のインライン定義）
+- NVENC は公式の `nvEncodeAPI.h`（`third_party/nvenc`、SDK 12.2）を使う。NVIDIA ドライバが NVENC API 12.2 以上に対応している必要がある
 - **初回は必ず短時間テスト**（クラッシュリスクあり）
 
 ### 手順

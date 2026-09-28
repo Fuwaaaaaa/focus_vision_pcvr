@@ -24,9 +24,11 @@ loads on boot. The driver opens the Rust streaming engine, registers HMD
 | `src/nvenc_encoder.cpp` / `.h` | NVENC session, QP delta map, `EncodeFrame()` → `fvp_submit_encoded_nal` | 470 + 320 |
 | `src/qp_map.h` | `computeQpDeltaMap()` (foveated QP offsets) — testable pure function | ~110 |
 
-Note: `nvenc_encoder.h` includes many `#[repr]` equivalents — inlined copies
-of NVENC SDK structs (to avoid pulling the full NVIDIA SDK into the build).
-This is a known fragility: field offsets must be kept in sync with the SDK.
+Note: NVENC types come from the official `nvEncodeAPI.h` in
+`third_party/nvenc` (SDK 12.2, MIT). The hand-written copies it replaced had
+wrong struct versions, layouts and constants. `src/nvenc_config.h` holds the
+settings applied on top of NVIDIA's preset, as pure functions the gtests
+cover.
 
 ---
 
@@ -140,7 +142,7 @@ against `streaming_engine.lib` (cdylib import lib).
 - `server_driver.cpp:11,72,93` — `s_instance` nullptr race during shutdown callbacks (audit #10)
 - `nvenc_encoder.cpp:17-18,102,341` — ComPtr `.Get()` for threading surface (audit #9)
 - `direct_mode.cpp:38,48` — terse error handling, missing log detail (audit #30)
-- NVENC SDK struct offsets — inlined copies must match NVIDIA SDK version (documented in TODOS.md)
+- NVENC runs only on a driver that supports NVENC API 12.2+ (official header in `third_party/nvenc`)
 
 ---
 
