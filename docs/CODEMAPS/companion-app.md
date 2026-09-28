@@ -18,6 +18,7 @@ engine reads it as its top config layer). Does not link against
 | `src/config.rs` | `LocalConfig` (video / sleep_mode / face_tracking / recording overrides). Persists to `%APPDATA%/FocusVisionPCVR/config/local.toml` | 194 |
 | `src/driver.rs` | SteamVR driver install / uninstall. Detects SteamVR via registry lookup | 115 |
 | `src/adb.rs` | `AdbDevice`, `list_devices` / `install_apk` / `dump_logcat` / `launch_app` (blocking `Command::new("adb")`) | 209 |
+| `src/headset_link.rs` | "Send PIN to headset": reads the headset's Wi-Fi address over adb, picks this PC's address toward it (routing table via a connected UDP socket), starts the client with `--es fvp_server/fvp_pin/fvp_udp_port`. Ports come from status.json (`tcp_port`/`udp_port`) | ~150 |
 | `src/export.rs` | `export_logs()` — zip PC log + ADB logcat + system info, sanitize IP/PII | 178 |
 | `src/stats_history.rs` | 30-second ring buffer for latency / FPS / packet-loss sparklines | 102 |
 

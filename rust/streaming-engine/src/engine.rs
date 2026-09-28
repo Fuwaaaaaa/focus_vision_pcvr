@@ -258,6 +258,9 @@ impl StreamingEngine {
         // a parent test or the C++ driver pre-initialised it — discard.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
+        // status.json tells the companion where the headset should connect.
+        crate::set_status_ports(config.network.tcp_port, config.network.udp_port);
+
         // Build tokio runtime with limited threads (eng review decision #1)
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

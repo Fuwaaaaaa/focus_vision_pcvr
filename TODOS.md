@@ -320,7 +320,8 @@
   - ①**サーバアドレス検証**: `client_session.h` の `parse_server_endpoint("ip"/"ip:port")`(IPv4 4オクテット + port 1-65535 検証、default 9944 = engine と一致)。client gtest 5件。アドレス文字列の**供給元**(config ファイル読込 or UI)は別途。
   - ~~**残り(実機検証が要る部分)**: 状態機械を**実I/O(connect/handshake/receiver init)に配線**~~ (2026-09-28): `StreamSession`(接続・ペアリング・ハートビート・サーバから届くメッセージ・再接続を専用スレッドで回す) と `VideoReceiver`(UDP 受信スレッド + `FrameAssembler`) を追加した。C++ クライアントを本物のエンジン(ヘッドレス版)につなぐ E2E テスト `client/tests/test_session_e2e.cpp` で、TLS 1.3・PIN・映像の受信・誤った PIN・hold 内の再接続・証明書の不一致を確かめた(CI の `client-e2e` ジョブ)。
   - ~~`openxr_app` への組み込み~~ (2026-09-28): 起動時のアドレスと PIN(`am start --es fvp_server … --es fvp_pin …` → MainActivity がファイルに書き、ネイティブ側が読んで消す)、MediaCodec へのフレーム投入(codec・サイズの変更で作り直し)、tracking sender、音声の受信と再生、スリープの減光、終了時の DISCONNECT。APK のビルドまで確認。
-  - **残り**: コンパニオンが adb で起動するときにアドレスと PIN を渡すこと、VR 内の PIN 入力 UI(無線のみで再ペアリングするときに要る)、コントローラ入力の初期化(ハプティクスはそれまで効かない)。デコードと描画は実機でしか確かめられない。
+  - ~~コンパニオンが adb で起動するときにアドレスと PIN を渡すこと~~ (2026-09-28): Home タブの「Send PIN to headset」と、Deploy のインストール後の起動が、HMD の Wi-Fi のアドレスを調べ、そこへ届く PC のアドレス・エンジンのポート(status.json の `tcp_port`/`udp_port`)・PIN を渡してアプリを起動する(`headset_link.rs`)。
+  - **残り**: VR 内の PIN 入力 UI(USB なしで再ペアリングするときに要る)、コントローラ入力の初期化(ハプティクスはそれまで効かない)。デコードと描画、adb からの起動は実機でしか確かめられない。
 - **resolution_scale への影響:** PC側(Rust+driver)は機能的。クライアント T8-T10 は正しいが、このセッション統合が無いため inert。
 - **Priority:** P0 (クライアント実機動作の前提・Phase 1 より上流)
 - **Depends on:** 実機(検証に必須) + UX設計
@@ -427,4 +428,4 @@
 - **P1: インストーラは Steam のルートにある SteamVR しか探さない。** 別ライブラリの場合に案内する `driver/install.bat` は同梱されていない。
 - **P1: 署名。** リリースジョブは署名なしでも公開する。ドライバ DLL とアンインストーラは署名しない。Android の keystore が未設定だと毎回一時鍵で署名され、`adb install -r` が更新に失敗する。
 - P2: スライダーが範囲外の正しい値を丸めて保存する（sleep 30–900 など）。保存のたびに全キーを書く。保存失敗を再試行しない。`adb devices` を 3 秒ごとに UI スレッドで実行する。シミュレーション停止の join が UI スレッドで最大 5 秒。Deploy が全 adb デバイス（スマホも）に入れ、タイムアウトがない。デモモードでも Install / Uninstall が動く。「Install Driver」は作業ディレクトリ相対で、管理者権限が要る。`build.bat` の `%ERRORLEVEL%` がブロック内で展開される。fuzz / long-run / coverage が continue-on-error。SteamVR 実行中の上書きインストールを確認しない。DESIGN.md との差（Instrument Serif 未使用、text-muted の色、型スケール外のサイズ、ステータスドットの点滅なし）。
-- P2（ドキュメント）: USER_GUIDE / TROUBLESHOOTING が存在しない UI を案内している（APK のドラッグ&ドロップ、「Deploy」ボタン、「Reinstall driver」、`logs\engine.log`、ビットレートグラフ）。FAQ の「約 30% の帯域削減」は NVENC が動いていないので実測できていない。
+- P2（ドキュメント）: TROUBLESHOOTING が存在しない UI を案内している（「Reinstall driver」、`logs\engine.log`、ビットレートグラフ）。FAQ の「約 30% の帯域削減」は NVENC が動いていないので実測できていない。(2026-09-28: USER_GUIDE の APK のドラッグ&ドロップ・「Deploy」ボタン・HMD での PIN 入力の記述は、実際の UI に合わせて直した)

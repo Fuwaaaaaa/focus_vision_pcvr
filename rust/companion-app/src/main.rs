@@ -3,6 +3,7 @@ mod config;
 mod demo;
 mod driver;
 mod export;
+mod headset_link;
 #[cfg(feature = "simulator")]
 mod sim;
 mod stats_history;
@@ -95,6 +96,14 @@ pub(crate) struct CompanionApp {
     // Deploy async state
     pub(crate) deploy_in_progress: bool,
     pub(crate) deploy_result: Arc<Mutex<Option<String>>>,
+
+    // "Send PIN to headset" async state (headset_link::send_to_headset)
+    pub(crate) pairing_in_progress: bool,
+    pub(crate) pairing_result: Arc<Mutex<Option<Result<String, String>>>>,
+    pub(crate) pairing_status: String,
+    // Where the headset connects: the engine's (TCP, UDP base) ports from
+    // status.json, or the defaults for an engine that does not publish them.
+    pub(crate) engine_ports: (u16, u16),
 
     // Engine status (read from status.json)
     last_status_read: Instant,
@@ -254,6 +263,10 @@ impl CompanionApp {
             audio_bitrate_kbps: cfg.audio.bitrate_kbps,
             deploy_in_progress: false,
             deploy_result: Arc::new(Mutex::new(None)),
+            pairing_in_progress: false,
+            pairing_result: Arc::new(Mutex::new(None)),
+            pairing_status: String::new(),
+            engine_ports: headset_link::DEFAULT_PORTS,
             last_status_read: Instant::now() - Duration::from_secs(10),
             active_tab: Tab::Home,
             status_log: Arc::new(Mutex::new(Vec::new())),
@@ -550,6 +563,7 @@ impl CompanionApp {
     fn apply_parsed_status(&mut self, parsed: status_parser::ParsedStatus) {
         use status_parser::ConnectionStatus as CS;
         self.connection_status = parsed.connection;
+        self.engine_ports = parsed.engine_ports.unwrap_or(headset_link::DEFAULT_PORTS);
         // Pin expiry: when the engine emits a fresh value, snapshot it
         // along with the wall-clock time we received it, so the UI can
         // count down locally. The engine re-emits the same value on every
@@ -603,6 +617,46 @@ impl CompanionApp {
         self.pin_expires_observed_at = None;
     }
 
+    /// Start the headset app over adb pointed at this PC with the current
+    /// PIN (headset_link). Prefers a device adb reports as a VIVE headset.
+    pub(crate) fn send_pin_to_headset(&mut self) {
+        let (Some(adb), Some(device)) = (
+            self.adb_path.clone(),
+            self.devices.iter().find(|d| d.is_focus_vision).or(self.devices.first()).cloned(),
+        ) else {
+            return;
+        };
+        self.pairing_in_progress = true;
+        self.pairing_status = format!("Sending the PIN to {}...", device.model);
+        let pin = self.pin_code.clone();
+        let ports = self.engine_ports;
+        let result = self.pairing_result.clone();
+        std::thread::Builder::new()
+            .name("fvp-pairing".into())
+            .spawn(move || {
+                let outcome = headset_link::send_to_headset(&adb, &device.serial, &pin, ports);
+                if let Ok(mut guard) = result.lock() {
+                    *guard = Some(outcome);
+                }
+            })
+            .expect("spawn pairing thread");
+    }
+
+    fn check_pairing_result(&mut self) {
+        let outcome = match self.pairing_result.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        if let Some(outcome) = outcome {
+            self.pairing_in_progress = false;
+            self.pairing_status = match outcome {
+                Ok(msg) | Err(msg) => msg,
+            };
+            let note = self.pairing_status.clone();
+            self.log(&note);
+        }
+    }
+
     fn check_deploy_result(&mut self) {
         if let Ok(mut result) = self.deploy_result.lock() {
             if let Some(msg) = result.take() {
@@ -629,6 +683,7 @@ impl eframe::App for CompanionApp {
         self.scan_devices();
         self.read_engine_status();
         self.check_deploy_result();
+        self.check_pairing_result();
         self.check_export_result();
 
         // Simulation: one-shot autostart (when launched with --simulate) and

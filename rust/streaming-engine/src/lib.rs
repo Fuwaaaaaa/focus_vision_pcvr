@@ -56,6 +56,24 @@ pub struct SubsystemStatus {
     pub packet_loss_pct: f32,
 }
 
+/// The engine's control (TCP) and UDP base ports, packed `tcp << 16 | udp`;
+/// 0 until an engine starts. Published in status.json so the companion can
+/// tell the headset where to connect.
+static STATUS_PORTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record the ports status.json reports (StreamingEngine::new).
+pub fn set_status_ports(tcp_port: u16, udp_port: u16) {
+    STATUS_PORTS.store(
+        (u32::from(tcp_port) << 16) | u32::from(udp_port),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn status_ports() -> Option<(u16, u16)> {
+    let packed = STATUS_PORTS.load(std::sync::atomic::Ordering::Relaxed);
+    (packed != 0).then_some(((packed >> 16) as u16, packed as u16))
+}
+
 /// Write engine status to a shared JSON file for the companion app.
 /// Path: %APPDATA%/FocusVisionPCVR/status.json (Windows)
 /// Uses atomic write (temp file + rename) to prevent partial reads.
@@ -81,6 +99,7 @@ pub fn write_status_file(
         bitrate_mbps,
         subsystems,
         pin_expires_in_seconds,
+        status_ports(),
     );
 
     // Atomic write: write to temp file then rename to prevent partial reads
@@ -92,6 +111,7 @@ pub fn write_status_file(
 }
 
 /// Build the status.json payload. Separated from `write_status_file` for testability.
+#[allow(clippy::too_many_arguments)]
 fn build_status_json(
     status: &str,
     pin: Option<u32>,
@@ -100,6 +120,7 @@ fn build_status_json(
     bitrate_mbps: Option<u32>,
     subsystems: Option<&SubsystemStatus>,
     pin_expires_in_seconds: Option<u32>,
+    ports: Option<(u16, u16)>,
 ) -> String {
     let pin_str = pin.map(|p| format!("{:06}", p)).unwrap_or_else(|| "------".to_string());
 
@@ -130,6 +151,12 @@ fn build_status_json(
             "pin_expires_in_seconds".to_string(),
             serde_json::Value::from(remaining),
         );
+    }
+    // Where the headset connects: the companion passes these (with the
+    // PIN) when it starts the headset app over adb.
+    if let Some((tcp_port, udp_port)) = ports {
+        obj.insert("tcp_port".to_string(), serde_json::Value::from(tcp_port));
+        obj.insert("udp_port".to_string(), serde_json::Value::from(udp_port));
     }
     serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_else(|_| "{}".to_string())
 }
@@ -675,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_build_status_json_without_subsystems() {
-        let json = build_status_json("idle", Some(123456), Some(5000), Some(90), Some(120), None, None);
+        let json = build_status_json("idle", Some(123456), Some(5000), Some(90), Some(120), None, None, None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["status"], "idle");
         assert_eq!(v["pin"], "123456");
@@ -692,7 +719,7 @@ mod tests {
         // Every payload must carry schema_version so a stale companion can
         // detect engine-version mismatch instead of silently parsing the
         // wrong field shape.
-        let json = build_status_json("idle", None, None, None, None, None, None);
+        let json = build_status_json("idle", None, None, None, None, None, None, None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["schema_version"], fvp_common::STATUS_SCHEMA_VERSION);
     }
@@ -705,7 +732,7 @@ mod tests {
             audio_enabled: true,
             packet_loss_pct: 3.27,
         };
-        let json = build_status_json("streaming", None, None, None, None, Some(&sub), None);
+        let json = build_status_json("streaming", None, None, None, None, Some(&sub), None, None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["status"], "streaming");
         assert_eq!(v["pin"], "------");
@@ -723,7 +750,7 @@ mod tests {
     #[test]
     fn test_build_status_json_escapes_special_chars() {
         // Quote + backslash in status should not break parsing.
-        let json = build_status_json(r#"weird"state\with"#, None, None, None, None, None, None);
+        let json = build_status_json(r#"weird"state\with"#, None, None, None, None, None, None, None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["status"], r#"weird"state\with"#);
     }
@@ -742,6 +769,7 @@ mod tests {
             None,
             None,
             Some(247),
+            None,
         );
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["pin"], "742103");
@@ -750,8 +778,21 @@ mod tests {
 
     #[test]
     fn test_build_status_json_omits_pin_expires_when_none() {
-        let json = build_status_json("waiting", Some(742103), None, None, None, None, None);
+        let json = build_status_json("waiting", Some(742103), None, None, None, None, None, None);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.get("pin_expires_in_seconds").is_none());
+    }
+
+    #[test]
+    fn test_build_status_json_publishes_the_ports_the_headset_connects_to() {
+        // The companion starts the headset app with these and the PIN.
+        let json = build_status_json("waiting", Some(1), None, None, None, None, None, Some((9950, 9955)));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["tcp_port"], 9950);
+        assert_eq!(v["udp_port"], 9955);
+
+        let json = build_status_json("waiting", Some(1), None, None, None, None, None, None);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("tcp_port").is_none(), "no engine yet: no ports");
     }
 }

@@ -151,6 +151,22 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   - **On exit** the app sends DISCONNECT, so the engine ends the session
     instead of holding it.
   - Checked: the APK builds (NDK 26.1). Not run on the headset.
+- **The companion hands the address and PIN to the headset.** Home shows a
+  **Send PIN to headset** button while the engine waits for a PIN (the
+  headset app has no PIN entry screen yet). Deploy's post-install launch
+  does the same when a PIN is waiting.
+  - It reads the headset's Wi-Fi address over adb (`ip -f inet addr show
+    wlan0`).
+  - It picks this PC's address toward that one from the routing table,
+    by connecting a UDP socket (which sends nothing).
+  - It starts the client with `fvp_server` / `fvp_pin` / `fvp_udp_port`
+    (`headset_link.rs`).
+  - The engine now publishes its ports in status.json (`tcp_port`,
+    `udp_port`), so a non-default `[network]` config reaches the headset.
+    Older engines fall back to 9944 / 9945.
+  - USER_GUIDE now describes this flow. It had described a PIN entry
+    screen on the headset, APK drag and drop, and a "Deploy" button,
+    none of which exist.
 
 ### Fixes
 - **The Android client starts.** Found by reading the code; not yet run on
