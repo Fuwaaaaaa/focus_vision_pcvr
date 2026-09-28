@@ -122,7 +122,9 @@ void OpenXRApp::createInstance(android_app* app) {
     createInfo.applicationInfo.engineVersion = 1;
     strncpy(createInfo.applicationInfo.engineName, "FocusVisionEngine",
         XR_MAX_ENGINE_NAME_SIZE);
-    createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+    // 1.0: the app uses nothing from 1.1, and a 1.0-only runtime refuses a
+    // 1.1 request with XR_ERROR_API_VERSION_UNSUPPORTED.
+    createInfo.applicationInfo.apiVersion = XR_API_VERSION_1_0;
 
     XR_CHECK(xrCreateInstance(&createInfo, &m_instance), "xrCreateInstance");
     LOGI("OpenXR instance created");
@@ -198,6 +200,29 @@ bool OpenXRApp::initEGL() {
 }
 
 void OpenXRApp::createSession() {
+    // The spec requires this call before xrCreateSession, which otherwise
+    // fails with XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING.
+    PFN_xrGetOpenGLESGraphicsRequirementsKHR getGraphicsRequirements = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(m_instance, "xrGetOpenGLESGraphicsRequirementsKHR",
+        reinterpret_cast<PFN_xrVoidFunction*>(&getGraphicsRequirements)),
+        "xrGetInstanceProcAddr(xrGetOpenGLESGraphicsRequirementsKHR)");
+    XrGraphicsRequirementsOpenGLESKHR requirements = {XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR};
+    XR_CHECK(getGraphicsRequirements(m_instance, m_systemId, &requirements),
+        "xrGetOpenGLESGraphicsRequirementsKHR");
+
+    GLint major = 0, minor = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &major);
+    glGetIntegerv(GL_MINOR_VERSION, &minor);
+    const XrVersion contextVersion = XR_MAKE_VERSION(major, minor, 0);
+    LOGI("GLES %d.%d; runtime supports %u.%u to %u.%u", major, minor,
+        XR_VERSION_MAJOR(requirements.minApiVersionSupported),
+        XR_VERSION_MINOR(requirements.minApiVersionSupported),
+        XR_VERSION_MAJOR(requirements.maxApiVersionSupported),
+        XR_VERSION_MINOR(requirements.maxApiVersionSupported));
+    if (contextVersion < requirements.minApiVersionSupported) {
+        throw std::runtime_error("GLES context is older than the OpenXR runtime requires");
+    }
+
     XrGraphicsBindingOpenGLESAndroidKHR gfxBinding = {
         XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR};
     gfxBinding.display = m_eglDisplay;
@@ -236,6 +261,11 @@ void OpenXRApp::mainLoop() {
     uint32_t frameCount = 0;
 
     while (m_running) {
+        // This loop only returns when the app stops, so Android lifecycle
+        // commands (pause, resume, destroy) must be handled here; left
+        // unread, the activity's onPause blocks and the system reports ANR.
+        pollAndroidEvents(m_androidApp);
+        if (!m_running) break;
         pollEvents();
 
         if (!m_sessionReady) {
@@ -597,6 +627,9 @@ void OpenXRApp::pollAndroidEvents(android_app* app) {
 }
 
 void OpenXRApp::shutdown() {
+    // Runs up to three times (APP_CMD_DESTROY, end of android_main, the
+    // destructor), so every handle is reset once released.
+    m_running = false;
     if (m_stageSpace != XR_NULL_HANDLE) {
         xrDestroySpace(m_stageSpace);
         m_stageSpace = XR_NULL_HANDLE;
@@ -615,6 +648,9 @@ void OpenXRApp::shutdown() {
         if (m_eglSurface != EGL_NO_SURFACE) eglDestroySurface(m_eglDisplay, m_eglSurface);
         if (m_eglContext != EGL_NO_CONTEXT) eglDestroyContext(m_eglDisplay, m_eglContext);
         eglTerminate(m_eglDisplay);
+        m_eglSurface = EGL_NO_SURFACE;
+        m_eglContext = EGL_NO_CONTEXT;
+        m_eglDisplay = EGL_NO_DISPLAY;
     }
     LOGI("OpenXR app shut down");
 }
