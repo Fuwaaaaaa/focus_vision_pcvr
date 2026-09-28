@@ -36,11 +36,14 @@ Module declarations: `src/lib.rs:1-14` (14 modules).
   - `run()` — accept → session → hold loop, disconnect-reason bookkeeping
   - `accept()` — backoff + `TcpControlServer::listen_and_accept` with the PIN heartbeat
   - `run_session()` — per-session setup (tracking peer, control task, UDP,
-    audio) and the frame loop
+    audio) and the frame loop. Every exit cancels the session (drop guard),
+    which stops the control task and audio; `HapticRoute` clears `HAPTIC_TX`
   - `hold()` — 5 s reconnect window on the session's server/PIN; a reconnect
     comes back as the next session
 - `ControlChannel` + `handle_tcp_control()` — TCP control task (heartbeat,
-  face data, transport feedback, CONFIG_UPDATE, disconnect; haptic/sleep out).
+  face data, transport feedback, CONFIG_UPDATE, disconnect; haptic/sleep out),
+  spawned by `spawn_control_task()`, which closes the connection when the
+  session is cancelled from our side.
   HEARTBEAT stats and TRANSPORT_FEEDBACK go to the frame loop as
   `ControlEvent`s over an mpsc channel — no shared locks
 - `AdaptiveState` — frame-loop-owned bandwidth/bitrate/burst/GCC/adaptive-FEC/

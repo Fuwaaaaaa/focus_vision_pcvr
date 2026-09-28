@@ -79,6 +79,16 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   SECURITY.md's "5 s PIN skip via TLS session resumption" never existed; the
   threat model now describes this behaviour. The simulator's mock client
   gained `abrupt_close` to exercise it end to end.
+- **A session ended on the PC side closes the HMD's connection.** When a
+  session ended for a reason other than the TCP connection (the UDP sender
+  could not be created, the frame source closed, engine shutdown), the
+  control task kept serving the HMD's connection until the HMD hung up, and
+  on shutdown the session's audio capture kept running. Every way out of a
+  session now cancels it: the control task closes the connection, and audio
+  stops. `queue_haptic` is routed to the session only while it runs; before,
+  events after a session went to its closed channel and were logged as
+  drops. A closed frame source now stops the engine instead of being counted
+  as a lost connection and starting a 5 s hold.
 - **Large IDR frames are no longer lost to slice FEC.** A slice whose data
   shards did not fit one Reed-Solomon code word (a literal cap of 200 data
   shards, or RS's 256 data + parity total, which at 40 % redundancy is only

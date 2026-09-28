@@ -26,9 +26,11 @@ static GAZE_CALLBACK: std::sync::RwLock<Option<extern "C" fn(f32, f32, i32)>> = 
 /// Set via fvp_set_bitrate_callback() from C++.
 static BITRATE_CALLBACK: std::sync::RwLock<Option<extern "C" fn(u32)>> = std::sync::RwLock::new(None);
 
+type HapticSlot = std::sync::RwLock<Option<mpsc::Sender<HapticEvent>>>;
+
 /// Channel for sending haptic events to the TCP control writer.
-/// Set per session when TCP connection is established.
-static HAPTIC_TX: std::sync::RwLock<Option<mpsc::Sender<HapticEvent>>> = std::sync::RwLock::new(None);
+/// Set for the lifetime of each session by a [`HapticRoute`].
+static HAPTIC_TX: HapticSlot = std::sync::RwLock::new(None);
 
 /// Counter for dropped haptic events (channel full). Exposed in status.json.
 static HAPTIC_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -119,6 +121,34 @@ pub fn queue_haptic(controller_id: u8, duration_ms: u16, frequency: f32, amplitu
                 if count % 100 == 1 {
                     log::warn!("Haptic event dropped (total: {})", count);
                 }
+            }
+        }
+    }
+}
+
+/// Routes [`queue_haptic`] to one session's control connection while alive
+/// and clears the route on drop, so between sessions haptic events are
+/// ignored rather than counted as drops against a closed channel. Leaves
+/// the slot alone if another session has installed its sender since.
+struct HapticRoute {
+    slot: &'static HapticSlot,
+    tx: mpsc::Sender<HapticEvent>,
+}
+
+impl HapticRoute {
+    fn install(slot: &'static HapticSlot, tx: mpsc::Sender<HapticEvent>) -> Self {
+        if let Ok(mut guard) = slot.write() {
+            *guard = Some(tx.clone());
+        }
+        Self { slot, tx }
+    }
+}
+
+impl Drop for HapticRoute {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.slot.write() {
+            if guard.as_ref().is_some_and(|current| current.same_channel(&self.tx)) {
+                *guard = None;
             }
         }
     }
@@ -681,6 +711,43 @@ async fn handle_tcp_control(
             }
         }
     }
+}
+
+/// Serve the session's control connection on the "tcp-control" task and
+/// return where its disconnect reason will arrive. If the session ends on
+/// our side first (UDP setup failed, frame source closed, engine shutdown),
+/// `ctl.cancel` fires and the task drops the connection, closing it, rather
+/// than serving it until the HMD hangs up; no reason is sent then.
+fn spawn_control_task(
+    mut ctl: ControlChannel,
+    stream: Box<dyn AsyncStream>,
+) -> tokio::sync::oneshot::Receiver<DisconnectReason> {
+    let (reason_tx, reason_rx) = tokio::sync::oneshot::channel();
+    let cancel = ctl.cancel.clone();
+    spawn_named(&tokio::runtime::Handle::current(), "tcp-control", async move {
+        // Biased toward the connection: when it ends, `handle_tcp_control`
+        // cancels the session itself and returns in the same poll.
+        let result = tokio::select! {
+            biased;
+            result = handle_tcp_control(&mut ctl, stream) => result,
+            _ = cancel.cancelled() => {
+                log::info!("Session ended on the server side — closing the TCP control connection");
+                return;
+            }
+        };
+        let reason = match result {
+            Ok(reason) => {
+                log::info!("TCP control ended: {:?}", reason);
+                reason
+            }
+            Err(e) => {
+                log::warn!("TCP control error: {}", e);
+                DisconnectReason::ConnectionLost
+            }
+        };
+        let _ = reason_tx.send(reason);
+    });
+    reason_rx
 }
 
 /// Hold a real WASAPI [`AudioCapture`] alive on a dedicated thread until
@@ -1363,6 +1430,7 @@ enum SessionEnd {
     Disconnected(DisconnectReason),
     /// The session could not start (UDP sender).
     SetupFailed,
+    /// Engine shutdown, or the frame source is gone.
     Shutdown,
 }
 
@@ -1555,7 +1623,8 @@ impl StreamingLoop {
     }
 
     /// Stream to a connected HMD until it disconnects, the frame source
-    /// closes, or the engine shuts down.
+    /// closes, or the engine shuts down. However it ends, the session's
+    /// control task, audio pipeline, haptic route and tracking peer end with it.
     async fn run_session(&mut self, stream: Box<dyn AsyncStream>, peer: SocketAddr) -> SessionEnd {
         let config = &self.config;
 
@@ -1563,14 +1632,15 @@ impl StreamingLoop {
         // tracking port for the lifetime of this session.
         let _peer_guard = AuthorizedPeerGuard::authorize(&self.authorized_peer, peer.ip());
 
-        // Per-session cancel: fires when TCP drops or HMD disconnects
+        // Per-session cancel: fires when TCP drops or HMD disconnects, and
+        // (via the guard) whenever this function returns, so the control
+        // task and the audio pipeline never outlive the session.
         let session_cancel = CancellationToken::new();
+        let _end_session = session_cancel.clone().drop_guard();
 
         // Haptic event channel (PC driver → TCP → HMD)
         let (haptic_tx, haptic_rx) = mpsc::channel::<HapticEvent>(16);
-        if let Ok(mut guard) = HAPTIC_TX.write() {
-            *guard = Some(haptic_tx);
-        }
+        let _haptic_route = HapticRoute::install(&HAPTIC_TX, haptic_tx);
 
         // Sleep-mode transition channel: `check_sleep_mode` on the frame
         // loop pushes `true` (entering sleep) or `false` (waking) here, and
@@ -1597,27 +1667,14 @@ impl StreamingLoop {
 
         // Spawn TCP control reader/writer. It reports the disconnect reason
         // for the hold logic.
-        let mut control = ControlChannel {
+        let control = ControlChannel {
             cancel: session_cancel.clone(),
             events: events_tx,
             osc_bridge,
             haptic_rx,
             sleep_rx,
         };
-        let (reason_tx, mut reason_rx) = tokio::sync::oneshot::channel();
-        spawn_named(&tokio::runtime::Handle::current(), "tcp-control", async move {
-            let reason = match handle_tcp_control(&mut control, stream).await {
-                Ok(reason) => {
-                    log::info!("TCP control ended: {:?}", reason);
-                    reason
-                }
-                Err(e) => {
-                    log::warn!("TCP control error: {}", e);
-                    DisconnectReason::ConnectionLost
-                }
-            };
-            let _ = reason_tx.send(reason);
-        });
+        let reason_rx = spawn_control_task(control, stream);
 
         if config.foveated.enabled {
             log::info!(
@@ -1635,7 +1692,6 @@ impl StreamingLoop {
             Ok(s) => s,
             Err(e) => {
                 log::error!("UDP sender failed: {}", e);
-                session_cancel.cancel();
                 return SessionEnd::SetupFailed;
             }
         };
@@ -1676,7 +1732,6 @@ impl StreamingLoop {
         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         status_tick.tick().await; // first tick is immediate; we just published
 
-        let mut ended_by_control = false;
         loop {
             tokio::select! {
                 _ = status_tick.tick() => {
@@ -1694,7 +1749,10 @@ impl StreamingLoop {
                 }
                 frame_opt = self.frame_rx.recv() => {
                     let Some(frame) = frame_opt else {
-                        break; // Channel closed (engine shutdown)
+                        // Every sender is gone (the engine is being
+                        // dropped), so nothing more can be streamed.
+                        log::info!("Frame source closed — stopping streaming");
+                        return SessionEnd::Shutdown;
                     };
                     video.send_frame(frame, framerate, &self.latency_tracker).await;
 
@@ -1728,7 +1786,6 @@ impl StreamingLoop {
                 }
                 _ = session_cancel.cancelled() => {
                     log::info!("Session ended — waiting for new connection");
-                    ended_by_control = true;
                     break;
                 }
                 _ = self.cancel.cancelled() => {
@@ -1738,18 +1795,12 @@ impl StreamingLoop {
             }
         }
 
-        // The control task cancels the session just before it reports why,
-        // so wait briefly for the reason. If the frame source ended the
-        // session instead, the control task may still be running: count it
-        // as a lost connection.
-        let reason = if ended_by_control {
-            tokio::time::timeout(std::time::Duration::from_secs(1), reason_rx)
-                .await
-                .ok()
-                .and_then(Result::ok)
-        } else {
-            reason_rx.try_recv().ok()
-        };
+        // Only the control task cancels the session while it runs, just
+        // before it reports why, so wait briefly for the reason.
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(1), reason_rx)
+            .await
+            .ok()
+            .and_then(Result::ok);
         SessionEnd::Disconnected(reason.unwrap_or(DisconnectReason::ConnectionLost))
     }
 
@@ -1959,6 +2010,89 @@ mod tests {
         if let Ok(mut guard) = HAPTIC_TX.write() {
             *guard = None;
         }
+    }
+
+    // The route tests use their own slots: HAPTIC_TX is shared with the
+    // queue_haptic tests above, which run in parallel.
+    #[test]
+    fn test_haptic_route_cleared_when_session_ends() {
+        static SLOT: HapticSlot = std::sync::RwLock::new(None);
+        let (tx, _rx) = mpsc::channel::<HapticEvent>(1);
+        let route = HapticRoute::install(&SLOT, tx);
+        assert!(SLOT.read().unwrap().is_some());
+        drop(route);
+        assert!(SLOT.read().unwrap().is_none(), "a finished session must not keep receiving haptics");
+    }
+
+    #[test]
+    fn test_haptic_route_keeps_newer_session_sender() {
+        static SLOT: HapticSlot = std::sync::RwLock::new(None);
+        let (old_tx, _old_rx) = mpsc::channel::<HapticEvent>(1);
+        let (new_tx, _new_rx) = mpsc::channel::<HapticEvent>(1);
+        let old_route = HapticRoute::install(&SLOT, old_tx);
+        let new_route = HapticRoute::install(&SLOT, new_tx.clone());
+        drop(old_route);
+        assert!(SLOT.read().unwrap().as_ref().is_some_and(|tx| tx.same_channel(&new_tx)));
+        drop(new_route);
+        assert!(SLOT.read().unwrap().is_none());
+    }
+
+    /// A control channel on a fresh session token, plus the senders that
+    /// keep its haptic and sleep inputs open.
+    fn test_control_channel(
+        cancel: &CancellationToken,
+    ) -> (ControlChannel, mpsc::Sender<HapticEvent>, mpsc::Sender<bool>) {
+        let (haptic_tx, haptic_rx) = mpsc::channel::<HapticEvent>(16);
+        let (sleep_tx, sleep_rx) = mpsc::channel::<bool>(8);
+        let (events_tx, _events_rx) = mpsc::channel::<ControlEvent>(CONTROL_EVENT_CAPACITY);
+        let control = ControlChannel {
+            cancel: cancel.clone(),
+            events: events_tx,
+            osc_bridge: crate::face_tracking::osc_bridge::OscBridge::with_smoothing(0.5),
+            haptic_rx,
+            sleep_rx,
+        };
+        (control, haptic_tx, sleep_tx)
+    }
+
+    #[tokio::test]
+    async fn test_control_task_closes_connection_when_session_ends() {
+        use tokio::io::AsyncReadExt;
+        let (mut hmd, server) = tokio::io::duplex(4096);
+        let cancel = CancellationToken::new();
+        let (control, _haptic_tx, _sleep_tx) = test_control_channel(&cancel);
+        let reason_rx = spawn_control_task(control, Box::new(server));
+
+        // The HMD stays connected; the session ends on our side (UDP setup
+        // failure, frame source closed, engine shutdown).
+        cancel.cancel();
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), hmd.read_to_end(&mut rest))
+            .await
+            .expect("the control connection must close when the session ends")
+            .unwrap();
+        assert!(reason_rx.await.is_err(), "no disconnect reason when our side ended the session");
+    }
+
+    #[tokio::test]
+    async fn test_control_task_reports_client_disconnect() {
+        use tokio::io::AsyncWriteExt;
+        let (mut hmd, server) = tokio::io::duplex(4096);
+        let cancel = CancellationToken::new();
+        let (control, _haptic_tx, _sleep_tx) = test_control_channel(&cancel);
+        let reason_rx = spawn_control_task(control, Box::new(server));
+
+        hmd.write_all(&build_tcp_msg(fvp_common::protocol::msg_type::DISCONNECT, &[]))
+            .await
+            .unwrap();
+
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(2), reason_rx)
+            .await
+            .expect("the control task must report why the connection ended")
+            .unwrap();
+        assert_eq!(reason, DisconnectReason::ClientRequested);
+        assert!(cancel.is_cancelled(), "the control task ends the session");
     }
 
     // The explicit `0u64 * tick` / `1u64 * tick` form in these tests is
