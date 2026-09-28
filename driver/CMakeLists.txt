@@ -24,9 +24,13 @@ if(DRIVER_SOURCES)
     target_link_libraries(driver_focus_vision_pcvr PRIVATE
         "${RUST_TARGET_DIR}/streaming_engine.lib"
         ws2_32 userenv ntdll bcrypt d3d11 dxgi propsys ole32 oleaut32 runtimeobject)
+    # SteamVR loads the DLL from <driver>/bin/win64/. A multi-config
+    # generator (Visual Studio, used by CI and build.bat) appends a
+    # per-config folder (bin/win64/Release/) unless the path contains a
+    # generator expression, so wrap it in one.
     set_target_properties(driver_focus_vision_pcvr PROPERTIES
         OUTPUT_NAME "driver_focus_vision_pcvr"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/focus_vision_pcvr/bin/win64")
+        RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/focus_vision_pcvr/bin/win64>")
     add_custom_command(TARGET driver_focus_vision_pcvr POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
             "${CMAKE_SOURCE_DIR}/driver.vrdrivermanifest"

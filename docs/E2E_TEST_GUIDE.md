@@ -41,7 +41,7 @@ HomeタブのInstall Driverボタンを押す。
 ### 方法B: 手動
 ```bash
 # SteamVRのドライバーフォルダーにコピー
-cp -r driver/build/Release/focus_vision_pcvr/ \
+cp -r driver/build/focus_vision_pcvr/ \
   "C:/Program Files (x86)/Steam/steamapps/common/SteamVR/drivers/"
 ```
 

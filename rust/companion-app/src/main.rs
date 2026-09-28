@@ -69,6 +69,9 @@ pub(crate) struct CompanionApp {
     // Driver state
     pub(crate) steamvr_dir: Option<PathBuf>,
     pub(crate) driver_installed: bool,
+    /// Set when the installer registered the driver with SteamVR
+    /// (`vrpathreg`) instead of it being copied into SteamVR's folder.
+    pub(crate) driver_registered_at: Option<PathBuf>,
     pub(crate) driver_status: String,
 
     // ADB state
@@ -210,10 +213,14 @@ impl CompanionApp {
         let mut app = Self::with_config(demo_mode, simulate, config::LocalConfig::load());
 
         app.steamvr_dir = driver::find_steamvr_drivers_dir();
-        app.driver_installed = app.steamvr_dir.as_ref()
-            .map(|d| driver::is_driver_installed(d))
-            .unwrap_or(false);
-        app.driver_status = if app.steamvr_dir.is_none() {
+        app.driver_registered_at = driver::find_registered_driver();
+        app.driver_installed = app.driver_registered_at.is_some()
+            || app.steamvr_dir.as_ref()
+                .map(|d| driver::is_driver_installed(d))
+                .unwrap_or(false);
+        app.driver_status = if app.driver_registered_at.is_some() {
+            "Driver registered with SteamVR".to_string()
+        } else if app.steamvr_dir.is_none() {
             "SteamVR not found".to_string()
         } else if app.driver_installed {
             "Driver installed".to_string()
@@ -231,6 +238,7 @@ impl CompanionApp {
         Self {
             steamvr_dir: None,
             driver_installed: false,
+            driver_registered_at: None,
             driver_status: "SteamVR not found".to_string(),
             adb_path: None,
             devices: Vec::new(),
@@ -320,13 +328,38 @@ impl CompanionApp {
     }
 }
 
-/// Load custom fonts from DESIGN.md: Instrument Serif (brand) + Geist (UI)
-/// + Geist Mono (stats/data). Missing font files fall back to egui defaults.
+/// Read `fonts/<file>` next to the exe (installer, release zip) or, failing
+/// that, in the working directory (`cargo run` from the repo). A file egui
+/// cannot parse is skipped: egui panics on one, and a CI download that saved
+/// an HTML 404 page as `.ttf` once crashed every launch of the installed app.
+fn read_font(file: &str) -> Option<Vec<u8>> {
+    let exe_dir = std::env::current_exe().ok()
+        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()));
+    let candidates = exe_dir.map(|d| d.join("fonts").join(file)).into_iter()
+        .chain(std::iter::once(PathBuf::from("fonts").join(file)));
+    for path in candidates {
+        let Ok(data) = std::fs::read(&path) else { continue };
+        if font_parses(&data) {
+            return Some(data);
+        }
+        log::warn!("Ignoring {}: not a font egui can load", path.display());
+    }
+    None
+}
+
+/// The same parse egui runs on font data (ab_glyph), without the panic.
+fn font_parses(data: &[u8]) -> bool {
+    ab_glyph::FontRef::try_from_slice(data).is_ok()
+}
+
+/// Load custom fonts from DESIGN.md: Instrument Serif (brand), Geist (UI)
+/// and Geist Mono (stats/data). Missing or unreadable font files fall back
+/// to egui defaults.
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
     // Instrument Serif for brand/display text
-    if let Ok(data) = std::fs::read("fonts/InstrumentSerif-Regular.ttf") {
+    if let Some(data) = read_font("InstrumentSerif-Regular.ttf") {
         fonts.font_data.insert(
             "InstrumentSerif".to_string(),
             egui::FontData::from_owned(data).into(),
@@ -337,7 +370,7 @@ fn install_fonts(ctx: &egui::Context) {
     }
 
     // Geist for UI body text
-    if let Ok(data) = std::fs::read("fonts/Geist-Regular.ttf") {
+    if let Some(data) = read_font("Geist-Regular.ttf") {
         fonts.font_data.insert(
             "Geist".to_string(),
             egui::FontData::from_owned(data).into(),
@@ -349,7 +382,7 @@ fn install_fonts(ctx: &egui::Context) {
     }
 
     // Geist Mono for stats/data
-    if let Ok(data) = std::fs::read("fonts/GeistMono-Regular.ttf") {
+    if let Some(data) = read_font("GeistMono-Regular.ttf") {
         fonts.font_data.insert(
             "GeistMono".to_string(),
             egui::FontData::from_owned(data).into(),
@@ -826,6 +859,19 @@ mod tests {
     #[test]
     fn parse_flags_order_independent() {
         assert_eq!(flags(&["foo", "--simulate", "bar"]), (false, true));
+    }
+
+    #[test]
+    fn font_check_accepts_real_fonts_and_rejects_an_html_page() {
+        // REGRESSION: CI saved GitHub's 404 page as Geist-Regular.ttf and
+        // egui panicked on it at every launch of the installed app.
+        let defaults = eframe::egui::FontDefinitions::default();
+        assert!(!defaults.font_data.is_empty());
+        for data in defaults.font_data.values() {
+            assert!(super::font_parses(&data.font));
+        }
+        assert!(!super::font_parses(b"<!DOCTYPE html><html><head><title>Page not found"));
+        assert!(!super::font_parses(b""));
     }
 
     // --- status state machine (no filesystem, no egui context) ---

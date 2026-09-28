@@ -98,17 +98,25 @@ jobs:
           # so the real VR path and its binary are unaffected.
           run: cargo build --release -p focus-vision-companion --features simulator
         - name: Download fonts
+          # -f: an HTTP error fails the step. The Geist URLs once moved and
+          # curl saved GitHub's 404 page as .ttf, which the installer shipped
+          # and egui panicked on at every launch.
           shell: bash
           run: |
             mkdir -p dist/fonts
-            # Instrument Serif from Google Fonts API
-            curl -sL -o dist/fonts/InstrumentSerif-Regular.ttf \
-              "https://github.com/google/fonts/raw/main/ofl/instrumentserif/InstrumentSerif-Regular.ttf" || true
-            # Geist from Vercel
-            curl -sL -o dist/fonts/Geist-Regular.ttf \
-              "https://github.com/vercel/geist-font/raw/main/packages/geist-font/fonts/geist-sans/Geist-Regular.ttf" || true
-            curl -sL -o dist/fonts/GeistMono-Regular.ttf \
-              "https://github.com/vercel/geist-font/raw/main/packages/geist-mono/fonts/geist-mono/GeistMono-Regular.ttf" || true
+            # Instrument Serif from Google Fonts
+            curl -fsSL -o dist/fonts/InstrumentSerif-Regular.ttf \
+              "https://github.com/google/fonts/raw/main/ofl/instrumentserif/InstrumentSerif-Regular.ttf"
+            # Geist from Vercel, pinned to a release tag
+            curl -fsSL -o dist/fonts/Geist-Regular.ttf \
+              "https://github.com/vercel/geist-font/raw/v1.7.2/fonts/Geist/ttf/Geist-Regular.ttf"
+            curl -fsSL -o dist/fonts/GeistMono-Regular.ttf \
+              "https://github.com/vercel/geist-font/raw/v1.7.2/fonts/GeistMono/ttf/GeistMono-Regular.ttf"
+            # A TrueType file starts with 00 01 00 00; an HTML page does not.
+            for f in dist/fonts/*.ttf; do
+              [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" = "00010000" ] \
+                || { echo "::error::$f is not a TrueType font"; exit 1; }
+            done
             ls -la dist/fonts/
         - name: Sign focus-vision.exe (Authenticode)
           # Skipped when secrets are not configured (PR builds, forks).
@@ -147,6 +155,13 @@ jobs:
         - run: cargo build --release -p streaming-engine
         - run: cmake -B driver/build -S driver -DCMAKE_BUILD_TYPE=Release
         - run: cmake --build driver/build --config Release
+        - name: Check the driver layout
+          # SteamVR loads <driver>/bin/win64/driver_<name>.dll; the installer
+          # and the release zip ship this folder as is.
+          shell: bash
+          run: |
+            test -f driver/build/focus_vision_pcvr/driver.vrdrivermanifest
+            test -f driver/build/focus_vision_pcvr/bin/win64/driver_focus_vision_pcvr.dll
         - name: Run C++ tests
           run: ctest --test-dir driver/build --build-config Release --output-on-failure
         - uses: actions/upload-artifact@v4
