@@ -9,7 +9,7 @@ use crate::config::AppConfig;
 use crate::control::tcp_server::{AsyncStream, TcpControlServer};
 use crate::metrics::latency::{FrameTimestamps, LatencyTracker};
 use crate::pipeline;
-use crate::tracking::receiver::{AuthorizedPeer, TrackingReceiver};
+use crate::tracking::receiver::{AuthorizedPeer, ControllerSlots, TrackingReceiver};
 use crate::transport::rtp::RtpPacketizer;
 use crate::transport::udp::UdpSender;
 use fvp_common::protocol::{ControllerState, TrackingData};
@@ -235,7 +235,7 @@ pub struct StreamingEngine {
     runtime: Runtime,
     frame_tx: mpsc::Sender<EncodedFrame>,
     latest_tracking: Arc<StdMutex<Option<TrackingData>>>,
-    latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>>,
+    latest_controllers: ControllerSlots,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
     cancel_token: CancellationToken,
     #[allow(dead_code)] // Available for future config queries
@@ -270,12 +270,14 @@ impl StreamingEngine {
 
         let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(4);
         let latest_tracking = Arc::new(StdMutex::new(None));
-        let latest_controllers: Arc<StdMutex<[Option<ControllerState>; 2]>> =
-            Arc::new(StdMutex::new([None, None]));
+        let latest_controllers: ControllerSlots = Arc::new(StdMutex::new([None, None]));
         let latency_tracker = Arc::new(StdMutex::new(LatencyTracker::new(config.video.framerate as usize)));
 
         let cancel_token = CancellationToken::new();
-        let tracking_clone = latest_tracking.clone();
+        let session_inputs = HmdInputs {
+            head: latest_tracking.clone(),
+            controllers: latest_controllers.clone(),
+        };
         let tracker_clone = latency_tracker.clone();
         let config_clone = config.clone();
         // Paired HMD address: written by the session loop, read by the
@@ -288,7 +290,7 @@ impl StreamingEngine {
         let stream_cancel = cancel_token.clone();
         spawn_named(runtime.handle(), "streaming", async move {
             tokio::select! {
-                result = run_streaming(config_clone, frame_rx, tracking_clone, tracker_clone, session_peer, stream_cancel) => {
+                result = run_streaming(config_clone, frame_rx, session_inputs, tracker_clone, session_peer, stream_cancel) => {
                     if let Err(e) = result {
                         log::error!("Streaming engine error: {}", e);
                     }
@@ -399,11 +401,12 @@ impl StreamingEngine {
     }
 
     /// Get latest controller state. Called from C++ thread.
-    /// `id`: 0 = left, 1 = right.
+    /// `id`: 0 = left, 1 = right. `None` once the controller has gone quiet
+    /// for [`CONTROLLER_STALE_AFTER`], so the driver releases its inputs.
     pub fn get_controller(&self, id: u8) -> Option<ControllerState> {
         let guard = self.latest_controllers.lock().map_err(|e| log::error!("Controller lock poisoned: {}", e)).ok()?;
-        let idx = id as usize;
-        if idx < 2 { guard[idx] } else { None }
+        let slot = *guard.get(id as usize)?;
+        fresh_controller_state(slot, std::time::Instant::now())
     }
 
     /// Cancel all async tasks for graceful shutdown.
@@ -424,6 +427,22 @@ impl StreamingEngine {
             }
         }
     }
+}
+
+/// The HMD sends each controller's state every frame (~11 ms at 90 Hz)
+/// while that controller is tracked, and stops when it isn't. A state this
+/// old is from a controller that went away — reporting it would keep its
+/// last trigger/stick values pressed in SteamVR.
+pub(crate) const CONTROLLER_STALE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The controller state in `slot` if it arrived within
+/// [`CONTROLLER_STALE_AFTER`] of `now`.
+fn fresh_controller_state(
+    slot: Option<(ControllerState, std::time::Instant)>,
+    now: std::time::Instant,
+) -> Option<ControllerState> {
+    slot.filter(|(_, received_at)| now.saturating_duration_since(*received_at) <= CONTROLLER_STALE_AFTER)
+        .map(|(state, _)| state)
 }
 
 /// Heartbeat stats received from HMD.
@@ -495,6 +514,36 @@ impl ControlChannel {
     }
 }
 
+/// A control connection without a message for this long is dead: the HMD
+/// sends a HEARTBEAT every HEARTBEAT_INTERVAL_MS.
+const CONTROL_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_millis(
+    fvp_common::HEARTBEAT_INTERVAL_MS * fvp_common::HEARTBEAT_MAX_MISSES as u64,
+);
+
+/// Take the next complete `[length u32 LE][type][payload]` message (type +
+/// payload) off the front of `inbox`. `Ok(None)` until one has fully
+/// arrived; `Err(length)` for a length over MAX_MSG_LEN, after which the
+/// stream can't be trusted.
+fn take_control_message(inbox: &mut Vec<u8>) -> Result<Option<Vec<u8>>, usize> {
+    loop {
+        if inbox.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes([inbox[0], inbox[1], inbox[2], inbox[3]]) as usize;
+        if len == 0 {
+            inbox.drain(..4); // an empty frame carries nothing
+            continue;
+        }
+        if len > fvp_common::MAX_MSG_LEN {
+            return Err(len);
+        }
+        if inbox.len() < 4 + len {
+            return Ok(None);
+        }
+        return Ok(Some(inbox.drain(..4 + len).skip(4).collect()));
+    }
+}
+
 /// Serve `ctl`'s connection until it closes, cancelling `ctl.cancel` then.
 /// Returns the disconnect reason so the caller can decide whether to hold
 /// state.
@@ -511,190 +560,210 @@ async fn handle_tcp_control(
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut last_config_update = std::time::Instant::now() - std::time::Duration::from_secs(2);
 
-    /// Send a framed message to the HMD.
+    /// Send a framed message to the HMD in one write (one TLS record) rather
+    /// than three.
     async fn send_msg<W: AsyncWriteExt + Unpin>(writer: &mut W, msg_type: u8, payload: &[u8]) -> std::io::Result<()> {
-        let len = (1 + payload.len()) as u32;
-        writer.write_all(&len.to_le_bytes()).await?;
-        writer.write_all(&[msg_type]).await?;
-        writer.write_all(payload).await?;
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
+        frame.push(msg_type);
+        frame.extend_from_slice(payload);
+        writer.write_all(&frame).await?;
         writer.flush().await?;
         Ok(())
     }
 
-    let mut msg_buf: Vec<u8> = Vec::with_capacity(256);
+    // Bytes read but not yet framed into a message. `read` — unlike
+    // `read_exact` — is cancel-safe, so a haptic or sleep event winning the
+    // select! below mid-message cannot lose part of it.
+    let mut inbox: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    // Reset by every read; fires after CONTROL_SILENCE_LIMIT without one.
+    let silence = tokio::time::sleep(CONTROL_SILENCE_LIMIT);
+    tokio::pin!(silence);
     let mut last_idr_time = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut idr_suppressed: u64 = 0;
 
     loop {
         // Concurrently: read inbound messages OR send haptic events
-        let mut len_buf = [0u8; 4];
         tokio::select! {
-            read_result = reader.read_exact(&mut len_buf) => {
-                if read_result.is_err() {
-                    log::info!("TCP control connection lost");
-                    cancel.cancel();
-                    return Ok(DisconnectReason::ConnectionLost);
-                }
-                let len = u32::from_le_bytes(len_buf) as usize;
-                if len == 0 { continue; }
-                if len > fvp_common::MAX_MSG_LEN {
-                    log::error!("TCP message too large ({} bytes), closing connection", len);
-                    cancel.cancel();
-                    return Ok(DisconnectReason::ProtocolError);
-                }
+            read_result = reader.read(&mut chunk) => {
+                let n = match read_result {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        log::info!("TCP control connection lost");
+                        cancel.cancel();
+                        return Ok(DisconnectReason::ConnectionLost);
+                    }
+                };
+                inbox.extend_from_slice(&chunk[..n]);
+                silence.as_mut().reset(tokio::time::Instant::now() + CONTROL_SILENCE_LIMIT);
 
-                msg_buf.clear();
-                msg_buf.resize(len, 0);
-                if reader.read_exact(&mut msg_buf).await.is_err() {
-                    log::info!("TCP control read failed mid-message");
-                    cancel.cancel();
-                    return Ok(DisconnectReason::ConnectionLost);
-                }
-                let msg_type = msg_buf[0];
+                // Handle every complete message now in the inbox.
+                loop {
+                    let msg = match take_control_message(&mut inbox) {
+                        Ok(Some(msg)) => msg,
+                        Ok(None) => break,
+                        Err(len) => {
+                            log::error!("TCP message too large ({} bytes), closing connection", len);
+                            cancel.cancel();
+                            return Ok(DisconnectReason::ProtocolError);
+                        }
+                    };
+                    let msg_type = msg[0];
+                    let payload = &msg[1..];
 
-                match msg_type {
-                    fvp_common::protocol::msg_type::IDR_REQUEST => {
-                        // Rate limit IDR requests: max 2/sec to prevent storm from slice timeouts
-                        let now = std::time::Instant::now();
-                        let should_fire = {
-                            let elapsed = now.duration_since(last_idr_time);
-                            elapsed >= std::time::Duration::from_millis(500)
-                        };
-                        if should_fire {
-                            last_idr_time = now;
-                            log::info!("Received IDR_REQUEST from client");
-                            notify_idr_request();
-                        } else {
-                            idr_suppressed += 1;
-                            if idr_suppressed % 10 == 1 {
-                                log::warn!("IDR_REQUEST suppressed (rate limit, {} total)", idr_suppressed);
+                    match msg_type {
+                        fvp_common::protocol::msg_type::IDR_REQUEST => {
+                            // Rate limit IDR requests: max 2/sec to prevent storm from slice timeouts
+                            let now = std::time::Instant::now();
+                            let should_fire = {
+                                let elapsed = now.duration_since(last_idr_time);
+                                elapsed >= std::time::Duration::from_millis(500)
+                            };
+                            if should_fire {
+                                last_idr_time = now;
+                                log::info!("Received IDR_REQUEST from client");
+                                notify_idr_request();
+                            } else {
+                                idr_suppressed += 1;
+                                if idr_suppressed % 10 == 1 {
+                                    log::warn!("IDR_REQUEST suppressed (rate limit, {} total)", idr_suppressed);
+                                }
                             }
                         }
-                    }
-                    fvp_common::protocol::msg_type::HEARTBEAT => {
-                        let payload = &msg_buf[1..];
-                        if payload.len() >= 26 {
-                            let stats_offset = 12;
-                            let s = &payload[stats_offset..];
-                            let packets_received = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                            let packets_lost = u32::from_le_bytes([s[4], s[5], s[6], s[7]]);
-                            let avg_decode_us = u32::from_le_bytes([s[8], s[9], s[10], s[11]]);
-                            let fps = u16::from_le_bytes([s[12], s[13]]);
+                        fvp_common::protocol::msg_type::HEARTBEAT => {
+                            if payload.len() >= 26 {
+                                let stats_offset = 12;
+                                let s = &payload[stats_offset..];
+                                let packets_received = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                                let packets_lost = u32::from_le_bytes([s[4], s[5], s[6], s[7]]);
+                                let avg_decode_us = u32::from_le_bytes([s[8], s[9], s[10], s[11]]);
+                                let fps = u16::from_le_bytes([s[12], s[13]]);
 
-                            ctl.forward(ControlEvent::Heartbeat(HmdStats {
-                                packets_received,
-                                packets_lost,
-                                avg_decode_us,
-                                fps,
-                            }));
+                                ctl.forward(ControlEvent::Heartbeat(HmdStats {
+                                    packets_received,
+                                    packets_lost,
+                                    avg_decode_us,
+                                    fps,
+                                }));
 
-                            // Send HEARTBEAT_ACK with PC-side latency for waterfall overlay
-                            let encode_us = PC_ENCODE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
-                            let total_us = PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
-                            let mut ack_payload = Vec::with_capacity(8);
-                            ack_payload.extend_from_slice(&encode_us.to_le_bytes());
-                            ack_payload.extend_from_slice(&total_us.to_le_bytes());
-                            if let Err(e) = send_msg(&mut writer,
-                                fvp_common::protocol::msg_type::HEARTBEAT_ACK,
-                                &ack_payload).await {
-                                log::warn!("Failed to send HEARTBEAT_ACK: {}", e);
+                                // Send HEARTBEAT_ACK with PC-side latency for waterfall overlay
+                                let encode_us = PC_ENCODE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
+                                let total_us = PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
+                                let mut ack_payload = Vec::with_capacity(8);
+                                ack_payload.extend_from_slice(&encode_us.to_le_bytes());
+                                ack_payload.extend_from_slice(&total_us.to_le_bytes());
+                                if let Err(e) = send_msg(&mut writer,
+                                    fvp_common::protocol::msg_type::HEARTBEAT_ACK,
+                                    &ack_payload).await {
+                                    log::warn!("Failed to send HEARTBEAT_ACK: {}", e);
+                                }
                             }
                         }
-                    }
-                    fvp_common::protocol::msg_type::FACE_DATA => {
-                        let payload = &msg_buf[1..];
-                        log::debug!("engine: FACE_DATA received, payload {}B", payload.len());
-                        if let Some((lip_valid, eye_valid, lip, eye)) =
-                            crate::face_tracking::osc_bridge::parse_face_data(payload)
-                        {
-                            log::debug!("engine: forwarding face data to OscBridge (lip_valid={}, eye_valid={})", lip_valid, eye_valid);
-                            ctl.osc_bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
-                        } else {
-                            log::warn!("engine: FACE_DATA parse failed ({}B)", payload.len());
+                        fvp_common::protocol::msg_type::FACE_DATA => {
+                            log::debug!("engine: FACE_DATA received, payload {}B", payload.len());
+                            if let Some((lip_valid, eye_valid, lip, eye)) =
+                                crate::face_tracking::osc_bridge::parse_face_data(payload)
+                            {
+                                log::debug!("engine: forwarding face data to OscBridge (lip_valid={}, eye_valid={})", lip_valid, eye_valid);
+                                ctl.osc_bridge.send_face_data(lip_valid, eye_valid, &lip, &eye);
+                            } else {
+                                log::warn!("engine: FACE_DATA parse failed ({}B)", payload.len());
+                            }
                         }
-                    }
-                    fvp_common::protocol::msg_type::TRANSPORT_FEEDBACK => {
-                        let payload = &msg_buf[1..];
-                        if let Some(entries) = fvp_common::protocol::parse_transport_feedback(payload) {
-                            log::debug!("Received TRANSPORT_FEEDBACK: {} entries", entries.len());
-                            ctl.forward(ControlEvent::TransportFeedback(entries));
-                        } else {
-                            log::warn!("Invalid TRANSPORT_FEEDBACK payload ({}B)", payload.len());
+                        fvp_common::protocol::msg_type::TRANSPORT_FEEDBACK => {
+                            if let Some(entries) = fvp_common::protocol::parse_transport_feedback(payload) {
+                                log::debug!("Received TRANSPORT_FEEDBACK: {} entries", entries.len());
+                                ctl.forward(ControlEvent::TransportFeedback(entries));
+                            } else {
+                                log::warn!("Invalid TRANSPORT_FEEDBACK payload ({}B)", payload.len());
+                            }
                         }
-                    }
-                    fvp_common::protocol::msg_type::CONFIG_UPDATE => {
-                        // HMD dashboard requests a config change.
-                        // Payload: [key:1B][value:4B LE]
-                        // Keys: 0x01=bitrate_mbps(u32), 0x02=codec(0=h264,1=h265)
-                        // Rate limit: ignore if <1s since last update
-                        let payload = &msg_buf[1..];
-                        let elapsed = last_config_update.elapsed();
-                        if elapsed < std::time::Duration::from_millis(CONFIG_UPDATE_MIN_INTERVAL_MS) {
-                            log::warn!("CONFIG_UPDATE rate limited ({:?} since last)", elapsed);
-                            continue;
-                        }
-                        if payload.len() >= 5 {
-                            last_config_update = std::time::Instant::now();
-                            let key = payload[0];
-                            let value = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-                            let mut ack_status: u8 = 0x00; // 0=rejected, 1=accepted
-                            match key {
-                                0x01 => { // bitrate_mbps
-                                    if (10..=200).contains(&value) {
-                                        log::info!("CONFIG_UPDATE: bitrate → {} Mbps", value);
-                                        notify_bitrate_change(value * 1_000_000);
+                        fvp_common::protocol::msg_type::CONFIG_UPDATE => {
+                            // HMD dashboard requests a config change.
+                            // Payload: [key:1B][value:4B LE]
+                            // Keys: 0x01=bitrate_mbps(u32), 0x02=codec(0=h264,1=h265)
+                            // Rate limit: ignore if <1s since last update
+                            let elapsed = last_config_update.elapsed();
+                            if elapsed < std::time::Duration::from_millis(CONFIG_UPDATE_MIN_INTERVAL_MS) {
+                                log::warn!("CONFIG_UPDATE rate limited ({:?} since last)", elapsed);
+                                continue;
+                            }
+                            if payload.len() >= 5 {
+                                last_config_update = std::time::Instant::now();
+                                let key = payload[0];
+                                let value = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                                let mut ack_status: u8 = 0x00; // 0=rejected, 1=accepted
+                                match key {
+                                    0x01 => { // bitrate_mbps
+                                        if (10..=200).contains(&value) {
+                                            log::info!("CONFIG_UPDATE: bitrate → {} Mbps", value);
+                                            notify_bitrate_change(value * 1_000_000);
+                                            ack_status = 0x01;
+                                        } else {
+                                            log::warn!("CONFIG_UPDATE: bitrate {} out of range", value);
+                                        }
+                                    }
+                                    0x02 => { // codec (0=h264, 1=h265)
+                                        log::info!("CONFIG_UPDATE: codec → {}", if value == 0 { "h264" } else { "h265" });
+                                        // Codec change requires stream restart — acknowledged but deferred
                                         ack_status = 0x01;
-                                    } else {
-                                        log::warn!("CONFIG_UPDATE: bitrate {} out of range", value);
+                                    }
+                                    0x03 => { // recording (0=off, 1=on)
+                                        ack_status = crate::recording::apply_recording_config_update(
+                                            value, &RECORDING_ENABLED,
+                                        );
+                                        log::info!(
+                                            "CONFIG_UPDATE: recording → {} (ack={})",
+                                            if value == 1 { "on" } else if value == 0 { "off" } else { "rejected" },
+                                            ack_status,
+                                        );
+                                    }
+                                    0x05 => { // audio recording (0=off, 1=on)
+                                        ack_status = crate::recording::apply_audio_recording_config_update(
+                                            value, &AUDIO_RECORDING_ENABLED,
+                                        );
+                                        log::info!(
+                                            "CONFIG_UPDATE: audio recording → {} (ack={})",
+                                            if value == 1 { "on" } else if value == 0 { "off" } else { "rejected" },
+                                            ack_status,
+                                        );
+                                    }
+                                    _ => {
+                                        log::warn!("CONFIG_UPDATE: unknown key 0x{:02x}", key);
                                     }
                                 }
-                                0x02 => { // codec (0=h264, 1=h265)
-                                    log::info!("CONFIG_UPDATE: codec → {}", if value == 0 { "h264" } else { "h265" });
-                                    // Codec change requires stream restart — acknowledged but deferred
-                                    ack_status = 0x01;
+                                // Send ACK back to HMD
+                                if let Err(e) = send_msg(&mut writer,
+                                    fvp_common::protocol::msg_type::CONFIG_UPDATE_ACK,
+                                    &[ack_status, key]).await
+                                {
+                                    log::warn!("Failed to send CONFIG_UPDATE_ACK: {}", e);
                                 }
-                                0x03 => { // recording (0=off, 1=on)
-                                    ack_status = crate::recording::apply_recording_config_update(
-                                        value, &RECORDING_ENABLED,
-                                    );
-                                    log::info!(
-                                        "CONFIG_UPDATE: recording → {} (ack={})",
-                                        if value == 1 { "on" } else if value == 0 { "off" } else { "rejected" },
-                                        ack_status,
-                                    );
-                                }
-                                0x05 => { // audio recording (0=off, 1=on)
-                                    ack_status = crate::recording::apply_audio_recording_config_update(
-                                        value, &AUDIO_RECORDING_ENABLED,
-                                    );
-                                    log::info!(
-                                        "CONFIG_UPDATE: audio recording → {} (ack={})",
-                                        if value == 1 { "on" } else if value == 0 { "off" } else { "rejected" },
-                                        ack_status,
-                                    );
-                                }
-                                _ => {
-                                    log::warn!("CONFIG_UPDATE: unknown key 0x{:02x}", key);
-                                }
-                            }
-                            // Send ACK back to HMD
-                            if let Err(e) = send_msg(&mut writer,
-                                fvp_common::protocol::msg_type::CONFIG_UPDATE_ACK,
-                                &[ack_status, key]).await
-                            {
-                                log::warn!("Failed to send CONFIG_UPDATE_ACK: {}", e);
                             }
                         }
-                    }
-                    fvp_common::protocol::msg_type::DISCONNECT => {
-                        log::info!("Client sent DISCONNECT — stopping stream");
-                        cancel.cancel();
-                        return Ok(DisconnectReason::ClientRequested);
-                    }
-                    _ => {
-                        log::warn!("Unknown TCP message type 0x{:02x} (len={}B) — skipping (client may be newer)", msg_type, msg_buf.len() - 1);
+                        fvp_common::protocol::msg_type::DISCONNECT => {
+                            log::info!("Client sent DISCONNECT — stopping stream");
+                            cancel.cancel();
+                            return Ok(DisconnectReason::ClientRequested);
+                        }
+                        _ => {
+                            log::warn!("Unknown TCP message type 0x{:02x} (len={}B) — skipping (client may be newer)", msg_type, payload.len());
+                        }
                     }
                 }
+            }
+            _ = &mut silence => {
+                // The HMD sends a HEARTBEAT every HEARTBEAT_INTERVAL_MS. A
+                // Wi-Fi drop that loses the FIN/RST leaves the read pending
+                // forever: the session would keep sending video to nobody
+                // and refuse the HMD's reconnects until some write failed.
+                log::warn!(
+                    "No message from the HMD for {:?} — treating the connection as lost",
+                    CONTROL_SILENCE_LIMIT,
+                );
+                cancel.cancel();
+                return Ok(DisconnectReason::ConnectionLost);
             }
             Some(haptic) = ctl.haptic_rx.recv() => {
                 let payload = haptic.to_payload();
@@ -1374,40 +1443,64 @@ fn publish_pin_status(server: &TcpControlServer, last: &mut Option<(u32, u32)>) 
     publish_waiting_status(*last);
 }
 
+/// The paired HMD's latest head pose and controller state, as stored by the
+/// tracking receiver and read by the driver every frame.
+#[derive(Clone)]
+struct HmdInputs {
+    head: Arc<StdMutex<Option<TrackingData>>>,
+    controllers: ControllerSlots,
+}
+
+impl HmdInputs {
+    fn clear(&self) {
+        if let Ok(mut head) = self.head.lock() {
+            *head = None;
+        }
+        if let Ok(mut controllers) = self.controllers.lock() {
+            *controllers = [None, None];
+        }
+    }
+}
+
 /// Marks `ip` as the paired HMD for the tracking receiver's source check
-/// while alive, and revokes it on drop — so every way a session can end
-/// (clean break, `continue`, early `return`) closes the tracking port to
-/// that address again.
+/// while alive. On drop it revokes it and clears the HMD's inputs — so
+/// every way a session can end (clean break, `continue`, early `return`)
+/// closes the tracking port to that address again, and SteamVR isn't left
+/// with the last pose or a trigger still held.
 struct AuthorizedPeerGuard {
     peer: AuthorizedPeer,
+    inputs: HmdInputs,
 }
 
 impl AuthorizedPeerGuard {
-    fn authorize(peer: &AuthorizedPeer, ip: std::net::IpAddr) -> Self {
+    fn authorize(peer: &AuthorizedPeer, ip: std::net::IpAddr, inputs: &HmdInputs) -> Self {
         if let Ok(mut guard) = peer.write() {
             *guard = Some(ip);
         }
-        Self { peer: peer.clone() }
+        Self { peer: peer.clone(), inputs: inputs.clone() }
     }
 }
 
 impl Drop for AuthorizedPeerGuard {
     fn drop(&mut self) {
+        // The receiver stores a packet under the read lock, so this waits for
+        // one in flight: nothing from the session lands after the clear.
         if let Ok(mut guard) = self.peer.write() {
             *guard = None;
         }
+        self.inputs.clear();
     }
 }
 
 async fn run_streaming(
     config: AppConfig,
     frame_rx: mpsc::Receiver<EncodedFrame>,
-    tracking: Arc<StdMutex<Option<TrackingData>>>,
+    inputs: HmdInputs,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
     authorized_peer: AuthorizedPeer,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    StreamingLoop::new(config, frame_rx, tracking, latency_tracker, authorized_peer, cancel)
+    StreamingLoop::new(config, frame_rx, inputs, latency_tracker, authorized_peer, cancel)
         .run()
         .await;
     Ok(())
@@ -1425,7 +1518,7 @@ enum Accepted {
     Connected(Box<Connection>),
     /// Accept failed; try again after the backoff.
     Retry,
-    /// Engine shutdown, or too many accept failures.
+    /// Engine shutdown.
     Stop,
 }
 
@@ -1448,7 +1541,7 @@ enum HoldOutcome {
 struct StreamingLoop {
     config: AppConfig,
     frame_rx: mpsc::Receiver<EncodedFrame>,
-    tracking: Arc<StdMutex<Option<TrackingData>>>,
+    inputs: HmdInputs,
     latency_tracker: Arc<StdMutex<LatencyTracker>>,
     authorized_peer: AuthorizedPeer,
     cancel: CancellationToken,
@@ -1468,7 +1561,7 @@ impl StreamingLoop {
     fn new(
         config: AppConfig,
         frame_rx: mpsc::Receiver<EncodedFrame>,
-        tracking: Arc<StdMutex<Option<TrackingData>>>,
+        inputs: HmdInputs,
         latency_tracker: Arc<StdMutex<LatencyTracker>>,
         authorized_peer: AuthorizedPeer,
         cancel: CancellationToken,
@@ -1489,7 +1582,7 @@ impl StreamingLoop {
         Self {
             config,
             frame_rx,
-            tracking,
+            inputs,
             latency_tracker,
             authorized_peer,
             cancel,
@@ -1563,14 +1656,6 @@ impl StreamingLoop {
                     self.reconnect_state.record_protocol_error();
                 }
             }
-
-            if self.reconnect_state.should_stop_engine() {
-                log::error!(
-                    "Max accept failures reached ({}) — stopping engine",
-                    self.reconnect_state.accept_failures(),
-                );
-                break;
-            }
         }
     }
 
@@ -1611,14 +1696,17 @@ impl StreamingLoop {
         match accept_result {
             Ok((stream, peer)) => Accepted::Connected(Box::new(Connection { server, stream, peer })),
             Err(e) => {
-                log::error!("TCP accept failed: {}", e);
                 self.reconnect_state.record_accept_failure();
-                if self.reconnect_state.should_stop_engine() {
+                if self.reconnect_state.is_listener_failing() {
+                    // Keep retrying: an engine that gives up can only be
+                    // revived by restarting SteamVR.
                     log::error!(
-                        "Max accept failures reached ({}) — stopping engine",
+                        "TCP listener keeps failing ({} in a row): {} — still retrying",
                         self.reconnect_state.accept_failures(),
+                        e,
                     );
-                    return Accepted::Stop;
+                } else {
+                    log::warn!("TCP accept failed: {}", e);
                 }
                 Accepted::Retry
             }
@@ -1633,7 +1721,7 @@ impl StreamingLoop {
 
         // Only the HMD that just completed TLS + PIN pairing may feed the
         // tracking port for the lifetime of this session.
-        let _peer_guard = AuthorizedPeerGuard::authorize(&self.authorized_peer, peer.ip());
+        let _peer_guard = AuthorizedPeerGuard::authorize(&self.authorized_peer, peer.ip(), &self.inputs);
 
         // Per-session cancel: fires when TCP drops or HMD disconnects, and
         // (via the guard) whenever this function returns, so the control
@@ -1778,7 +1866,7 @@ impl StreamingLoop {
                     }
 
                     check_sleep_mode(
-                        &self.tracking, &mut adaptive.sleep_detector,
+                        &self.inputs.head, &mut adaptive.sleep_detector,
                         config.video.bitrate_mbps, config.sleep_mode.timeout_seconds,
                         &sleep_tx,
                     );
@@ -2345,6 +2433,73 @@ mod tests {
     }
 
     #[test]
+    fn test_take_control_message_waits_for_whole_messages_and_splits_joined_ones() {
+        let a = build_tcp_msg(fvp_common::protocol::msg_type::HEARTBEAT, &[1, 2, 3]);
+        let b = build_tcp_msg(fvp_common::protocol::msg_type::IDR_REQUEST, &[]);
+        let mut inbox = Vec::new();
+        // A message split across reads is taken only once it is complete.
+        inbox.extend_from_slice(&a[..2]);
+        assert_eq!(take_control_message(&mut inbox), Ok(None));
+        inbox.extend_from_slice(&a[2..]);
+        // Two messages in one read come out one at a time, in order.
+        inbox.extend_from_slice(&b);
+        assert_eq!(take_control_message(&mut inbox), Ok(Some(vec![0x10, 1, 2, 3])));
+        assert_eq!(take_control_message(&mut inbox), Ok(Some(vec![0x30])));
+        assert_eq!(take_control_message(&mut inbox), Ok(None));
+        assert!(inbox.is_empty());
+    }
+
+    #[test]
+    fn test_take_control_message_skips_empty_frames_and_rejects_oversized_ones() {
+        let mut inbox = 0u32.to_le_bytes().to_vec();
+        inbox.extend_from_slice(&build_tcp_msg(fvp_common::protocol::msg_type::HEARTBEAT, &[7]));
+        assert_eq!(take_control_message(&mut inbox), Ok(Some(vec![0x10, 7])));
+
+        let too_long = fvp_common::MAX_MSG_LEN + 1;
+        let mut inbox = (too_long as u32).to_le_bytes().to_vec();
+        assert_eq!(take_control_message(&mut inbox), Err(too_long));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_silent_hmd_connection_is_dropped_after_the_liveness_limit() {
+        // REGRESSION: the read had no timeout, so a Wi-Fi drop that lost the
+        // FIN/RST left the session "streaming" — video to nobody, the HMD's
+        // reconnects refused — until some write happened to fail.
+        let (_hmd, server) = tokio::io::duplex(4096);
+        let cancel = CancellationToken::new();
+        let (mut control, _haptic_tx, _sleep_tx) = test_control_channel(&cancel);
+        let started = tokio::time::Instant::now();
+        let reason = handle_tcp_control(&mut control, Box::new(server)).await.unwrap();
+        assert!(matches!(reason, DisconnectReason::ConnectionLost));
+        assert!(started.elapsed() >= CONTROL_SILENCE_LIMIT);
+        assert!(cancel.is_cancelled(), "the session ends with the connection");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_heartbeats_keep_the_hmd_connection_alive() {
+        use tokio::io::AsyncWriteExt;
+        let (mut hmd, server) = tokio::io::duplex(64 * 1024);
+        let cancel = CancellationToken::new();
+        let (mut control, _haptic_tx, _sleep_tx) = test_control_channel(&cancel);
+        let interval = std::time::Duration::from_millis(fvp_common::HEARTBEAT_INTERVAL_MS);
+        let beats: u32 = 10; // spans well past CONTROL_SILENCE_LIMIT
+        let hmd_task = tokio::spawn(async move {
+            let heartbeat = build_tcp_msg(fvp_common::protocol::msg_type::HEARTBEAT, &[0u8; 26]);
+            for _ in 0..beats {
+                hmd.write_all(&heartbeat).await.unwrap();
+                tokio::time::sleep(interval).await;
+            }
+            hmd // then stays connected, silent
+        });
+        let started = tokio::time::Instant::now();
+        let reason = handle_tcp_control(&mut control, Box::new(server)).await.unwrap();
+        assert!(matches!(reason, DisconnectReason::ConnectionLost));
+        // Alive through every heartbeat; dropped only once they stopped.
+        assert!(started.elapsed() >= interval * (beats - 1) + CONTROL_SILENCE_LIMIT);
+        drop(hmd_task.await.unwrap());
+    }
+
+    #[test]
     fn test_bitrate_adjustment_interval_scales_with_framerate() {
         // At 90fps, adjustment every 90 frames = 1 second
         // At 96fps, adjustment every 96 frames = 1 second
@@ -2470,13 +2625,38 @@ mod tests {
     fn test_authorized_peer_guard_revokes_on_drop() {
         use crate::tracking::receiver::is_authorized_source;
         let peer: AuthorizedPeer = Arc::new(std::sync::RwLock::new(None));
+        let inputs = HmdInputs {
+            head: Arc::new(StdMutex::new(None)),
+            controllers: Arc::new(StdMutex::new([None, None])),
+        };
         let hmd = std::net::IpAddr::from([192, 168, 1, 50]);
         assert!(!is_authorized_source(&peer, hmd), "nothing authorized before a session");
         {
-            let _session = AuthorizedPeerGuard::authorize(&peer, hmd);
+            let _session = AuthorizedPeerGuard::authorize(&peer, hmd, &inputs);
             assert!(is_authorized_source(&peer, hmd));
             assert!(!is_authorized_source(&peer, std::net::IpAddr::from([192, 168, 1, 99])));
+            // The HMD's last input before it goes away: trigger held.
+            *inputs.head.lock().unwrap() = Some(TrackingData::default());
+            let held = ControllerState { trigger: 1.0, ..Default::default() };
+            inputs.controllers.lock().unwrap()[1] = Some((held, std::time::Instant::now()));
         }
         assert!(!is_authorized_source(&peer, hmd), "session end must revoke the HMD");
+        assert!(inputs.head.lock().unwrap().is_none(), "session end must drop the head pose");
+        assert!(inputs.controllers.lock().unwrap().iter().all(Option::is_none),
+            "session end must release the controllers");
+    }
+
+    #[test]
+    fn test_fresh_controller_state_drops_stale_input() {
+        let now = std::time::Instant::now();
+        let state = ControllerState { trigger: 1.0, ..Default::default() };
+        let fresh = fresh_controller_state(Some((state, now - CONTROLLER_STALE_AFTER)), now);
+        assert_eq!(fresh.map(|s| s.trigger), Some(1.0), "still fresh right at the limit");
+        let stale_at = now - CONTROLLER_STALE_AFTER - std::time::Duration::from_millis(1);
+        assert!(fresh_controller_state(Some((state, stale_at)), now).is_none(),
+            "a controller that stopped reporting must read as gone");
+        assert!(fresh_controller_state(None, now).is_none());
+        // A state stamped after `now` (the reader sampled its clock first) is fresh.
+        assert!(fresh_controller_state(Some((state, now + std::time::Duration::from_millis(5))), now).is_some());
     }
 }

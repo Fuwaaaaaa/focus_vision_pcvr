@@ -8,7 +8,8 @@
 //! receiver: TCP+TLS handshake (HELLO → PIN → STREAM_CONFIG → STREAM_START),
 //! UDP receive of RTP packets, header-driven FEC reassembly
 //! (`pipeline::FecFrameReassembler`, the Rust twin of the client's
-//! FecFrameDecoder), periodic HEARTBEAT_ACK back over TCP. Synthetic tracking data
+//! FecFrameDecoder), a HEARTBEAT with receive stats every 500 ms over TCP,
+//! answered by the engine's HEARTBEAT_ACK. Synthetic tracking data
 //! flows over UDP to the tracking port. Stats are aggregated and returned
 //! when the run completes so tests can assert on them.
 
@@ -50,7 +51,7 @@ pub struct MockClientConfig {
     pub audio_udp_port: u16,
     /// Tracking sender target (engine listens here).
     pub tracking_target: SocketAddr,
-    /// HEARTBEAT_ACK cadence. Default 500 ms matches `HEARTBEAT_INTERVAL_MS`.
+    /// HEARTBEAT cadence. Default 500 ms matches `HEARTBEAT_INTERVAL_MS`.
     pub heartbeat_interval: Duration,
     /// If `Some`, the stream loop emits FACE_DATA (0x35) at `face_send_interval`.
     pub face_pattern: Option<FaceMode>,
@@ -84,6 +85,12 @@ pub struct MockClientConfig {
     /// polite DISCONNECT — what a Wi-Fi drop looks like to the engine, so
     /// it takes the connection-lost path with its reconnect hold window.
     pub abrupt_close: bool,
+    /// If `Some`, stop sending anything on the control channel this long
+    /// into the stream while leaving the connection open — a link that died
+    /// without a FIN/RST reaching the engine. The engine should give up on
+    /// it after its silence limit; `MockClientStats::control_closed_after`
+    /// says when it did.
+    pub silent_after: Option<Duration>,
 }
 
 impl MockClientConfig {
@@ -109,6 +116,7 @@ impl MockClientConfig {
             measure_decode_latency: false,
             receive_audio: false,
             abrupt_close: false,
+            silent_after: None,
         }
     }
 }
@@ -123,6 +131,9 @@ pub struct MockClientStats {
     pub idr_frames_seen: u64,
     /// RTP packets received on the video UDP socket.
     pub video_packets_received: u64,
+    /// Video packets missing from the RTP sequence — the loss the HEARTBEATs
+    /// reported.
+    pub video_packets_lost: u64,
     /// Total bytes received on the video UDP socket (RTP header + FVP header +
     /// payload, including FEC shards). Lets the E2E measure bandwidth, e.g. that
     /// resolution_scale=0.5 roughly quarters the bytes on the wire.
@@ -132,8 +143,13 @@ pub struct MockClientStats {
     pub audio_packets_received: u64,
     /// Total bytes received on the audio UDP socket (RTP header + Opus payload).
     pub audio_bytes_received: u64,
-    /// HEARTBEAT_ACK messages sent.
+    /// HEARTBEAT messages sent.
     pub heartbeats_sent: u64,
+    /// HEARTBEAT_ACKs received — the engine answers every HEARTBEAT.
+    pub heartbeat_acks_received: u64,
+    /// How long into the stream the engine closed the control connection.
+    /// `None` if it was still open when the run ended.
+    pub control_closed_after: Option<Duration>,
     /// FACE_DATA messages sent (mock-client → engine) when `face_pattern` is set.
     pub face_messages_sent: u64,
     /// Captured OSC traffic from the loopback receiver. Empty when
@@ -219,11 +235,12 @@ pub async fn run(
         ..stats
     };
     log::info!(
-        "mock-client done: {} packets / {} frames ({} IDR) / {} HB-ACK in {:?}",
+        "mock-client done: {} packets / {} frames ({} IDR) / {} heartbeats ({} acked) in {:?}",
         stats.video_packets_received,
         stats.frames_decoded,
         stats.idr_frames_seen,
         stats.heartbeats_sent,
+        stats.heartbeat_acks_received,
         stats.stream_duration,
     );
     Ok(stats)
@@ -383,6 +400,41 @@ where
     Ok((msg_type, payload))
 }
 
+/// HEARTBEAT payload as the HMD builds it: [sequence u32][timestamp_ms u64]
+/// [received u32][lost u32][avg_decode_us u32][fps u16], little-endian, with
+/// the video counts for the `elapsed` since the previous HEARTBEAT. The
+/// engine reads the stats at offset 12. There is no decoder here, so
+/// avg_decode_us stays 0.
+fn heartbeat_payload(sequence: u32, received: u64, lost: u64, frames: u64, elapsed: Duration) -> [u8; 26] {
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let fps = (frames as u128 * 1000 / elapsed.as_millis().max(1)).min(u16::MAX as u128) as u16;
+    let mut p = [0u8; 26];
+    p[0..4].copy_from_slice(&sequence.to_le_bytes());
+    p[4..12].copy_from_slice(&timestamp_ms.to_le_bytes());
+    p[12..16].copy_from_slice(&u32::try_from(received).unwrap_or(u32::MAX).to_le_bytes());
+    p[16..20].copy_from_slice(&u32::try_from(lost).unwrap_or(u32::MAX).to_le_bytes());
+    p[24..26].copy_from_slice(&fps.to_le_bytes());
+    p
+}
+
+/// Packets missing between the newest video packet so far (`last_seq`) and
+/// `packet`, by RTP sequence number; advances `last_seq`. A late packet —
+/// reordered or duplicated — adds nothing: it was already counted as lost.
+fn count_rtp_gap(last_seq: &mut Option<u16>, packet: &[u8]) -> u64 {
+    if packet.len() < fvp_common::RTP_HEADER_LEN {
+        return 0;
+    }
+    let seq = u16::from_be_bytes([packet[2], packet[3]]);
+    let gap = last_seq.map_or(0, |prev| seq.wrapping_sub(prev).wrapping_sub(1));
+    if gap >= 0x8000 {
+        return 0;
+    }
+    *last_seq = Some(seq);
+    u64::from(gap)
+}
+
 /// Post-handshake streaming loop. Concurrent tasks share a
 /// `MockClientStats` via Arc<Mutex>: TCP read (HAPTIC capture), TCP
 /// write (heartbeat + FACE_DATA), UDP receive + depacketize, OSC
@@ -399,6 +451,7 @@ where
     use std::sync::Mutex as StdMutex;
 
     let stats = Arc::new(StdMutex::new(MockClientStats::default()));
+    let stream_start = Instant::now();
 
     // Split the TLS stream so a reader task can decode inbound TCP
     // messages (HAPTIC_EVENT etc.) while the main loop drives outbound
@@ -406,8 +459,9 @@ where
     // halves backed by the same underlying stream via an internal lock.
     let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp);
 
-    // Inbound TCP reader: capture HAPTIC_EVENT messages emitted by the
-    // engine when production code (or scenario stimuli) call
+    // Inbound TCP reader: counts HEARTBEAT_ACKs, notes when the engine
+    // closes the connection, and captures the HAPTIC_EVENT messages the
+    // engine emits when production code (or scenario stimuli) call
     // `engine::queue_haptic`. Other inbound types are ignored — the
     // mock client doesn't act on them, and silently dropping keeps the
     // reader simple.
@@ -421,6 +475,11 @@ where
                 r = read_message(&mut tcp_read) => match r {
                     Ok((mt, payload)) => {
                         match mt {
+                            t if t == msg_type::HEARTBEAT_ACK => {
+                                if let Ok(mut s) = stats_reader.lock() {
+                                    s.heartbeat_acks_received += 1;
+                                }
+                            }
                             t if t == msg_type::HAPTIC_EVENT && capture_haptic => {
                                 if let Some(event) = HapticEvent::from_payload(&payload) {
                                     if let Ok(mut s) = stats_reader.lock() {
@@ -445,6 +504,9 @@ where
                     }
                     Err(e) => {
                         log::debug!("mock-client TCP reader exiting: {}", e);
+                        if let Ok(mut s) = stats_reader.lock() {
+                            s.control_closed_after = Some(stream_start.elapsed());
+                        }
                         break;
                     }
                 },
@@ -481,6 +543,7 @@ where
         // packets must not be mistaken for the start of the next frame.
         let mut frame_start: Option<Instant> = None;
         let mut last_completed: Option<u32> = None;
+        let mut last_seq: Option<u16> = None;
         while !video_cancel.is_cancelled() {
             tokio::select! {
                 r = receiver.recv(&mut buf) => match r {
@@ -492,8 +555,10 @@ where
                                 frame_start = Some(Instant::now());
                             }
                         }
+                        let lost = count_rtp_gap(&mut last_seq, &buf[..n]);
                         let mut s = stats_video.lock().unwrap();
                         s.video_packets_received += 1;
+                        s.video_packets_lost += lost;
                         s.video_bytes_received += n as u64;
                         if let Some(frame) = reassembler.feed(&buf[..n]) {
                             last_completed = Some(frame.frame_index);
@@ -543,13 +608,11 @@ where
         let stats_audio = Arc::clone(&stats);
         let audio_cancel = cancel.clone();
         Some(tokio::spawn(async move {
-            log::info!("TEMP-AUDIO-TASK-START");
             let mut buf = [0u8; 2048];
             while !audio_cancel.is_cancelled() {
                 tokio::select! {
                     r = receiver.recv(&mut buf) => match r {
                         Ok((n, _peer)) => {
-                            log::info!("TEMP-AUDIO-RECV n={} pt={}", n, if n>=2 {buf[1]&0x7F} else {255});
                             // RTP header is 12 bytes; PT is the low 7 bits of byte 1.
                             if n >= 12 && (buf[1] & 0x7F) == 111 {
                                 let mut s = stats_audio.lock().unwrap();
@@ -595,12 +658,19 @@ where
         None
     };
 
-    // Periodic HEARTBEAT_ACK on the TCP channel. Payload mirrors a minimal
-    // production heartbeat (decode latency + packet loss percentage —
-    // engine just parses for transport feedback).
+    // A HEARTBEAT on the TCP channel every `heartbeat_interval` with the
+    // video counts since the previous one, as the HMD sends it: the engine
+    // feeds the loss to its adaptive bitrate/FEC, answers with a
+    // HEARTBEAT_ACK, and drops a connection that stays silent.
     let deadline = config.duration.map(|d| Instant::now() + d);
     let heartbeat_interval = config.heartbeat_interval;
     let mut next_heartbeat = Instant::now() + heartbeat_interval;
+    let mut last_heartbeat = Instant::now();
+    let mut heartbeat_sequence: u32 = 0;
+    // (packets received, packets lost, frames) as of the last HEARTBEAT.
+    let mut reported = (0u64, 0u64, 0u64);
+    let silent_at = config.silent_after.map(|d| stream_start + d);
+    let mut silent = false;
 
     // Optional FACE_DATA emission on the same TCP channel. `next_face` is
     // `Some(deadline)` when `face_pattern` is set; we share the heartbeat
@@ -623,10 +693,25 @@ where
         }
         let now = Instant::now();
 
-        // 6-byte payload: decode_latency_us:u32 (0) + packet_loss_pct:u16 (0)
-        if now >= next_heartbeat {
-            let payload = [0u8; 6];
-            if let Err(e) = send_message(&mut tcp_write, msg_type::HEARTBEAT_ACK, &payload).await {
+        if !silent && silent_at.is_some_and(|t| now >= t) {
+            log::info!("mock-client going silent on the control channel (connection left open)");
+            silent = true;
+            next_face = None;
+        }
+
+        if !silent && now >= next_heartbeat {
+            let totals = {
+                let s = stats.lock().unwrap();
+                (s.video_packets_received, s.video_packets_lost, s.frames_decoded)
+            };
+            let payload = heartbeat_payload(
+                heartbeat_sequence,
+                totals.0 - reported.0,
+                totals.1 - reported.1,
+                totals.2 - reported.2,
+                now - last_heartbeat,
+            );
+            if let Err(e) = send_message(&mut tcp_write, msg_type::HEARTBEAT, &payload).await {
                 log::warn!("mock-client heartbeat send failed: {}", e);
                 break;
             }
@@ -634,6 +719,9 @@ where
                 let mut s = stats.lock().unwrap();
                 s.heartbeats_sent += 1;
             }
+            heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
+            reported = totals;
+            last_heartbeat = now;
             next_heartbeat = now + heartbeat_interval;
         }
 
@@ -654,25 +742,15 @@ where
             }
         }
 
-        // Sleep until either the next heartbeat, next face send, or
-        // cancel/deadline-check tick.
-        let mut next_event = next_heartbeat;
-        if let Some(f) = next_face {
-            if f < next_event {
-                next_event = f;
-            }
-        }
-        if let Some(d) = deadline {
-            if d < next_event {
-                next_event = d;
-            }
-        }
-        let now2 = Instant::now();
-        let nap = if next_event > now2 {
-            (next_event - now2).min(Duration::from_millis(100))
-        } else {
-            Duration::from_millis(10)
-        };
+        // Sleep until the next heartbeat, face send, going silent or the
+        // deadline — at most 100 ms, then check cancel/deadline again.
+        let next_event = [(!silent).then_some(next_heartbeat), next_face, silent_at.filter(|_| !silent), deadline]
+            .into_iter()
+            .flatten()
+            .min();
+        let nap = next_event
+            .map_or(Duration::from_millis(100), |t| t.saturating_duration_since(Instant::now()))
+            .clamp(Duration::from_millis(1), Duration::from_millis(100));
         tokio::select! {
             _ = tokio::time::sleep(nap) => {}
             _ = cancel.cancelled() => break,
@@ -681,8 +759,8 @@ where
 
     // Polite DISCONNECT so the engine logs a clean shutdown instead of
     // counting this against `reconnect_attempts` — unless the run simulates
-    // a dropped link.
-    if !config.abrupt_close {
+    // a dropped or dead link.
+    if !config.abrupt_close && !silent {
         let _ = send_message(&mut tcp_write, msg_type::DISCONNECT, &[]).await;
     }
 
@@ -776,8 +854,43 @@ mod tests {
         assert_eq!(s.idr_frames_seen, 0);
         assert_eq!(s.video_packets_received, 0);
         assert_eq!(s.heartbeats_sent, 0);
+        assert_eq!(s.heartbeat_acks_received, 0);
+        assert_eq!(s.control_closed_after, None);
         assert_eq!(s.audio_packets_received, 0);
         assert_eq!(s.audio_bytes_received, 0);
+    }
+
+    #[test]
+    fn test_heartbeat_payload_matches_the_hmd_layout() {
+        // 500 ms with 30 frames → 60 fps.
+        let p = heartbeat_payload(7, 1000, 5, 30, Duration::from_millis(500));
+        assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 7, "sequence");
+        assert!(u64::from_le_bytes(p[4..12].try_into().unwrap()) > 0, "wall-clock timestamp");
+        // The engine reads the stats from offset 12.
+        assert_eq!(u32::from_le_bytes(p[12..16].try_into().unwrap()), 1000, "received");
+        assert_eq!(u32::from_le_bytes(p[16..20].try_into().unwrap()), 5, "lost");
+        assert_eq!(u32::from_le_bytes(p[20..24].try_into().unwrap()), 0, "no decoder");
+        assert_eq!(u16::from_le_bytes(p[24..26].try_into().unwrap()), 60, "fps");
+    }
+
+    #[test]
+    fn test_count_rtp_gap() {
+        let packet = |seq: u16| {
+            let mut p = vec![0x80, 97];
+            p.extend_from_slice(&seq.to_be_bytes());
+            p.extend_from_slice(&[0; 8]);
+            p
+        };
+        let mut last = None;
+        assert_eq!(count_rtp_gap(&mut last, &packet(10)), 0, "first packet");
+        assert_eq!(count_rtp_gap(&mut last, &packet(11)), 0);
+        assert_eq!(count_rtp_gap(&mut last, &packet(15)), 3, "12..=14 missing");
+        assert_eq!(count_rtp_gap(&mut last, &packet(13)), 0, "late: already counted");
+        assert_eq!(count_rtp_gap(&mut last, &packet(15)), 0, "duplicate");
+        assert_eq!(count_rtp_gap(&mut last, &packet(16)), 0, "a late packet doesn't move the newest");
+        let mut last = Some(u16::MAX - 1);
+        assert_eq!(count_rtp_gap(&mut last, &packet(1)), 2, "u16::MAX and 0 missing across the wrap");
+        assert_eq!(count_rtp_gap(&mut last, &[0x80, 97]), 0, "too short for an RTP header");
     }
 
     /// The audio receiver must count PT=111 (Opus) RTP packets and ignore

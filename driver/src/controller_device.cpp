@@ -1,7 +1,4 @@
 #include "controller_device.h"
-extern "C" {
-#include "streaming_engine.h"
-}
 #include <cstring>
 #include <cstdio>
 
@@ -108,6 +105,32 @@ void CControllerDevice::CreateInputComponents()
     input->CreateHapticComponent(m_propertyContainer, "/output/haptic", &m_hHaptic);
 }
 
+void CControllerDevice::UpdateInputs(const ControllerState& state)
+{
+    auto input = vr::VRDriverInput();
+    input->UpdateScalarComponent(m_hTrigger, state.trigger, 0.0);
+    input->UpdateScalarComponent(m_hGrip, state.grip, 0.0);
+    input->UpdateScalarComponent(m_hJoystickX, state.thumbstick_x, 0.0);
+    input->UpdateScalarComponent(m_hJoystickY, state.thumbstick_y, 0.0);
+
+    input->UpdateBooleanComponent(m_hA,
+        (state.button_flags & 0x01) != 0, 0.0);  // A_X_PRESSED
+    input->UpdateBooleanComponent(m_hB,
+        (state.button_flags & 0x02) != 0, 0.0);  // B_Y_PRESSED
+    input->UpdateBooleanComponent(m_hMenu,
+        (state.button_flags & 0x04) != 0, 0.0);  // MENU_PRESSED
+    input->UpdateBooleanComponent(m_hSystem,
+        (state.button_flags & 0x08) != 0, 0.0);  // SYSTEM_PRESSED
+    input->UpdateBooleanComponent(m_hThumbstickClick,
+        (state.button_flags & 0x10) != 0, 0.0);  // THUMBSTICK_CLICK
+    input->UpdateBooleanComponent(m_hTriggerTouch,
+        (state.button_flags & 0x20) != 0, 0.0);  // TRIGGER_TOUCH
+    input->UpdateBooleanComponent(m_hThumbstickTouch,
+        (state.button_flags & 0x40) != 0, 0.0);  // THUMBSTICK_TOUCH
+    input->UpdateBooleanComponent(m_hGripTouch,
+        (state.button_flags & 0x80) != 0, 0.0);  // GRIP_TOUCH
+}
+
 void CControllerDevice::TriggerHaptic(float duration_s, float frequency, float amplitude)
 {
     uint16_t duration_ms = static_cast<uint16_t>(duration_s * 1000.0f);
@@ -138,34 +161,23 @@ void CControllerDevice::RunFrame()
         m_pose.qRotation.z = state.orientation[2];
         m_pose.qRotation.w = state.orientation[3];
 
-        // Update input components
-        auto input = vr::VRDriverInput();
-        input->UpdateScalarComponent(m_hTrigger, state.trigger, 0.0);
-        input->UpdateScalarComponent(m_hGrip, state.grip, 0.0);
-        input->UpdateScalarComponent(m_hJoystickX, state.thumbstick_x, 0.0);
-        input->UpdateScalarComponent(m_hJoystickY, state.thumbstick_y, 0.0);
-
-        input->UpdateBooleanComponent(m_hA,
-            (state.button_flags & 0x01) != 0, 0.0);  // A_X_PRESSED
-        input->UpdateBooleanComponent(m_hB,
-            (state.button_flags & 0x02) != 0, 0.0);  // B_Y_PRESSED
-        input->UpdateBooleanComponent(m_hMenu,
-            (state.button_flags & 0x04) != 0, 0.0);  // MENU_PRESSED
-        input->UpdateBooleanComponent(m_hSystem,
-            (state.button_flags & 0x08) != 0, 0.0);  // SYSTEM_PRESSED
-        input->UpdateBooleanComponent(m_hThumbstickClick,
-            (state.button_flags & 0x10) != 0, 0.0);  // THUMBSTICK_CLICK
-        input->UpdateBooleanComponent(m_hTriggerTouch,
-            (state.button_flags & 0x20) != 0, 0.0);  // TRIGGER_TOUCH
-        input->UpdateBooleanComponent(m_hThumbstickTouch,
-            (state.button_flags & 0x40) != 0, 0.0);  // THUMBSTICK_TOUCH
-        input->UpdateBooleanComponent(m_hGripTouch,
-            (state.button_flags & 0x80) != 0, 0.0);  // GRIP_TOUCH
+        UpdateInputs(state);
+        m_inputsLive = true;
     }
     else
     {
         m_pose.poseIsValid = false;
         m_pose.result = vr::TrackingResult_Calibrating_InProgress;
+
+        // The controller stopped reporting (untracked, or the session
+        // ended). SteamVR keeps the last value of every input, so release
+        // them once — otherwise a held trigger or pushed stick stays that
+        // way until the controller comes back.
+        if (m_inputsLive)
+        {
+            UpdateInputs(ControllerState{});
+            m_inputsLive = false;
+        }
     }
 
     // Push pose to SteamVR

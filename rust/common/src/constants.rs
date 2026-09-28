@@ -20,8 +20,11 @@ pub const MAX_FRAME_SHARDS: usize = 4096;
 pub const DEFAULT_FEC_REDUNDANCY: f32 = 0.2;
 /// Heartbeat interval in milliseconds
 pub const HEARTBEAT_INTERVAL_MS: u64 = 500;
-/// Max heartbeat misses before disconnect
-pub const HEARTBEAT_MAX_MISSES: u32 = 3;
+/// Heartbeats that may go missing before the link counts as dead: 3 s at
+/// 500 ms, on both ends. The engine drops a control connection that has
+/// been silent this long; the client (StreamSession) does the same with
+/// the HEARTBEAT_ACKs.
+pub const HEARTBEAT_MAX_MISSES: u32 = 6;
 /// Max PIN pairing attempts before lockout
 pub const MAX_PIN_ATTEMPTS: u8 = 5;
 /// PIN lockout duration in seconds
