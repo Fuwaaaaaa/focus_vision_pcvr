@@ -10,13 +10,14 @@
 
 #![cfg(feature = "simulator")]
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use fvp_common::protocol::VideoCodec;
+use fvp_common::protocol::{ControllerState, VideoCodec};
 use streaming_engine::config::AppConfig;
 use streaming_engine::engine::{EncodedFrame, StreamingEngine};
 use streaming_engine::metrics::latency::FrameTimestamps;
+use streaming_engine::simulator::tracking_sender::{PoseMode, TrackingSender};
 use streaming_engine::simulator::{run as run_mock_client, MockClientConfig, MockClientStats};
 // Shared with sim.rs and the scenario runner. Reserves a contiguous,
 // non-ephemeral port block so the engine's ephemeral sender sockets can't
@@ -204,6 +205,9 @@ fn headless_e2e_basic_video_flow() {
     assert!(stats.heartbeats_sent >= 2,
         "expected >=2 heartbeats over 2 s @ 500 ms, got {}",
         stats.heartbeats_sent);
+    assert!(stats.heartbeat_acks_received >= 2,
+        "the engine must answer the heartbeats, got {} acks for {}",
+        stats.heartbeat_acks_received, stats.heartbeats_sent);
     assert!(frames_accepted > 0,
         "engine should accept some submitted frames once the channel drains");
 }
@@ -284,6 +288,136 @@ fn spawn_mock_client(
 fn read_status() -> Option<serde_json::Value> {
     let content = std::fs::read_to_string(status_path()?).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// Send the HMD's tracking (head pose, plus any controllers in `mode`) to
+/// the engine at 90 Hz from its own thread until `cancel`. The source is
+/// 127.0.0.1, the address the mock client pairs from.
+fn spawn_tracking(target: SocketAddr, mode: PoseMode, cancel: CancellationToken) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let sender = TrackingSender::new(target).await.expect("tracking socket");
+            sender.run(mode, 90, cancel).await;
+        });
+    })
+}
+
+/// REGRESSION: the engine kept the HMD's last input forever. A controller
+/// that lost tracking, or a session that ended, left its trigger held and
+/// its stick pushed in SteamVR — and the headset's last pose valid.
+#[test]
+fn headless_e2e_stale_and_ended_hmd_input_is_released() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .is_test(true).try_init();
+
+    delete_stale_status();
+    let (tcp_port, udp_port) = pick_free_ports();
+    let mut config = sim_test_config(tcp_port, udp_port);
+    config.video.framerate = 60;
+    let engine = StreamingEngine::new(config).expect("engine new");
+    let pin = wait_for_pin(Duration::from_secs(3)).expect("engine never published a PIN");
+    let server_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let tracking_target = SocketAddr::new(server_ip, udp_port + fvp_common::TRACKING_PORT_OFFSET);
+    let mut stream = SyntheticNalStream::new(VideoCodec::H265, 60);
+
+    let mut hmd = MockClientConfig::from_ports(server_ip, tcp_port, udp_port, pin);
+    hmd.duration = Some(Duration::from_millis(3000));
+    let hmd = spawn_mock_client(hmd);
+
+    // 1. The right trigger is held.
+    let held = ControllerState {
+        controller_id: 1,
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        trigger: 1.0,
+        ..Default::default()
+    };
+    let with_controller = PoseMode::Still { head: PoseMode::default_head(), left: None, right: Some(held) };
+    let controller_cancel = CancellationToken::new();
+    let controller_tracking = spawn_tracking(tracking_target, with_controller, controller_cancel.clone());
+    let mut held_seen = false;
+    pump_frames(&engine, &mut stream, Duration::from_millis(1200), || {
+        held_seen |= engine.get_controller(1).is_some_and(|c| c.trigger == 1.0);
+    });
+    assert!(held_seen, "the held trigger must reach the driver while the controller reports");
+
+    // 2. The controller stops reporting (lost tracking); the head goes on.
+    controller_cancel.cancel();
+    controller_tracking.join().unwrap();
+    let head_cancel = CancellationToken::new();
+    let head_tracking = spawn_tracking(tracking_target, PoseMode::still_origin(), head_cancel.clone());
+    pump_frames(&engine, &mut stream, Duration::from_millis(500), || {});
+    assert!(engine.get_controller(1).is_none(),
+        "a controller that stopped reporting must not keep its trigger held");
+    assert!(engine.get_tracking().is_some(), "the head is still tracked");
+
+    // 3. The session ends (DISCONNECT at the mock's 3 s). The head pose
+    //    must go too, although tracking packets keep arriving.
+    pump_frames(&engine, &mut stream, Duration::from_millis(1500), || {});
+    hmd.join().unwrap().expect("session");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.get_tracking().is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pose_after_session = engine.get_tracking();
+    head_cancel.cancel();
+    head_tracking.join().unwrap();
+    engine.shutdown();
+    assert!(pose_after_session.is_none(), "the pose of an HMD that left must not stay valid");
+}
+
+/// REGRESSION: a link that died without a FIN/RST reaching the PC (Wi-Fi
+/// gone, headset asleep) left the engine's control read pending forever —
+/// the session kept streaming to nobody and turned away the HMD's
+/// reconnects. The engine now drops a control connection that has been
+/// silent for 3 s (six missed heartbeats).
+#[test]
+fn headless_e2e_silent_hmd_is_dropped() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .is_test(true).try_init();
+
+    delete_stale_status();
+    let (tcp_port, udp_port) = pick_free_ports();
+    let mut config = sim_test_config(tcp_port, udp_port);
+    config.video.framerate = 60;
+    let engine = StreamingEngine::new(config).expect("engine new");
+    let pin = wait_for_pin(Duration::from_secs(3)).expect("engine never published a PIN");
+    let server_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let tracking_target = SocketAddr::new(server_ip, udp_port + fvp_common::TRACKING_PORT_OFFSET);
+
+    // Heartbeats stop 1 s in; the connection stays open.
+    let silent_after = Duration::from_secs(1);
+    let mut hmd = MockClientConfig::from_ports(server_ip, tcp_port, udp_port, pin);
+    hmd.duration = Some(Duration::from_secs(6));
+    hmd.silent_after = Some(silent_after);
+    let hmd = spawn_mock_client(hmd);
+    // Tracking keeps arriving throughout: only the control channel died.
+    let tracking_cancel = CancellationToken::new();
+    let tracking = spawn_tracking(tracking_target, PoseMode::still_origin(), tracking_cancel.clone());
+
+    let mut stream = SyntheticNalStream::new(VideoCodec::H265, 60);
+    let mut tracked_while_alive = false;
+    pump_frames(&engine, &mut stream, Duration::from_millis(6200), || {
+        tracked_while_alive |= engine.get_tracking().is_some();
+    });
+    let stats = hmd.join().unwrap().expect("silent session");
+    let pose_after_drop = engine.get_tracking();
+    let status = read_status();
+    tracking_cancel.cancel();
+    tracking.join().unwrap();
+    engine.shutdown();
+
+    eprintln!("silent HMD: {} heartbeats, closed after {:?}", stats.heartbeats_sent, stats.control_closed_after);
+    let closed = stats.control_closed_after.expect("the engine must drop a silent control connection");
+    // The last heartbeat went out 0.5-1 s in; the limit is 3 s after it.
+    assert!(closed >= Duration::from_secs(3),
+        "dropped after {closed:?}: before the HMD was silent for the full 3 s");
+    assert!(closed <= silent_after + Duration::from_secs(4),
+        "dropped after {closed:?}: long after the 3 s limit");
+    assert!(tracked_while_alive, "the session must take the HMD's tracking while it lasts");
+    assert!(pose_after_drop.is_none(), "a dropped HMD's tracking must be refused and its pose cleared");
+    let status = status.expect("status.json must exist");
+    assert_eq!(status["status"], "waiting", "the engine must be waiting for the HMD again: {status}");
 }
 
 /// REGRESSION: when the link dropped (no DISCONNECT) and the HMD came back

@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 use tokio::net::UdpSocket;
 
 use fvp_common::protocol::{TrackingData, ControllerState};
@@ -13,14 +14,20 @@ const PACKET_CONTROLLER: u8 = 0x02;
 /// session starts and clears it when the session ends.
 pub type AuthorizedPeer = Arc<RwLock<Option<IpAddr>>>;
 
+/// The latest state of each controller (0 = left, 1 = right) and when it
+/// arrived, so a reader can tell input that stopped coming from input that
+/// holds still.
+pub type ControllerSlots = Arc<Mutex<[Option<(ControllerState, Instant)>; 2]>>;
+
 /// Whether a tracking datagram from `src` should be accepted: only the
 /// paired HMD's address, compared in canonical form so an IPv4-mapped IPv6
 /// source (`::ffff:a.b.c.d`) matches its IPv4 control-channel peer.
 pub fn is_authorized_source(authorized: &AuthorizedPeer, src: IpAddr) -> bool {
-    match authorized.read() {
-        Ok(guard) => guard.is_some_and(|ip| ip.to_canonical() == src.to_canonical()),
-        Err(_) => false,
-    }
+    authorized.read().is_ok_and(|session| is_paired_hmd(*session, src))
+}
+
+fn is_paired_hmd(session: Option<IpAddr>, src: IpAddr) -> bool {
+    session.is_some_and(|ip| ip.to_canonical() == src.to_canonical())
 }
 
 /// Receives tracking data (6DoF poses) and controller state from HMD via UDP.
@@ -31,14 +38,14 @@ pub fn is_authorized_source(authorized: &AuthorizedPeer, src: IpAddr) -> bool {
 /// the foveation gaze point that SteamVR sees.
 pub struct TrackingReceiver {
     latest_head: Arc<Mutex<Option<TrackingData>>>,
-    latest_controllers: Arc<Mutex<[Option<ControllerState>; 2]>>,
+    latest_controllers: ControllerSlots,
     authorized_peer: AuthorizedPeer,
 }
 
 impl TrackingReceiver {
     pub fn new(
         latest_head: Arc<Mutex<Option<TrackingData>>>,
-        latest_controllers: Arc<Mutex<[Option<ControllerState>; 2]>>,
+        latest_controllers: ControllerSlots,
         authorized_peer: AuthorizedPeer,
     ) -> Self {
         Self {
@@ -68,7 +75,12 @@ impl TrackingReceiver {
                     continue;
                 }
             };
-            if !is_authorized_source(&self.authorized_peer, peer.ip()) {
+            // Held until the packet is stored: a session that ends meanwhile
+            // waits for it before clearing the HMD's inputs, so a late packet
+            // can't bring them back.
+            let Ok(session) = self.authorized_peer.read() else { continue };
+            if !is_paired_hmd(*session, peer.ip()) {
+                drop(session);
                 rejected += 1;
                 // Log the 1st, 2nd, 4th, 8th… drop so a flood can't spam the log.
                 if rejected.is_power_of_two() {
@@ -103,7 +115,7 @@ impl TrackingReceiver {
                         if let Ok(mut guard) = self.latest_controllers.lock() {
                             let idx = state.controller_id as usize;
                             if idx < 2 {
-                                guard[idx] = Some(state);
+                                guard[idx] = Some((state, Instant::now()));
                             } else {
                                 log::debug!("Ignoring controller_id {} (out of range 0..2)", idx);
                             }
@@ -408,7 +420,7 @@ mod tests {
 
         let ctrls = *controllers.lock().unwrap();
         assert!(ctrls[0].is_some(), "Left controller should be updated");
-        let c = ctrls[0].as_ref().unwrap();
+        let (c, _received_at) = ctrls[0].as_ref().unwrap();
         assert_eq!(c.controller_id, 0);
         assert!((c.trigger - 0.75).abs() < 1e-6);
 

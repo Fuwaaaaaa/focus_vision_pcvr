@@ -3,6 +3,10 @@
 #include <openvr_driver.h>
 #include <cstdint>
 
+extern "C" {
+#include "streaming_engine.h"
+}
+
 /**
  * Controller tracked device (left or right hand).
  * Receives input state from the Rust streaming engine (which gets it from the real HMD).
@@ -34,11 +38,15 @@ public:
 private:
     void SetupProperties();
     void CreateInputComponents();
+    /// Push every button/axis in `state` to SteamVR.
+    void UpdateInputs(const ControllerState& state);
 
     bool m_isLeft;
     uint32_t m_objectId = vr::k_unTrackedDeviceIndexInvalid;
     vr::PropertyContainerHandle_t m_propertyContainer = vr::k_ulInvalidPropertyContainer;
     vr::DriverPose_t m_pose{};
+    /// Inputs currently hold values from the engine (vs. released).
+    bool m_inputsLive = false;
 
     // Input component handles
     vr::VRInputComponentHandle_t m_hTrigger = vr::k_ulInvalidInputComponentHandle;

@@ -14,8 +14,10 @@
 
 use std::time::Duration;
 
-/// Hard cap on consecutive accept failures. Past this, the engine bails out —
-/// distinct from `MAX_RECONNECT_ATTEMPTS` which only governs log noise.
+/// Consecutive accept failures after which the listener counts as failing
+/// and each retry is logged as an error. The engine never stops on its own:
+/// it keeps retrying (every 16 s at most). Stopping — as it once did past
+/// this count — left the headset unable to connect until SteamVR restarted.
 pub(crate) const MAX_ACCEPT_FAILURES: u32 = 5;
 
 /// Soft cap on Wi-Fi reconnection attempts. The engine keeps accepting past
@@ -86,10 +88,11 @@ impl ReconnectState {
         self.accept_failures = self.accept_failures.saturating_add(1);
     }
 
-    /// Engine should bail out — only triggered by accept failures, never by
-    /// reconnect attempts.
-    pub(crate) fn should_stop_engine(&self) -> bool {
-        self.accept_failures > MAX_ACCEPT_FAILURES
+    /// The listener keeps failing — worth an error in the log. Only accept
+    /// failures count, never reconnect attempts. The engine keeps retrying
+    /// either way.
+    pub(crate) fn is_listener_failing(&self) -> bool {
+        self.accept_failures >= MAX_ACCEPT_FAILURES
     }
 
     /// Soft warning gate for a flaky Wi-Fi link. Reads cleanly in the loop:
@@ -171,32 +174,34 @@ mod tests {
     }
 
     #[test]
-    fn test_break_after_max_accept_failures() {
+    fn test_listener_failing_after_max_accept_failures_but_retries_continue() {
+        // REGRESSION: past MAX_ACCEPT_FAILURES the engine used to stop for
+        // good, and any LAN host could get it there by connecting and
+        // resetting a few times. Now it only reports the listener as failing
+        // and keeps retrying with the capped backoff.
         let mut s = ReconnectState::new();
-        for _ in 0..MAX_ACCEPT_FAILURES {
+        for _ in 0..(MAX_ACCEPT_FAILURES - 1) {
             s.record_accept_failure();
-            assert!(!s.should_stop_engine(),
-                "must keep going at or below the limit ({})",
-                s.accept_failures());
+            assert!(!s.is_listener_failing());
         }
-        // One more push us past the cap.
         s.record_accept_failure();
-        assert!(s.should_stop_engine(),
-            "exceeding {} accept failures must stop the engine",
-            MAX_ACCEPT_FAILURES);
+        assert!(s.is_listener_failing());
+        for _ in 0..100 {
+            s.record_accept_failure();
+        }
+        assert_eq!(s.next_backoff(), Some(Duration::from_secs(16)), "retries keep coming");
     }
 
     #[test]
-    fn test_no_break_at_max_reconnect_attempts() {
-        // Reconnect attempts are warning-only; the engine must keep accepting
-        // even past MAX_RECONNECT_ATTEMPTS so a long Wi-Fi outage doesn't
-        // permanently kill the session.
+    fn test_reconnect_attempts_never_mark_the_listener_failing() {
+        // Reconnect attempts are warning-only; a long Wi-Fi outage must not
+        // look like a broken listener.
         let mut s = ReconnectState::new();
         for _ in 0..(MAX_RECONNECT_ATTEMPTS + 5) {
             s.record_connection_lost();
         }
-        assert!(!s.should_stop_engine(),
-            "reconnect attempts must not stop the engine");
+        assert!(!s.is_listener_failing(),
+            "reconnect attempts must not count as accept failures");
         assert!(s.is_reconnect_warning_due(),
             "warning should fire once we've crossed the soft cap");
     }

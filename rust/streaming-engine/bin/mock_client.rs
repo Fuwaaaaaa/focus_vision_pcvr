@@ -3,8 +3,8 @@
 //! Pairs with `focus-vision-headless` (B3) to exercise the engine's full
 //! transport pipeline end-to-end without a real Focus Vision headset.
 //! Connects TCP+TLS, completes the HELLO → PIN → STREAM_CONFIG handshake,
-//! receives RTP video on UDP, sends HEARTBEAT_ACK back, prints summary
-//! stats on exit.
+//! receives RTP video on UDP, sends a HEARTBEAT with receive stats every
+//! 500 ms, prints summary stats on exit.
 //!
 //! Gated behind the `simulator` feature.
 //!
@@ -188,9 +188,11 @@ fn main() -> ExitCode {
     println!("connect duration:    {:?}", stats.connect_duration);
     println!("stream duration:     {:?}", stats.stream_duration);
     println!("video packets:       {}", stats.video_packets_received);
+    println!("video packets lost:  {}", stats.video_packets_lost);
     println!("frames decoded:      {}", stats.frames_decoded);
     println!("IDR frames seen:     {}", stats.idr_frames_seen);
     println!("heartbeats sent:     {}", stats.heartbeats_sent);
+    println!("heartbeat acks:      {}", stats.heartbeat_acks_received);
 
     ExitCode::SUCCESS
 }

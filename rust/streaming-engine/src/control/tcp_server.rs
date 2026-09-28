@@ -11,6 +11,13 @@ use crate::config::AppConfig;
 use crate::control::pairing::PairingState;
 use crate::control::tls;
 
+/// accept() errors in a row after which the listener itself counts as
+/// broken. Single errors are about one connection and are skipped.
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 100;
+/// Pause after an accept() error, so a persistent one (out of file
+/// descriptors) does not spin the loop.
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
+
 /// Combined async read+write trait for boxed TLS or plain TCP streams.
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
@@ -147,14 +154,37 @@ impl TcpControlServer {
             addr, self.tls_acceptor.is_some());
         log::info!("Pairing PIN: {:06}", self.pairing.lock().await.get_pin());
 
+        let mut accept_errors: u32 = 0;
         loop {
             let expires_in = self.pairing.lock().await.expires_in();
             let accepted = tokio::select! {
-                r = listener.accept() => Some(r?),
+                r = listener.accept() => Some(r),
                 _ = tokio::time::sleep(expires_in) => None,
             };
             self.pairing.lock().await.rotate_if_expired();
-            let Some((tcp_stream, peer)) = accepted else { continue };
+            let (tcp_stream, peer) = match accepted {
+                None => continue,
+                Some(Ok(conn)) => {
+                    accept_errors = 0;
+                    conn
+                }
+                Some(Err(e)) => {
+                    // An error from accept() is about one connection (reset
+                    // or aborted before we took it) or a passing resource
+                    // shortage — not the listener. Returning it would count
+                    // toward stopping the engine, so anyone on the LAN could
+                    // stop it by connecting and resetting a few times.
+                    accept_errors += 1;
+                    if accept_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                        return Err(e);
+                    }
+                    log::warn!("TCP accept error (still listening): {}", e);
+                    tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
+                    continue;
+                }
+            };
+            // Control messages are small and latency-sensitive (haptics).
+            let _ = tcp_stream.set_nodelay(true);
             log::info!("TCP connection from {}", peer);
 
             if let Some(ref acceptor) = self.tls_acceptor {

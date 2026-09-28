@@ -231,7 +231,7 @@
 
 ### ~~TCP再接続holdのステートフル化~~ (完了)
 - hold中にTCPリスナーを再作成しHMDが再接続可能に
-- accept_failures(5回で停止)とreconnect_attempts(10回で警告のみ)を分離
+- accept_failures(5回で停止)とreconnect_attempts(10回で警告のみ)を分離 (2026-09-29: accept_failures でも止めず、エラーを出して再試行を続けるように変更)
 - Wi-Fi断でエンジンが永久停止するリスクを解消
 - ~~hold 中に再接続を受け付けても、その接続を捨てて新しい PIN で listen し直していた~~ (2026-09-25 修正): hold はセッションの server を再利用してセッションの PIN を 5 秒だけ再び受け付け、再接続した接続でストリーミングを続ける (`headless_e2e_reconnect_within_hold_keeps_pin_and_streams`)
 - 残: PIN を使わない再接続 (TLS 内で渡す再接続トークン、または TLS session resumption) はプロトコル変更とクライアント実装が要る。hold の 5 秒が進行中のハンドシェイクを途中で切ってしまう問題 (bind と accept を分ける) も未対応
@@ -408,14 +408,14 @@
 - ~~P2（TLS）: PIN 認証の前に fingerprint を保存する。connect / handshake にタイムアウトがない。connect 失敗後の `disconnect()` が未初期化の mbedtls 構造体を解放する。fd を二重に close する。`psa_crypto_init()` を呼んでいない。~~ (2026-09-28 修正): 証明書はペアリング成功後に固定する。接続・TLS・各ハンドシェイク段階・書き込みにタイムアウトを付けた(ノンブロッキングのソケットと `mbedtls_net_poll`)。mbedtls の文脈は常に初期化済みで、ソケットは `mbedtls_net_free` だけが閉じる。`psa_crypto_init()` を呼ぶ。1 メッセージを 1 つの TLS レコードで送る。
 
 ### エンジン
-- **P1: 制御チャネルに生存確認がない。** `HEARTBEAT_MAX_MISSES` は未使用、TCP keepalive もない。Wi-Fi が黙って切れると、エンジンは「配信中」のまま HMD の再接続を拒み続ける。
-- **P1: セッション終了後も tracking / コントローラの状態が残る。** 切断時にスティックを倒していると、SteamVR では倒したままになる。
-- **P1: `accept()` のエラーでエンジンが止まる。** 接続単位のエラーも数えるため、LAN の誰かが接続→RST を 6 回繰り返すと SteamVR の再起動まで止まる。
+- ~~**P1: 制御チャネルに生存確認がない。** `HEARTBEAT_MAX_MISSES` は未使用、TCP keepalive もない。Wi-Fi が黙って切れると、エンジンは「配信中」のまま HMD の再接続を拒み続ける。~~ (2026-09-29): HMD から 3 秒(`HEARTBEAT_INTERVAL_MS` × `HEARTBEAT_MAX_MISSES` = 500 ms × 6)何も届かない制御接続は切断として扱う。クライアントの `livenessTimeoutMs` と同じ 3 秒。制御メッセージの読み取りは cancel-safe な `read` + 受信バッファにした(`read_exact` を select! に入れると、ハプティクス送信が勝ったときに読みかけのメッセージが壊れる)。`headless_e2e_silent_hmd_is_dropped`
+- ~~**P1: セッション終了後も tracking / コントローラの状態が残る。** 切断時にスティックを倒していると、SteamVR では倒したままになる。~~ (2026-09-29): セッションが終わると head pose とコントローラの状態を消す(`AuthorizedPeerGuard` の drop。受信側は read lock を持ったまま保存するので、終了後に遅れたパケットが状態を戻すことはない)。250 ms 届かないコントローラは `get_controller` が `None` を返し、ドライバはそのとき入力を一度だけ離した状態にする。`headless_e2e_stale_and_ended_hmd_input_is_released`
+- ~~**P1: `accept()` のエラーでエンジンが止まる。** 接続単位のエラーも数えるため、LAN の誰かが接続→RST を 6 回繰り返すと SteamVR の再起動まで止まる。~~ (2026-09-29): 接続単位の `accept()` エラーはログに出して待ち受けを続ける(100 回連続で初めてリスナーの失敗として返す)。リスナーの失敗が続いてもエンジンは止まらず、最大 16 秒間隔で再試行を続ける。
 - **P1: 音声キャプチャが 48 kHz ステレオ決め打ち。** 44.1 / 96 kHz の機器では cpal がループバックを開けず無音。5.1 / 7.1 はダウンミックスしない。
 - **P1: フェイストラッキングの OSC 名の並びが `XrEyeExpressionHTC` と違う**（例: index 2 は RIGHT_BLINK なのに `EyeLeftRight` で送る）。舌の並びも違う。キャリブレーションの重みが min を引かない（安静時に 1.0 が出る）。`face_tracking.enabled` を無視する。`+Inf` が NaN ガードを通る。`smoothing = 0` だと 0 に戻らない。
 - **P1: 適応ビットレートの上限が 200 Mbps 決め打ちで、`bitrate_mbps` は初期値にすぎない。**
-- **P1（テストの穴）: モッククライアントは HEARTBEAT ではなく中身ゼロの HEARTBEAT_ACK を送る。** E2E は個数しか見ないため、適応制御の経路が試されていない。
-- P2: バースト検出器に EWMA 済みのロスを渡している。ロス報告の半分を捨てる。エンコード時間が常に約 0、status.json の fps は設定値。LowDelay の Opus では in-band FEC が効かない。録音の WAV ヘッダがクラッシュ時に 0、同じ秒の再接続でファイルが上書きされる。音声デバイスの切り替えを追わない。sleep 中のビットレートが次のセッションに残る。再接続の最初の 4 フレームが古く、セッション開始時に IDR を出さない。256 B を超える datagram でログがあふれる。tracking の bind を再試行しない。`set_nodelay` がなく、1 メッセージが 3 つの TLS レコードになる。
+- ~~**P1（テストの穴）: モッククライアントは HEARTBEAT ではなく中身ゼロの HEARTBEAT_ACK を送る。** E2E は個数しか見ないため、適応制御の経路が試されていない。~~ (2026-09-29): HMD と同じ形の HEARTBEAT(RTP シーケンス番号の抜けから数えたロス、受信数、fps)を 500 ms ごとに送り、エンジンの HEARTBEAT_ACK を数える。E2E は ACK が返ることも確かめる。
+- P2: バースト検出器に EWMA 済みのロスを渡している。ロス報告の半分を捨てる。エンコード時間が常に約 0、status.json の fps は設定値。LowDelay の Opus では in-band FEC が効かない。録音の WAV ヘッダがクラッシュ時に 0、同じ秒の再接続でファイルが上書きされる。音声デバイスの切り替えを追わない。sleep 中のビットレートが次のセッションに残る。再接続の最初の 4 フレームが古く、セッション開始時に IDR を出さない。256 B を超える datagram でログがあふれる。tracking の bind を再試行しない。(2026-09-29 修正: `set_nodelay` を付け、1 メッセージを 1 回の書き込み = 1 つの TLS レコードで送る)
 - P2（設定）: `sleep_bitrate_mbps` 未検証（0 可、4294 超で overflow）。`udp_port` が 65533 以上で u16 の足し算が overflow。`resolution_per_eye` / `ipd` が NaN や 0 を通す。効かない設定: `face_tracking.enabled`、`active_profile`、`audio.bitrate_kbps`（128k 固定）、`[memory_monitor]`、SessionLogger（本番で作られない）。TLS の初期化に失敗すると黙って平文になる。
 - P2: バッファプールを補充しない（毎パケット確保）。fuzz が本番の経路（FEC 付き packetize、`encode_frame_sliced`、`parse_face_data`、HEARTBEAT、CONFIG_UPDATE）を通っていない。
 
