@@ -61,9 +61,13 @@ jobs:
         - name: Clippy (simulator)
           run: cargo clippy --workspace --features simulator --all-targets -- -D warnings
         - name: Security audit
-          continue-on-error: true
+          # A known vulnerability in Cargo.lock fails the job. Unmaintained
+          # and unsound notices are warnings and do not. This step used to
+          # run in pwsh, where `2>/dev/null` fails, and continue-on-error
+          # hid that — the audit never ran.
+          shell: bash
           run: |
-            cargo install cargo-audit --locked 2>/dev/null || true
+            cargo install cargo-audit --locked
             cargo audit
         - uses: actions/upload-artifact@v4
           with:
