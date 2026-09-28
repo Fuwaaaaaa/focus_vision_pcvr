@@ -77,6 +77,23 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   replaced it.
 
 ### Fixes
+- **The Android client starts.** Found by reading the code; not yet run on
+  the headset.
+  - The manifest had no `android.app.lib_name`, so `NativeActivity` looked
+    for `libmain.so` and threw at launch.
+  - The manifest also lacked the `<queries>` that the Khronos OpenXR
+    loader needs, with targetSdk 34, to find the runtime.
+  - `xrGetOpenGLESGraphicsRequirementsKHR` was never called, and the spec
+    makes `xrCreateSession` fail without it. It is now called before
+    session creation, and the GLES context version is checked against the
+    requirement.
+  - The instance asked for OpenXR 1.1 (`XR_CURRENT_API_VERSION`), which a
+    1.0-only runtime refuses. It now asks for 1.0, since nothing from 1.1
+    is used.
+  - The frame loop never returned and never read Android lifecycle
+    commands, so pause/resume blocked (ANR) and a destroy was never seen.
+    It now handles them every iteration.
+  - `shutdown()` can safely run more than once.
 - **The encoder bitrate is `bitrate_mbps`.** The driver set NVENC's target
   to `encoded_w * encoded_h * bitrate_pixel_factor` — about 7 Mbps at the
   native 1832×1920 — while `bitrate_mbps = 80` was sent to the HMD in

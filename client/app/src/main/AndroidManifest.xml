@@ -6,6 +6,17 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" />
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+    <!-- The Khronos OpenXR loader finds the runtime through these; with
+         targetSdk >= 30 package visibility hides them unless declared. -->
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
+    </queries>
     <application android:allowBackup="false" android:hasCode="true" android:label="@string/app_name">
         <meta-data android:name="com.htc.vr.content.NumDoFHmd" android:value="6DoF" />
         <meta-data android:name="com.htc.vr.content.NumDoFController" android:value="6DoF" />
@@ -13,10 +24,14 @@
             android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode|density"
             android:launchMode="singleTask" android:screenOrientation="landscape"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" android:exported="true">
+            <!-- NativeActivity loads this library; without it, it looks for
+                 libmain.so and the app dies at launch. -->
+            <meta-data android:name="android.app.lib_name" android:value="focusvision_native" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
                 <category android:name="com.htc.intent.category.VRAPP" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
             </intent-filter>
         </activity>
     </application>

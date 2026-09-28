@@ -35,3 +35,4 @@ config/local.toml
 *.temp
 *.bak
 *.orig
+client/app/.cxx/
