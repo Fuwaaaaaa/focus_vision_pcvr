@@ -39,7 +39,6 @@ void OpenXRApp::initialize(android_app* app) {
     m_renderer.init();
     m_timewarp.init();
     m_overlay.init();
-    m_heartbeat.init(&m_tcpClient, &m_stats);
     m_facialTracker.init(m_instance, m_session);
 
     // TOFU pinning store: app-private, app-uninstall removes it.
@@ -284,9 +283,6 @@ void OpenXRApp::mainLoop() {
         // Receive and decode video packets before rendering
         receiveAndDecodeVideo();
         renderFrame();
-
-        // Send heartbeat with stats to PC (every 500ms)
-        m_heartbeat.tick();
         frameCount++;
     }
 }

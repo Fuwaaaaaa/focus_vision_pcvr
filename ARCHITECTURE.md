@@ -115,6 +115,8 @@ focus_vision_psvr/
 │       │   ├── video_decoder.cpp JNI SurfaceTexture zero-copy
 │       │   ├── audio_player.cpp  Opus + AAudio
 │       │   ├── fec_decoder.cpp   RS recovery (GF(2^8))
+│       │   ├── stream_session.cpp  Connect/pair/stream/reconnect thread
+│       │   ├── video_receiver.cpp  UDP video thread → frame_assembler.cpp
 │       │   ├── tcp_client.cpp    TLS TCP (MbedTLS)
 │       │   ├── tracking_sender.cpp  UDP head+gaze
 │       │   ├── timewarp.cpp      Rotation correction

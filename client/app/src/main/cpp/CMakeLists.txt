@@ -59,6 +59,9 @@ set(CLIENT_SOURCES
     network_receiver.cpp
     video_decoder.cpp
     tcp_client.cpp
+    stream_session.cpp
+    frame_assembler.cpp
+    video_receiver.cpp
     tracking_sender.cpp
     controller_poller.cpp
     timewarp.cpp

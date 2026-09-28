@@ -318,7 +318,8 @@
 - **進捗(2026-06-02):** 純粋部はローカル完結検証で前進:
   - ②**オーケストレーション・ポリシー**: `client_session.h` の `ClientSession` 状態機械(Disconnected→Connecting→Pairing→Configuring→Streaming→Reconnecting、PIN拒否は再接続しない、指数backoff base1s×2 cap16s = engine reconnect.rs と一致)。client gtest 9件。
   - ①**サーバアドレス検証**: `client_session.h` の `parse_server_endpoint("ip"/"ip:port")`(IPv4 4オクテット + port 1-65535 検証、default 9944 = engine と一致)。client gtest 5件。アドレス文字列の**供給元**(config ファイル読込 or UI)は別途。
-  - **残り(実機検証が要る部分)**: 状態機械を**実I/O(connect/handshake/receiver init)に配線**、アドレス文字列の供給(config/UI)、PIN入力UX。
+  - ~~**残り(実機検証が要る部分)**: 状態機械を**実I/O(connect/handshake/receiver init)に配線**~~ (2026-09-28): `StreamSession`(接続・ペアリング・ハートビート・サーバから届くメッセージ・再接続を専用スレッドで回す) と `VideoReceiver`(UDP 受信スレッド + `FrameAssembler`) を追加した。C++ クライアントを本物のエンジン(ヘッドレス版)につなぐ E2E テスト `client/tests/test_session_e2e.cpp` で、TLS 1.3・PIN・映像の受信・誤った PIN・hold 内の再接続・証明書の不一致を確かめた(CI の `client-e2e` ジョブ)。
+  - **残り**: `openxr_app` への組み込み(受け取ったフレームを MediaCodec へ、ハプティクス・スリープの処理、tracking sender の起動)、アドレスと PIN の供給(まずはコンパニオンが adb で起動するときに渡す)、VR 内の PIN 入力 UI。デコードと描画は実機でしか確かめられない。
 - **resolution_scale への影響:** PC側(Rust+driver)は機能的。クライアント T8-T10 は正しいが、このセッション統合が無いため inert。
 - **Priority:** P0 (クライアント実機動作の前提・Phase 1 より上流)
 - **Depends on:** 実機(検証に必須) + UX設計
@@ -371,8 +372,8 @@
 - **Depends on:** NVIDIA GPU + SteamVR のある環境（ビルドと gtest 以外は検証できない）
 
 ## コード調査で見つけた問題（2026-09-25、未対応）
-- **C++ クライアントの受信が遅い:** `openxr_app.cpp` は 1 回の render loop で最大 64 パケットしか読まず、ループは `xrWaitFrame` で止まる。約 5.8k パケット/秒が上限で、80 Mbps には足りない。約 900 パケットのスライス IDR は 100 ms の `SLICE_TIMEOUT` 内に読み切れない可能性がある。実機で確認が要る。
-- **MediaCodec に渡る順番が入れ替わる:** 完成したフレームは、同じ decoder が次のフレームを見たときか flush のときにしか渡されず、flush は bulk → sliced の順。bulk と sliced が混ざると N+1 が N より先に（IDR より先に P が）渡ることがある。
+- ~~**C++ クライアントの受信が遅い:** `openxr_app.cpp` は 1 回の render loop で最大 64 パケットしか読まず、ループは `xrWaitFrame` で止まる。約 5.8k パケット/秒が上限で、80 Mbps には足りない。~~ (2026-09-28): `VideoReceiver` が専用スレッドで受信し、FEC の復元もそこで行う。`openxr_app` への組み込みは次の作業(上の P0)。
+- ~~**MediaCodec に渡る順番が入れ替わる:** 完成したフレームは、同じ decoder が次のフレームを見たときか flush のときにしか渡されず、flush は bulk → sliced の順。~~ (2026-09-28): `FrameAssembler` は、bulk でも sliced でも、そろった時点でフレームを渡すので、送った順に出る。
 - **RS の行列をほぼ毎フレーム作り直している:** `FecEncoder` のキャッシュはデータ shard 数が前回と同じときしか効かず、実際のエンコーダ出力はフレームごとにサイズが変わる。IDR 級のスライス（約 180 shard）では行列の作成が重い。スライスをまたいで共有する `ReedSolomon` の LRU があるとよい。
 - **bitrate を変える経路がばらばら:** adaptive controller、sleep（起きると controller の値ではなく `bitrate_mbps` に戻る）、CONFIG_UPDATE 0x01（controller を通らない）、thermal（`notify` しない）がそれぞれ別に動いている。1 つの実効値（min(controller, sleep, thermal, user)）にまとめたい。`GccEstimator::set_current_bitrate` はどこからも呼ばれていない。
 - **`config.pairing.max_attempts` / `lockout_seconds` が使われていない:** `PairingState` は定数を直接使う。
@@ -393,16 +394,16 @@
 - P2: `DestroySwapTextureSet` がセットの 3 枚のうち 1 枚しか消さない。`initEncoder` が `full_range` と foveation の設定を無視する。head pose が一度来ると以後ずっと「有効」、速度が未設定、`GetPose` が同期なしで読む。CONFIG_UPDATE の codec 変更 (0x02) は受理を返すが何もしない。
 
 ### Android クライアント（上の P0 のセッション配線に加えて）
-- **P1: サーバから届くメッセージを読まない。** `recvMessage` は handshake でしか使われず、HEARTBEAT_ACK / HAPTIC_EVENT / SLEEP_ENTER・EXIT / CONFIG_UPDATE_ACK が溜まる。受信バッファが埋まるとサーバの送信が止まり、クライアントの `mbedtls_ssl_write` が描画スレッドを止める。
-- **P1: HEARTBEAT のロス統計が常に 0。** `StatsReporter::onPacketLost` / `onFrameDecoded` を誰も呼ばず、TRANSPORT_FEEDBACK (0x12) も送らない。サーバの適応 FEC は 5% まで下がり、ビットレートは 200 Mbps まで上がり続ける（GCC は入力なし）。
+- ~~**P1: サーバから届くメッセージを読まない。**~~ (2026-09-28): `StreamSession` のスレッドが読み、`ServerEvent` としてアプリに渡す。TLS の読み書きはそのスレッドだけが行う。アプリ側の処理(ハプティクス・スリープ表示)は `openxr_app` への組み込みと一緒に行う。
+- **P1: HEARTBEAT のロス統計が常に 0。** (2026-09-28 一部修正): `FrameAssembler` が RTP シーケンス番号の抜けをロスとして数え、`StreamSession` が 500 ms ごとに実際の値と実時間から計算した fps を送る(E2E で HEARTBEAT_ACK まで確認済み)。`onFrameDecoded` はデコーダの配線と一緒に呼ぶ。TRANSPORT_FEEDBACK (0x12) は未実装で、GCC は入力なしのまま。
 - **P1: STREAM_CONFIG の codec を無視する。** デコーダは常に `video/hevc` で、handshake より前に作られる。
 - **P1: 描画の問題。** 右目が上下逆になる（Renderer は V を反転、Timewarp はしない）。Timewarp の行列を転置なしで渡し、+Z を前方とし、頂点ごとに透視除算している。フレームとそれを描いたときの頭の姿勢を結びつける手段がプロトコルにない。
-- **P1: 復元できないフレームを黙って捨て、IDR を要求しない**（bulk / sliced とも）。次の定期 IDR まで壊れた参照から予測し続ける。
+- ~~**P1: 復元できないフレームを黙って捨て、IDR を要求しない**（bulk / sliced とも）。~~ (2026-09-28): `FrameAssembler` は、欠けたフレーム(シャード不足・届かなかった frame index・100 ms のタイムアウト)があると IDR を要求し、キーフレームが来るまで非キーフレームを渡さない。セッション開始時も同じ。
 - **P1: OpenXR 拡張を有効にしていない。** instance は 2 つの拡張しか有効にしないので、`vive_focus3_controller`・facial tracking・eye gaze が使えない。eye tracker と controller poller がそれぞれ `xrAttachSessionActionSets` を呼ぶ（セッションで 1 回しか許されない）。
 - **P1: 音声を受信・再生する処理が配線されていない**（RTP の除去も `pump()` の呼び出しもない）。
 - P1（要確認）: FEC の復元を描画スレッドで O(n²·1200) で行う。約 200 shard のスライスで 100 ms 以上止まる可能性。
-- P2: MediaCodec の入力バッファがないと黙ってフレームを捨てる。`releaseOutputBuffer` の直後に `updateTexImage` を呼ぶ。SurfaceTexture の変換行列を無視する。sRGB swapchain にガンマ済みの映像を書く（二重ガンマ）。前のフレームの遅れた 1 パケットで進行中のフレームを捨てる。映像 UDP の送信元を確認しない。送る head pose が左目の pose。
-- P2（TLS）: PIN 認証の前に fingerprint を保存する（最初に別の IP へつないだら永久にそれを信用する）。connect / handshake にタイムアウトがない。connect 失敗後の `disconnect()` が未初期化の mbedtls 構造体を解放する。fd を二重に close する。`psa_crypto_init()` を呼んでいない（MbedTLS 3.6 の TLS 1.3 で要るか要確認）。
+- P2: MediaCodec の入力バッファがないと黙ってフレームを捨てる。`releaseOutputBuffer` の直後に `updateTexImage` を呼ぶ。SurfaceTexture の変換行列を無視する。sRGB swapchain にガンマ済みの映像を書く（二重ガンマ）。送る head pose が左目の pose。(2026-09-28 修正: 遅れた 1 パケットで進行中のフレームを捨てる件と、映像 UDP の送信元を確認しない件は `FrameAssembler` / `VideoReceiver` で直した)
+- ~~P2（TLS）: PIN 認証の前に fingerprint を保存する。connect / handshake にタイムアウトがない。connect 失敗後の `disconnect()` が未初期化の mbedtls 構造体を解放する。fd を二重に close する。`psa_crypto_init()` を呼んでいない。~~ (2026-09-28 修正): 証明書はペアリング成功後に固定する。接続・TLS・各ハンドシェイク段階・書き込みにタイムアウトを付けた(ノンブロッキングのソケットと `mbedtls_net_poll`)。mbedtls の文脈は常に初期化済みで、ソケットは `mbedtls_net_free` だけが閉じる。`psa_crypto_init()` を呼ぶ。1 メッセージを 1 つの TLS レコードで送る。
 
 ### エンジン
 - **P1: 制御チャネルに生存確認がない。** `HEARTBEAT_MAX_MISSES` は未使用、TCP keepalive もない。Wi-Fi が黙って切れると、エンジンは「配信中」のまま HMD の再接続を拒み続ける。

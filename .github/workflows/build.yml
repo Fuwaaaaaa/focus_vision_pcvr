@@ -179,6 +179,29 @@ jobs:
         - name: Run client C++ tests (hardware-independent logic)
           run: ctest --test-dir client/tests/build --build-config Release --output-on-failure
 
+    client-e2e:
+      # The Android client's networking code (StreamSession, TcpControlClient
+      # over MbedTLS, VideoReceiver) built for Windows and run against the
+      # real engine — the headless simulator binary from rust-build: TLS 1.3,
+      # PIN pairing, video over RTP/FEC/UDP, reconnect within the engine's
+      # hold. The Linux job above builds the same sources (POSIX sockets) but
+      # has no engine binary, so its E2E tests skip.
+      name: Android Client vs Engine (host E2E)
+      runs-on: windows-latest
+      needs: rust-build
+      steps:
+        - uses: actions/checkout@v4
+        - uses: actions/download-artifact@v4
+          with:
+            name: simulator-binaries
+            path: sim-bin
+        - run: cmake -S client/tests -B client/tests/build
+        - run: cmake --build client/tests/build --config Release
+        - name: Run client tests against the engine
+          env:
+            FVP_HEADLESS_BIN: ${{ github.workspace }}\sim-bin\focus-vision-headless.exe
+          run: ctest --test-dir client/tests/build --build-config Release --output-on-failure
+
     android-build:
       name: Android OpenXR Client
       runs-on: ubuntu-latest

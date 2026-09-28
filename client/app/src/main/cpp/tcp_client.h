@@ -1,22 +1,26 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <atomic>
 
-#include <mbedtls/ssl.h>
-#include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
 #include <mbedtls/net_sockets.h>
-#include <mbedtls/sha256.h>
+#include <mbedtls/ssl.h>
 
-/// TCP control channel client. Handles handshake, PIN pairing, stream config.
+/// TLS control channel to the engine: connect, pair with the PIN, receive
+/// STREAM_CONFIG, then exchange framed messages
+/// ([length u32 LE][type u8][payload]).
 ///
-/// Security model: TLS 1.3 with TOFU (Trust-On-First-Use) certificate pinning.
-/// Caller MUST call setFingerprintStorePath() before connect() — without it the
-/// client refuses to connect, since accepting any cert without persistence would
-/// allow silent MITM substitution between sessions.
+/// Security model: TLS 1.3 (the engine's rustls accepts nothing older) with
+/// TOFU certificate pinning. The caller MUST call setFingerprintStorePath()
+/// before connect(). The first server seen is pinned only once pairing with
+/// it succeeds, so reaching a wrong address does not pin that host.
+///
+/// Not thread-safe: one thread (StreamSession's) owns an instance. MbedTLS
+/// does not allow reading and writing one connection from two threads.
 class TcpControlClient {
 public:
     struct StreamConfig {
@@ -29,57 +33,75 @@ public:
         uint32_t encodedHeight = 0;
     };
 
-    /// Set the file path used to persist the pinned server cert SHA-256.
-    /// Recommended location: <ANativeActivity::internalDataPath>/server_fingerprint.hex
-    /// Must be called before connect().
+    enum class HandshakeResult { Ok, PinRejected, Failed };
+    enum class RecvResult { Message, Timeout, Closed };
+
+    TcpControlClient();
+    ~TcpControlClient();
+    TcpControlClient(const TcpControlClient&) = delete;
+    TcpControlClient& operator=(const TcpControlClient&) = delete;
+
+    /// File that persists the pinned server certificate SHA-256.
+    /// Recommended: <ANativeActivity::internalDataPath>/server_fingerprint.hex
     void setFingerprintStorePath(std::string path) { m_fingerprintStorePath = std::move(path); }
 
-    /// Forget the pinned fingerprint (e.g. after the user explicitly re-pairs
-    /// with a new server). Removes the on-disk file if present.
+    /// Forget the pinned fingerprint (the user re-pairs with another PC).
     void clearPinnedFingerprint();
 
-    bool connect(const char* serverAddress, int port);
+    /// TCP connect (giving up after `timeoutMs`), TLS handshake, and the
+    /// check against the pinned fingerprint.
+    bool connect(const char* serverAddress, int port, int timeoutMs = 5000);
+
+    /// Close the connection. Safe to call at any time, repeatedly.
     void disconnect();
 
-    /// Run the handshake: HELLO → PIN → CONFIG → START.
-    /// Returns true if streaming is ready.
-    bool handshake(uint32_t pin);
+    /// HELLO → PIN → STREAM_CONFIG, each step waiting at most
+    /// `stepTimeoutMs`. On Ok, getStreamConfig() is valid and the server
+    /// waits for startStream().
+    HandshakeResult handshake(uint32_t pin, int stepTimeoutMs = 10000);
+
+    /// Send STREAM_START: the server starts sending video after this.
+    bool startStream();
 
     const StreamConfig& getStreamConfig() const { return m_config; }
     bool isConnected() const { return m_connected; }
 
-    /// Request an IDR keyframe from the server (msg_type 0x30).
+    /// Request an IDR keyframe from the server.
     bool requestIdr();
 
-    /// Send a framed message: [length:u32 LE][type:u8][payload]
+    /// Send one framed message.
     bool sendMessage(uint8_t type, const uint8_t* payload, int payloadLen);
 
-    /// Receive a framed message. Returns (type, payload). Blocking.
-    bool recvMessage(uint8_t& outType, std::vector<uint8_t>& outPayload);
+    /// Wait up to `timeoutMs` for one complete message.
+    RecvResult recvMessage(uint8_t& outType, std::vector<uint8_t>& outPayload, int timeoutMs);
 
 private:
-    int m_socket = -1;
     std::atomic<bool> m_connected{false};
+    bool m_tlsEstablished = false;
     StreamConfig m_config;
 
-    // TLS state
-    bool m_tlsEnabled = false;
     mbedtls_ssl_context m_ssl;
     mbedtls_ssl_config m_sslConf;
     mbedtls_entropy_context m_entropy;
     mbedtls_ctr_drbg_context m_ctrDrbg;
     mbedtls_net_context m_netCtx;
 
+    // Decrypted bytes not yet framed into a message.
+    std::vector<uint8_t> m_rxBuf;
+
     // TOFU pinning state.
     std::string m_fingerprintStorePath; // empty == not configured (connect refused)
     std::string m_pinnedFingerprint;    // hex sha256, loaded from disk on first verify
+    std::string m_peerFingerprint;      // this connection's server
+    bool m_peerNeedsPinning = false;    // no pin yet: pin m_peerFingerprint once paired
 
-    bool initTls();
-    void shutdownTls();
-    int tlsSend(const uint8_t* data, int len);
-    int tlsRecv(uint8_t* data, int len);
-
-    /// After TLS handshake, pin or verify the leaf certificate SHA-256.
-    /// Returns true to allow the connection, false to abort it.
-    bool verifyOrPinServerCert();
+    void initContexts();
+    void freeContexts();
+    bool tlsHandshake(int timeoutMs);
+    bool checkServerCert();
+    bool pinPeerFingerprint();
+    bool writeAll(const uint8_t* data, size_t len);
+    /// 1 = a message was taken from m_rxBuf, 0 = incomplete, -1 = bad frame.
+    int takeMessage(uint8_t& outType, std::vector<uint8_t>& outPayload);
+    bool expectMessage(uint8_t type, std::vector<uint8_t>& payload, int timeoutMs);
 };

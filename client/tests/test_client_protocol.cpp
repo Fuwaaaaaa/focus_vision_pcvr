@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "client_protocol.h"
@@ -191,4 +192,56 @@ TEST(FvpHeader, RejectedParseLeavesOutputUntouched) {
     auto bad = makePacket(5, 0, 3, 0, 4);
     EXPECT_FALSE(parseFvpHeader(bad.data(), bad.size(), h));
     EXPECT_EQ(h.frameIndex, 99u);
+}
+
+// ---------------------------------------------------------------------------
+// HEARTBEAT / HEARTBEAT_ACK / HAPTIC_EVENT (engine.rs handle_tcp_control)
+// ---------------------------------------------------------------------------
+
+TEST(Heartbeat, PayloadLayoutMatchesTheEngine) {
+    HeartbeatStats s;
+    s.packetsReceived = 0x01020304;
+    s.packetsLost = 7;
+    s.avgDecodeUs = 2500;
+    s.fps = 90;
+    const auto p = buildHeartbeatPayload(0xAABBCCDD, 0x1122334455667788ULL, s);
+    ASSERT_EQ(p.size(), 26u) << "the engine ignores heartbeats shorter than 26 bytes";
+    EXPECT_EQ(readU32Le(p.data()), 0xAABBCCDDu);
+    EXPECT_EQ(p[4], 0x88);
+    EXPECT_EQ(p[11], 0x11);
+    // The engine reads the stats at offset 12.
+    EXPECT_EQ(readU32Le(p.data() + 12), 0x01020304u);
+    EXPECT_EQ(readU32Le(p.data() + 16), 7u);
+    EXPECT_EQ(readU32Le(p.data() + 20), 2500u);
+    EXPECT_EQ(readU16Le(p.data() + 24), 90u);
+}
+
+TEST(Heartbeat, AckCarriesPcLatencies) {
+    const uint8_t payload[8] = {0x10, 0x27, 0, 0, 0x20, 0x4E, 0, 0}; // 10000, 20000
+    HeartbeatAck ack;
+    ASSERT_TRUE(parseHeartbeatAck(payload, sizeof(payload), ack));
+    EXPECT_EQ(ack.pcEncodeUs, 10000u);
+    EXPECT_EQ(ack.pcTotalUs, 20000u);
+    EXPECT_FALSE(parseHeartbeatAck(payload, 7, ack));
+}
+
+TEST(Haptic, ParsesTheEnginePayload) {
+    // engine.rs HapticEvent::to_payload: id u8, duration_ms u16, frequency f32, amplitude f32.
+    uint8_t payload[11] = {1, 0x2C, 0x01}; // controller 1, 300 ms
+    const float frequency = 160.0f;
+    const float amplitude = 0.75f;
+    std::memcpy(payload + 3, &frequency, 4);
+    std::memcpy(payload + 7, &amplitude, 4);
+    HapticEvent e;
+    ASSERT_TRUE(parseHapticEvent(payload, sizeof(payload), e));
+    EXPECT_EQ(e.controllerId, 1);
+    EXPECT_EQ(e.durationMs, 300);
+    EXPECT_FLOAT_EQ(e.frequency, 160.0f);
+    EXPECT_FLOAT_EQ(e.amplitude, 0.75f);
+    EXPECT_FALSE(parseHapticEvent(payload, 10, e));
+}
+
+TEST(Rtp, SequenceNumberIsBigEndian) {
+    const uint8_t header[4] = {0x80, 97, 0x12, 0x34};
+    EXPECT_EQ(rtpSequence(header), 0x1234);
 }
