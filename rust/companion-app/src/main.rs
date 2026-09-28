@@ -1,9 +1,15 @@
+// A GUI app: no console window in the shipped (release) exe. Closing that
+// window killed the process without `on_exit`, losing the last settings
+// change. Debug builds keep the console for `cargo run` logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod adb;
 mod config;
 mod demo;
 mod driver;
 mod export;
 mod headset_link;
+mod process;
 #[cfg(feature = "simulator")]
 mod sim;
 mod stats_history;
@@ -208,7 +214,7 @@ fn config_save_due(dirty_since: Option<Instant>, now: Instant) -> bool {
     dirty_since.is_some_and(|t| now.saturating_duration_since(t) >= CONFIG_SAVE_DEBOUNCE)
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub(crate) enum Tab {
     Home,
     Deploy,
@@ -365,10 +371,96 @@ fn font_parses(data: &[u8]) -> bool {
     ab_glyph::FontRef::try_from_slice(data).is_ok()
 }
 
-/// Load custom fonts from DESIGN.md: Instrument Serif (brand), Geist (UI)
-/// and Geist Mono (stats/data). Missing or unreadable font files fall back
-/// to egui defaults.
+/// Japanese fonts that ship with the OS, most preferred first. Geist and
+/// egui's built-in fonts have no kana or kanji, so without one of these
+/// every Japanese label is a row of boxes. Face 0 of each collection is a
+/// regular Japanese face.
+fn japanese_font_candidates() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let fonts_dir = std::env::var_os("WINDIR")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
+            .join("Fonts");
+        // Yu Gothic Medium rather than Regular: egui draws without hinting,
+        // and Regular comes out thin and faint at 11-13 px.
+        ["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"]
+            .iter()
+            .map(|file| fonts_dir.join(file))
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+}
+
+/// Whether `data` is a font egui can load that has kana and kanji.
+fn covers_japanese(data: &[u8]) -> bool {
+    use ab_glyph::Font;
+    ab_glyph::FontRef::try_from_slice(data)
+        .is_ok_and(|font| "あア漢（".chars().all(|c| font.glyph_id(c).0 != 0))
+}
+
+/// The first of `japanese_font_candidates()` that exists and covers Japanese.
+fn read_japanese_font() -> Option<(PathBuf, Vec<u8>)> {
+    japanese_font_candidates().into_iter().find_map(|path| {
+        let data = std::fs::read(&path).ok()?;
+        covers_japanese(&data).then_some((path, data))
+    })
+}
+
+/// A font's (ascent, descent below the baseline, line gap) in em.
+fn vertical_metrics(data: &[u8]) -> Option<(f32, f32, f32)> {
+    use ab_glyph::Font;
+    let font = ab_glyph::FontRef::try_from_slice(data).ok()?;
+    let em = font.units_per_em()?;
+    Some((font.ascent_unscaled() / em, -font.descent_unscaled() / em, font.line_gap_unscaled() / em))
+}
+
+/// `FontTweak::y_offset_factor` that puts `fallback`'s baseline on
+/// `primary`'s. egui lines up two fonts in a row by centering their heights
+/// (ascent + descent + line gap), not by their baselines, so a fallback with
+/// other metrics sits too high or low — Yu Gothic's large line gap lifts it
+/// about 0.25 em above Geist. egui applies the factor to the fallback's
+/// size scaled by its (ascent + descent) em.
+fn baseline_offset_factor(primary: &[u8], fallback: &[u8]) -> f32 {
+    let (Some((ascent_p, descent_p, gap_p)), Some((ascent_f, descent_f, gap_f))) =
+        (vertical_metrics(primary), vertical_metrics(fallback))
+    else {
+        return 0.0;
+    };
+    let height_p = ascent_p + descent_p + gap_p;
+    let height_f = ascent_f + descent_f + gap_f;
+    let shift_em = ascent_p - ascent_f - 0.5 * (height_p - height_f);
+    shift_em / (ascent_f + descent_f)
+}
+
+/// Add `data` as the first fallback of every font family: right after the
+/// family's own font, which keeps what it covers, and ahead of egui's
+/// built-in fallbacks — whose full-width punctuation comes from an icon
+/// font and looks out of place in Japanese text.
+fn add_fallback_font(fonts: &mut egui::FontDefinitions, name: &str, data: Vec<u8>, tweak: egui::FontTweak) {
+    fonts.font_data.insert(name.to_string(), egui::FontData::from_owned(data).tweak(tweak).into());
+    for family in fonts.families.values_mut() {
+        family.insert(family.len().min(1), name.to_string());
+    }
+}
+
 fn install_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(font_definitions());
+}
+
+/// Custom fonts from DESIGN.md: Instrument Serif (brand), Geist (UI) and
+/// Geist Mono (stats/data), plus an OS font for Japanese text. Missing or
+/// unreadable font files fall back to egui defaults.
+fn font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
 
     // Instrument Serif for brand/display text
@@ -405,7 +497,24 @@ fn install_fonts(ctx: &egui::Context) {
             .insert(0, "GeistMono".to_string());
     }
 
-    ctx.set_fonts(fonts);
+    match read_japanese_font() {
+        Some((path, data)) => {
+            // Line it up with the UI font. Geist Mono shares Geist's metrics,
+            // so monospace text lines up too.
+            let ui_font = fonts.families.get(&egui::FontFamily::Proportional)
+                .and_then(|family| family.first())
+                .and_then(|name| fonts.font_data.get(name));
+            let tweak = egui::FontTweak {
+                y_offset_factor: ui_font.map_or(0.0, |ui_font| baseline_offset_factor(&ui_font.font, &data)),
+                ..Default::default()
+            };
+            log::info!("Japanese text font: {} ({tweak:?})", path.display());
+            add_fallback_font(&mut fonts, "Japanese", data, tweak);
+        }
+        None => log::warn!("No Japanese font found; Japanese text will show as boxes"),
+    }
+
+    fonts
 }
 
 impl CompanionApp {
@@ -786,12 +895,19 @@ impl eframe::App for CompanionApp {
             });
         });
 
+        // Every tab scrolls: at the default 480×640 (and the 400×500
+        // minimum) Settings and a busy Home run past the bottom of the
+        // window. One scroll offset per tab, so switching tabs doesn't carry
+        // Settings' position over to Home.
         egui::CentralPanel::default().show(ctx, |ui| {
-            match self.active_tab {
-                Tab::Home => self.render_home(ui, accent, text_muted),
-                Tab::Deploy => self.render_deploy(ui, accent, text_muted),
-                Tab::Settings => self.render_settings(ui, accent, text_muted),
-            }
+            egui::ScrollArea::vertical()
+                .id_salt(("tab_scroll", self.active_tab))
+                .auto_shrink(false)
+                .show(ui, |ui| match self.active_tab {
+                    Tab::Home => self.render_home(ui, accent, text_muted),
+                    Tab::Deploy => self.render_deploy(ui, accent, text_muted),
+                    Tab::Settings => self.render_settings(ui, accent, text_muted),
+                });
         });
     }
 
@@ -808,8 +924,7 @@ impl eframe::App for CompanionApp {
 pub(crate) fn rfd_pick_file() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-        let output = Command::new("powershell")
+        let output = process::command("powershell")
             .args(["-Command", r#"
                 Add-Type -AssemblyName System.Windows.Forms
                 $dialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -838,11 +953,10 @@ pub(crate) fn rfd_pick_file() -> Option<String> {
 pub(crate) fn pick_save_path(default_stem: &str, ext: &str) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
         // Inject the values via env vars rather than concatenating into the
         // script body — that way a user-supplied stem with quotes or
         // backticks can't break the PowerShell quoting.
-        let output = Command::new("powershell")
+        let output = process::command("powershell")
             .env("FVP_SAVE_STEM", default_stem)
             .env("FVP_SAVE_EXT", ext)
             .args([
@@ -927,6 +1041,82 @@ mod tests {
         }
         assert!(!super::font_parses(b"<!DOCTYPE html><html><head><title>Page not found"));
         assert!(!super::font_parses(b""));
+    }
+
+    #[test]
+    fn japanese_fallback_follows_each_familys_own_font() {
+        let mut fonts = eframe::egui::FontDefinitions::default();
+        let before = fonts.families.clone();
+        super::add_fallback_font(&mut fonts, "Japanese", vec![0; 4], Default::default());
+        assert!(fonts.font_data.contains_key("Japanese"));
+        for (family, old) in fonts.families.values().zip(before.values()) {
+            assert_eq!(family[0], old[0], "each family keeps its own font first");
+            assert_eq!(family[1], "Japanese", "ahead of egui's emoji/icon fallbacks");
+            assert_eq!(family[2..], old[1..]);
+        }
+    }
+
+    /// REGRESSION: Japanese text sat ~3 px above the Latin baseline at 11-13
+    /// px (Yu Gothic's large line gap; egui centers mixed fonts' heights).
+    #[test]
+    fn japanese_text_sits_on_the_latin_baseline() {
+        use eframe::egui::{epaint::text::Glyph, Color32, Context, FontId, RawInput};
+        if super::read_japanese_font().is_none() {
+            // Windows always ships one (Yu Gothic); elsewhere it's optional.
+            if cfg!(windows) {
+                panic!("no Japanese font among {:?}", super::japanese_font_candidates());
+            }
+            eprintln!("no Japanese font on this machine; skipping the baseline check");
+            return;
+        }
+        let ctx = Context::default();
+        super::install_fonts(&ctx);
+        let _ = ctx.run(RawInput::default(), |_| {});
+        // Where a glyph is drawn: its baseline (`pos`) plus its bitmap's offset.
+        let bottom = |g: &Glyph| g.pos.y + g.uv_rect.offset.y + g.uv_rect.size.y;
+        for size in [11.0, 13.0, 15.0, 20.0, 32.0] {
+            // Both H's stand on the baseline; the full-width one exists only
+            // in the Japanese font.
+            let galley = ctx.fonts(|f| f.layout_no_wrap("HＨ".into(), FontId::proportional(size), Color32::WHITE));
+            let [latin, japanese] = [&galley.rows[0].glyphs[0], &galley.rows[0].glyphs[1]];
+            assert_ne!(latin.font_impl_height, japanese.font_impl_height, "Ｈ must come from the Japanese font");
+            let off = bottom(japanese) - bottom(latin);
+            assert!(off.abs() <= 1.0, "at {size} px the Japanese text stands {off:+.2} px off the Latin baseline");
+        }
+    }
+
+    /// REGRESSION: no loaded font had kana or kanji, so the engine-stopped
+    /// banner and every other Japanese label rendered as boxes.
+    #[test]
+    fn japanese_ui_text_has_glyphs() {
+        use eframe::egui::{Context, FontId, RawInput};
+        let defaults = eframe::egui::FontDefinitions::default();
+        assert!(defaults.font_data.values().all(|d| !super::covers_japanese(&d.font)),
+            "egui's own fonts have no Japanese — the OS font is what draws it");
+        if super::read_japanese_font().is_none() {
+            // Windows always ships one (Yu Gothic); elsewhere it's optional.
+            if cfg!(windows) {
+                panic!("no Japanese font among {:?}", super::japanese_font_candidates());
+            }
+            eprintln!("no Japanese font on this machine; skipping the glyph check");
+            return;
+        }
+
+        let ctx = Context::default();
+        super::install_fonts(&ctx);
+        let _ = ctx.run(RawInput::default(), |_| {}); // fonts load at frame start
+        for text in [
+            "DEMO MODE — シミュレーション中（実エンジンは起動していません）",
+            "SIMULATION — ローカルエンジン稼働中（ハードウェア不要）",
+            "ストリーミングエンジンが停止しています",
+            "実機なしでパイプライン全体をローカル実行（ヘッドセット不要）",
+            "ADB経由でFocus VisionにAPKをインストール",
+            "実エンジンが稼働中です（status.json が新しい）。",
+        ] {
+            for font in [FontId::proportional(13.0), FontId::monospace(13.0)] {
+                assert!(ctx.fonts(|f| f.has_glyphs(&font, text)), "{font:?} can't draw {text:?}");
+            }
+        }
     }
 
     // --- status state machine (no filesystem, no egui context) ---

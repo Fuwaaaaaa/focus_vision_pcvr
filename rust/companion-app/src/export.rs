@@ -353,7 +353,7 @@ pub(crate) fn system_info() -> String {
     // GPU info via DXGI (Windows)
     #[cfg(windows)]
     {
-        if let Ok(output) = std::process::Command::new("wmic")
+        if let Ok(output) = crate::process::command("wmic")
             .args(["path", "win32_VideoController", "get", "Name"])
             .output()
         {

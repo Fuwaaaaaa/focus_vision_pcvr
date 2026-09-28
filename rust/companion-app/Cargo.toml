@@ -18,7 +18,10 @@ path = "src/main.rs"
 simulator = ["dep:streaming-engine", "dep:tokio", "dep:tokio-util"]
 
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+# No "persistence": the app keeps its settings in local.toml, and eframe's
+# saved window geometry reopened a window closed while minimized (saved as
+# 0×0 at -32000,-32000) as an 80×103 sliver.
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.31"
 serde = { workspace = true }
 toml = { workspace = true }

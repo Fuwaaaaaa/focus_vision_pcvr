@@ -6,7 +6,7 @@
 //! its connection.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::process::Command;
+use crate::process;
 
 pub const CLIENT_PACKAGE: &str = "com.focusvision.pcvr";
 
@@ -67,7 +67,7 @@ pub fn send_to_headset(
     if !is_pin(pin) {
         return Err("No PIN to send yet: start SteamVR first.".to_string());
     }
-    let output = Command::new(adb_path)
+    let output = process::command(adb_path)
         .args(["-s", serial, "shell", "ip", "-f", "inet", "addr", "show", "wlan0"])
         .output()
         .map_err(|e| format!("Failed to run adb: {e}"))?;
@@ -78,7 +78,7 @@ pub fn send_to_headset(
         .ok_or_else(|| format!("This PC has no route to the headset ({headset_ip})."))?;
     let server = SocketAddrV4::new(pc_ip, tcp_port);
 
-    let output = Command::new(adb_path)
+    let output = process::command(adb_path)
         .args(launch_args(serial, server, pin, udp_port))
         .output()
         .map_err(|e| format!("Failed to run adb: {e}"))?;
