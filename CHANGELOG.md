@@ -303,6 +303,10 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   until the controller's first change; and nothing asked for a keyframe.
   At session start the engine now drops the queue, sets the encoder to the
   bitrate setting and requests an IDR (`headless_e2e_session_starts_clean`).
+- **A codec change over CONFIG_UPDATE is refused, not pretended.** The
+  engine acknowledged key 0x02 as accepted though nothing changed: the
+  encoder's codec is set up when SteamVR starts (`[video] codec`). It now
+  answers "rejected" and logs why.
 - **PC audio from any output device.** Capture asked WASAPI for 48 kHz,
   which its shared mode refuses unless it is the device's own rate (cpal
   asks for no conversion), so a 44.1 or 96 kHz device gave no audio at
