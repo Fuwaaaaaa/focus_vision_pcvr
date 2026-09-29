@@ -5,8 +5,8 @@
 ; Builds a single FocusVision-<version>-Setup.exe that:
 ;   - Installs the companion app, fonts, default config, and OpenVR driver
 ;     tree under "$PROGRAMFILES64\Focus Vision PCVR\"
-;   - Auto-registers the SteamVR driver via vrpathreg (path resolved from
-;     the registry — works regardless of which drive Steam is on)
+;   - Auto-registers the SteamVR driver via vrpathreg, through the companion
+;     app (`--register-driver`), which finds SteamVR in any Steam library
 ;   - Creates Start Menu and Desktop shortcuts
 ;   - Writes an uninstaller that reverses everything (incl. vrpathreg
 ;     removedriver) but leaves the user's %APPDATA% config and recordings
@@ -212,49 +212,28 @@ SectionEnd
 
 ; ---- Function: SteamVR driver registration --------------------------------
 ;
-; Resolves the SteamVR vrpathreg.exe path from the registry. Steam writes
-; InstallPath into HKLM\Software\WOW6432Node\Valve\Steam on 64-bit Windows
-; (and the same key without the WOW6432Node on the rare 32-bit hosts). If
-; both lookups fail we fall back to the hard-coded default path so the
-; common case still works.
+; The companion app does it (`--register-driver`, driver.rs): it finds
+; SteamVR through openvrpaths.vrpath and every Steam library in
+; libraryfolders.vdf, and runs that SteamVR's vrpathreg adddriver.
+; REGRESSION: this script looked only in the Steam folder itself, so a
+; SteamVR in another library (D:\SteamLibrary...) was never registered, and
+; the driver/install.bat it pointed to was not shipped.
+; Exit codes: 0 registered, 2 SteamVR not found, 3 vrpathreg failed.
 
 Function RegisterSteamVRDriver
     Push $0
-    Push $1
-    Push $2
 
-    SetRegView 32  ; Steam writes under Wow6432Node on 64-bit Windows
-    ReadRegStr $0 HKLM "Software\Valve\Steam" "InstallPath"
-    SetRegView default
-    ${If} $0 == ""
-        ReadRegStr $0 HKLM "Software\Valve\Steam" "InstallPath"
-    ${EndIf}
-    ${If} $0 == ""
-        DetailPrint "Steam がレジストリに見つかりません — デフォルトパスを試行"
-        StrCpy $0 "$PROGRAMFILES32\Steam"
-    ${EndIf}
-
-    StrCpy $1 "$0\steamapps\common\SteamVR\bin\win64\vrpathreg.exe"
-    ${IfNot} ${FileExists} "$1"
-        DetailPrint "vrpathreg が見つかりません: $1"
-        DetailPrint "SteamVR をインストール後、手動で driver/install.bat を実行してください"
-        Goto done  ; not Return: the registers pushed above must be restored
-    ${EndIf}
-
-    DetailPrint "ドライバを登録しています: $1"
-    ; ExecToLog pushes only the exit code (ExecToStack also pushes the
-    ; output, which was left on the stack and popped into $2/$1/$0 below).
-    nsExec::ExecToLog '"$1" adddriver "$INSTDIR\driver\${DRIVER_DIRNAME}"'
-    Pop $2  ; exit code
-    ${If} $2 == 0
+    ; ExecToLog pushes only the exit code.
+    nsExec::ExecToLog '"$INSTDIR\${APP_EXE}" --register-driver "$INSTDIR\driver\${DRIVER_DIRNAME}"'
+    Pop $0
+    ${If} $0 == 0
         DetailPrint "SteamVR ドライバ登録成功 — SteamVR を再起動してください"
+    ${ElseIf} $0 == 2
+        DetailPrint "SteamVR が見つかりません。SteamVR をインストールして一度起動した後、このインストーラをもう一度実行してください"
     ${Else}
-        DetailPrint "ドライバ登録失敗 (exit $2) — 手動で driver/install.bat を実行してください"
+        DetailPrint "ドライバ登録失敗 (exit $0)。SteamVR を終了してから、このインストーラをもう一度実行してください"
     ${EndIf}
 
-  done:
-    Pop $2
-    Pop $1
     Pop $0
 FunctionEnd
 
@@ -262,29 +241,14 @@ FunctionEnd
 
 Function un.UnregisterSteamVRDriver
     Push $0
-    Push $1
-    Push $2
 
-    SetRegView 32
-    ReadRegStr $0 HKLM "Software\Valve\Steam" "InstallPath"
-    SetRegView default
-    ${If} $0 == ""
-        ReadRegStr $0 HKLM "Software\Valve\Steam" "InstallPath"
-    ${EndIf}
-    ${If} $0 == ""
-        StrCpy $0 "$PROGRAMFILES32\Steam"
-    ${EndIf}
-
-    StrCpy $1 "$0\steamapps\common\SteamVR\bin\win64\vrpathreg.exe"
-    ${If} ${FileExists} "$1"
+    ${If} ${FileExists} "$INSTDIR\${APP_EXE}"
         DetailPrint "SteamVR ドライバ登録を解除しています"
-        nsExec::ExecToLog '"$1" removedriver "$INSTDIR\driver\${DRIVER_DIRNAME}"'
-        Pop $2
-        DetailPrint "vrpathreg removedriver exit: $2"
+        nsExec::ExecToLog '"$INSTDIR\${APP_EXE}" --unregister-driver "$INSTDIR\driver\${DRIVER_DIRNAME}"'
+        Pop $0
+        DetailPrint "登録解除 exit: $0"
     ${EndIf}
 
-    Pop $2
-    Pop $1
     Pop $0
 FunctionEnd
 

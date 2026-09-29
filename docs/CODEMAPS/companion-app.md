@@ -17,7 +17,7 @@ engine reads it as its top config layer). Does not link against
 | `src/main.rs` | `CompanionApp` struct, `eframe::App` impl, 3-tab UI (Home / Deploy / Settings) | ~1150 |
 | `src/file_dialog.rs` | Open / save dialogs through PowerShell's Windows Forms, each on its own thread (`DialogTask`); the path comes back as hex of its UTF-8 bytes, since PowerShell 5.1's stdout is in the OEM code page | ~190 |
 | `src/config.rs` | `LocalConfig` (video / sleep_mode / face_tracking / recording overrides). Persists to `%APPDATA%/FocusVisionPCVR/config/local.toml` | 194 |
-| `src/driver.rs` | SteamVR driver install / uninstall. Detects SteamVR via registry lookup; SteamVR's log directory from `openvrpaths.vrpath` | ~310 |
+| `src/driver.rs` | SteamVR driver install / uninstall. Finds SteamVR in any Steam library (`openvrpaths.vrpath` runtime, `libraryfolders.vdf`); `--register-driver` / `--unregister-driver` CLI the installer calls (vrpathreg); SteamVR's log directory | ~460 |
 | `src/adb.rs` | `AdbDevice`, `list_devices` / `install_apk` / `dump_logcat` / `launch_app` (blocking `Command::new("adb")`) | 209 |
 | `src/headset_link.rs` | "Send PIN to headset": reads the headset's Wi-Fi address over adb, picks this PC's address toward it (routing table via a connected UDP socket), starts the client with `--es fvp_server/fvp_pin/fvp_udp_port`. Ports come from status.json (`tcp_port`/`udp_port`) | ~150 |
 | `src/export.rs` | `export_logs()` — zip the engine log (`engine.log`, `engine.prev.log`), status.json, `config/local.toml`, SteamVR's vrserver / vrcompositor logs, ADB logcat, system info (Windows version, GPUs + driver versions via CIM), PII masked | ~740 |
@@ -80,7 +80,7 @@ up changes on the next SteamVR start (no hot-reload currently).
 |---|---|---|
 | `config.rs` | 9 | round-trip, recording override, parse failure fallback |
 | `adb.rs` | 6 | device list parsing, timeout handling |
-| `driver.rs` | 5 | registered driver, SteamVR log dir from the vrpath, install |
+| `driver.rs` | 10 | registered driver, SteamVR log dir, SteamVR in another library / vrpath runtime first, libraryfolders.vdf parsing, CLI arguments, install |
 | `stats_history.rs` | ~3 | ring buffer eviction |
 | `file_dialog.rs` | 5 | Japanese paths through real PowerShell, hex decoding, dialog thread answer |
 | `export.rs` | 24 | PII masking (IP / MAC / SSID / e-mail / user path / PIN), log added masked, system info without wmic |
