@@ -28,6 +28,7 @@ Key modules in streaming-engine:
 - `control/reconnect.rs` — Accept-failure / reconnect-attempt counters + exponential backoff
 - `metrics/session_log.rs` — JSONL session logging with rotation
 - `metrics/memory.rs` — Process RSS monitoring (GetProcessMemoryInfo / /proc/self/status)
+- `logging.rs` — engine log file `%APPDATA%/FocusVisionPCVR/engine.log` (+ `engine.prev.log`); vrserver.exe's stderr is kept nowhere
 - `recording/` — Video Annex-B + audio WAV recorders, runtime toggles via CONFIG_UPDATE
 - `simulator.rs` + `bin/headless.rs` + `bin/mock_client.rs` — In-process E2E harness (`--features simulator`)
 
@@ -46,7 +47,7 @@ cargo test --workspace                              # 500+ Rust tests
 ```bash
 cargo test --workspace                              # All Rust tests (500+ unit + integration)
 cargo test -p streaming-engine                      # Engine: 380+ tests + integration
-cargo test -p focus-vision-companion --bins         # Companion: 118 tests (config, ADB, export/PII mask, status_parser, status state machine, demo, svg_export, ui/settings validator, driver detection, font check, Japanese font fallback + baseline, headset_link, hidden child process, file dialog paths)
+cargo test -p focus-vision-companion --bins         # Companion: 121 tests (config, ADB, export/PII mask + collected logs, status_parser, status state machine, demo, svg_export, ui/settings validator, driver detection, font check, Japanese font fallback + baseline, headset_link, hidden child process, file dialog paths)
 cargo test -p fvp-common                            # Common: protocol structs / flags / versioning
 cargo bench -p streaming-engine                     # Criterion benchmarks
 cargo clippy --workspace --all-features --all-targets -- -D warnings  # CI clippy gate, fully clean

@@ -347,22 +347,69 @@ fn looks_like_ipv6(s: &str) -> bool {
 /// Collect system info string.
 pub(crate) fn system_info() -> String {
     let mut info = String::new();
+    info.push_str(&format!("Companion: {}\n", env!("CARGO_PKG_VERSION")));
     info.push_str(&format!("OS: {}\n", std::env::consts::OS));
     info.push_str(&format!("Arch: {}\n", std::env::consts::ARCH));
 
-    // GPU info via DXGI (Windows)
+    // Windows version, and every GPU with its driver version (NVENC needs
+    // a recent NVIDIA driver). Through CIM: wmic is gone from Windows 11
+    // 24H2 on.
     #[cfg(windows)]
     {
-        if let Ok(output) = crate::process::command("wmic")
-            .args(["path", "win32_VideoController", "get", "Name"])
-            .output()
-        {
-            let gpu = String::from_utf8_lossy(&output.stdout);
-            info.push_str(&format!("GPU: {}\n", gpu.lines().nth(1).unwrap_or("Unknown").trim()));
+        let script = r#"
+            [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+            $os = Get-CimInstance Win32_OperatingSystem
+            "Windows: $($os.Caption) $($os.Version)"
+            Get-CimInstance Win32_VideoController | ForEach-Object { "GPU: $($_.Name) (driver $($_.DriverVersion))" }
+        "#;
+        match crate::process::command("powershell").args(["-NoProfile", "-Command", script]).output() {
+            Ok(output) => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let lines: Vec<&str> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| l.starts_with("Windows: ") || l.starts_with("GPU: "))
+                    .collect();
+                if lines.is_empty() {
+                    info.push_str("GPU: unknown (no answer from CIM)\n");
+                }
+                for line in lines {
+                    info.push_str(line);
+                    info.push('\n');
+                }
+            }
+            Err(e) => info.push_str(&format!("GPU: unknown (PowerShell: {e})\n")),
         }
     }
 
     info
+}
+
+/// SteamVR's logs that tell about the driver (vrserver) and the frames it
+/// gets (vrcompositor), this run's and the last.
+const STEAMVR_LOGS: [&str; 4] = ["vrserver.txt", "vrserver.previous.txt", "vrcompositor.txt", "vrcompositor.previous.txt"];
+
+/// Add `path` to the zip as `name`, with PII masked; a file that can't be
+/// read leaves `name.error.txt` saying why. Missing files are skipped.
+fn add_log<W: Write + std::io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    options: zip::write::SimpleFileOptions,
+    path: &std::path::Path,
+    name: &str,
+) {
+    if !path.exists() {
+        return;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let _ = zip.start_file(name, options);
+            let _ = zip.write_all(sanitize_pii(&String::from_utf8_lossy(&bytes)).as_bytes());
+        }
+        Err(e) => {
+            let _ = zip.start_file(format!("{name}.error.txt"), options);
+            let _ = zip.write_all(format!("Failed to read {}: {e}", path.display()).as_bytes());
+        }
+    }
 }
 
 /// Export logs to a zip file. Returns the output path on success.
@@ -382,26 +429,33 @@ pub fn export_logs(adb_path: Option<&str>, device_serial: Option<&str>) -> Resul
     zip.start_file("system-info.txt", options).map_err(|e| e.to_string())?;
     zip.write_all(system_info().as_bytes()).map_err(|e| e.to_string())?;
 
-    // 2. PC-side engine logs
+    // 2. PC side: the engine's log (engine.log, engine.prev.log), status.json,
+    // and the companion's settings overrides
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let log_dir = PathBuf::from(appdata).join("FocusVisionPCVR");
-        if log_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&log_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "json" || e == "log") {
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            let fname = match path.file_name() {
-                                Some(f) => f.to_string_lossy(),
-                                None => continue,
-                            };
-                            let name = format!("pc/{}", fname);
-                            let _ = zip.start_file(&name, options);
-                            let _ = zip.write_all(sanitize_pii(&content).as_bytes());
-                        }
+        if let Ok(entries) = std::fs::read_dir(&log_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "json" || e == "log") {
+                    if let Some(fname) = path.file_name() {
+                        add_log(&mut zip, options, &path, &format!("pc/{}", fname.to_string_lossy()));
                     }
                 }
             }
+        }
+        add_log(&mut zip, options, &log_dir.join("config").join("local.toml"), "pc/config/local.toml");
+    }
+
+    // 2b. SteamVR's logs: the driver writes to vrserver.txt
+    match crate::driver::find_steamvr_log_dir() {
+        Some(dir) => {
+            for name in STEAMVR_LOGS {
+                add_log(&mut zip, options, &dir.join(name), &format!("steamvr/{name}"));
+            }
+        }
+        None => {
+            let _ = zip.start_file("steamvr/not-found.txt", options);
+            let _ = zip.write_all(b"SteamVR's log directory was not found (openvrpaths.vrpath / Steam install path).");
         }
     }
 
@@ -453,6 +507,35 @@ mod tests {
         assert!(!info.is_empty());
         assert!(info.contains("OS:"));
         assert!(info.contains("Arch:"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_info_names_windows_and_the_gpus_without_wmic() {
+        // REGRESSION: the GPU came from wmic, which Windows 11 24H2 removed.
+        let info = system_info();
+        assert!(info.lines().any(|l| l.starts_with("Windows: ")), "{info}");
+        assert!(info.lines().any(|l| l.starts_with("GPU: ") && l.contains("(driver ")), "{info}");
+    }
+
+    #[test]
+    fn a_log_is_added_masked_and_a_missing_one_is_skipped() {
+        let dir = std::env::temp_dir().join(format!("fvp-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("vrserver.txt");
+        std::fs::write(&log, "Focus Vision: connected to 192.168.1.20\n").unwrap();
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        add_log(&mut zip, options, &log, "steamvr/vrserver.txt");
+        add_log(&mut zip, options, &dir.join("vrcompositor.txt"), "steamvr/vrcompositor.txt");
+        let mut archive = zip::ZipArchive::new(zip.finish().unwrap()).unwrap();
+
+        assert_eq!(archive.len(), 1, "the missing log adds nothing");
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("steamvr/vrserver.txt").unwrap(), &mut text).unwrap();
+        assert_eq!(text, "Focus Vision: connected to [REDACTED_IP]\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

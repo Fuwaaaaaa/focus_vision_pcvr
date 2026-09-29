@@ -428,7 +428,7 @@
 - ~~**P1: Settings にスクロールがなく、既定の 480×640 では Codec・Export Logs・Reset が見えない。**~~ (2026-09-29): 全タブを縦スクロールにした(タブごとにスクロール位置を持つ)。
 - ~~**P1: コンソールウィンドウが開く**（`windows_subsystem` なし。閉じると最後の設定保存が飛ぶ）。~~ (2026-09-29): リリースビルドは GUI サブシステム(デバッグビルドは `cargo run` のログのためコンソールを残す)。adb / PowerShell / wmic は `CREATE_NO_WINDOW` で起動する(`process::command`。これがないとデバイス検出のたびに黒い窓が出る)。
 - ~~P2: 最小化したまま(タスクバーから)閉じると、次の起動で 80×103 px の窓になる。~~ (2026-09-29): eframe の `persistence` が最小化中の位置 (-32000, -32000) とサイズ 0×0 を保存し、次回それを復元していた。アプリは eframe の保存領域を使っていないので、機能ごと外した(既存の app.ron は読まれない)。
-- **P1: 診断 zip に PC のログがほぼ入らない。** エンジンの `log::` 出力はどこにも記録されず、vrserver.txt も集めない。`wmic` は Windows 11 24H2 以降にない。
+- ~~**P1: 診断 zip に PC のログがほぼ入らない。** エンジンの `log::` 出力はどこにも記録されず、vrserver.txt も集めない。`wmic` は Windows 11 24H2 以降にない。~~ (2026-09-29): エンジンは `%APPDATA%/FocusVisionPCVR/engine.log` に書く(エンジンは info、依存は warn、`RUST_LOG` で変更可。前回の分と 16 MB を超えた分は `engine.prev.log`)。zip にはそれと status.json、`config/local.toml`、SteamVR の vrserver / vrcompositor のログ(`openvrpaths.vrpath` の `log` から探す)を入れる。system info は CIM で Windows の版と GPU・ドライバの版を出す(この PC にも wmic はなかった)。SteamVR 上での出力は未確認。
 - ~~**P1: ファイル選択で日本語のパスが化ける**（PowerShell 5.1 の出力は OEM コードページ）。選択ダイアログが UI スレッドで動く。~~ (2026-09-29): スクリプトはパスを UTF-8 バイトの 16 進で出す(`file_dialog.rs`。本物の PowerShell を通すテストあり。この PC でも CP932 で出ることを確認した)。ダイアログは別スレッドで開き、閉じるまでボタンを無効にする。`-NoProfile -STA` で起動する。ダイアログの見た目は未確認(ウィンドウの後ろに出る可能性は以前と同じ)。
 - **P1: インストーラは Steam のルートにある SteamVR しか探さない。** 別ライブラリの場合に案内する `driver/install.bat` は同梱されていない。
 - **P1: 署名。** リリースジョブは署名なしでも公開する。ドライバ DLL とアンインストーラは署名しない。Android の keystore が未設定だと毎回一時鍵で署名され、`adb install -r` が更新に失敗する。

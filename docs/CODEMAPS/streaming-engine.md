@@ -166,6 +166,7 @@ Module declarations: `src/lib.rs:1-14` (14 modules).
 | `src/video/test_pattern.rs` | `generate_nv12_frame` (integration test helper) |
 | `src/sleep_mode.rs` | `SleepDetector`, `SleepTransition` |
 | `src/codec_benchmark.rs` | auto H.264 vs H.265 selection |
+| `src/logging.rs` | The engine's log → `%APPDATA%/FocusVisionPCVR/engine.log` (engine at info, others at warn; `RUST_LOG` overrides), previous run / first 16 MB in `engine.prev.log`. `fvp_init` installs it |
 
 ---
 

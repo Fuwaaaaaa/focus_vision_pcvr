@@ -321,6 +321,18 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   on its own thread, and its button waits for it. PowerShell starts with
   `-NoProfile` (a profile's output could have mixed into the path) and
   `-STA`.
+- **The engine keeps a log, and Export Logs collects what a bug report
+  needs.** Under SteamVR the engine logged to vrserver.exe's stderr, which
+  is kept nowhere (and without `RUST_LOG`, errors only).
+  - The engine writes `%APPDATA%/FocusVisionPCVR/engine.log`: its own
+    messages at info, other crates' at warn (`RUST_LOG` overrides). The
+    previous run's log, or a long run's first 16 MB, is `engine.prev.log`.
+  - The zip now holds that log, status.json, the companion's
+    `config/local.toml`, and SteamVR's vrserver / vrcompositor logs (this
+    run's and the last), found through `openvrpaths.vrpath`. The driver
+    logs to vrserver.txt.
+  - System info names Windows and each GPU with its driver version,
+    through CIM: the GPU came from wmic, which Windows 11 24H2 removed.
 - **The Android client starts.** Found by reading the code; not yet run on
   the headset.
   - The manifest had no `android.app.lib_name`, so `NativeActivity` looked

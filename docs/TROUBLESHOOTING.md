@@ -202,9 +202,13 @@
 
 上記で解決しない場合、サポート/Issue 用にログを収集します:
 
-1. PC 側コンパニオンアプリ → Home タブ → **Export Logs** ボタン
-2. PC 側ログ + HMD 側 logcat + システム情報 (GPU/ドライバ/Windows バージョン) を ZIP にまとめてくれる
-3. PII (IP アドレス、ホスト名) は自動でマスクされる
+1. PC 側コンパニオンアプリ → Settings タブ → Diagnostics の **Export Logs (zip)** ボタン
+2. ダウンロードフォルダに ZIP ができる。中身:
+   - エンジンのログ (`%APPDATA%\FocusVisionPCVR\engine.log` と前回分の `engine.prev.log`)、status.json、コンパニオンの設定 (`config\local.toml`)
+   - SteamVR のログ (vrserver.txt、vrcompositor.txt と、それぞれ前回分。ドライバのログは vrserver.txt に出る)
+   - HMD 側 logcat (ADB で接続しているとき)
+   - システム情報 (Windows のバージョン、GPU とドライババージョン)
+3. PII (IP アドレス、MAC アドレス、SSID、メールアドレス、ユーザー名を含むパス、PIN) は自動でマスクされる
 4. ZIP を [GitHub Issues](https://github.com/Fuwaaaaaa/focus_vision_pcvr/issues) に添付して報告
 
 ログ収集なしで Issue を立てる場合でも、以下の情報があると調査が早いです:

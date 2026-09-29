@@ -125,19 +125,40 @@ pub fn is_driver_installed(drivers_dir: &Path) -> bool {
 /// into SteamVR's `drivers` folder. SteamVR lists those directories under
 /// `external_drivers` in `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`.
 pub fn find_registered_driver() -> Option<PathBuf> {
-    let path = dirs_next::cache_dir()?.join("openvr").join("openvrpaths.vrpath");
-    registered_driver_in(&fs::read_to_string(path).ok()?)
+    registered_driver_in(&read_vrpath()?)
 }
 
 fn registered_driver_in(vrpath_json: &str) -> Option<PathBuf> {
-    let paths: serde_json::Value =
-        serde_json::from_str(vrpath_json.trim_start_matches('\u{feff}')).ok()?;
-    paths.get("external_drivers")?
-        .as_array()?
-        .iter()
-        .filter_map(|d| d.as_str())
-        .map(PathBuf::from)
-        .find(|d| has_driver_dll(d))
+    vrpath_list(vrpath_json, "external_drivers").into_iter().find(|d| has_driver_dll(d))
+}
+
+/// SteamVR's log directory (vrserver.txt, vrcompositor.txt): `log` in
+/// `openvrpaths.vrpath`, else `logs` under Steam's install path.
+pub fn find_steamvr_log_dir() -> Option<PathBuf> {
+    read_vrpath()
+        .and_then(|json| log_dir_in(&json))
+        .or_else(|| read_steam_install_path_from_registry().map(|steam| steam.join("logs")).filter(|d| d.is_dir()))
+}
+
+fn log_dir_in(vrpath_json: &str) -> Option<PathBuf> {
+    vrpath_list(vrpath_json, "log").into_iter().find(|d| d.is_dir())
+}
+
+/// `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`, where SteamVR records its
+/// runtime, config, log and external driver directories.
+fn read_vrpath() -> Option<String> {
+    fs::read_to_string(dirs_next::cache_dir()?.join("openvr").join("openvrpaths.vrpath")).ok()
+}
+
+/// The directories listed under `key` in an openvrpaths.vrpath.
+fn vrpath_list(vrpath_json: &str, key: &str) -> Vec<PathBuf> {
+    // SteamVR may write the file with a UTF-8 BOM.
+    let paths: Option<serde_json::Value> = serde_json::from_str(vrpath_json.trim_start_matches('\u{feff}')).ok();
+    paths
+        .as_ref()
+        .and_then(|p| p.get(key)?.as_array())
+        .map(|dirs| dirs.iter().filter_map(|d| d.as_str()).map(PathBuf::from).collect())
+        .unwrap_or_default()
 }
 
 /// Install our driver into SteamVR's drivers directory.
@@ -257,6 +278,21 @@ mod tests {
         assert_eq!(registered_driver_in(r#"{"external_drivers": null, "version": 1}"#), None);
         assert_eq!(registered_driver_in(r#"{"version": 1}"#), None);
         assert_eq!(registered_driver_in("not json"), None);
+    }
+
+    #[test]
+    fn steamvr_logs_are_where_the_vrpath_says() {
+        let gone = std::env::temp_dir().join("fvp-no-such-log-dir");
+        let logs = TempDriverDir::new("logs", false);
+        let json = serde_json::json!({
+            "log": [gone.to_string_lossy(), logs.0.to_string_lossy()],
+            "runtime": [r"C:\Steam\steamapps\common\SteamVR"],
+            "version": 1,
+        })
+        .to_string();
+        assert_eq!(log_dir_in(&json), Some(logs.0.clone()), "the first that exists");
+        assert_eq!(log_dir_in(&format!("\u{feff}{json}")), Some(logs.0.clone()));
+        assert_eq!(log_dir_in(r#"{"version": 1}"#), None);
     }
 
     #[test]
