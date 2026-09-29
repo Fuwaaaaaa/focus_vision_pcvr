@@ -248,8 +248,14 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     projection's `top` / `bottom` now follow OpenVR's convention (`top` is
     the lower edge's tangent, as `ComposeProjection` and ALVR use it); they
     were swapped, which turns an asymmetric field of view upside down.
-  - Still missing: compositing the layers above the scene (overlays, the
-    dashboard).
+  - **The dashboard and overlays are streamed.** `SubmitLayer` kept only the
+    first layer, the scene. Every layer is now drawn, bottom first: the
+    scene opaque (some apps submit it with zero alpha), each layer above it
+    blended by its alpha (as ALVR does). A layer rendered at another head
+    orientation than the scene's (the compositor draws its overlays at a
+    newer pose when an app falls behind) is turned to the scene's, per
+    pixel, with the eye's field of view (`layer_compose.h`, host-tested;
+    the shader is checked on WARP).
 
 ### Fixes
 - **The engine notices a dead link and lets the headset back in** (#18).
@@ -463,9 +469,6 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   SteamVR driver's video path is wired (its D3D11 side tested on WARP), but
   neither has run on the headset, under SteamVR, or on an NVIDIA GPU. The
   hardware-free simulator path is unaffected.
-- **Overlays are not shown.** The driver streams the scene layer only, so
-  the SteamVR dashboard and other overlays don't reach the headset. Tracked
-  in TODOS.md.
 
 ## [3.0.0] - 2026-06-01
 

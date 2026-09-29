@@ -19,12 +19,13 @@ loads on boot. The driver opens the Rust streaming engine, registers HMD
 | `src/server_driver.cpp` / `.h` | `CServerDriver` (`IServerTrackedDeviceProvider`) — Init/Cleanup lifecycle + SteamVR interface glue | 240 + 33 |
 | `src/hmd_device.cpp` / `.h` | `CHmdDevice` (`ITrackedDeviceServerDriver`) — pose, IPD, refresh rate, component activation | 180 |
 | `src/controller_device.cpp` / `.h` | `CControllerDevice` (`ITrackedDeviceServerDriver`) — input component, haptic via `fvp_haptic_event` | 180 |
-| `src/direct_mode.cpp` / `.h` | `CDirectModeComponent` (`IVRDriverDirectModeComponent`) — D3D11 device, swap sets, SubmitLayer / Present → blit → encode | 240 + 100 |
+| `src/direct_mode.cpp` / `.h` | `CDirectModeComponent` (`IVRDriverDirectModeComponent`) — D3D11 device, swap sets, SubmitLayer (all layers) / Present → blit + composite → encode | 280 + 120 |
 | `src/display_component.h` | `CDisplayComponent` (`IVRDisplayComponent`) — render size, projection, eye viewports, no distortion | 80 |
 | `src/display_geometry.h` | FOV → raw projection, eye viewports — pure, tested | 60 |
 | `src/gpu_adapter.cpp` / `.h` | Pick the GPU (NVIDIA first), create the D3D11 device, LUID for SteamVR | 70 + 70 |
 | `src/swap_textures.cpp` / `.h` | `SwapTextureSets` — shareable textures + DXGI shared handles for the compositor | 80 + 55 |
-| `src/eye_blit.cpp` / `.h` | `EyeBlit` — draws an eye's region of a layer into NVENC's B8G8R8A8 input (scale, flip, sRGB) | 170 + 80 |
+| `src/eye_blit.cpp` / `.h` | `EyeBlit` — draws an eye's region of a layer into NVENC's B8G8R8A8 input (scale, flip, sRGB); `drawOver` blends a layer above the scene, turned to its head pose | 230 + 90 |
+| `src/layer_compose.h` | Turning a layer rendered at another head pose to the scene's (rotation, ray lookup) — pure, tested, mirrored by EyeBlit's shader | 100 |
 | `src/sync_texture.cpp` / `.h` | `SyncTexture` — the compositor's keyed mutex, held while Present reads the frame | 30 + 30 |
 | `src/nvenc_encoder.cpp` / `.h` | NVENC session on EyeBlit's output, QP delta map, `encode()` | 330 + 110 |
 | `src/driver_log.h` | `driverLog()` → SteamVR's vrserver.txt | 25 |
@@ -109,9 +110,10 @@ CServerDriver::Cleanup()
 ### `CDirectModeComponent` (direct_mode.h)
 - `init()`: D3D11 device (`fvp_gpu::createDevice`), `EyeBlit`, `NvencEncoder`
 - `CreateSwapTextureSet()` → `SwapTextureSets` (real DXGI shared handles)
-- `SubmitLayer()` keeps the frame's first layer; `Present(syncTexture)`
-  blits both eyes side by side under the sync texture's mutex, encodes, submits
-- Not yet: compositing overlay layers (TODOS)
+- `SubmitLayer()` collects the frame's layers (scene first, up to 16); `Present(syncTexture)`
+  blits both eyes side by side under the sync texture's mutex, blends each
+  layer above the scene on (turned to the scene's head pose, `layer_compose.h`),
+  encodes, submits
 
 ### `SwapTextureSets` / `EyeBlit` / `SyncTexture`
 - D3D11 only, no OpenVR calls — tested on WARP (`tests/test_d3d_pipeline.cpp`)
@@ -132,7 +134,7 @@ CServerDriver::Cleanup()
 
 ---
 
-## Tests (80 GoogleTest cases)
+## Tests (90 GoogleTest cases)
 
 `driver/tests/test_qp_map.cpp`:
 - `ComputeQpDeltaMap_centerGaze_fovealZero` — gaze at (0,0) produces zero QP offset in fovea
@@ -149,8 +151,10 @@ Build via `cd driver/build && cmake --build . && ctest`. Run on Windows only
 `driver/tests/test_d3d_pipeline.cpp` (WARP, no GPU needed): shared handles
 the compositor can open, whole-set destroy, left/right eye from a
 double-wide sRGB texture, scaling, flipped bounds, BGRA and float sources,
+layers blended by alpha over an opaque scene and turned to its head pose,
 the sync texture's keyed mutex. `test_display_geometry.cpp`: projection,
-eye viewports, GPU choice, LUID packing.
+eye viewports, GPU choice, LUID packing. `test_layer_compose.cpp`: the
+rotation between layer and scene poses and where a ray lands in the layer.
 
 **Not tested**: `NvencEncoder` encode path (needs NVIDIA GPU),
 `CDirectModeComponent` / `CHmdDevice` wiring (needs SteamVR).
@@ -174,7 +178,6 @@ against `streaming_engine.lib` (cdylib import lib).
 - Nothing of this pipeline has run under SteamVR or on an NVIDIA GPU yet
 - SteamVR starts with a fixed default FOV
   (`display_geometry.h`) until the headset reports its own (VIEW_CONFIG, first connection)
-- Overlay layers (SteamVR dashboard) are not composited
 - NVENC runs only on a driver that supports NVENC API 12.2+ (official header in `third_party/nvenc`)
 
 ---

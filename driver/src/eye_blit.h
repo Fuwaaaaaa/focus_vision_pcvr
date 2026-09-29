@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <string>
 
+#include "layer_compose.h"
+
 namespace fvp_blit {
 
 /// Whether sampling `format` yields linear light, which has to be encoded
@@ -36,9 +38,10 @@ struct UvRect {
 }  // namespace fvp_blit
 
 /**
- * Draws the eyes of a submitted layer into the encoder's input texture,
+ * Draws the eyes of the submitted layers into the encoder's input texture,
  * side by side (left eye in the left half): each eye's region of its swap
- * texture, scaled to the encoded size, in the format NVENC reads
+ * texture, scaled to the encoded size, the layers above the scene blended
+ * on (layer_compose.h), in the format NVENC reads
  * (B8G8R8A8, NV_ENC_BUFFER_FORMAT_ARGB). A draw rather than CopyResource,
  * which D3D11 silently skips between format groups (the compositor's
  * R8G8B8A8 vs NVENC's B8G8R8A8) and which can't scale (SteamVR
@@ -58,18 +61,32 @@ public:
     ID3D11Texture2D* output() const { return m_output.Get(); }
 
     /// Draw the `uv` region of the texture behind `source` (of `format`) to
-    /// fill eye `eye`'s half of output() (0 = left, 1 = right). Queued on
-    /// `context`; false if not initialized.
+    /// fill eye `eye`'s half of output() (0 = left, 1 = right), opaque: the
+    /// frame's first layer, the scene. Queued on `context`; false if not
+    /// initialized.
     bool draw(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source, DXGI_FORMAT format,
               const fvp_blit::UvRect& uv, int eye);
 
+    /// Blend a layer above the scene (an overlay, the dashboard) onto eye
+    /// `eye`'s half by its alpha, turned by `placement` to the scene's head
+    /// orientation within the eye's field of view `eyeFov`. What falls
+    /// outside the layer's image keeps the scene.
+    bool drawOver(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source, DXGI_FORMAT format,
+                  const fvp_blit::UvRect& uv, int eye, const fvp_layers::Placement& placement,
+                  const fvp_layers::Tangents& eyeFov);
+
 private:
+    bool drawLayer(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source, DXGI_FORMAT format,
+                   const fvp_blit::UvRect& uv, int eye, bool over, const fvp_layers::Placement& placement,
+                   const fvp_layers::Tangents& eyeFov);
+
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_output;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_outputView;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> m_vertexShader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_pixelShader;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_params;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_sampler;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> m_blendOver;
     uint32_t m_eyeWidth = 0;
     uint32_t m_eyeHeight = 0;
 };
