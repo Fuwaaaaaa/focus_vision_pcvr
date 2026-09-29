@@ -250,8 +250,8 @@ pub fn encode_view_config(c: &ViewConfig) -> [u8; VIEW_CONFIG_PAYLOAD_LEN] {
         c.eyes[1].left, c.eyes[1].right, c.eyes[1].up, c.eyes[1].down,
         c.ipd_m,
     ];
-    for (chunk, v) in out.chunks_exact_mut(4).zip(values) {
-        chunk.copy_from_slice(&v.to_le_bytes());
+    for (i, v) in values.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
     out
 }
