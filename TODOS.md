@@ -363,13 +363,14 @@
 
 ## ⚠ BLOCKER (P0): ドライバが NVENC を初期化しない — 実機では映像が 1 フレームも出ない
 （2026-09-25 のコード調査で判明。GPU・SteamVR が無い開発機では検証できないため、直さずに記録）
-- **What:** `CDirectModeComponent::initEncoder`（`driver/src/direct_mode.cpp`）を呼ぶ場所がどこにもない（`git log -S` でも追加以来ずっと未使用）。`m_encoderReady` は常に false で、`Present()` は毎回早期 return する。
+（2026-09-29: 下の 3 点と表示コンポーネント・フレームのコピーを配線した。D3D11 の部分は WARP の gtest で確認済み。SteamVR と NVIDIA GPU での確認はまだ。残りは bitrate の反映）
+- ~~**What:** `CDirectModeComponent::initEncoder`（`driver/src/direct_mode.cpp`）を呼ぶ場所がどこにもない（`git log -S` でも追加以来ずっと未使用）。`m_encoderReady` は常に false で、`Present()` は毎回早期 return する。~~ (2026-09-29): `CHmdDevice::Activate` が `CDirectModeComponent::init()` を呼び、デバイス・`EyeBlit`・`NvencEncoder` を作る。
 - **同じ経路のほかの問題:**
-  - driver は D3D11 デバイスを作っていない。`CreateSwapTextureSet` は `m_encoder.getDevice()`（初期化前は null）を使うので、スワップテクスチャも作れない。
-  - `rSharedTextureHandles` に入れているのは `m_nextHandle++` の連番で、DXGI の本物の共有ハンドル（`IDXGIResource::GetSharedHandle`）ではない。SteamVR の compositor はこれを開けない。
+  - ~~driver は D3D11 デバイスを作っていない。`CreateSwapTextureSet` は `m_encoder.getDevice()`（初期化前は null）を使うので、スワップテクスチャも作れない。~~ (2026-09-29): NVIDIA の GPU(なければ最もメモリの多いハードウェア GPU)にデバイスを作り、`Prop_GraphicsAdapterLuid_Uint64` で compositor に同じアダプタを使わせる(`gpu_adapter.*`)。
+  - ~~`rSharedTextureHandles` に入れているのは `m_nextHandle++` の連番で、DXGI の本物の共有ハンドル（`IDXGIResource::GetSharedHandle`）ではない。SteamVR の compositor はこれを開けない。~~ (2026-09-29): `SwapTextureSets` が `GetSharedHandle` の値を返す。別デバイスから開けることを WARP で確認。
   - ~~`nvenc_encoder.h` の手書きの NVENC 関数テーブルの並びが、公式の `nvEncodeAPI.h`（`NV_ENCODE_API_FUNCTION_LIST`）と合っていない疑いがある~~ (2026-09-28 修正): 疑いどおりだった。関数テーブルに加えて、構造体バージョンの作り方、`NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS` / `NV_ENC_INITIALIZE_PARAMS` / `NV_ENC_LOCK_BITSTREAM` / `NV_ENC_RC_PARAMS` / `NV_ENC_PIC_PARAMS` のレイアウト、`NV_ENC_BUFFER_FORMAT_ARGB`（0x20 → 正しくは 0x01000000）、`NV_ENC_PIC_FLAG_FORCEIDR`（4 → 正しくは 2）も違っていた。公式ヘッダ（`third_party/nvenc`、SDK 12.2）に置き換え、preset config を `nvEncGetEncodePresetConfigEx` で取得して設定を上書きする形にした（`driver/src/nvenc_config.h`）。HEVC の QP delta map は 32x32 CTB 単位に直した（64 は NVENC が対応していない）。実機で NVENC が動くかはまだ確認していない。
   - `fvp_set_bitrate_callback` を driver が登録しておらず、`NvencEncoder` に reconfigure（`nvEncReconfigureEncoder`）の経路もない。adaptive bitrate の変更は NVENC に届かない。
-- **直すのに必要なこと:** D3D11 デバイスの作成（SteamVR が使うアダプタ）、本物の共有テクスチャ、`initEncoder` の呼び出し、関数テーブルの検証、bitrate callback と reconfigure（Present スレッドで適用する atomic な保留値）。
+- **直すのに必要なこと:** ~~D3D11 デバイスの作成（SteamVR が使うアダプタ）、本物の共有テクスチャ、`initEncoder` の呼び出し、~~ 関数テーブルの検証（実機）、bitrate callback と reconfigure（Present スレッドで適用する atomic な保留値）。
 - **Priority:** P0（実機での映像の前提）
 - **Depends on:** NVIDIA GPU + SteamVR のある環境（ビルドと gtest 以外は検証できない）
 
@@ -386,14 +387,15 @@
 （コードを読んで見つけたもの。実機では確認していない。同じ監査で見つかったもののうち、PIN の回避、依存の脆弱性と CI の監査、Android アプリの起動時クラッシュ、インストーラの DLL 配置とフォント、NVENC の定義は修正済み。CHANGELOG [Unreleased] を参照）
 
 ### ドライバ（上の P0 に加えて、映像を出すまでに要るもの）
-- **P0: 表示コンポーネントがない。** HMD は DirectMode コンポーネントしか返さず（`hmd_device.cpp` `GetComponent`）、`IVRDisplayComponent` がない。投影・レンダーターゲットの大きさ・目ごとのビューポートを compositor が得られない。
-- **P0: フレームコピーが何もしない。** `FrameCopy` は `R8G8B8A8_UNORM`、NVENC の入力は `B8G8R8A8_UNORM` で、形式グループが違う `CopyResource` は D3D11 が無視する。compositor の `nFormat` との一致も要る。
-- **P1: 左目しか送らない**（`direct_mode.cpp` `Present`）。立体視にならない。
-- **P1: `syncTexture` を使っていない。** keyed mutex の取得も vsync イベントもないので、描画途中のフレームを読む可能性がある（実機で確認が要る）。
-- **P1: NVENC が使えないとき、黙ってダミー NAL（IDR ヘッダ + `0xAB`）を流す。** `init()` は true を返し、失敗は `OutputDebugStringA` にしか出ない（vrserver.txt に残らない）。失敗として扱い、`VRDriverLog` に出すべき。
+- ~~**P0: 表示コンポーネントがない。** HMD は DirectMode コンポーネントしか返さず（`hmd_device.cpp` `GetComponent`）、`IVRDisplayComponent` がない。投影・レンダーターゲットの大きさ・目ごとのビューポートを compositor が得られない。~~ (2026-09-29): `CDisplayComponent`。レンダーサイズは `render_width/height`、歪みなし。FOV は固定の既定値(片目 100°、`display_geometry.h`)。
+- ~~**P0: フレームコピーが何もしない。** `FrameCopy` は `R8G8B8A8_UNORM`、NVENC の入力は `B8G8R8A8_UNORM` で、形式グループが違う `CopyResource` は D3D11 が無視する。compositor の `nFormat` との一致も要る。~~ (2026-09-29): `EyeBlit` がシェーダで描き写す。レイヤーの bounds(左目・反転)、サイズの違い(SteamVR のスーパーサンプリング)、sRGB / float の元テクスチャを吸収して、NVENC の B8G8R8A8 入力にする。WARP で読み戻して確認。
+- **P1: 左目しか送らない**（`direct_mode.cpp` `Present`）。立体視にならない。クライアントも 1 本の映像を両目に出している。プロトコル(左右並びの大きさ)・クライアント(目ごとの UV)・ドライバ(両目を描き写す)をまとめて変える。同時に、ヘッドセットの FOV をクライアントから送らせて `CDisplayComponent` に使う(いまは固定値で、実機の FOV と違う分だけ像の大きさがずれる)。
+- **P1: 重ねるレイヤーを合成していない。** `SubmitLayer` の最初のレイヤー(シーン)しか使わないので、SteamVR のダッシュボードやオーバーレイが映らない。
+- ~~**P1: `syncTexture` を使っていない。** keyed mutex の取得も vsync イベントもないので、描画途中のフレームを読む可能性がある（実機で確認が要る）。~~ (2026-09-29): `Present` は sync texture の keyed mutex を取ってから読む(10 ms 待って取れなければそのフレームを飛ばす)。vsync イベントは HMD のスレッドが refresh 間隔で送る(`Prop_DriverDirectModeSendsVsyncEvents_Bool`)。実機でのタイミングは未確認。
+- ~~**P1: NVENC が使えないとき、黙ってダミー NAL（IDR ヘッダ + `0xAB`）を流す。** `init()` は true を返し、失敗は `OutputDebugStringA` にしか出ない（vrserver.txt に残らない）。失敗として扱い、`VRDriverLog` に出すべき。~~ (2026-09-29): `init()` は false を返し、理由を vrserver.txt に出す。映像は流さない。
 - **P1: コントローラの入力プロファイルがない。** `{focus_vision_pcvr}/input/controller_profile.json` が存在せず、`Prop_ControllerType_String` も未設定なので、SteamVR 側にボタン割り当てがない。
-- **P1: 終了時の use-after-free。** `server_driver.cpp` `Cleanup` がデバイスを破棄してから `fvp_shutdown()` を呼ぶため、tracking タスクの gaze / IDR コールバックが破棄済みの `m_hmdDevice` を触りうる。`fvp_shutdown` を先に呼ぶ。
-- P2: `DestroySwapTextureSet` がセットの 3 枚のうち 1 枚しか消さない。`initEncoder` が `full_range` と foveation の設定を無視する。head pose が一度来ると以後ずっと「有効」、速度が未設定、`GetPose` が同期なしで読む。CONFIG_UPDATE の codec 変更 (0x02) は受理を返すが何もしない。
+- ~~**P1: 終了時の use-after-free。** `server_driver.cpp` `Cleanup` がデバイスを破棄してから `fvp_shutdown()` を呼ぶため、tracking タスクの gaze / IDR コールバックが破棄済みの `m_hmdDevice` を触りうる。`fvp_shutdown` を先に呼ぶ。~~ (2026-09-29): `fvp_shutdown` を先に呼ぶ。
+- P2: ~~`DestroySwapTextureSet` がセットの 3 枚のうち 1 枚しか消さない。`initEncoder` が `full_range` と foveation の設定を無視する。head pose が一度来ると以後ずっと「有効」、~~ (2026-09-29 修正。head pose はエンジンがセッション終了時に消す #18) 速度が未設定、`GetPose` が同期なしで読む。CONFIG_UPDATE の codec 変更 (0x02) は受理を返すが何もしない。
 
 ### Android クライアント（上の P0 のセッション配線に加えて）
 - ~~**P1: サーバから届くメッセージを読まない。**~~ (2026-09-28): `StreamSession` のスレッドが読み、`ServerEvent` としてアプリに渡す。TLS の読み書きはそのスレッドだけが行う。アプリ側の処理(ハプティクス・スリープ表示)は `openxr_app` への組み込みと一緒に行う。

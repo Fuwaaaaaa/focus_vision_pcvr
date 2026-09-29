@@ -6,7 +6,7 @@
 - CMake 3.18+
 - Windows SDK (for driver DLL)
 - Android SDK + NDK 26.1 (for client APK)
-- NVIDIA GPU with NVENC support (for real encoding; test pattern fallback available)
+- NVIDIA GPU with NVENC support (for encoding; without one SteamVR runs but no video is streamed)
 
 ## Build
 

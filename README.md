@@ -148,7 +148,7 @@ cargo run -p focus-vision-companion --features simulator -- --simulate
 <summary><b>C++ テスト (GoogleTest)</b></summary>
 
 ```bash
-cd driver/build && ctest  # 44 tests (QP map / NVENC config / VUI / encode params)
+cd driver/build && ctest  # 63 tests (QP map / NVENC config / VUI / encode params / display geometry / D3D11 direct mode on WARP)
 ```
 
 </details>
