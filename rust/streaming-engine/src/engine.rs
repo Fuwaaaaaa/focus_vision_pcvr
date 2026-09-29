@@ -737,9 +737,13 @@ async fn handle_tcp_control(
                                         }
                                     }
                                     0x02 => { // codec (0=h264, 1=h265)
-                                        log::info!("CONFIG_UPDATE: codec → {}", if value == 0 { "h264" } else { "h265" });
-                                        // Codec change requires stream restart — acknowledged but deferred
-                                        ack_status = 0x01;
+                                        // REGRESSION: accepted, though nothing
+                                        // changed. The encoder is set up when
+                                        // SteamVR starts ([video] codec).
+                                        log::warn!(
+                                            "CONFIG_UPDATE: codec → {} rejected: it takes effect when SteamVR restarts ([video] codec)",
+                                            if value == 0 { "h264" } else { "h265" },
+                                        );
                                     }
                                     0x03 => { // recording (0=off, 1=on)
                                         ack_status = crate::recording::apply_recording_config_update(
@@ -2338,6 +2342,8 @@ mod tests {
         /// Everything forwarded to the frame loop.
         events: Vec<ControlEvent>,
         disconnect_reason: Option<DisconnectReason>,
+        /// What the engine sent back (framed messages).
+        response: Vec<u8>,
     }
 
     impl TcpTestHarness {
@@ -2347,6 +2353,7 @@ mod tests {
                 osc_bridge: None,
                 events: Vec::new(),
                 disconnect_reason: None,
+                response: Vec::new(),
             }
         }
 
@@ -2391,8 +2398,26 @@ mod tests {
                 std::time::Duration::from_millis(100),
                 client_read.read_to_end(&mut response)
             ).await;
+            self.response = response;
 
             self
+        }
+
+        /// The payloads of the messages of `msg_type` the engine sent back.
+        fn sent(&self, msg_type: u8) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut rest = &self.response[..];
+            while rest.len() >= 5 {
+                let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+                if len == 0 || rest.len() < 4 + len {
+                    break;
+                }
+                if rest[4] == msg_type {
+                    out.push(rest[5..4 + len].to_vec());
+                }
+                rest = &rest[4 + len..];
+            }
+            out
         }
     }
 
@@ -2424,6 +2449,29 @@ mod tests {
         let harness = harness.run_with_input(&msg).await;
         assert!(!harness.cancel.is_cancelled());
         assert!(harness.events.is_empty(), "rejected, got {:?}", harness.events);
+    }
+
+    #[tokio::test]
+    async fn a_codec_change_is_refused_not_pretended() {
+        // REGRESSION: acknowledged as accepted, though the encoder never
+        // changed codec (it is set up when SteamVR starts).
+        let mut payload = vec![0x02u8]; // key = codec
+        payload.extend_from_slice(&0u32.to_le_bytes()); // h264
+        let msg = build_tcp_msg(fvp_common::protocol::msg_type::CONFIG_UPDATE, &payload);
+
+        let harness = TcpTestHarness::new().run_with_input(&msg).await;
+        let acks = harness.sent(fvp_common::protocol::msg_type::CONFIG_UPDATE_ACK);
+        assert_eq!(acks, vec![vec![0x00, 0x02]], "[rejected, key codec]");
+    }
+
+    #[tokio::test]
+    async fn a_bitrate_change_is_acknowledged() {
+        let mut payload = vec![0x01u8];
+        payload.extend_from_slice(&60u32.to_le_bytes());
+        let msg = build_tcp_msg(fvp_common::protocol::msg_type::CONFIG_UPDATE, &payload);
+        let harness = TcpTestHarness::new().run_with_input(&msg).await;
+        let acks = harness.sent(fvp_common::protocol::msg_type::CONFIG_UPDATE_ACK);
+        assert_eq!(acks, vec![vec![0x01, 0x01]], "[accepted, key bitrate]");
     }
 
     #[tokio::test]
