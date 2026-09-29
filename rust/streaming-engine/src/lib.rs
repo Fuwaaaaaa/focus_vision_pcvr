@@ -13,6 +13,7 @@ pub mod face_tracking;
 pub mod sleep_mode;
 pub mod recording;
 pub mod thermal;
+pub mod logging;
 
 #[cfg(feature = "simulator")]
 pub mod simulator;
@@ -251,7 +252,10 @@ fn build_fvp_config(cfg: &config::AppConfig) -> FvpConfig {
 #[no_mangle]
 pub extern "C" fn fvp_init() -> i32 {
     ffi_panic_guard!(-1, {
-        INIT.call_once(|| { env_logger::init(); });
+        // The log goes to a file: vrserver.exe's stderr is kept nowhere.
+        INIT.call_once(|| {
+            logging::init(dirs_next::data_dir().map(|d| d.join("FocusVisionPCVR")).as_deref());
+        });
         log::info!("Focus Vision PCVR Streaming Engine initializing...");
 
         // vrserver.exe's working directory is SteamVR's, so the config is
