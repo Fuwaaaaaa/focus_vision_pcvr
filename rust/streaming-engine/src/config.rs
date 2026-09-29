@@ -626,9 +626,20 @@ impl AppConfig {
             errors.push(ConfigError { field: "network.udp_port", message: format!("{} < 1024, clamped to {}", self.network.udp_port, default_udp_port()) });
             self.network.udp_port = default_udp_port();
         }
+        // The streams use udp_port + 1..=3 (video, tracking, audio).
+        // REGRESSION: a udp_port above 65532 overflowed that u16 sum.
+        let max_udp = u16::MAX - fvp_common::AUDIO_PORT_OFFSET;
+        if self.network.udp_port > max_udp {
+            errors.push(ConfigError { field: "network.udp_port", message: format!("{} > {} (the streams use it + 1..=3), clamped to {}", self.network.udp_port, max_udp, default_udp_port()) });
+            self.network.udp_port = default_udp_port();
+        }
         if self.network.tcp_port == self.network.udp_port {
             errors.push(ConfigError { field: "network.udp_port", message: format!("== tcp_port ({}), offsetting", self.network.tcp_port) });
-            self.network.udp_port = self.network.tcp_port + 1;
+            self.network.udp_port = if self.network.tcp_port < max_udp {
+                self.network.tcp_port + 1
+            } else {
+                self.network.tcp_port - 1
+            };
         }
 
         // FEC redundancy
@@ -673,6 +684,21 @@ impl AppConfig {
         validate_range(&mut self.video.bitrate_mbps, 10, 200, 80, "video.bitrate_mbps", &mut errors);
         validate_range(&mut self.video.framerate, 30, 120, 90, "video.framerate", &mut errors);
         validate_f32_range(&mut self.video.resolution_scale, 0.5, 1.0, 1.0, "video.resolution_scale", &mut errors);
+        // REGRESSION: 0 (or an odd size, which 4:2:0 encoding can't take)
+        // went through to the driver and the encoder.
+        let default_size = default_resolution();
+        for (i, size) in self.video.resolution_per_eye.iter_mut().enumerate() {
+            validate_range(size, 320, 4096, default_size[i], "video.resolution_per_eye", &mut errors);
+            if *size % 2 == 1 {
+                errors.push(ConfigError { field: "video.resolution_per_eye", message: format!("{} is odd, rounded down to {}", size, *size - 1) });
+                *size -= 1;
+            }
+        }
+
+        // Display: the IPD the headset reports is accepted in the same range
+        // (VIEW_CONFIG). REGRESSION: NaN or 0 went through.
+        validate_f32_range(&mut self.display.ipd, 0.040, 0.090, default_ipd(), "display.ipd", &mut errors);
+        validate_f32_range(&mut self.display.seconds_from_vsync_to_photons, 0.0, 0.1, default_vsync_to_photons(), "display.seconds_from_vsync_to_photons", &mut errors);
         if self.video.bitrate_pixel_factor.take().is_some() {
             errors.push(ConfigError {
                 field: "video.bitrate_pixel_factor",
@@ -685,6 +711,9 @@ impl AppConfig {
 
         // Sleep mode
         validate_range(&mut self.sleep_mode.timeout_seconds, 30, 3600, 300, "sleep_mode.timeout_seconds", &mut errors);
+        // REGRESSION: 0 was accepted, and above 4294 the bps (× 1 000 000)
+        // overflowed u32.
+        validate_range(&mut self.sleep_mode.sleep_bitrate_mbps, 1, 200, default_sleep_bitrate(), "sleep_mode.sleep_bitrate_mbps", &mut errors);
         // motion_threshold: min is exclusive (> 0.0) — keep manual check
         if self.sleep_mode.motion_threshold <= 0.0 || self.sleep_mode.motion_threshold > 0.1
             || self.sleep_mode.motion_threshold.is_nan()
@@ -967,6 +996,64 @@ mod tests {
         assert!(errors.iter().any(|e| e.field == "video.bitrate_pixel_factor"));
         assert_eq!(cfg.video.bitrate_mbps, 100, "the encoder bitrate comes from bitrate_mbps");
         assert_eq!(cfg.video.bitrate_pixel_factor, None);
+    }
+
+    #[test]
+    fn a_udp_port_whose_streams_would_pass_65535_is_reset() {
+        let mut cfg = AppConfig::default();
+        cfg.network.udp_port = 65534; // audio at + 3 = 65537
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "network.udp_port"));
+        assert_eq!(cfg.network.udp_port, default_udp_port());
+        cfg.network.udp_port = 65532; // + 3 = 65535, fits
+        assert!(cfg.validate().is_empty());
+    }
+
+    #[test]
+    fn a_port_conflict_at_the_top_moves_down() {
+        let mut cfg = AppConfig::default();
+        cfg.network.tcp_port = 65532;
+        cfg.network.udp_port = 65532;
+        cfg.validate();
+        assert_eq!(cfg.network.udp_port, 65531, "65533 would put audio past 65535");
+    }
+
+    #[test]
+    fn sleep_bitrate_needs_to_be_a_real_bitrate() {
+        for bad in [0, 5000] {
+            let mut cfg = AppConfig::default();
+            cfg.sleep_mode.sleep_bitrate_mbps = bad;
+            let errors = cfg.validate();
+            assert!(errors.iter().any(|e| e.field == "sleep_mode.sleep_bitrate_mbps"), "{bad}");
+            assert_eq!(cfg.sleep_mode.sleep_bitrate_mbps, default_sleep_bitrate());
+        }
+    }
+
+    #[test]
+    fn eye_size_is_plausible_and_even() {
+        let mut cfg = AppConfig::default();
+        cfg.video.resolution_per_eye = [0, 1921];
+        let errors = cfg.validate();
+        assert_eq!(cfg.video.resolution_per_eye, [1832, 1920], "0 reset, odd rounded down");
+        assert_eq!(errors.iter().filter(|e| e.field == "video.resolution_per_eye").count(), 2);
+    }
+
+    #[test]
+    fn ipd_and_vsync_to_photons_reject_nan_and_zero() {
+        let mut cfg = AppConfig::default();
+        cfg.display.ipd = f32::NAN;
+        cfg.display.seconds_from_vsync_to_photons = f32::INFINITY;
+        cfg.validate();
+        assert_eq!(cfg.display.ipd, default_ipd());
+        assert_eq!(cfg.display.seconds_from_vsync_to_photons, default_vsync_to_photons());
+        cfg.display.ipd = 0.0;
+        cfg.validate();
+        assert_eq!(cfg.display.ipd, default_ipd());
+    }
+
+    #[test]
+    fn the_default_config_is_valid() {
+        assert!(AppConfig::default().validate().is_empty());
     }
 
     #[test]

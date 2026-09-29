@@ -283,6 +283,14 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     the shader is checked on WARP).
 
 ### Fixes
+- **Config values that broke the engine are corrected at startup.**
+  `sleep_bitrate_mbps` took 0 and overflowed above 4294 (× 1 000 000 in a
+  u32); a `udp_port` above 65532 overflowed its + 1..=3 stream ports, and
+  a TCP/UDP conflict at the top of the range moved past 65535;
+  `resolution_per_eye` took 0 or an odd size (4:2:0 encoding needs even);
+  `ipd` and `seconds_from_vsync_to_photons` took NaN or 0. Each is now
+  checked like the other settings (reset with a warning, or rounded down
+  to even).
 - **The engine notices a dead link and lets the headset back in** (#18).
   - A control connection silent for 3 s (six missed heartbeats) is dropped.
     A Wi-Fi drop that lost the FIN/RST left the session streaming to nobody
