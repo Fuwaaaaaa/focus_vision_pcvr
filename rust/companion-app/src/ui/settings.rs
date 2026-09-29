@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::{config, driver, export, CompanionApp};
+use crate::{config, driver, export, file_dialog, CompanionApp};
 
 /// Severity tier for the inline recording-dir diagnostic. Two levels keeps
 /// the visual language simple — yellow for "you typed something the engine
@@ -294,21 +294,27 @@ impl CompanionApp {
             ui.label(egui::RichText::new("PC logs + HMD logcat + system info → zip").size(11.0).color(text_muted));
 
             // Stats SVG export — same group as log export because both
-            // produce shareable diagnostic artifacts. Runs synchronously:
-            // the SVG render is just a string format over 30 samples,
-            // which finishes well within one paint tick.
+            // produce shareable diagnostic artifacts. The SVG (a string
+            // format over 30 samples) is rendered on click; the save dialog
+            // runs on its own thread.
             ui.add_space(8.0);
-            if ui.button("Export Stats Graph (.svg)").clicked() {
+            let choosing = self.svg_dialog.is_some();
+            let label = if choosing { "Choosing where to save..." } else { "Export Stats Graph (.svg)" };
+            if ui.add_enabled(!choosing, egui::Button::new(label)).clicked() {
                 let svg = crate::svg_export::render(&self.stats_history);
-                match crate::pick_save_path("focus-vision-stats", "svg") {
-                    Some(path) => match std::fs::write(&path, svg) {
+                let dialog = file_dialog::DialogTask::spawn(ui.ctx(), || {
+                    file_dialog::pick_save_path("focus-vision-stats", "svg")
+                });
+                self.svg_dialog = Some((dialog, svg));
+            }
+            if let Some(answer) = self.svg_dialog.as_ref().and_then(|(d, _)| d.poll()) {
+                let (_, svg) = self.svg_dialog.take().expect("polled above");
+                // None: cancelled (or no dialog on this platform), which
+                // needs no log line.
+                if let Some(path) = answer {
+                    match std::fs::write(&path, svg) {
                         Ok(()) => self.log(&format!("Stats SVG saved: {}", path.display())),
                         Err(e) => self.log(&format!("Stats SVG save failed: {e}")),
-                    },
-                    None => {
-                        // User cancelled the dialog (or no dialog backend on
-                        // this platform). No log line — cancellation is
-                        // expected, not an error worth surfacing.
                     }
                 }
             }

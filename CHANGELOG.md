@@ -286,6 +286,16 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     settings change); adb, PowerShell and wmic start without one.
   - A window closed while minimized reopened as an 80×103 sliver (eframe
     saved it as 0×0); eframe's window persistence is off.
+- **File dialogs keep Japanese paths, and the window keeps drawing.** The
+  APK picker and the stats SVG save dialog read PowerShell 5.1's output as
+  UTF-8, but it is written in the console's code page (932 on Japanese
+  Windows): a path under a Japanese user name came back mangled. The
+  dialog script now prints the path as hex of its UTF-8 bytes
+  (`file_dialog.rs`; a test runs the real PowerShell). The dialogs ran on
+  the UI thread, which froze the window until they closed; each now runs
+  on its own thread, and its button waits for it. PowerShell starts with
+  `-NoProfile` (a profile's output could have mixed into the path) and
+  `-STA`.
 - **The Android client starts.** Found by reading the code; not yet run on
   the headset.
   - The manifest had no `android.app.lib_name`, so `NativeActivity` looked
