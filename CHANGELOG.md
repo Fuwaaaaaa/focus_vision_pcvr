@@ -439,6 +439,22 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   and masks SSIDs, the pairing PIN, user names in profile paths, e-mail, MAC,
   IPv4 (octets 0–255) and IPv6 addresses, without touching version strings,
   C++ `Class::method` scopes or clock times.
+- **Face tracking drives the right avatar parameters.** Checked with unit
+  and OSC loopback tests; not yet in VRChat.
+  - The OSC name tables now follow `XrEyeExpressionHTC` /
+    `XrLipExpressionHTC` (the order the headset sends): the eye table was
+    grouped per eye (index 2, RIGHT_BLINK, went out as `EyeLeftRight`), and
+    the tongue's was shuffled. A test builds the expected names from the
+    enum's own. The simulator had the right blink at index 6 as well.
+  - Calibration's weights didn't take off the resting value, so a face at
+    rest sent 1.0. Profiles gain `offsets` (the relaxed minimum): sent =
+    (raw − offset) × weight. Profiles without them read as offset 0.
+  - A parameter falling below the threshold is sent as 0 once; before,
+    nothing was sent and VRChat kept the last value (a mouth left open).
+  - `+Inf` got past the NaN guard and stuck in the smoothing; non-finite
+    values are dropped, others clamped to 0..1.
+  - `face_tracking.enabled` and `active_profile` are applied (both were
+    read and ignored).
 
 ### Internal
 - **`run_streaming` split, adaptive state without locks.** The ~440-line

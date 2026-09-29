@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 pub const TOTAL_BLENDSHAPES: usize = 51;
 
 /// Face tracking expression profile.
-/// Per-blendshape sensitivity weights that scale raw HTC values before OSC output.
-/// A weight of 1.0 = unchanged, 2.0 = doubled sensitivity, 0.5 = halved.
+/// Per-blendshape sensitivity weights that scale raw HTC values before OSC
+/// output, after taking off each one's resting value: sent = (raw − offset)
+/// × weight. A weight of 1.0 = unchanged, 2.0 = doubled sensitivity, 0.5 =
+/// halved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FtProfile {
     pub name: String,
@@ -16,6 +18,11 @@ pub struct FtProfile {
     /// Optional smoothing override. None = use global config.
     #[serde(default)]
     pub smoothing_override: Option<f32>,
+    /// Per-blendshape resting values (calibration's relaxed minimum), in the
+    /// same order as `weights`. Missing values (and profiles saved before
+    /// offsets existed) are 0.0.
+    #[serde(default)]
+    pub offsets: Vec<f32>,
 }
 
 fn default_weights() -> Vec<f32> {
@@ -28,6 +35,7 @@ impl Default for FtProfile {
             name: "default".to_string(),
             weights: default_weights(),
             smoothing_override: None,
+            offsets: Vec::new(),
         }
     }
 }
@@ -38,16 +46,29 @@ impl FtProfile {
         self.weights.get(index).copied().unwrap_or(1.0)
     }
 
-    /// Ensure weights vector has exactly TOTAL_BLENDSHAPES entries, padding with 1.0.
-    pub fn normalize(&mut self) {
-        self.weights.resize(TOTAL_BLENDSHAPES, 1.0);
+    /// Resting value for a blendshape index (0-50). Returns 0.0 if absent.
+    pub fn offset(&self, index: usize) -> f32 {
+        self.offsets.get(index).copied().unwrap_or(0.0)
     }
 
-    /// Replace NaN/Infinity/negative weights with 1.0.
+    /// Ensure weights (and offsets) have exactly TOTAL_BLENDSHAPES entries,
+    /// padding with 1.0 (0.0).
+    pub fn normalize(&mut self) {
+        self.weights.resize(TOTAL_BLENDSHAPES, 1.0);
+        self.offsets.resize(TOTAL_BLENDSHAPES, 0.0);
+    }
+
+    /// Replace NaN/Infinity/negative weights with 1.0, and offsets outside
+    /// 0..1 (or not finite) with 0.0.
     pub fn sanitize_weights(&mut self) {
         for w in &mut self.weights {
             if w.is_nan() || w.is_infinite() || *w < 0.0 {
                 *w = 1.0;
+            }
+        }
+        for o in &mut self.offsets {
+            if !(0.0..=1.0).contains(o) {
+                *o = 0.0;
             }
         }
     }
@@ -170,6 +191,7 @@ mod tests {
             name: "test".to_string(),
             weights: vec![2.0, 0.5], // Only 2 values
             smoothing_override: None,
+            offsets: Vec::new(),
         };
         p.normalize();
         assert_eq!(p.weights.len(), TOTAL_BLENDSHAPES);
@@ -184,6 +206,7 @@ mod tests {
             name: "avatar_test".to_string(),
             weights: vec![1.5; TOTAL_BLENDSHAPES],
             smoothing_override: Some(0.8),
+            offsets: Vec::new(),
         };
         let json = serde_json::to_string(&p).unwrap();
         let p2: FtProfile = serde_json::from_str(&json).unwrap();
@@ -216,6 +239,7 @@ mod tests {
                 w
             },
             smoothing_override: Some(0.7),
+            offsets: Vec::new(),
         };
 
         let json = serde_json::to_string_pretty(&p).unwrap();
@@ -240,6 +264,7 @@ mod tests {
             name: "bad".to_string(),
             weights: vec![2.0, f32::NAN, f32::INFINITY, -1.5],
             smoothing_override: None,
+            offsets: Vec::new(),
         };
         p.validate();
         assert_eq!(p.weights.len(), TOTAL_BLENDSHAPES);
@@ -249,5 +274,24 @@ mod tests {
         assert_eq!(p.weights[3], 1.0); // Negative → 1.0
         assert_eq!(p.weights[4], 1.0); // Padded
         assert!(p.weights.iter().all(|w| w.is_finite() && *w >= 0.0));
+    }
+
+    #[test]
+    fn a_profile_saved_before_offsets_rests_at_zero() {
+        let mut p: FtProfile = serde_json::from_str(r#"{"name":"old","weights":[2.0]}"#).unwrap();
+        p.validate();
+        assert_eq!(p.offsets.len(), TOTAL_BLENDSHAPES);
+        assert!(p.offsets.iter().all(|&o| o == 0.0));
+        assert_eq!(p.offset(3), 0.0);
+    }
+
+    #[test]
+    fn offsets_outside_zero_to_one_are_dropped() {
+        let mut p = FtProfile {
+            offsets: vec![0.3, f32::NAN, f32::INFINITY, -0.1, 1.5],
+            ..FtProfile::default()
+        };
+        p.validate();
+        assert_eq!(&p.offsets[..5], &[0.3, 0.0, 0.0, 0.0, 0.0]);
     }
 }

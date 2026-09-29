@@ -19,14 +19,24 @@ pub struct OscBridge {
     smoothing: f32,
     prev_lip: [f32; 37],
     prev_eye: [f32; 14],
+    /// What each parameter was last sent as (0.0: never, or back to rest).
+    sent_lip: [f32; 37],
+    sent_eye: [f32; 14],
     /// Active expression profile weights. None = all weights 1.0 (no scaling).
     profile_weights: Option<Vec<f32>>,
+    /// Active profile's resting values, taken off before the weights.
+    /// None = all 0.0.
+    profile_offsets: Option<Vec<f32>>,
     /// OSC destination. `DEFAULT_TARGET` in production; integration tests
     /// override this to route to a captured-loopback receiver.
     target: String,
 }
 
-// HTC lip expression names (37), in order of XrLipExpressionHTC enum
+// HTC lip expression names (37), in order of the XrLipExpressionHTC enum
+// (openxr.h: XR_LIP_EXPRESSION_JAW_RIGHT_HTC = 0 ... TONGUE_DOWNLEFT_MORPH
+// = 36), which is the order the headset sends them in.
+// REGRESSION: the tongue (26..36) was in another order, so e.g.
+// TONGUE_LEFT drove TongueLongStep2.
 const LIP_NAMES: [&str; 37] = [
     "JawRight", "JawLeft", "JawForward", "JawOpen",
     "MouthApeShape", "MouthUpperRight", "MouthUpperLeft",
@@ -39,20 +49,30 @@ const LIP_NAMES: [&str; 37] = [
     "MouthLowerDownRight", "MouthLowerDownLeft",
     "MouthUpperInside", "MouthLowerInside",
     "MouthLowerOverlay",
-    "TongueLongStep1", "TongueLongStep2",
-    "TongueDown", "TongueUp", "TongueRight", "TongueLeft",
-    "TongueRoll", "TongueUpLeftMorph", "TongueUpRightMorph",
-    "TongueDownLeftMorph", "TongueDownRightMorph",
+    "TongueLongStep1", "TongueLeft", "TongueRight", "TongueUp", "TongueDown",
+    "TongueRoll", "TongueLongStep2",
+    "TongueUpRightMorph", "TongueUpLeftMorph",
+    "TongueDownRightMorph", "TongueDownLeftMorph",
 ];
 
-// HTC eye expression names (14), in order of XrEyeExpressionHTC enum
+// HTC eye expression names (14), in order of the XrEyeExpressionHTC enum
+// (openxr.h). "Out" is towards that eye's side: the left eye looking out
+// looks left, the right eye looking in looks left too.
+// REGRESSION: the table was grouped per eye, so e.g. index 2 (RIGHT_BLINK)
+// went out as EyeLeftRight.
 const EYE_NAMES: [&str; 14] = [
-    "EyeLeftBlink", "EyeLeftWide", "EyeLeftRight", "EyeLeftLeft",
-    "EyeLeftUp", "EyeLeftDown",
-    "EyeRightBlink", "EyeRightWide", "EyeRightRight", "EyeRightLeft",
-    "EyeRightUp", "EyeRightDown",
+    "EyeLeftBlink", "EyeLeftWide",
+    "EyeRightBlink", "EyeRightWide",
     "EyeLeftSqueeze", "EyeRightSqueeze",
+    "EyeLeftDown", "EyeRightDown",
+    "EyeLeftLeft", "EyeRightLeft", // LEFT_OUT, RIGHT_IN
+    "EyeLeftRight", "EyeRightRight", // LEFT_IN, RIGHT_OUT
+    "EyeLeftUp", "EyeRightUp",
 ];
+
+/// Below this a parameter counts as at rest: it is sent as 0.0 once, then
+/// not again until it rises (VRChat keeps a parameter's last value).
+const REST_THRESHOLD: f32 = 0.01;
 
 impl Default for OscBridge {
     fn default() -> Self {
@@ -76,7 +96,10 @@ impl OscBridge {
             smoothing: smoothing.clamp(0.0, 0.99),
             prev_lip: [0.0; 37],
             prev_eye: [0.0; 14],
+            sent_lip: [0.0; 37],
+            sent_eye: [0.0; 14],
             profile_weights: None,
+            profile_offsets: None,
             target: DEFAULT_TARGET.to_string(),
         }
     }
@@ -110,52 +133,56 @@ impl OscBridge {
 
         let target = self.target.as_str();
         let alpha = self.smoothing;
+        let profile = Profile {
+            weights: self.profile_weights.as_deref(),
+            offsets: self.profile_offsets.as_deref(),
+        };
 
         if lip_valid {
-            Self::apply_smoothing_and_send(
-                socket, target, lip, &mut self.prev_lip,
-                &LIP_NAMES, 0, alpha, self.profile_weights.as_deref(),
-            );
+            let group = Group { names: &LIP_NAMES, prev: &mut self.prev_lip, sent: &mut self.sent_lip, first: 0 };
+            Self::apply_smoothing_and_send(socket, target, lip, group, alpha, profile);
         }
 
         if eye_valid {
-            Self::apply_smoothing_and_send(
-                socket, target, eye, &mut self.prev_eye,
-                &EYE_NAMES, 37, alpha, self.profile_weights.as_deref(),
-            );
+            let group = Group { names: &EYE_NAMES, prev: &mut self.prev_eye, sent: &mut self.sent_eye, first: 37 };
+            Self::apply_smoothing_and_send(socket, target, eye, group, alpha, profile);
         }
     }
 
     /// EMA smoothing + profile weighting + OSC send for one blendshape group.
-    /// `weight_offset` is the starting index in `profile_weights` (lip=0, eye=37).
-    /// Values <= 0.01 after scaling are skipped. NaN inputs are dropped to avoid
-    /// poisoning EMA state.
-    #[allow(clippy::too_many_arguments)]
+    /// A parameter is sent while it is above `REST_THRESHOLD`, and once more
+    /// as 0.0 when it falls below. Non-finite inputs are dropped to avoid
+    /// poisoning EMA state; the rest are clamped to 0..1.
     fn apply_smoothing_and_send(
         socket: &UdpSocket,
         target: &str,
         raw: &[f32],
-        prev: &mut [f32],
-        names: &[&str],
-        weight_offset: usize,
+        group: Group<'_>,
         alpha: f32,
-        profile_weights: Option<&[f32]>,
+        profile: Profile<'_>,
     ) {
         for (i, &r) in raw.iter().enumerate() {
-            if r.is_nan() { continue; }
-            let smoothed = alpha * prev[i] + (1.0 - alpha) * r;
-            prev[i] = smoothed;
-            let weight = profile_weights
-                .and_then(|w| w.get(weight_offset + i).copied())
-                .unwrap_or(1.0);
-            let scaled = (smoothed * weight).clamp(0.0, 1.0);
-            if scaled > 0.01 {
-                let addr = format!("/avatar/parameters/{}", names[i]);
-                if let Some(msg) = encode_osc_float(&addr, scaled) {
-                    match socket.send_to(&msg, target) {
-                        Ok(n) => log::trace!("OSC send {} -> {} ({}B sent)", addr, target, n),
-                        Err(e) => log::warn!("OSC send to {} failed: {}", target, e),
-                    }
+            // REGRESSION: only NaN was dropped; +Inf went into the EMA and
+            // stayed there.
+            if !r.is_finite() {
+                continue;
+            }
+            let smoothed = alpha * group.prev[i] + (1.0 - alpha) * r.clamp(0.0, 1.0);
+            group.prev[i] = smoothed;
+            let scaled = profile.apply(group.first + i, smoothed);
+            // REGRESSION: a parameter falling below the threshold was not
+            // sent at all, so with no smoothing (a jump to 0) the avatar kept
+            // its last value — a mouth left open.
+            let value = if scaled > REST_THRESHOLD { scaled } else { 0.0 };
+            if value == 0.0 && group.sent[i] == 0.0 {
+                continue;
+            }
+            group.sent[i] = value;
+            let addr = format!("/avatar/parameters/{}", group.names[i]);
+            if let Some(msg) = encode_osc_float(&addr, value) {
+                match socket.send_to(&msg, target) {
+                    Ok(n) => log::trace!("OSC send {} -> {} ({}B sent)", addr, target, n),
+                    Err(e) => log::warn!("OSC send to {} failed: {}", target, e),
                 }
             }
         }
@@ -171,9 +198,11 @@ impl OscBridge {
         self.enabled = enabled;
     }
 
-    /// Set the active expression profile weights. None = no scaling (all 1.0).
+    /// Set the active expression profile (weights and resting values).
+    /// None = no scaling (all weights 1.0, offsets 0.0).
     pub fn set_profile(&mut self, profile: Option<&crate::face_tracking::profiles::FtProfile>) {
         self.profile_weights = profile.map(|p| p.weights.clone());
+        self.profile_offsets = profile.map(|p| p.offsets.clone());
         if let Some(p) = profile {
             log::info!("FT profile activated: {}", p.name);
             // Apply smoothing override if present
@@ -183,6 +212,32 @@ impl OscBridge {
         } else {
             log::info!("FT profile cleared (using defaults)");
         }
+    }
+}
+
+/// One blendshape group's names and state; `first` is its index in a
+/// profile's 51 values (lip 0, eye 37).
+struct Group<'a> {
+    names: &'a [&'a str],
+    prev: &'a mut [f32],
+    sent: &'a mut [f32],
+    first: usize,
+}
+
+/// The active profile's weights and resting values, if any.
+#[derive(Clone, Copy)]
+struct Profile<'a> {
+    weights: Option<&'a [f32]>,
+    offsets: Option<&'a [f32]>,
+}
+
+impl Profile<'_> {
+    /// (value − resting value) × weight, clamped to 0..1, for blendshape
+    /// `index` (0..51).
+    fn apply(&self, index: usize, value: f32) -> f32 {
+        let weight = self.weights.and_then(|w| w.get(index).copied()).unwrap_or(1.0);
+        let offset = self.offsets.and_then(|o| o.get(index).copied()).unwrap_or(0.0);
+        ((value - offset) * weight).clamp(0.0, 1.0)
     }
 }
 
@@ -261,6 +316,63 @@ mod tests {
     #[test]
     fn test_lip_names_count() {
         assert_eq!(LIP_NAMES.len(), 37);
+    }
+
+    /// `XR_LIP_EXPRESSION_<name>_HTC` in enum order, copied from openxr.h.
+    const LIP_ENUM: [&str; 37] = [
+        "JAW_RIGHT", "JAW_LEFT", "JAW_FORWARD", "JAW_OPEN", "MOUTH_APE_SHAPE",
+        "MOUTH_UPPER_RIGHT", "MOUTH_UPPER_LEFT", "MOUTH_LOWER_RIGHT", "MOUTH_LOWER_LEFT",
+        "MOUTH_UPPER_OVERTURN", "MOUTH_LOWER_OVERTURN", "MOUTH_POUT",
+        "MOUTH_RAISER_RIGHT", "MOUTH_RAISER_LEFT", "MOUTH_STRETCHER_RIGHT", "MOUTH_STRETCHER_LEFT",
+        "CHEEK_PUFF_RIGHT", "CHEEK_PUFF_LEFT", "CHEEK_SUCK",
+        "MOUTH_UPPER_UPRIGHT", "MOUTH_UPPER_UPLEFT", "MOUTH_LOWER_DOWNRIGHT", "MOUTH_LOWER_DOWNLEFT",
+        "MOUTH_UPPER_INSIDE", "MOUTH_LOWER_INSIDE", "MOUTH_LOWER_OVERLAY",
+        "TONGUE_LONGSTEP1", "TONGUE_LEFT", "TONGUE_RIGHT", "TONGUE_UP", "TONGUE_DOWN", "TONGUE_ROLL",
+        "TONGUE_LONGSTEP2", "TONGUE_UPRIGHT_MORPH", "TONGUE_UPLEFT_MORPH",
+        "TONGUE_DOWNRIGHT_MORPH", "TONGUE_DOWNLEFT_MORPH",
+    ];
+
+    /// `XR_EYE_EXPRESSION_<name>_HTC` in enum order, copied from openxr.h.
+    const EYE_ENUM: [&str; 14] = [
+        "LEFT_BLINK", "LEFT_WIDE", "RIGHT_BLINK", "RIGHT_WIDE", "LEFT_SQUEEZE", "RIGHT_SQUEEZE",
+        "LEFT_DOWN", "RIGHT_DOWN", "LEFT_OUT", "RIGHT_IN", "LEFT_IN", "RIGHT_OUT", "LEFT_UP", "RIGHT_UP",
+    ];
+
+    fn camel(word: &str) -> String {
+        match word {
+            // The names this bridge has always sent (SRanipal's).
+            "RAISER" => "Smile".into(),
+            "STRETCHER" => "Sad".into(),
+            "UPRIGHT" => "UpRight".into(),
+            "UPLEFT" => "UpLeft".into(),
+            "DOWNRIGHT" => "DownRight".into(),
+            "DOWNLEFT" => "DownLeft".into(),
+            "LONGSTEP1" => "LongStep1".into(),
+            "LONGSTEP2" => "LongStep2".into(),
+            _ => word[..1].to_string() + &word[1..].to_lowercase(),
+        }
+    }
+
+    #[test]
+    fn lip_names_follow_the_openxr_enum() {
+        for (i, e) in LIP_ENUM.iter().enumerate() {
+            let expected: String = e.split('_').map(camel).collect();
+            assert_eq!(LIP_NAMES[i], expected, "lip {i} ({e})");
+        }
+    }
+
+    #[test]
+    fn eye_names_follow_the_openxr_enum() {
+        for (i, e) in EYE_ENUM.iter().enumerate() {
+            let (side, what) = e.split_once('_').unwrap();
+            // Out is towards the eye's own side, in towards the other.
+            let what = match (side, what) {
+                ("LEFT", "OUT") | ("RIGHT", "IN") => "Left".to_string(),
+                ("LEFT", "IN") | ("RIGHT", "OUT") => "Right".to_string(),
+                _ => camel(what),
+            };
+            assert_eq!(EYE_NAMES[i], format!("Eye{}{what}", camel(side)), "eye {i} ({e})");
+        }
     }
 
     #[test]
@@ -407,6 +519,7 @@ mod tests {
                 w
             },
             smoothing_override: None,
+            offsets: Vec::new(),
         };
         bridge.set_profile(Some(&profile));
 
@@ -451,6 +564,7 @@ mod tests {
                 w
             },
             smoothing_override: None,
+            offsets: Vec::new(),
         };
         bridge.set_profile(Some(&profile));
 
@@ -473,6 +587,7 @@ mod tests {
             name: "smooth".to_string(),
             weights: vec![1.0; 51],
             smoothing_override: Some(0.3),
+            offsets: Vec::new(),
         };
         bridge.set_profile(Some(&profile));
         assert!((bridge.smoothing - 0.3).abs() < 1e-6);

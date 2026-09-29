@@ -22,7 +22,7 @@ pub(crate) const LIP_SMILE_LEFT: usize = 13;
 pub(crate) const LIP_SAD_RIGHT: usize = 14;
 pub(crate) const LIP_SAD_LEFT: usize = 15;
 pub(crate) const EYE_LEFT_BLINK: usize = 0;
-pub(crate) const EYE_RIGHT_BLINK: usize = 6;
+pub(crate) const EYE_RIGHT_BLINK: usize = 2;
 
 /// How the synthetic blendshape vector evolves over time. The named
 /// presets (`Blink`, `Talk`, `Smile`, `Frown`) only activate the channels
