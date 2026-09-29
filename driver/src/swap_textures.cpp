@@ -59,6 +59,7 @@ bool SwapTextureSets::create(ID3D11Device* device, uint32_t pid, uint32_t width,
         outHandles[i] = created[i].handle;
         m_textures.push_back(std::move(created[i]));
     }
+    m_current.emplace_back(setId, 0u);
     return true;
 }
 
@@ -76,10 +77,39 @@ void SwapTextureSets::destroySet(uint64_t handle) {
     m_textures.erase(std::remove_if(m_textures.begin(), m_textures.end(),
                                     [setId](const Texture& e) { return e.setId == setId; }),
                      m_textures.end());
+    m_current.erase(std::remove_if(m_current.begin(), m_current.end(),
+                                   [setId](const auto& e) { return e.first == setId; }),
+                    m_current.end());
 }
 
 void SwapTextureSets::destroyAll(uint32_t pid) {
     m_textures.erase(std::remove_if(m_textures.begin(), m_textures.end(),
                                     [pid](const Texture& e) { return e.pid == pid; }),
                      m_textures.end());
+    // Drop the indices of sets that no longer have textures.
+    m_current.erase(std::remove_if(m_current.begin(), m_current.end(),
+                                   [this](const auto& e) {
+                                       return std::none_of(m_textures.begin(), m_textures.end(),
+                                                           [&](const Texture& t) { return t.setId == e.first; });
+                                   }),
+                    m_current.end());
+}
+
+void SwapTextureSets::nextIndices(const uint64_t (&handles)[2], uint32_t (&indices)[2]) {
+    uint32_t advancedSet = 0;
+    bool advanced = false;
+    for (int eye = 0; eye < 2; eye++) {
+        const Texture* t = find(handles[eye]);
+        if (!t) continue;
+        for (auto& [setId, index] : m_current) {
+            if (setId != t->setId) continue;
+            if (!advanced || setId != advancedSet) {
+                index = (index + 1) % kTexturesPerSet;
+                advancedSet = setId;
+                advanced = true;
+            }
+            indices[eye] = index;
+            break;
+        }
+    }
 }

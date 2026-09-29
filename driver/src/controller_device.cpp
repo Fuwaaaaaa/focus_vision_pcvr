@@ -1,6 +1,8 @@
 #include "controller_device.h"
+#include "touch_profile.h"
 #include <cstring>
 #include <cstdio>
+#include <string>
 
 CControllerDevice::CControllerDevice(bool isLeft)
     : m_isLeft(isLeft)
@@ -16,7 +18,7 @@ CControllerDevice::CControllerDevice(bool isLeft)
 
 const char* CControllerDevice::GetSerialNumber() const
 {
-    return m_isLeft ? "FVP_CTRL_LEFT" : "FVP_CTRL_RIGHT";
+    return fvp_touch::identity(m_isLeft).serial;
 }
 
 vr::EVRInitError CControllerDevice::Activate(uint32_t unObjectId)
@@ -54,55 +56,80 @@ vr::DriverPose_t CControllerDevice::GetPose()
 void CControllerDevice::SetupProperties()
 {
     auto props = vr::VRProperties();
+    const fvp_touch::Identity id = fvp_touch::identity(m_isLeft);
 
+    // Oculus Touch (Quest 2) — see touch_profile.h for why.
     props->SetStringProperty(m_propertyContainer,
-        vr::Prop_ModelNumber_String, "Focus Vision PCVR Controller");
+        vr::Prop_TrackingSystemName_String, fvp_touch::kTrackingSystemName);
     props->SetStringProperty(m_propertyContainer,
-        vr::Prop_SerialNumber_String, GetSerialNumber());
+        vr::Prop_ManufacturerName_String, fvp_touch::kManufacturer);
     props->SetStringProperty(m_propertyContainer,
-        vr::Prop_ManufacturerName_String, "FocusVisionPCVR");
+        vr::Prop_ModelNumber_String, id.modelNumber);
     props->SetStringProperty(m_propertyContainer,
-        vr::Prop_TrackingSystemName_String, "focus_vision_pcvr");
+        vr::Prop_SerialNumber_String, id.serial);
+    props->SetStringProperty(m_propertyContainer,
+        vr::Prop_AttachedDeviceId_String, id.serial);
+    props->SetStringProperty(m_propertyContainer,
+        vr::Prop_RegisteredDeviceType_String, id.registeredDeviceType);
+    props->SetStringProperty(m_propertyContainer,
+        vr::Prop_RenderModelName_String, id.renderModel);
+    props->SetStringProperty(m_propertyContainer,
+        vr::Prop_ControllerType_String, fvp_touch::kControllerType);
+    props->SetStringProperty(m_propertyContainer,
+        vr::Prop_InputProfilePath_String, fvp_touch::kInputProfilePath);
+
+    const std::string icons = id.iconBase;
+    const struct { vr::ETrackedDeviceProperty prop; const char* suffix; } iconFiles[] = {
+        {vr::Prop_NamedIconPathDeviceOff_String, "_off.png"},
+        {vr::Prop_NamedIconPathDeviceSearching_String, "_searching.gif"},
+        {vr::Prop_NamedIconPathDeviceSearchingAlert_String, "_searching_alert.gif"},
+        {vr::Prop_NamedIconPathDeviceReady_String, "_ready.png"},
+        {vr::Prop_NamedIconPathDeviceReadyAlert_String, "_ready_alert.png"},
+        {vr::Prop_NamedIconPathDeviceAlertLow_String, "_ready_low.png"},
+        {vr::Prop_NamedIconPathDeviceStandby_String, "_standby.png"},
+        {vr::Prop_NamedIconPathDeviceStandbyAlert_String, "_standby_alert.gif"},
+    };
+    for (const auto& icon : iconFiles) {
+        props->SetStringProperty(m_propertyContainer, icon.prop, (icons + icon.suffix).c_str());
+    }
 
     props->SetInt32Property(m_propertyContainer,
         vr::Prop_ControllerRoleHint_Int32,
         m_isLeft ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand);
-
-    // Input profile (SteamVR uses this to map controls)
-    props->SetStringProperty(m_propertyContainer,
-        vr::Prop_InputProfilePath_String, "{focus_vision_pcvr}/input/controller_profile.json");
-    props->SetStringProperty(m_propertyContainer,
-        vr::Prop_RenderModelName_String, "generic_controller");
+    props->SetInt32Property(m_propertyContainer,
+        vr::Prop_Axis0Type_Int32, vr::k_eControllerAxis_Joystick);
+    props->SetBoolProperty(m_propertyContainer,
+        vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
 }
 
 void CControllerDevice::CreateInputComponents()
 {
     auto input = vr::VRDriverInput();
+    const fvp_touch::FaceButtons face = fvp_touch::faceButtons(m_isLeft);
 
-    // Buttons (boolean)
-    input->CreateBooleanComponent(m_propertyContainer, "/input/a/click", &m_hA);
-    input->CreateBooleanComponent(m_propertyContainer, "/input/b/click", &m_hB);
-    input->CreateBooleanComponent(m_propertyContainer, "/input/system/click", &m_hSystem);
-    input->CreateBooleanComponent(m_propertyContainer, "/input/application_menu/click", &m_hMenu);
-    input->CreateBooleanComponent(m_propertyContainer, "/input/joystick/click", &m_hThumbstickClick);
+    // Buttons (boolean): Touch's paths — X / Y on the left, A / B on the right
+    input->CreateBooleanComponent(m_propertyContainer, face.primaryClick, &m_hPrimary);
+    input->CreateBooleanComponent(m_propertyContainer, face.secondaryClick, &m_hSecondary);
+    input->CreateBooleanComponent(m_propertyContainer, fvp_touch::kSystemClick, &m_hSystem);
+    input->CreateBooleanComponent(m_propertyContainer, fvp_touch::kStickClick, &m_hThumbstickClick);
 
     // Analog axes (scalar)
-    input->CreateScalarComponent(m_propertyContainer, "/input/trigger/value",
+    input->CreateScalarComponent(m_propertyContainer, fvp_touch::kTriggerValue,
         &m_hTrigger, vr::VRScalarType_Absolute, vr::VRScalarUnits_NormalizedOneSided);
-    input->CreateScalarComponent(m_propertyContainer, "/input/grip/value",
+    input->CreateScalarComponent(m_propertyContainer, fvp_touch::kGripValue,
         &m_hGrip, vr::VRScalarType_Absolute, vr::VRScalarUnits_NormalizedOneSided);
-    input->CreateScalarComponent(m_propertyContainer, "/input/joystick/x",
+    input->CreateScalarComponent(m_propertyContainer, fvp_touch::kStickX,
         &m_hJoystickX, vr::VRScalarType_Absolute, vr::VRScalarUnits_NormalizedTwoSided);
-    input->CreateScalarComponent(m_propertyContainer, "/input/joystick/y",
+    input->CreateScalarComponent(m_propertyContainer, fvp_touch::kStickY,
         &m_hJoystickY, vr::VRScalarType_Absolute, vr::VRScalarUnits_NormalizedTwoSided);
 
     // Touch sensors (boolean)
-    input->CreateBooleanComponent(m_propertyContainer, "/input/trigger/touch", &m_hTriggerTouch);
-    input->CreateBooleanComponent(m_propertyContainer, "/input/joystick/touch", &m_hThumbstickTouch);
-    input->CreateBooleanComponent(m_propertyContainer, "/input/grip/touch", &m_hGripTouch);
+    input->CreateBooleanComponent(m_propertyContainer, fvp_touch::kTriggerTouch, &m_hTriggerTouch);
+    input->CreateBooleanComponent(m_propertyContainer, fvp_touch::kStickTouch, &m_hThumbstickTouch);
+    input->CreateBooleanComponent(m_propertyContainer, fvp_touch::kGripTouch, &m_hGripTouch);
 
     // Haptic output
-    input->CreateHapticComponent(m_propertyContainer, "/output/haptic", &m_hHaptic);
+    input->CreateHapticComponent(m_propertyContainer, fvp_touch::kHaptic, &m_hHaptic);
 }
 
 void CControllerDevice::UpdateInputs(const ControllerState& state)
@@ -113,22 +140,14 @@ void CControllerDevice::UpdateInputs(const ControllerState& state)
     input->UpdateScalarComponent(m_hJoystickX, state.thumbstick_x, 0.0);
     input->UpdateScalarComponent(m_hJoystickY, state.thumbstick_y, 0.0);
 
-    input->UpdateBooleanComponent(m_hA,
-        (state.button_flags & 0x01) != 0, 0.0);  // A_X_PRESSED
-    input->UpdateBooleanComponent(m_hB,
-        (state.button_flags & 0x02) != 0, 0.0);  // B_Y_PRESSED
-    input->UpdateBooleanComponent(m_hMenu,
-        (state.button_flags & 0x04) != 0, 0.0);  // MENU_PRESSED
-    input->UpdateBooleanComponent(m_hSystem,
-        (state.button_flags & 0x08) != 0, 0.0);  // SYSTEM_PRESSED
-    input->UpdateBooleanComponent(m_hThumbstickClick,
-        (state.button_flags & 0x10) != 0, 0.0);  // THUMBSTICK_CLICK
-    input->UpdateBooleanComponent(m_hTriggerTouch,
-        (state.button_flags & 0x20) != 0, 0.0);  // TRIGGER_TOUCH
-    input->UpdateBooleanComponent(m_hThumbstickTouch,
-        (state.button_flags & 0x40) != 0, 0.0);  // THUMBSTICK_TOUCH
-    input->UpdateBooleanComponent(m_hGripTouch,
-        (state.button_flags & 0x80) != 0, 0.0);  // GRIP_TOUCH
+    const fvp_touch::Buttons b = fvp_touch::buttons(state.button_flags);
+    input->UpdateBooleanComponent(m_hPrimary, b.primary, 0.0);
+    input->UpdateBooleanComponent(m_hSecondary, b.secondary, 0.0);
+    input->UpdateBooleanComponent(m_hSystem, b.system, 0.0);
+    input->UpdateBooleanComponent(m_hThumbstickClick, b.stickClick, 0.0);
+    input->UpdateBooleanComponent(m_hTriggerTouch, b.triggerTouch, 0.0);
+    input->UpdateBooleanComponent(m_hThumbstickTouch, b.stickTouch, 0.0);
+    input->UpdateBooleanComponent(m_hGripTouch, b.gripTouch, 0.0);
 }
 
 void CControllerDevice::TriggerHaptic(float duration_s, float frequency, float amplitude)
