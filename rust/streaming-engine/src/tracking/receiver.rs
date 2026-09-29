@@ -60,8 +60,14 @@ impl TrackingReceiver {
         let socket = UdpSocket::bind(bind_addr).await?;
         log::info!("Tracking receiver listening on {}", bind_addr);
 
-        let mut buf = [0u8; 256]; // Tracking packets are small (<100 bytes)
+        // Tracking packets are small (<100 bytes); the buffer takes a whole
+        // Ethernet-sized datagram so a larger one is read and ignored.
+        // REGRESSION: with 256 bytes, Windows failed every larger datagram
+        // (WSAEMSGSIZE) and each failure was logged: anyone on the LAN could
+        // fill the engine log.
+        let mut buf = [0u8; 2048];
         let mut rejected: u64 = 0;
+        let mut recv_errors: u64 = 0;
 
         loop {
             let (len, peer) = match socket.recv_from(&mut buf).await {
@@ -69,8 +75,12 @@ impl TrackingReceiver {
                 Err(e) => {
                     // A transient socket error (e.g. WSAECONNRESET surfacing
                     // on Windows) must not kill tracking for the rest of the
-                    // engine's life — skip it and keep receiving.
-                    log::warn!("Tracking recv error (continuing): {}", e);
+                    // engine's life — skip it and keep receiving. Logged on
+                    // the 1st, 2nd, 4th, 8th… so a flood can't spam the log.
+                    recv_errors += 1;
+                    if recv_errors.is_power_of_two() {
+                        log::warn!("Tracking recv error (continuing, {} so far): {}", recv_errors, e);
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     continue;
                 }
@@ -353,6 +363,35 @@ mod tests {
         let d = data.unwrap();
         assert_eq!(d.position, [0.5, 1.5, 2.5]);
 
+        recv_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn an_oversized_datagram_is_ignored_and_tracking_goes_on() {
+        // A datagram larger than any tracking packet neither stops the
+        // receiver nor gets in the way of the next pose.
+        let head = Arc::new(Mutex::new(None));
+        let controllers = Arc::new(Mutex::new([None, None]));
+        let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = tmp.local_addr().unwrap();
+        drop(tmp);
+        let head2 = head.clone();
+        let recv_handle = tokio::spawn(async move {
+            let r = TrackingReceiver::new(head2, controllers, loopback_peer());
+            r.run(recv_addr).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut big = make_head_pose_packet(1, 9.0, 9.0, 9.0);
+        big.resize(1200, 0);
+        sender.send_to(&big, recv_addr).await.unwrap();
+        sender.send_to(&make_head_pose_packet(2, 0.5, 1.5, 2.5), recv_addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let data = head.lock().unwrap().expect("tracking still arrives");
+        assert_eq!(data.position, [0.5, 1.5, 2.5]);
+        assert!(!recv_handle.is_finished(), "the receiver keeps running");
         recv_handle.abort();
     }
 
