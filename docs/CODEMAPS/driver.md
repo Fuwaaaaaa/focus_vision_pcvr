@@ -47,8 +47,8 @@ SteamVR loads DLL
 
 CServerDriver::Init()
   → fvp_init() (Rust engine start)
-  → fvp_set_idr_callback / fvp_set_gaze_callback
-    (fvp_set_bitrate_callback is not registered yet — see TODOS P0 "NVENC")
+  → fvp_set_idr_callback / fvp_set_gaze_callback / fvp_set_bitrate_callback
+    (a new bitrate is applied before the next encode: nvEncReconfigureEncoder)
   → create CHmdDevice + 2x CControllerDevice
   → TrackedDeviceAdded() for each
 
@@ -125,7 +125,7 @@ CServerDriver::Cleanup()
 
 ---
 
-## Tests (63 GoogleTest cases)
+## Tests (64 GoogleTest cases)
 
 `driver/tests/test_qp_map.cpp`:
 - `ComputeQpDeltaMap_centerGaze_fovealZero` — gaze at (0,0) produces zero QP offset in fovea

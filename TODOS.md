@@ -363,14 +363,14 @@
 
 ## ⚠ BLOCKER (P0): ドライバが NVENC を初期化しない — 実機では映像が 1 フレームも出ない
 （2026-09-25 のコード調査で判明。GPU・SteamVR が無い開発機では検証できないため、直さずに記録）
-（2026-09-29: 下の 3 点と表示コンポーネント・フレームのコピーを配線した。D3D11 の部分は WARP の gtest で確認済み。SteamVR と NVIDIA GPU での確認はまだ。残りは bitrate の反映）
+（2026-09-29: 下の各点と表示コンポーネント・フレームのコピー・bitrate の反映を配線した。D3D11 の部分は WARP の gtest で確認済み。SteamVR と NVIDIA GPU での確認はまだ）
 - ~~**What:** `CDirectModeComponent::initEncoder`（`driver/src/direct_mode.cpp`）を呼ぶ場所がどこにもない（`git log -S` でも追加以来ずっと未使用）。`m_encoderReady` は常に false で、`Present()` は毎回早期 return する。~~ (2026-09-29): `CHmdDevice::Activate` が `CDirectModeComponent::init()` を呼び、デバイス・`EyeBlit`・`NvencEncoder` を作る。
 - **同じ経路のほかの問題:**
   - ~~driver は D3D11 デバイスを作っていない。`CreateSwapTextureSet` は `m_encoder.getDevice()`（初期化前は null）を使うので、スワップテクスチャも作れない。~~ (2026-09-29): NVIDIA の GPU(なければ最もメモリの多いハードウェア GPU)にデバイスを作り、`Prop_GraphicsAdapterLuid_Uint64` で compositor に同じアダプタを使わせる(`gpu_adapter.*`)。
   - ~~`rSharedTextureHandles` に入れているのは `m_nextHandle++` の連番で、DXGI の本物の共有ハンドル（`IDXGIResource::GetSharedHandle`）ではない。SteamVR の compositor はこれを開けない。~~ (2026-09-29): `SwapTextureSets` が `GetSharedHandle` の値を返す。別デバイスから開けることを WARP で確認。
   - ~~`nvenc_encoder.h` の手書きの NVENC 関数テーブルの並びが、公式の `nvEncodeAPI.h`（`NV_ENCODE_API_FUNCTION_LIST`）と合っていない疑いがある~~ (2026-09-28 修正): 疑いどおりだった。関数テーブルに加えて、構造体バージョンの作り方、`NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS` / `NV_ENC_INITIALIZE_PARAMS` / `NV_ENC_LOCK_BITSTREAM` / `NV_ENC_RC_PARAMS` / `NV_ENC_PIC_PARAMS` のレイアウト、`NV_ENC_BUFFER_FORMAT_ARGB`（0x20 → 正しくは 0x01000000）、`NV_ENC_PIC_FLAG_FORCEIDR`（4 → 正しくは 2）も違っていた。公式ヘッダ（`third_party/nvenc`、SDK 12.2）に置き換え、preset config を `nvEncGetEncodePresetConfigEx` で取得して設定を上書きする形にした（`driver/src/nvenc_config.h`）。HEVC の QP delta map は 32x32 CTB 単位に直した（64 は NVENC が対応していない）。実機で NVENC が動くかはまだ確認していない。
-  - `fvp_set_bitrate_callback` を driver が登録しておらず、`NvencEncoder` に reconfigure（`nvEncReconfigureEncoder`）の経路もない。adaptive bitrate の変更は NVENC に届かない。
-- **直すのに必要なこと:** ~~D3D11 デバイスの作成（SteamVR が使うアダプタ）、本物の共有テクスチャ、`initEncoder` の呼び出し、~~ 関数テーブルの検証（実機）、bitrate callback と reconfigure（Present スレッドで適用する atomic な保留値）。
+  - ~~`fvp_set_bitrate_callback` を driver が登録しておらず、`NvencEncoder` に reconfigure（`nvEncReconfigureEncoder`）の経路もない。adaptive bitrate の変更は NVENC に届かない。~~ (2026-09-29): callback を登録し、値を atomic に預けて、次の encode の前に `nvEncReconfigureEncoder` で反映する(IDR なし、rate control のリセットなし。`fvp_nvenc::reconfigureParams`)。失敗したら元の bitrate のまま続ける。
+- **直すのに必要なこと:** ~~D3D11 デバイスの作成（SteamVR が使うアダプタ）、本物の共有テクスチャ、`initEncoder` の呼び出し、~~ 関数テーブルの検証（実機）~~、bitrate callback と reconfigure（Present スレッドで適用する atomic な保留値）~~。
 - **Priority:** P0（実機での映像の前提）
 - **Depends on:** NVIDIA GPU + SteamVR のある環境（ビルドと gtest 以外は検証できない）
 

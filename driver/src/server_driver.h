@@ -26,6 +26,9 @@ public:
     /// Forward gaze data from tracking receiver to the NVENC encoder.
     void updateGaze(float gazeX, float gazeY, bool valid);
 
+    /// Forward a new target bitrate from the engine to the NVENC encoder.
+    void updateBitrate(uint32_t bitrateBps);
+
 private:
     std::unique_ptr<CHmdDevice> m_hmdDevice;
     std::unique_ptr<CControllerDevice> m_leftController;

@@ -80,6 +80,22 @@ inline void applyStreamSettings(NV_ENC_CONFIG& cfg, const StreamSettings& s) {
     }
 }
 
+/// nvEncReconfigureEncoder params that move the running session to `s`
+/// (the adaptive bitrate's new target): `init` is the session's initialize
+/// params, `cfg` its config, updated in place and pointed to. No IDR and no
+/// rate-control reset, so the stream carries on without a keyframe spike.
+inline NV_ENC_RECONFIGURE_PARAMS reconfigureParams(const NV_ENC_INITIALIZE_PARAMS& init,
+                                                   NV_ENC_CONFIG& cfg, const StreamSettings& s) {
+    applyStreamSettings(cfg, s);
+    NV_ENC_RECONFIGURE_PARAMS params = {};
+    params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+    params.reInitEncodeParams = init;
+    params.reInitEncodeParams.encodeConfig = &cfg;
+    params.resetEncoder = 0;
+    params.forceIDR = 0;
+    return params;
+}
+
 /// NVENC API version the header was written for, in the format
 /// NvEncodeAPIGetMaxSupportedVersion reports ((major << 4) | minor).
 constexpr uint32_t kRequiredApiVersion = (NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION;

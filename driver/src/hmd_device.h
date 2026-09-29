@@ -32,6 +32,9 @@ public:
     /// Forward gaze data for foveated encoding.
     void updateGaze(float x, float y, bool valid) { m_directMode.updateGaze(x, y, valid); }
 
+    /// Forward a new target bitrate to the encoder.
+    void updateBitrate(uint32_t bitrateBps) { m_directMode.updateBitrate(bitrateBps); }
+
     uint32_t GetObjectId() const { return m_objectId; }
 
 private:

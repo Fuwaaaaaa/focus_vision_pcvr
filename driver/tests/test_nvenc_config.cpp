@@ -117,6 +117,41 @@ TEST(NvencConfig, ZeroFpsDoesNotDivideByZero) {
     EXPECT_EQ(cfg.rcParams.vbvBufferSize, 1'000'000u);
 }
 
+TEST(NvencConfig, ReconfigureChangesOnlyTheBitrate) {
+    // REGRESSION: the adaptive bitrate never reached NVENC (no callback,
+    // no reconfigure); the encoder kept the starting bitrate.
+    StreamSettings s;
+    s.bitrate_bps = 80'000'000;
+    s.fps = 90;
+    s.qp_delta_map = true;
+    NV_ENC_CONFIG cfg{};
+    applyStreamSettings(cfg, s);
+    NV_ENC_INITIALIZE_PARAMS init{};
+    init.version = NV_ENC_INITIALIZE_PARAMS_VER;
+    init.encodeWidth = 1832;
+    init.encodeHeight = 1920;
+    init.frameRateNum = 90;
+    init.enablePTD = 1;
+    init.encodeConfig = &cfg;
+
+    NV_ENC_CONFIG next = cfg;
+    s.bitrate_bps = 30'000'000;
+    const NV_ENC_RECONFIGURE_PARAMS p = reconfigureParams(init, next, s);
+
+    EXPECT_EQ(p.version, static_cast<uint32_t>(NV_ENC_RECONFIGURE_PARAMS_VER));
+    EXPECT_EQ(p.reInitEncodeParams.encodeConfig, &next) << "the updated config, not the running one";
+    EXPECT_EQ(next.rcParams.averageBitRate, 30'000'000u);
+    EXPECT_EQ(next.rcParams.maxBitRate, 30'000'000u);
+    EXPECT_EQ(next.rcParams.vbvBufferSize, 30'000'000u / 90) << "still one frame of bits";
+    EXPECT_EQ(next.rcParams.qpMapMode, NV_ENC_QP_MAP_DELTA) << "foveation kept";
+    EXPECT_EQ(p.reInitEncodeParams.encodeWidth, 1832u) << "same session shape";
+    EXPECT_EQ(p.reInitEncodeParams.encodeHeight, 1920u);
+    EXPECT_EQ(p.reInitEncodeParams.enablePTD, 1u);
+    EXPECT_EQ(p.resetEncoder, 0u) << "no rate-control reset";
+    EXPECT_EQ(p.forceIDR, 0u) << "no keyframe spike on every bitrate step";
+    EXPECT_EQ(cfg.rcParams.averageBitRate, 80'000'000u) << "the running config is untouched";
+}
+
 TEST(NvencConfig, DriverVersionGate) {
     EXPECT_TRUE(driverSupportsApi((12u << 4) | 2u));
     EXPECT_TRUE(driverSupportsApi((13u << 4) | 0u));
