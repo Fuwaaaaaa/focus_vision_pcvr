@@ -67,7 +67,7 @@ per-frame (driven by SteamVR compositor):
   → CDirectModeComponent::SubmitLayer() per layer (the first, the scene, is kept)
   → CDirectModeComponent::Present(syncTexture)
     → SyncTexture::acquire (the compositor's keyed mutex)
-    → EyeBlit::draw(left eye of the layer) → release
+    → EyeBlit::draw(each eye of the layer → its half of the frame) → release
     → NvencEncoder::encode() → fvp_submit_encoded_nal()
   → CDirectModeComponent::PostPresent() — FramePacer: wait out the frame's
     slot at the refresh rate (as ALVR does)
@@ -108,8 +108,8 @@ CServerDriver::Cleanup()
 - `init()`: D3D11 device (`fvp_gpu::createDevice`), `EyeBlit`, `NvencEncoder`
 - `CreateSwapTextureSet()` → `SwapTextureSets` (real DXGI shared handles)
 - `SubmitLayer()` keeps the frame's first layer; `Present(syncTexture)`
-  blits its left eye under the sync texture's mutex, encodes, submits
-- Not yet: the right eye, compositing overlay layers (TODOS)
+  blits both eyes side by side under the sync texture's mutex, encodes, submits
+- Not yet: compositing overlay layers (TODOS)
 
 ### `SwapTextureSets` / `EyeBlit` / `SyncTexture`
 - D3D11 only, no OpenVR calls — tested on WARP (`tests/test_d3d_pipeline.cpp`)
@@ -130,7 +130,7 @@ CServerDriver::Cleanup()
 
 ---
 
-## Tests (74 GoogleTest cases)
+## Tests (78 GoogleTest cases)
 
 `driver/tests/test_qp_map.cpp`:
 - `ComputeQpDeltaMap_centerGaze_fovealZero` — gaze at (0,0) produces zero QP offset in fovea
@@ -170,7 +170,7 @@ against `streaming_engine.lib` (cdylib import lib).
 ## Known issues (from audit)
 
 - Nothing of this pipeline has run under SteamVR or on an NVIDIA GPU yet
-- Mono: only the left eye is streamed; the FOV is a fixed default
+- The FOV is a fixed default
   (`display_geometry.h`) until the headset reports its own
 - Overlay layers (SteamVR dashboard) are not composited
 - NVENC runs only on a driver that supports NVENC API 12.2+ (official header in `third_party/nvenc`)

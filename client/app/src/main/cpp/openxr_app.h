@@ -10,10 +10,8 @@
 #include "network_receiver.h"
 #include "video_decoder.h"
 #include "nal_validator.h"
-#include "timewarp.h"
 #include "overlay_renderer.h"
 #include "facial_tracker.h"
-#include "pose_history.h"
 #include "tracking_sender.h"
 #include "controller_poller.h"
 #include "audio_player.h"
@@ -142,16 +140,15 @@ private:
     EyeTracker m_eyeTracker;
     HmdProfile m_hmdProfile;
 
-    // Timewarp
-    Timewarp m_timewarp;
     OverlayRenderer m_overlay;
     FacialTracker m_facialTracker;
-    PoseHistory m_poseHistory;
 
-    // State: last decoded frame
+    // State: last decoded frame. Until a newer one arrives it is shown
+    // reprojected from the head orientation it was first shown at.
     GLuint m_lastDecodedTexture = 0;
-    uint32_t m_lastFrameIndex = 0;
+    XrQuaternionf m_frameOrientation{0.0f, 0.0f, 0.0f, 1.0f};
     bool m_hasDecodedFrame = false;
+    uint8_t m_videoLayout = 0;  // fvp_client_protocol::STEREO_* of the stream
 
     // Connection and pairing state
     PairingState m_pairingState = PairingState::Idle;

@@ -19,13 +19,14 @@
  *
  *   CreateSwapTextureSet -> shareable textures, DXGI shared handles
  *   SubmitLayer          -> remember the frame's first layer (the scene)
- *   Present              -> with the sync texture held: EyeBlit (left eye
- *                           -> encoder input) -> NvencEncoder
- *                           -> fvp_submit_encoded_nal()
+ *   Present              -> with the sync texture held: EyeBlit (both
+ *                           eyes side by side -> encoder input)
+ *                           -> NvencEncoder -> fvp_submit_encoded_nal()
+ *   PostPresent          -> wait out the frame's slot (FramePacer)
  *
  * NVENC encoding runs in C++; only NAL byte arrays cross the C ABI into
- * Rust. Not yet: the right eye (stereo) and compositing the layers above
- * the scene (overlays, the SteamVR dashboard) — see TODOS.md.
+ * Rust. Not yet: compositing the layers above the scene (overlays, the
+ * SteamVR dashboard) — see TODOS.md.
  */
 class CDirectModeComponent : public vr::IVRDriverDirectModeComponent
 {
@@ -94,10 +95,10 @@ private:
     FramePacer m_pacer;
     void* m_pacingTimer = nullptr;  // high-resolution waitable timer (HANDLE)
 
-    // The first layer submitted since the last Present: the scene.
+    // The first layer submitted since the last Present: the scene, per eye.
     bool m_haveLayer = false;
-    vr::SharedTextureHandle_t m_layerTexture = 0;
-    vr::VRTextureBounds_t m_layerBounds{};
+    vr::SharedTextureHandle_t m_layerTexture[2] = {};
+    vr::VRTextureBounds_t m_layerBounds[2] = {};
 
     uint32_t m_frameIndex = 0;
     std::vector<uint8_t> m_nal;

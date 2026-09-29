@@ -40,7 +40,7 @@ the engine falls back to `default.toml` alone. Changes apply on the next engine
 | Field | Type | Default | Range | Description |
 |-------|------|---------|-------|-------------|
 | `codec` | string | "h265" | "h264", "h265" | Video codec. H.265 = better compression, H.264 = faster decode on some devices |
-| `bitrate_mbps` | u32 | 80 | 10-200 | Target bitrate in Mbps: the NVENC target, the value STREAM_CONFIG sends to the HMD, and the adaptive bitrate controller's starting point (the controller's changes do not reach NVENC yet — see TODOS) |
+| `bitrate_mbps` | u32 | 80 | 10-200 | Target bitrate in Mbps: the NVENC target, the value STREAM_CONFIG sends to the HMD, and the adaptive bitrate controller's starting point; the controller's changes reach NVENC at runtime. Covers both eyes: a frame holds two (side by side) |
 | `resolution_per_eye` | [u32; 2] | [1832, 1920] | — | Per-eye render resolution [width, height]. Must match SteamVR render target |
 | `framerate` | u32 | 90 | 30-120 | Target framerate. Supported: 72, 90, 96, 120 |
 | `full_range` | bool | true | — | Full RGB (0-255) vs limited range (16-235). Affects NVENC VUI parameters |

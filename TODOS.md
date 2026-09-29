@@ -389,7 +389,8 @@
 ### ドライバ（上の P0 に加えて、映像を出すまでに要るもの）
 - ~~**P0: 表示コンポーネントがない。** HMD は DirectMode コンポーネントしか返さず（`hmd_device.cpp` `GetComponent`）、`IVRDisplayComponent` がない。投影・レンダーターゲットの大きさ・目ごとのビューポートを compositor が得られない。~~ (2026-09-29): `CDisplayComponent`。レンダーサイズは `render_width/height`、歪みなし。FOV は固定の既定値(片目 100°、`display_geometry.h`)。
 - ~~**P0: フレームコピーが何もしない。** `FrameCopy` は `R8G8B8A8_UNORM`、NVENC の入力は `B8G8R8A8_UNORM` で、形式グループが違う `CopyResource` は D3D11 が無視する。compositor の `nFormat` との一致も要る。~~ (2026-09-29): `EyeBlit` がシェーダで描き写す。レイヤーの bounds(左目・反転)、サイズの違い(SteamVR のスーパーサンプリング)、sRGB / float の元テクスチャを吸収して、NVENC の B8G8R8A8 入力にする。WARP で読み戻して確認。
-- **P1: 左目しか送らない**（`direct_mode.cpp` `Present`）。立体視にならない。クライアントも 1 本の映像を両目に出している。プロトコル(左右並びの大きさ)・クライアント(目ごとの UV)・ドライバ(両目を描き写す)をまとめて変える。同時に、ヘッドセットの FOV をクライアントから送らせて `CDisplayComponent` に使う(いまは固定値で、実機の FOV と違う分だけ像の大きさがずれる)。
+- ~~**P1: 左目しか送らない**（`direct_mode.cpp` `Present`）。立体視にならない。クライアントも 1 本の映像を両目に出している。~~ (2026-09-29): 左右並び(プロトコル v5)。ドライバは最初のレイヤーの両目を幅 2 倍のエンコーダ入力の左右に描き、STREAM_CONFIG の 26 バイト目で配置を伝える。クライアントは幅 2 倍でデコードし、目ごとに半分を表示する。foveated の QP マップも目ごとに中心を置く。映像の画素数が 2 倍になるので、同じ `bitrate_mbps` では画質が下がる(実機で既定値を見直す)。
+- **P1: ヘッドセットの FOV を使っていない。** `CDisplayComponent` の投影は固定の既定値(片目 100°)で、実機の FOV と違う分だけ像の大きさがずれる。クライアントから目ごとの FOV(と IPD)を送らせ、ドライバが `IVRServerDriverHost::SetDisplayProjectionRaw` / `SetDisplayEyeToHead` で差し替える。
 - **P1: 重ねるレイヤーを合成していない。** `SubmitLayer` の最初のレイヤー(シーン)しか使わないので、SteamVR のダッシュボードやオーバーレイが映らない。
 - ~~**P1: `syncTexture` を使っていない。** keyed mutex の取得も vsync イベントもないので、描画途中のフレームを読む可能性がある（実機で確認が要る）。~~ (2026-09-29): `Present` は sync texture の keyed mutex を取ってから読む(10 ms 待って取れなければそのフレームを飛ばす)。vsync は SteamVR に任せ、`PostPresent` でフレームの枠の終わりまで待ってペースを作る(`FramePacer`。ALVR の現行の方式。最初は自前の vsync イベントをスレッドから送っていた)。実機でのタイミングは未確認。
 - ~~**P1: NVENC が使えないとき、黙ってダミー NAL（IDR ヘッダ + `0xAB`）を流す。** `init()` は true を返し、失敗は `OutputDebugStringA` にしか出ない（vrserver.txt に残らない）。失敗として扱い、`VRDriverLog` に出すべき。~~ (2026-09-29): `init()` は false を返し、理由を vrserver.txt に出す。映像は流さない。
@@ -400,8 +401,9 @@
 ### Android クライアント（上の P0 のセッション配線に加えて）
 - ~~**P1: サーバから届くメッセージを読まない。**~~ (2026-09-28): `StreamSession` のスレッドが読み、`ServerEvent` としてアプリに渡す。TLS の読み書きはそのスレッドだけが行う。アプリ側の処理(ハプティクス・スリープ表示)は `openxr_app` への組み込みと一緒に行う。
 - **P1: HEARTBEAT のロス統計が常に 0。** (2026-09-28 一部修正): `FrameAssembler` が RTP シーケンス番号の抜けをロスとして数え、`StreamSession` が 500 ms ごとに実際の値と実時間から計算した fps を送る(E2E で HEARTBEAT_ACK まで確認済み)。`onFrameDecoded` はデコーダの配線と一緒に呼ぶ。TRANSPORT_FEEDBACK (0x12) は未実装で、GCC は入力なしのまま。
-- **P1: STREAM_CONFIG の codec を無視する。** デコーダは常に `video/hevc` で、handshake より前に作られる。
-- **P1: 描画の問題。** 右目が上下逆になる（Renderer は V を反転、Timewarp はしない）。Timewarp の行列を転置なしで渡し、+Z を前方とし、頂点ごとに透視除算している。フレームとそれを描いたときの頭の姿勢を結びつける手段がプロトコルにない。
+- ~~**P1: STREAM_CONFIG の codec を無視する。** デコーダは常に `video/hevc` で、handshake より前に作られる。~~ (2026-09-29 確認): `configureDecoder` が STREAM_CONFIG の codec と大きさでデコーダを作り直す。
+- ~~**P1: 描画の問題。** 右目が上下逆になる（Renderer は V を反転、Timewarp はしない）。Timewarp の行列を転置なしで渡し、+Z を前方とし、頂点ごとに透視除算している。~~ (2026-09-29): Renderer と Timewarp を 1 つのシェーダにまとめた。デコード済みフレームは 1 ループに 1 回だけ取り出して両目に使う(目ごとに取り出していたので、左右で違うフレームになっていた)。回転の補正はピクセルごとに、-Z 前方で、行列は転置して渡す。計算は `video_view.h` にあり、host の gtest で確かめる。シェーダは glslang で GLSL ES 3.00 として検証した(実機では未確認)。
+- **P1: フレームとそれを描いたときの頭の姿勢を結びつける手段がプロトコルにない。** 回転の補正は、フレームを最初に表示したときの姿勢からの差だけを補う。
 - ~~**P1: 復元できないフレームを黙って捨て、IDR を要求しない**（bulk / sliced とも）。~~ (2026-09-28): `FrameAssembler` は、欠けたフレーム(シャード不足・届かなかった frame index・100 ms のタイムアウト)があると IDR を要求し、キーフレームが来るまで非キーフレームを渡さない。セッション開始時も同じ。
 - **P1: OpenXR 拡張を有効にしていない。** instance は 2 つの拡張しか有効にしないので、`vive_focus3_controller`・facial tracking・eye gaze が使えない。eye tracker と controller poller がそれぞれ `xrAttachSessionActionSets` を呼ぶ（セッションで 1 回しか許されない）。
 - **P1: 音声を受信・再生する処理が配線されていない**（RTP の除去も `pump()` の呼び出しもない）。
@@ -431,4 +433,5 @@
 - **P1: インストーラは Steam のルートにある SteamVR しか探さない。** 別ライブラリの場合に案内する `driver/install.bat` は同梱されていない。
 - **P1: 署名。** リリースジョブは署名なしでも公開する。ドライバ DLL とアンインストーラは署名しない。Android の keystore が未設定だと毎回一時鍵で署名され、`adb install -r` が更新に失敗する。
 - P2: スライダーが範囲外の正しい値を丸めて保存する（sleep 30–900 など）。保存のたびに全キーを書く。保存失敗を再試行しない。`adb devices` を 3 秒ごとに UI スレッドで実行する。シミュレーション停止の join が UI スレッドで最大 5 秒。Deploy が全 adb デバイス（スマホも）に入れ、タイムアウトがない。デモモードでも Install / Uninstall が動く。「Install Driver」は作業ディレクトリ相対で、管理者権限が要る。`build.bat` の `%ERRORLEVEL%` がブロック内で展開される。fuzz / long-run / coverage が continue-on-error。SteamVR 実行中の上書きインストールを確認しない。DESIGN.md との差（Instrument Serif 未使用、text-muted の色、型スケール外のサイズ、ステータスドットの点滅なし）。
+- P2（CI）: `SessionE2E.PairsAndStreamsVideoFromTheRealEngine` が一度、失われたフレーム 4 (上限 2) で落ちた(2026-09-29、PR #22。ドライバだけの変更で、再実行で通った)。同じ PC 内の UDP でも、CI ランナーが混むと落とす。続くようなら上限か受信バッファを見直す。
 - P2（ドキュメント）: TROUBLESHOOTING が存在しない UI を案内している（「Reinstall driver」、`logs\engine.log`、ビットレートグラフ）。FAQ の「約 30% の帯域削減」は NVENC が動いていないので実測できていない。(2026-09-28: USER_GUIDE の APK のドラッグ&ドロップ・「Deploy」ボタン・HMD での PIN 入力の記述は、実際の UI に合わせて直した)

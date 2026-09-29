@@ -329,3 +329,48 @@ TEST(FoveatedPreset, PartialMatchReturnsNull) {
 
 // NVENC struct versions and constants: see test_nvenc_config.cpp (the
 // driver now uses the official nvEncodeAPI.h instead of hand-written types).
+
+// --- Side-by-side stereo: one fovea per eye ---
+
+TEST(SideBySideQpMap, EachEyeHasItsOwnFovea) {
+    // Two 640x320 eyes, 32-pixel blocks: a 40x10 grid.
+    std::vector<int8_t> map;
+    uint32_t cols = 0, rows = 0;
+    computeSideBySideQpDeltaMap(0.5f, 0.5f, 640, 320, 32, 0.15f, 0.35f, 5, 15, map, cols, rows);
+    ASSERT_EQ(cols, 40u);
+    ASSERT_EQ(rows, 10u);
+    ASSERT_EQ(map.size(), 400u);
+    // The centre of each eye is in its fovea...
+    EXPECT_EQ(map[5 * cols + 10], 0) << "left eye's centre";
+    EXPECT_EQ(map[5 * cols + 30], 0) << "right eye's centre";
+    // ...and the frame's centre (the seam, both eyes' edges) is not.
+    EXPECT_EQ(map[5 * cols + 20], 15);
+    EXPECT_EQ(map[5 * cols + 19], 15);
+    // Mirror images: the same pattern in both halves.
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint32_t c = 0; c < cols / 2; c++)
+            EXPECT_EQ(map[r * cols + c], map[r * cols + c + cols / 2]) << r << "," << c;
+}
+
+TEST(SideBySideQpMap, GazeMovesBothFoveae) {
+    std::vector<int8_t> map;
+    uint32_t cols = 0, rows = 0;
+    computeSideBySideQpDeltaMap(0.1f, 0.5f, 640, 320, 32, 0.1f, 0.2f, 5, 15, map, cols, rows);
+    EXPECT_EQ(map[5 * cols + 2], 0) << "left eye, gaze near its left edge";
+    EXPECT_EQ(map[5 * cols + 22], 0) << "right eye, same place in its half";
+    EXPECT_NE(map[5 * cols + 10], 0) << "left eye's centre is outside the fovea now";
+}
+
+TEST(SideBySideQpMap, ABlockOnTheSeamBelongsToTheEyeOfItsCentre) {
+    // 1832-pixel eyes don't divide into 32-pixel blocks: block 57 spans
+    // pixels 1824..1856, its centre (1840) in the right eye.
+    std::vector<int8_t> map;
+    uint32_t cols = 0, rows = 0;
+    // Fovea at the right eye's left edge only.
+    computeSideBySideQpDeltaMap(0.0f, 0.5f, 1832, 1920, 32, 0.02f, 0.03f, 5, 15, map, cols, rows);
+    EXPECT_EQ(cols, 115u) << "3664 / 32, rounded up";
+    const uint32_t mid = rows / 2;
+    EXPECT_EQ(map[mid * cols + 57], 0) << "seam block: right eye, next to the gaze";
+    EXPECT_EQ(map[mid * cols + 0], 0) << "left eye's left edge";
+    EXPECT_NE(map[mid * cols + 56], 0) << "left eye's right edge, far from its gaze";
+}

@@ -40,6 +40,36 @@ inline void computeCtuGrid(uint32_t width, uint32_t height, uint32_t ctuSize,
     outRows = (height + ctuSize - 1) / ctuSize;
 }
 
+/// QP delta map for a frame holding two eyes side by side (each
+/// `eyeWidth` × `height` pixels): a fovea around the gaze point in each
+/// eye, radii as fractions of the eye's width. A block on the seam belongs
+/// to the eye its centre is in.
+inline void computeSideBySideQpDeltaMap(
+    float gazeX, float gazeY,
+    uint32_t eyeWidth, uint32_t height, uint32_t blockSize,
+    float foveaRadius, float midRadius,
+    int8_t midQpDelta, int8_t peripheralQpDelta,
+    std::vector<int8_t>& outMap, uint32_t& outCols, uint32_t& outRows)
+{
+    computeCtuGrid(eyeWidth * 2, height, blockSize, outCols, outRows);
+    outMap.resize(outCols * outRows);
+    const float w = static_cast<float>(eyeWidth);
+    const float fovea = foveaRadius * w;
+    const float mid = midRadius * w;
+    for (uint32_t row = 0; row < outRows; ++row) {
+        for (uint32_t col = 0; col < outCols; ++col) {
+            const float cx = (static_cast<float>(col) + 0.5f) * static_cast<float>(blockSize);
+            const float cy = (static_cast<float>(row) + 0.5f) * static_cast<float>(blockSize);
+            const float eyeX = cx >= w ? cx - w : cx;  // position within its eye
+            const float dx = eyeX - gazeX * w;
+            const float dy = cy - gazeY * static_cast<float>(height);
+            const float dist = sqrtf(dx * dx + dy * dy);
+            outMap[row * outCols + col] =
+                dist <= fovea ? 0 : dist <= mid ? midQpDelta : peripheralQpDelta;
+        }
+    }
+}
+
 /// Compute QP delta map for foveated encoding.
 /// Pure function: no NVENC or GPU dependencies.
 ///

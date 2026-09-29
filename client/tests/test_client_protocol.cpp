@@ -23,16 +23,18 @@ void put_u32(std::vector<uint8_t>& v, uint32_t x) {
 }  // namespace
 
 TEST(ClientProtocol, ProtocolVersionMatchesServer) {
-    // Must match Rust PROTOCOL_VERSION = 4 (12-byte FVP header with
-    // data_shard_count).
-    EXPECT_EQ(PROTOCOL_VERSION, 4);
+    // Must match Rust PROTOCOL_VERSION = 5 (side-by-side stereo) and
+    // protocol::stereo_layout.
+    EXPECT_EQ(PROTOCOL_VERSION, 5);
+    EXPECT_EQ(STEREO_MONO, 0);
+    EXPECT_EQ(STEREO_SIDE_BY_SIDE, 1);
 }
 
 TEST(ClientProtocol, BuildHelloPayloadAdvertisesVersionAndCaps) {
     auto p = buildHelloPayload(PROTOCOL_VERSION, hello_caps::RESOLUTION_SCALE);
     // Layout mirrors Rust encode_hello(): [ver_lo, ver_hi, caps].
     ASSERT_EQ(p.size(), 3u);
-    EXPECT_EQ(p[0], 4);     // version low byte (v4)
+    EXPECT_EQ(p[0], 5);     // version low byte (v5)
     EXPECT_EQ(p[1], 0);     // version high byte
     EXPECT_EQ(p[2], 0x01);  // RESOLUTION_SCALE
 }
@@ -61,6 +63,26 @@ TEST(ClientProtocol, ParseStreamConfig25ByteReadsEncodedDims) {
     EXPECT_EQ(c.codec, 1);
     EXPECT_EQ(c.encodedWidth, 916u);
     EXPECT_EQ(c.encodedHeight, 960u);
+    EXPECT_EQ(c.layout, STEREO_MONO) << "a server before v5 sends one image";
+}
+
+TEST(ClientProtocol, ParseStreamConfig26ByteReadsTheStereoLayout) {
+    std::vector<uint8_t> p;
+    put_u32(p, 1832); put_u32(p, 1920);
+    put_u32(p, 80);   put_u32(p, 90);
+    p.push_back(1);
+    put_u32(p, 1832); put_u32(p, 1920);
+    p.push_back(STEREO_SIDE_BY_SIDE);
+    ASSERT_EQ(p.size(), 26u);
+
+    StreamConfigView c;
+    ASSERT_TRUE(parseStreamConfig(p.data(), p.size(), c));
+    EXPECT_EQ(c.encodedWidth, 1832u) << "encoded dims stay per eye";
+    EXPECT_EQ(c.layout, STEREO_SIDE_BY_SIDE);
+
+    p[25] = 7;  // unknown layout: show it as one image rather than guess
+    ASSERT_TRUE(parseStreamConfig(p.data(), p.size(), c));
+    EXPECT_EQ(c.layout, STEREO_MONO);
 }
 
 TEST(ClientProtocol, ParseStreamConfigLegacy17ByteEncodedEqualsNative) {
@@ -95,6 +117,16 @@ TEST(ClientProtocol, DecoderInitDimsFallsBackToNativeWhenEncodedUnset) {
     auto d = decoderInitDims(1832, 1920, 0, 0);
     EXPECT_EQ(d.width, 1832u);
     EXPECT_EQ(d.height, 1920u);
+}
+
+TEST(ClientProtocol, DecoderInitDimsHoldBothEyesSideBySide) {
+    // REGRESSION (mono): the decoder was sized for one eye, and the one
+    // image went to both eyes.
+    auto d = decoderInitDims(1832, 1920, 1832, 1920, STEREO_SIDE_BY_SIDE);
+    EXPECT_EQ(d.width, 3664u);
+    EXPECT_EQ(d.height, 1920u);
+    d = decoderInitDims(1832, 1920, 916, 960, STEREO_SIDE_BY_SIDE);
+    EXPECT_EQ(d.width, 1832u) << "two downscaled eyes";
 }
 
 // --- FVP video packet header (v4) ---

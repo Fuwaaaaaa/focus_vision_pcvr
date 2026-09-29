@@ -25,8 +25,9 @@ public:
     using LogFn = void (*)(const char* message);
 
     struct Config {
-        uint32_t width = 1832;
+        uint32_t width = 1832 * 2;  // the frame: both eyes side by side
         uint32_t height = 1920;
+        uint32_t eye_width = 1832;  // one eye's half of `width`
         uint32_t fps = 90;
         uint32_t bitrate_bps = 80'000'000;
         bool use_hevc = true;

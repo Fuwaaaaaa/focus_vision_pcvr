@@ -2,7 +2,7 @@
 
 > **Scope**: On-HMD Android native app that runs on VIVE Focus Vision. Pairs
 > with the PC driver, receives video/audio/control over Wi-Fi, renders via
-> OpenXR with timewarp.
+> OpenXR, each eye its half of a side-by-side frame, reprojected per pixel.
 
 Native activity (C++/NDK) with a trivial Kotlin shell. All app logic is
 C++; Kotlin only inherits `NativeActivity` and loads the `.so`.
@@ -34,20 +34,20 @@ Initialization steps (`initialize()`):
 4. `createSession()` — `xrCreateSession` with OpenGL ES Android binding
 5. `createReferenceSpace()` — `XR_REFERENCE_SPACE_TYPE_STAGE`
 6. `createSwapchains()` — per-eye via `XrSwapchainWrapper`
-7. Init sub-components (Renderer / Timewarp / Overlay / Heartbeat / FacialTracker / VideoDecoder)
+7. Init sub-components (Renderer / Overlay / Heartbeat / FacialTracker / VideoDecoder)
 
 Main loop per-frame:
 - `pollEvents()` / `pollAndroidEvents()`
 - `receiveAndDecodeVideo()` (UDP → FEC → NAL → MediaCodec)
-- `renderFrame()` (OpenXR frame begin → timewarp on decoded texture → submit)
+- `renderFrame()` (OpenXR frame begin → newest decoded frame, taken once → each eye its half, reprojected if the frame is old → submit)
 - Heartbeat 500 ms interval
 - Battery level poll every 30 s
 
 Owns ~30+ members: OpenXR handles, EGL state, per-eye swapchains, renderer,
-timewarp, overlay, network receiver, FEC decoders (bulk + slice),
+overlay, network receiver, FEC decoders (bulk + slice),
 video decoder, audio player, TCP client, tracking sender, controller
 poller, eye tracker, HMD profile, heartbeat, stats reporter, facial
-tracker, pose history, pairing state, dashboard state.
+tracker, pairing state, dashboard state.
 
 ---
 
@@ -72,8 +72,8 @@ tracker, pose history, pairing state, dashboard state.
 | `fec_decoder.h/.cpp` | `FecFrameDecoder` / `SlicedFecFrameDecoder` | Reed-Solomon recovery. Sliced version has 4 independent RS contexts, u32 length prefix, 100 ms timeout. `beginFrame` rejects `dataShards` 0 / > total; each frame is returned by `tryDecode` at most once |
 | `nal_validator.h/.cpp` | `NalValidator` | Sanity-check NAL unit header before feeding MediaCodec |
 | `video_decoder.h/.cpp` | `VideoDecoder` | MediaCodec via JNI + SurfaceTexture zero-copy path |
-| `timewarp.h/.cpp` | `Timewarp` | GL_TEXTURE_EXTERNAL_OES rotation correction shader |
-| `renderer.h/.cpp` | `Renderer` | Final composition to OpenXR swapchain images |
+| `video_view.h` | `fvp_video::` | Which half of the side-by-side frame each eye shows, and the per-pixel rotational reprojection (pure, host-tested) |
+| `renderer.h/.cpp` | `Renderer` | Draws one eye of the decoded frame (GL_TEXTURE_EXTERNAL_OES) into its swapchain image, reprojecting in the fragment shader (the math in `video_view.h`) |
 
 ### Audio
 | File | Class | Role |
@@ -86,7 +86,6 @@ tracker, pose history, pairing state, dashboard state.
 | `controller_poller.h/.cpp` | `ControllerPoller` | OpenXR action set poll for trigger / grip / thumbstick / touch / battery |
 | `eye_tracker.h/.cpp` | `EyeTracker` | `XR_EXT_eye_gaze_interaction` gaze pose |
 | `facial_tracker.h/.cpp` | `FacialTracker` | HTC OpenXR facial tracking extension (lip + eye blendshapes → 51 floats) |
-| `pose_history.h` | `PoseHistory` | Ring buffer of recent head poses for timewarp blend |
 | `hmd_profile.h/.cpp` | `HmdProfile` / `DisplayProfile` / `CodecProfile` | Per-HMD static data (IPD, refresh, supported codecs) |
 
 ### Rendering

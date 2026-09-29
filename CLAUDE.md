@@ -21,7 +21,7 @@ Key modules in streaming-engine:
 - `face_tracking/profiles.rs` — Per-avatar expression profiles (51 blendshape weights, JSON)
 - `face_tracking/calibration.rs` — Guided auto-calibration (min/max → weight computation)
 - `config.rs` — TOML config with validation (structured ConfigError, range checks, NaN rejection)
-- `transport/` — RTP packetization, FEC (adaptive + fixed + slice), UDP with buffer pool. Video packet = 12 B RTP + 12 B FVP header (protocol v4: `data_shard_count` at bytes 22..24, payload from byte 24)
+- `transport/` — RTP packetization, FEC (adaptive + fixed + slice), UDP with buffer pool. Video packet = 12 B RTP + 12 B FVP header (protocol v4: `data_shard_count` at bytes 22..24, payload from byte 24). Protocol v5: each frame holds both eyes side by side
 - `transport/slice.rs` — SliceSplitter: NAL → N slices at byte boundaries
 - `adaptive/` — Bandwidth estimation, bitrate controller, GCC delay estimator, burst detector
 - `control/` — TCP server with TLS, PIN pairing, CONFIG_UPDATE protocol (`0x03` video, `0x05` audio)
@@ -57,10 +57,10 @@ cargo run -p streaming-engine --bin focus-vision-headless --features simulator
 cargo test --workspace --features simulator -- --test-threads=1  # includes headless_e2e_test
 # C++ tests (requires CMake build):
 cd driver/build && cmake --build . --config Release
-ctest --test-dir driver/build --build-config Release --output-on-failure  # 74 gtest cases (D3D11 ones on WARP, no GPU needed)
+ctest --test-dir driver/build --build-config Release --output-on-failure  # 78 gtest cases (D3D11 ones on WARP, no GPU needed)
 # Android client host tests (hardware-independent logic, no NDK — host toolchain):
 cmake -S client/tests -B client/tests/build && cmake --build client/tests/build --config Release
-ctest --test-dir client/tests/build --build-config Release --output-on-failure  # 63 gtest cases: client_protocol (incl. FVP header parse), session, fec_decoder (golden RS vectors), frame_assembler, launch_request; host shims in client/tests/shim/ (FVP_TEST_LOG=1 prints the client's log)
+ctest --test-dir client/tests/build --build-config Release --output-on-failure  # 72 gtest cases: client_protocol (incl. FVP header parse, stereo layout), session, fec_decoder (golden RS vectors), frame_assembler, launch_request, video_view (eye halves + reprojection math); host shims in client/tests/shim/ (FVP_TEST_LOG=1 prints the client's log)
 # C++ client vs the real engine (test_session_e2e.cpp; skipped without the binary; CI job client-e2e):
 cargo build --release -p streaming-engine --features simulator --bins
 FVP_HEADLESS_BIN=target/release/focus-vision-headless.exe ctest --test-dir client/tests/build --build-config Release -R SessionE2E --output-on-failure
