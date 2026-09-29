@@ -497,6 +497,9 @@ enum ControlEvent {
     Heartbeat(HmdStats),
     /// TRANSPORT_FEEDBACK: per-packet receive times for delay-based estimation.
     TransportFeedback(Vec<fvp_common::protocol::TransportFeedbackEntry>),
+    /// CONFIG_UPDATE bitrate: the user's new setting (Mbps), for the
+    /// bitrate controller.
+    BitrateSetting(u32),
 }
 
 /// Room for this many [`ControlEvent`]s while the frame loop is busy (a
@@ -717,9 +720,14 @@ async fn handle_tcp_control(
                                 let mut ack_status: u8 = 0x00; // 0=rejected, 1=accepted
                                 match key {
                                     0x01 => { // bitrate_mbps
-                                        if (10..=200).contains(&value) {
+                                        use crate::adaptive::bitrate_controller::{MAX_BITRATE_MBPS, MIN_BITRATE_MBPS};
+                                        if (MIN_BITRATE_MBPS..=MAX_BITRATE_MBPS).contains(&value) {
                                             log::info!("CONFIG_UPDATE: bitrate → {} Mbps", value);
-                                            notify_bitrate_change(value * 1_000_000);
+                                            // Through the controller, which
+                                            // keeps it as the ceiling; set
+                                            // straight on the encoder, the
+                                            // next adjustment undid it.
+                                            ctl.forward(ControlEvent::BitrateSetting(value));
                                             ack_status = 0x01;
                                         } else {
                                             log::warn!("CONFIG_UPDATE: bitrate {} out of range", value);
@@ -1140,6 +1148,10 @@ impl AdaptiveState {
                 if self.gcc_enabled {
                     self.gcc_estimator.process_feedback(&entries);
                 }
+            }
+            ControlEvent::BitrateSetting(mbps) => {
+                self.bitrate_ctrl.set_setting_mbps(mbps);
+                notify_bitrate_change(self.bitrate_ctrl.current_bitrate_bps() as u32);
             }
         }
     }
@@ -1915,7 +1927,7 @@ impl StreamingLoop {
                     // is None and the whole block is a no-op.
                     if let Some(gov) = self.thermal_gov.as_mut() {
                         if let Some(multiplier) = gov.tick() {
-                            let base_max_bps = (config.video.bitrate_mbps as u64) * 1_000_000;
+                            let base_max_bps = (adaptive.bitrate_ctrl.setting_mbps() as u64) * 1_000_000;
                             let ceiling = (base_max_bps as f64 * multiplier) as u64;
                             adaptive.bitrate_ctrl.set_thermal_ceiling_bps(ceiling);
                         }
@@ -1923,7 +1935,7 @@ impl StreamingLoop {
 
                     check_sleep_mode(
                         &self.inputs.head, &mut adaptive.sleep_detector,
-                        config.video.bitrate_mbps, config.sleep_mode.timeout_seconds,
+                        adaptive.bitrate_ctrl.setting_mbps(), config.sleep_mode.timeout_seconds,
                         &sleep_tx,
                     );
 
@@ -2373,6 +2385,12 @@ mod tests {
         let harness = harness.run_with_input(&msg).await;
         // Should not cancel (valid update)
         assert!(!harness.cancel.is_cancelled());
+        // REGRESSION: it went straight to the encoder, and the controller's
+        // next adjustment undid it.
+        assert!(
+            matches!(harness.events.as_slice(), [ControlEvent::BitrateSetting(100)]),
+            "the setting must reach the bitrate controller, got {:?}", harness.events,
+        );
     }
 
     #[tokio::test]
@@ -2384,6 +2402,7 @@ mod tests {
         let harness = TcpTestHarness::new();
         let harness = harness.run_with_input(&msg).await;
         assert!(!harness.cancel.is_cancelled());
+        assert!(harness.events.is_empty(), "rejected, got {:?}", harness.events);
     }
 
     #[tokio::test]

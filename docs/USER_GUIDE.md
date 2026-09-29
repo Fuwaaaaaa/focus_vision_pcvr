@@ -161,7 +161,7 @@ GUI から変更できる主な項目:
 `%APPDATA%\FocusVisionPCVR\config\local.toml` を作成すると、より詳細なパラメータを変更できます。テンプレートは `%PROGRAMFILES%\Focus Vision PCVR\config\default.toml` を参考にしてください。
 
 代表的な調整項目:
-- `[video] bitrate_mbps`: 既定 80 Mbps。Wi-Fi 環境が悪い場合は 40-60 Mbps に下げると安定
+- `[video] bitrate_mbps`: 既定 80 Mbps。ビットレートの上限で、回線が悪いと自動で下げ、良くなるとこの値まで戻す (10〜200)。Wi-Fi 環境が悪い場合は 40-60 Mbps に下げると安定
 - `[network] congestion_control = "loss"`: GCC delay-based 推定を無効化、ロスベースのみで動作
 - `[recording] retention_days`: 録画ファイルの自動削除日数 (既定 30、0 = 削除しない)
 - `[thermal] enabled = true`: GPU 温度監視を有効化 (要 `nvml` feature build)

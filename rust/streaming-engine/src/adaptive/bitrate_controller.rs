@@ -143,8 +143,16 @@ fn decide_clamp_dominant(
     network_dom
 }
 
+/// Lowest bitrate the controller goes to, and the lowest setting accepted.
+pub(crate) const MIN_BITRATE_MBPS: u32 = 10;
+/// Highest bitrate setting accepted (`[video] bitrate_mbps`, CONFIG_UPDATE).
+pub(crate) const MAX_BITRATE_MBPS: u32 = 200;
+
 /// Adaptive bitrate controller.
-/// Adjusts encoding bitrate based on network quality estimates.
+/// Adjusts encoding bitrate based on network quality estimates, between the
+/// 10 Mbps floor and the user's setting (`[video] bitrate_mbps`, or the
+/// headset dashboard's CONFIG_UPDATE): it backs off on loss or delay and
+/// recovers up to the setting, never above it.
 pub struct BitrateController {
     current_bitrate_bps: u64,
     min_bitrate_bps: u64,
@@ -165,11 +173,15 @@ pub struct BitrateController {
 }
 
 impl BitrateController {
-    pub fn new(initial_bitrate_mbps: u32) -> Self {
+    /// Start at the user's setting, which is also the ceiling.
+    /// REGRESSION: the setting was only the starting point, and a good link
+    /// took the stream up to 200 Mbps whatever the user had chosen.
+    pub fn new(bitrate_mbps: u32) -> Self {
+        let setting = Self::setting_bps(bitrate_mbps);
         Self {
-            current_bitrate_bps: initial_bitrate_mbps as u64 * 1_000_000,
-            min_bitrate_bps: 10_000_000,   // 10 Mbps floor
-            max_bitrate_bps: 200_000_000,  // 200 Mbps ceiling
+            current_bitrate_bps: setting,
+            min_bitrate_bps: MIN_BITRATE_MBPS as u64 * 1_000_000,
+            max_bitrate_bps: setting,
             thermal_ceiling_bps: None,
             target_loss_rate: 0.02,        // 2%
             last_adjustment: Instant::now(),
@@ -178,13 +190,34 @@ impl BitrateController {
         }
     }
 
-    /// Constructor with custom hysteresis duration (for testing).
+    /// `mbps` within the accepted settings, in bps.
+    fn setting_bps(mbps: u32) -> u64 {
+        mbps.clamp(MIN_BITRATE_MBPS, MAX_BITRATE_MBPS) as u64 * 1_000_000
+    }
+
+    /// Constructor with custom hysteresis duration, starting at
+    /// `initial_bitrate_mbps` below the 200 Mbps maximum setting so tests
+    /// can watch it grow (for testing).
     #[cfg(test)]
     pub(crate) fn new_with_hysteresis(initial_bitrate_mbps: u32, hysteresis: Duration) -> Self {
         Self {
             hysteresis_duration: hysteresis,
-            ..Self::new(initial_bitrate_mbps)
+            current_bitrate_bps: initial_bitrate_mbps as u64 * 1_000_000,
+            ..Self::new(MAX_BITRATE_MBPS)
         }
+    }
+
+    /// The user chose a new bitrate (the headset dashboard): it becomes the
+    /// ceiling, and the stream goes to it now (within the thermal ceiling).
+    pub fn set_setting_mbps(&mut self, bitrate_mbps: u32) {
+        self.max_bitrate_bps = Self::setting_bps(bitrate_mbps);
+        self.current_bitrate_bps = self.clamp_to_bounds(self.max_bitrate_bps);
+        self.last_adjustment = Instant::now();
+    }
+
+    /// The user's setting: the most the controller asks for.
+    pub fn setting_mbps(&self) -> u32 {
+        (self.max_bitrate_bps / 1_000_000) as u32
     }
 
     /// Evaluate network conditions and adjust bitrate.
@@ -279,6 +312,72 @@ mod tests {
     fn test_initial_bitrate() {
         let ctrl = BitrateController::new(80);
         assert_eq!(ctrl.current_bitrate_mbps(), 80);
+        assert_eq!(ctrl.setting_mbps(), 80);
+    }
+
+    /// The setting's controller, with a hysteresis short enough to watch it
+    /// try to grow.
+    fn quick(setting_mbps: u32) -> BitrateController {
+        BitrateController {
+            hysteresis_duration: Duration::from_millis(1),
+            ..BitrateController::new(setting_mbps)
+        }
+    }
+
+    fn clean_link() -> BandwidthEstimator {
+        let mut est = BandwidthEstimator::new();
+        est.update(100, 0, 5.0);
+        est
+    }
+
+    #[test]
+    fn a_clean_link_does_not_go_past_the_setting() {
+        // REGRESSION: the setting was only where the stream started; with no
+        // loss it grew 5 % a step up to 200 Mbps.
+        let mut ctrl = quick(80);
+        let (gcc, burst) = (GccEstimator::new(80_000_000), BurstDetector::new());
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(2));
+            ctrl.adjust(&clean_link(), &gcc, &burst);
+        }
+        assert_eq!(ctrl.current_bitrate_mbps(), 80);
+    }
+
+    #[test]
+    fn after_loss_it_recovers_up_to_the_setting() {
+        let mut ctrl = quick(80);
+        let (gcc, burst) = (GccEstimator::new(80_000_000), BurstDetector::new());
+        let mut lossy = BandwidthEstimator::new();
+        lossy.update(50, 50, 10.0);
+        ctrl.adjust(&lossy, &gcc, &burst);
+        let backed_off = ctrl.current_bitrate_mbps();
+        assert!(backed_off < 80, "backs off on loss: {backed_off}");
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(2));
+            ctrl.adjust(&clean_link(), &gcc, &burst);
+        }
+        assert_eq!(ctrl.current_bitrate_mbps(), 80, "back to the setting, not past it");
+    }
+
+    #[test]
+    fn a_new_setting_applies_at_once_within_the_thermal_ceiling() {
+        let mut ctrl = BitrateController::new(80);
+        ctrl.set_setting_mbps(50);
+        assert_eq!((ctrl.setting_mbps(), ctrl.current_bitrate_mbps()), (50, 50));
+        ctrl.set_setting_mbps(120);
+        assert_eq!((ctrl.setting_mbps(), ctrl.current_bitrate_mbps()), (120, 120));
+        ctrl.set_thermal_ceiling_bps(60_000_000);
+        ctrl.set_setting_mbps(150);
+        assert_eq!((ctrl.setting_mbps(), ctrl.current_bitrate_mbps()), (150, 60), "thermal still caps");
+    }
+
+    #[test]
+    fn settings_outside_the_accepted_range_are_clamped() {
+        assert_eq!(BitrateController::new(500).setting_mbps(), MAX_BITRATE_MBPS);
+        assert_eq!(BitrateController::new(1).setting_mbps(), MIN_BITRATE_MBPS);
+        let mut ctrl = BitrateController::new(80);
+        ctrl.set_setting_mbps(0);
+        assert_eq!(ctrl.current_bitrate_mbps(), MIN_BITRATE_MBPS);
     }
 
     #[test]

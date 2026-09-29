@@ -95,7 +95,7 @@ Module declarations: `src/lib.rs:1-14` (14 modules).
 | File | Key items | Responsibility |
 |---|---|---|
 | `bandwidth_estimator.rs` | `BandwidthEstimator` | EWMA loss tracking + RTT (single-responsibility after PR splitting delay into gcc_estimator) |
-| `bitrate_controller.rs` | `BitrateController` | CBR adjustment; `adjust(bw, gcc, burst) -> bool`; max-reduction model |
+| `bitrate_controller.rs` | `BitrateController` | CBR adjustment between 10 Mbps and the user's setting (`[video] bitrate_mbps`, CONFIG_UPDATE → `set_setting_mbps`); `adjust(bw, gcc, burst) -> bool`; max-reduction model |
 | `gcc_estimator.rs` | `GccEstimator` (`DelayTrend`, `bitrate_multiplier`) | delay-based bandwidth estimation (`process_feedback`) |
 | `burst_detector.rs` | `BurstDetector` (`LossPattern` enum) | Wi-Fi burst vs sustained classifier (500 ms threshold by default; `new_with_thresholds` for tests) |
 

@@ -307,6 +307,14 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     resampler (Blackman, 16 zero crossings; tones within 0.1 % of ideal,
     −70 dB of what 48 kHz can't carry when going down).
   - Checked with unit tests; not yet on a 44.1 kHz or surround device.
+- **`bitrate_mbps` is the most the stream uses.** It was only where the
+  adaptive controller started; on a clean link it grew 5 % a step up to
+  200 Mbps, whatever the user had set (USER_GUIDE advises lowering it for
+  a weak Wi-Fi). The controller now backs off on loss or delay and
+  recovers up to the setting. A bitrate chosen on the headset dashboard
+  (CONFIG_UPDATE) goes to the controller as the new setting; it was set on
+  the encoder directly, and the next adjustment undid it. The thermal cap
+  and the wake from sleep follow the current setting too.
 - **The companion draws Japanese and fits its window** (#19).
   - Japanese text was boxes (no loaded font had kana or kanji). The OS's
     Japanese font (Yu Gothic Medium, else Meiryo or MS Gothic) follows Geist,
