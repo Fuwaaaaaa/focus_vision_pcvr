@@ -1792,6 +1792,16 @@ impl StreamingLoop {
         let osc_target = format!("127.0.0.1:{}", config.face_tracking.osc_port);
         log::debug!("OSC bridge target: {}", osc_target);
         osc_bridge.set_target(osc_target);
+        // REGRESSION: `enabled` and `active_profile` were read but never
+        // applied: face data always went out, with no profile.
+        osc_bridge.set_enabled(config.face_tracking.enabled);
+        let profile_name = &config.face_tracking.active_profile;
+        if !profile_name.is_empty() {
+            match crate::face_tracking::profiles::load_profile(profile_name) {
+                Some(profile) => osc_bridge.set_profile(Some(&profile)),
+                None => log::warn!("Face tracking profile '{}' not found or invalid; using none", profile_name),
+            }
+        }
 
         // Spawn TCP control reader/writer. It reports the disconnect reason
         // for the hold logic.

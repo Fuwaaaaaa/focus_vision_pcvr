@@ -125,9 +125,9 @@ Module declarations: `src/lib.rs:1-14` (14 modules).
 
 | File | Key items |
 |---|---|
-| `osc_bridge.rs` | `OscBridge` (EMA smoothing via `apply_smoothing_and_send` helper, VRChat OSC) |
-| `profiles.rs` | `FtProfile`, `validate()` (normalize + sanitize), JSON save/load |
-| `calibration.rs` | `CalibrationState`, 2-step guided (Relax → ExaggerateAll) |
+| `osc_bridge.rs` | `OscBridge` (EMA smoothing, profile offset + weight, VRChat OSC; name tables in `XrLipExpressionHTC` / `XrEyeExpressionHTC` order, checked against the enum; a parameter falling to rest is sent as 0 once) |
+| `profiles.rs` | `FtProfile` (weights, resting `offsets`, smoothing override), `validate()` (normalize + sanitize), JSON save/load |
+| `calibration.rs` | `CalibrationState`, 2-step guided (Relax → ExaggerateAll) → offset = min, weight = 1 / range |
 | `mod.rs` | HTC blendshape indices, `TOTAL_BLENDSHAPES = 51` |
 
 ---

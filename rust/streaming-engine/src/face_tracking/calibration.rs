@@ -74,8 +74,12 @@ impl CalibrationState {
             return true;
         }
 
-        // Combine lip + eye into one array
+        // Combine lip + eye into one array. A non-finite value would make
+        // the range infinite (weight 0): skipped.
         for (i, &v) in lip.iter().chain(eye.iter()).enumerate() {
+            if !v.is_finite() {
+                continue;
+            }
             if v < self.min_values[i] {
                 self.min_values[i] = v;
             }
@@ -95,16 +99,22 @@ impl CalibrationState {
         }
     }
 
-    /// Compute the profile from collected calibration data.
-    /// Weight = 1.0 / (max - min) for each blendshape.
-    /// If max == min (no range), weight defaults to 1.0.
+    /// Compute the profile from collected calibration data: offset = min and
+    /// weight = 1.0 / (max - min) for each blendshape, so the relaxed face
+    /// sends 0 and the exaggerated one 1.
+    /// If max == min (no range), offset 0.0 and weight 1.0 (unchanged).
     pub fn compute_profile(&self) -> FtProfile {
         let mut weights = vec![1.0f32; TOTAL_BLENDSHAPES];
+        let mut offsets = vec![0.0f32; TOTAL_BLENDSHAPES];
 
-        for (i, weight) in weights.iter_mut().enumerate() {
-            let range = self.max_values[i] - self.min_values[i];
+        // REGRESSION: the minimum was not taken off, so a face at rest
+        // (min / range, e.g. 0.3 / 0.3) sent 1.0.
+        let ranges = self.min_values.iter().zip(&self.max_values);
+        for ((weight, offset), (&min, &max)) in weights.iter_mut().zip(offsets.iter_mut()).zip(ranges) {
+            let range = max - min;
             if range > 0.01 {
                 *weight = 1.0 / range;
+                *offset = min.clamp(0.0, 1.0);
             }
         }
 
@@ -112,6 +122,7 @@ impl CalibrationState {
             name: self.profile_name.clone(),
             weights,
             smoothing_override: None,
+            offsets,
         }
     }
 }
@@ -179,6 +190,43 @@ mod tests {
         assert!((profile.weights[0] - 1.25).abs() < 0.01);
         // Weight for eye: 1.0 / (0.8 - 0.05) = 1.333
         assert!((profile.weights[37] - 1.333).abs() < 0.01);
+        // The relaxed values are the offsets.
+        assert!((profile.offsets[0] - 0.1).abs() < 1e-6);
+        assert!((profile.offsets[37] - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_relaxed_face_sends_zero_and_an_exaggerated_one_one() {
+        let mut state = CalibrationState::new("rest");
+        for _ in 0..FRAMES_PER_STEP {
+            state.update(&[0.3; 37], &[0.2; 14]);
+        }
+        for _ in 0..FRAMES_PER_STEP {
+            state.update(&[0.6; 37], &[0.9; 14]);
+        }
+        let p = state.compute_profile();
+        let sent = |i: usize, raw: f32| ((raw - p.offset(i)) * p.weight(i)).clamp(0.0, 1.0);
+        assert!(sent(3, 0.3).abs() < 1e-5, "jaw at rest: {}", sent(3, 0.3));
+        assert!((sent(3, 0.6) - 1.0).abs() < 1e-5);
+        assert!((sent(3, 0.45) - 0.5).abs() < 1e-5, "halfway");
+        assert!(sent(37, 0.2).abs() < 1e-5, "eye at rest");
+    }
+
+    #[test]
+    fn infinite_samples_are_ignored() {
+        let mut state = CalibrationState::new("inf");
+        for frame in 0..FRAMES_PER_STEP {
+            let mut lip = [0.1f32; 37];
+            if frame % 2 == 0 {
+                lip[0] = f32::INFINITY;
+            }
+            state.update(&lip, &[0.1; 14]);
+        }
+        for _ in 0..FRAMES_PER_STEP {
+            state.update(&[0.9; 37], &[0.9; 14]);
+        }
+        let p = state.compute_profile();
+        assert!((p.weights[0] - 1.25).abs() < 0.01, "weight {}", p.weights[0]);
     }
 
     #[test]

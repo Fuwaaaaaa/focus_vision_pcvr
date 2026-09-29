@@ -110,8 +110,8 @@ fn eye_blendshapes_use_separate_name_table() {
     let mut eye = [0.0f32; 14];
     // EyeLeftBlink (eye index 0)
     eye[0] = 0.8;
-    // EyeRightBlink (eye index 6)
-    eye[6] = 0.7;
+    // EyeRightBlink (eye index 2, XR_EYE_EXPRESSION_RIGHT_BLINK_HTC)
+    eye[2] = 0.7;
 
     bridge.send_face_data(false, true, &lip, &eye);
 
@@ -177,4 +177,78 @@ fn values_below_threshold_are_dropped() {
         "expected no packets for below-threshold input, got {}",
         packets.len()
     );
+}
+
+#[test]
+fn a_parameter_falling_to_rest_is_sent_as_zero_once() {
+    // REGRESSION: below the threshold nothing was sent, so VRChat kept the
+    // last value — with no smoothing, a mouth that closed stayed open.
+    let (rx, target) = bind_receiver();
+    let mut bridge = OscBridge::with_smoothing(0.0);
+    bridge.set_target(target);
+    let eye = [0.0f32; 14];
+    let mut lip = [0.0f32; 37];
+
+    lip[3] = 0.8; // JawOpen
+    bridge.send_face_data(true, false, &lip, &eye);
+    lip[3] = 0.0;
+    bridge.send_face_data(true, false, &lip, &eye);
+    bridge.send_face_data(true, false, &lip, &eye);
+
+    let jaw: Vec<f32> = drain(&rx)
+        .iter()
+        .filter_map(|p| parse_osc_float(p))
+        .filter(|(addr, _)| addr == "/avatar/parameters/JawOpen")
+        .map(|(_, v)| v)
+        .collect();
+    assert_eq!(jaw, vec![0.8, 0.0], "open, then closed once");
+}
+
+#[test]
+fn an_infinite_input_does_not_stick() {
+    let (rx, target) = bind_receiver();
+    let mut bridge = OscBridge::with_smoothing(0.5);
+    bridge.set_target(target);
+    let eye = [0.0f32; 14];
+    let mut lip = [0.0f32; 37];
+
+    lip[3] = f32::INFINITY;
+    bridge.send_face_data(true, false, &lip, &eye);
+    lip[3] = 0.0;
+    for _ in 0..20 {
+        bridge.send_face_data(true, false, &lip, &eye);
+    }
+    let jaw: Vec<f32> = drain(&rx)
+        .iter()
+        .filter_map(|p| parse_osc_float(p))
+        .filter(|(addr, _)| addr == "/avatar/parameters/JawOpen")
+        .map(|(_, v)| v)
+        .collect();
+    assert!(jaw.is_empty(), "the infinity never reached the EMA: {jaw:?}");
+}
+
+#[test]
+fn a_calibrated_profile_sends_zero_at_rest() {
+    // REGRESSION: the calibration's weight (1 / range) was applied without
+    // taking off the resting value, so a face at rest sent 1.0.
+    use streaming_engine::face_tracking::calibration::CalibrationState;
+    let mut calibration = CalibrationState::new("rest");
+    while !calibration.is_done() {
+        let raw = if calibration.current_step().index() == 0 { 0.3 } else { 0.6 };
+        calibration.update(&[raw; 37], &[raw; 14]);
+    }
+    let profile = calibration.compute_profile();
+
+    let (rx, target) = bind_receiver();
+    let mut bridge = OscBridge::with_smoothing(0.0);
+    bridge.set_target(target);
+    bridge.set_profile(Some(&profile));
+    let eye = [0.0f32; 14];
+    bridge.send_face_data(true, false, &[0.3; 37], &eye);
+    assert!(drain(&rx).is_empty(), "a relaxed face sends nothing");
+
+    bridge.send_face_data(true, false, &[0.6; 37], &eye);
+    let parsed: HashMap<String, f32> = drain(&rx).iter().filter_map(|p| parse_osc_float(p)).collect();
+    let jaw = parsed["/avatar/parameters/JawOpen"];
+    assert!((jaw - 1.0).abs() < 1e-3, "the exaggerated face sends 1.0: {jaw}");
 }

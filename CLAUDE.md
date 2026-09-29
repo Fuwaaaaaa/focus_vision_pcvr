@@ -18,8 +18,8 @@ Key modules in streaming-engine:
 - `thermal.rs` — `ThermalGovernor` + `NvmlThermalSource` (feature = "nvml"), bitrate ceiling cap
 - `sleep_mode.rs` — User inactivity detection and sleep/wake transitions
 - `face_tracking/osc_bridge.rs` — HTC blendshapes → VRChat OSC with EMA smoothing + profile weights
-- `face_tracking/profiles.rs` — Per-avatar expression profiles (51 blendshape weights, JSON)
-- `face_tracking/calibration.rs` — Guided auto-calibration (min/max → weight computation)
+- `face_tracking/profiles.rs` — Per-avatar expression profiles (51 blendshape weights + resting offsets, JSON)
+- `face_tracking/calibration.rs` — Guided auto-calibration (min/max → resting offset + weight)
 - `config.rs` — TOML config with validation (structured ConfigError, range checks, NaN rejection)
 - `transport/` — RTP packetization, FEC (adaptive + fixed + slice), UDP with buffer pool. Video packet = 12 B RTP + 12 B FVP header (protocol v4: `data_shard_count` at bytes 22..24, payload from byte 24). Protocol v5: each frame holds both eyes side by side
 - `transport/slice.rs` — SliceSplitter: NAL → N slices at byte boundaries

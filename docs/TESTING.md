@@ -498,9 +498,11 @@ mid_radius = 0.05
 {
   "name": "avatar_test",
   "weights": [2.0, 2.0, 2.0, 2.0, 1.0, 1.0, ... ],
-  "smoothing_override": 0.4
+  "smoothing_override": 0.4,
+  "offsets": [0.1, 0.0, 0.0, 0.05, ... ]
 }
-# → 最初の4 blendshape (Jaw系) が2倍感度
+# → 最初の4 blendshape (Jaw系) が2倍感度。送る値は (生の値 − offset) × weight
+#   (offsets は安静時の値。省略すると 0)
 
 # config/local.toml:
 [face_tracking]
@@ -515,6 +517,8 @@ active_profile = "avatar_test"
 | プロファイルなし | active_profile="" | 通常動作（weight 1.0） |
 | 不正プロファイル名 | `active_profile = "../evil"` | 読込拒否（ログ警告） |
 | NaN weight | `"weights": [NaN]` | 1.0にサニタイズ |
+| 範囲外の offset | `"offsets": [1.5]` | 0.0にサニタイズ |
+| face_tracking.enabled = false | FTデータを送る | OSC を送らない |
 
 ### 13B. FT 自動キャリブレーション
 
@@ -534,6 +538,7 @@ cargo test -p streaming-engine -- calibration
 | Relaxステップ | 90フレーム（~1秒）のmin収集 | min値が正しく記録 |
 | ExaggerateAllステップ | 90フレームのmax収集 | max値が正しく記録 |
 | weight計算 | 1.0 / (max - min) | 妥当な値（0.5〜5.0程度） |
+| offset計算 | min | 安静時に 0、最大の表情で 1 を送る |
 | 定数値（動かない） | range < 0.01 | weight = 1.0（ゼロ除算なし） |
 | プロファイル生成 | compute_profile() | 有効なFtProfileオブジェクト |
 
