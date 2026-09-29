@@ -1,4 +1,4 @@
-use std::process::Command;
+use crate::process;
 
 /// ADB device info
 #[derive(Debug, Clone)]
@@ -11,7 +11,7 @@ pub struct AdbDevice {
 /// Find adb.exe — check PATH, then common install locations.
 pub fn find_adb() -> Option<String> {
     // Check PATH first
-    if Command::new("adb").arg("version").output().is_ok() {
+    if process::command("adb").arg("version").output().is_ok() {
         return Some("adb".to_string());
     }
 
@@ -64,7 +64,7 @@ pub fn parse_device_list(output: &str) -> Vec<AdbDevice> {
 
 /// List connected ADB devices.
 pub fn list_devices(adb_path: &str) -> Vec<AdbDevice> {
-    let output = match Command::new(adb_path).arg("devices").arg("-l").output() {
+    let output = match process::command(adb_path).arg("devices").arg("-l").output() {
         Ok(o) => o,
         Err(_) => return vec![],
     };
@@ -76,7 +76,7 @@ pub fn list_devices(adb_path: &str) -> Vec<AdbDevice> {
 /// Install APK on a device via ADB.
 /// Returns Ok(output) on success, Err(error) on failure.
 pub fn install_apk(adb_path: &str, serial: &str, apk_path: &str) -> Result<String, String> {
-    let output = Command::new(adb_path)
+    let output = process::command(adb_path)
         .args(["-s", serial, "install", "-r", apk_path])
         .output()
         .map_err(|e| format!("Failed to run adb: {e}"))?;
@@ -93,7 +93,7 @@ pub fn install_apk(adb_path: &str, serial: &str, apk_path: &str) -> Result<Strin
 
 /// Dump logcat from the device (non-blocking — returns buffered log).
 pub fn dump_logcat(adb_path: &str, serial: &str) -> Result<String, String> {
-    let output = Command::new(adb_path)
+    let output = process::command(adb_path)
         .args(["-s", serial, "logcat", "-d", "-s", "FocusVision:*"])
         .output()
         .map_err(|e| format!("Failed to run adb: {e}"))?;
@@ -108,7 +108,7 @@ pub fn dump_logcat(adb_path: &str, serial: &str) -> Result<String, String> {
 /// Launch the app on the device.
 pub fn launch_app(adb_path: &str, serial: &str, package: &str) -> Result<String, String> {
     let activity = format!("{package}/.MainActivity");
-    let output = Command::new(adb_path)
+    let output = process::command(adb_path)
         .args(["-s", serial, "shell", "am", "start", "-n", &activity])
         .output()
         .map_err(|e| format!("Failed to run adb: {e}"))?;

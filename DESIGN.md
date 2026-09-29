@@ -18,6 +18,7 @@
 - **Body/UI:** Geist — クリーンで現代的。読みやすく、UIに最適
 - **Data/Tables:** Geist Mono (tabular-nums) — レイテンシー、FPS、ビットレート等の数値表示
 - **Code:** Geist Mono
+- **Japanese (companion app):** OS 同梱フォントを Geist / Geist Mono の代替として使う — 游ゴシック Medium（なければメイリオ → MS ゴシック）。欧文は Geist のまま、かな・漢字・全角記号だけを和文フォントで描き、ベースラインを Geist にそろえる
 - **Loading:** Google Fonts (Instrument Serif) + CDN (Geist: cdn.jsdelivr.net/npm/geist)
 - **Scale:**
   - 2xs: 11px — 極小ラベル
@@ -150,3 +151,4 @@
 | 2026-04-07 | Sleep mode: no text overlay | 暗転中はテキストなし。「ツールが消える」哲学と一貫 |
 | 2026-04-07 | Battery: number-only display | アイコンではなく数字。VR内の可読性とミニマル方針 |
 | 2026-04-07 | FT status: companion only | HMDオーバーレイには表示しない。情報最小限の原則 |
+| 2026-09-29 | Japanese: OS font (Yu Gothic Medium) as Geist's fallback | Geist に和文がなく、日本語のバナーが豆腐になっていた。同梱すると十数 MB 増えるため OS のフォントを使う。egui はヒンティングなしで描くので、Regular より太い Medium を選ぶ |
