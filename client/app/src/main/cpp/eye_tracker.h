@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <atomic>
 
+#include "video_view.h"
+
 /**
  * Eye tracking via OpenXR XR_EXT_eye_gaze_interaction.
  *
@@ -13,6 +15,9 @@
  * Supported HMDs: VIVE Focus Vision, Quest Pro, Vision Pro.
  * On HMDs without eye tracking, isAvailable() returns false
  * and the system falls back to fixed-center foveation.
+ *
+ * The app attaches the action set together with the others (a session
+ * allows one xrAttachSessionActionSets) and syncs actions once per frame.
  */
 class EyeTracker {
 public:
@@ -23,14 +28,22 @@ public:
         uint64_t timestamp_ns;
     };
 
-    /// Initialize eye tracking. Returns true if the extension is available.
-    bool init(XrInstance instance, XrSession session, XrSpace viewSpace);
+    /// Create the gaze action and suggest its binding, if the extension is
+    /// enabled (`extensionEnabled`) and the system supports eye gaze.
+    /// Returns the action set for the app to attach, or XR_NULL_HANDLE.
+    XrActionSet createActions(XrInstance instance, XrSystemId system, bool extensionEnabled);
+
+    /// After the app attached the action sets: the gaze space, located in
+    /// `viewSpace`.
+    bool createSpace(XrSession session, XrSpace viewSpace);
 
     /// Shut down and release resources.
     void shutdown();
 
-    /// Poll current gaze. Call once per frame after xrLocateViews.
-    GazeData poll(XrTime displayTime);
+    /// The current gaze, as synced by the app's xrSyncActions this frame,
+    /// placed in the eye image whose field of view is `fov`. Call once per
+    /// frame after xrLocateViews.
+    GazeData poll(XrTime displayTime, const fvp_video::Tangents& fov);
 
     bool isAvailable() const { return m_available; }
 

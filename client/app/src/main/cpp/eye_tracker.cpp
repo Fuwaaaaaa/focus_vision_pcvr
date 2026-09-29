@@ -1,30 +1,20 @@
 #include "eye_tracker.h"
 #include "xr_utils.h"
 #include <cstring>
-#include <cmath>
 
-bool EyeTracker::init(XrInstance instance, XrSession session, XrSpace viewSpace) {
-    m_session = session;
-    m_viewSpace = viewSpace;
-
-    // Check if XR_EXT_eye_gaze_interaction is supported
-    uint32_t extCount = 0;
-    xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
-    std::vector<XrExtensionProperties> exts(extCount, {XR_TYPE_EXTENSION_PROPERTIES});
-    xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, exts.data());
-
-    bool hasEyeGaze = false;
-    for (const auto& ext : exts) {
-        if (strcmp(ext.extensionName, "XR_EXT_eye_gaze_interaction") == 0) {
-            hasEyeGaze = true;
-            break;
-        }
+XrActionSet EyeTracker::createActions(XrInstance instance, XrSystemId system, bool extensionEnabled) {
+    if (!extensionEnabled) {
+        LOGI("EyeTracker: XR_EXT_eye_gaze_interaction not available — using fixed center");
+        return XR_NULL_HANDLE;
     }
 
-    if (!hasEyeGaze) {
-        LOGI("EyeTracker: XR_EXT_eye_gaze_interaction not available — using fixed center");
-        m_available = false;
-        return false;
+    // The extension can be present on a system without eye tracking.
+    XrSystemEyeGazeInteractionPropertiesEXT eyeGaze = {XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT};
+    XrSystemProperties properties = {XR_TYPE_SYSTEM_PROPERTIES};
+    properties.next = &eyeGaze;
+    if (XR_FAILED(xrGetSystemProperties(instance, system, &properties)) || !eyeGaze.supportsEyeGazeInteraction) {
+        LOGI("EyeTracker: this headset has no eye gaze interaction — using fixed center");
+        return XR_NULL_HANDLE;
     }
 
     // Create action set for eye gaze
@@ -33,7 +23,8 @@ bool EyeTracker::init(XrInstance instance, XrSession session, XrSpace viewSpace)
     strncpy(actionSetInfo.localizedActionSetName, "Eye Gaze", XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE);
     if (xrCreateActionSet(instance, &actionSetInfo, &m_actionSet) != XR_SUCCESS) {
         LOGW("EyeTracker: Failed to create action set");
-        return false;
+        m_actionSet = XR_NULL_HANDLE;
+        return XR_NULL_HANDLE;
     }
 
     // Create gaze action
@@ -43,7 +34,8 @@ bool EyeTracker::init(XrInstance instance, XrSession session, XrSpace viewSpace)
     strncpy(actionInfo.localizedActionName, "Gaze Pose", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
     if (xrCreateAction(m_actionSet, &actionInfo, &m_gazeAction) != XR_SUCCESS) {
         LOGW("EyeTracker: Failed to create gaze action");
-        return false;
+        shutdown();
+        return XR_NULL_HANDLE;
     }
 
     // Suggest interaction profile for eye gaze
@@ -61,26 +53,22 @@ bool EyeTracker::init(XrInstance instance, XrSession session, XrSpace viewSpace)
 
     if (xrSuggestInteractionProfileBindings(instance, &suggestedBinding) != XR_SUCCESS) {
         LOGW("EyeTracker: Failed to suggest gaze binding");
-        return false;
+        shutdown();
+        return XR_NULL_HANDLE;
     }
+    return m_actionSet;
+}
 
-    // Create gaze space
+bool EyeTracker::createSpace(XrSession session, XrSpace viewSpace) {
+    if (m_gazeAction == XR_NULL_HANDLE) return false;
+    m_session = session;
+    m_viewSpace = viewSpace;
+
     XrActionSpaceCreateInfo spaceInfo = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
     spaceInfo.action = m_gazeAction;
     spaceInfo.poseInActionSpace.orientation.w = 1.0f;
-
     if (xrCreateActionSpace(session, &spaceInfo, &m_gazeSpace) != XR_SUCCESS) {
         LOGW("EyeTracker: Failed to create gaze space");
-        return false;
-    }
-
-    // Attach action set to session
-    XrSessionActionSetsAttachInfo attachInfo = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
-    attachInfo.actionSets = &m_actionSet;
-    attachInfo.countActionSets = 1;
-
-    if (xrAttachSessionActionSets(session, &attachInfo) != XR_SUCCESS) {
-        LOGW("EyeTracker: Failed to attach action set");
         return false;
     }
 
@@ -105,19 +93,12 @@ void EyeTracker::shutdown() {
     m_available = false;
 }
 
-EyeTracker::GazeData EyeTracker::poll(XrTime displayTime) {
+EyeTracker::GazeData EyeTracker::poll(XrTime displayTime, const fvp_video::Tangents& fov) {
     GazeData data = {0.5f, 0.5f, false, 0}; // Default: center
 
     if (!m_available || m_gazeSpace == XR_NULL_HANDLE) {
         return data;
     }
-
-    // Sync action set
-    XrActiveActionSet activeSet = {m_actionSet, XR_NULL_PATH};
-    XrActionsSyncInfo syncInfo = {XR_TYPE_ACTIONS_SYNC_INFO};
-    syncInfo.activeActionSets = &activeSet;
-    syncInfo.countActiveActionSets = 1;
-    xrSyncActions(m_session, &syncInfo);
 
     // Get gaze pose state
     XrActionStatePose poseState = {XR_TYPE_ACTION_STATE_POSE};
@@ -139,36 +120,9 @@ EyeTracker::GazeData EyeTracker::poll(XrTime displayTime) {
         return data;
     }
 
-    // Convert gaze direction (quaternion → normalized screen coords)
-    // The gaze pose orientation represents where the user is looking.
-    // We need to project this onto the screen plane.
-    //
-    // Extract forward vector from quaternion:
-    float qx = location.pose.orientation.x;
-    float qy = location.pose.orientation.y;
-    float qz = location.pose.orientation.z;
-    float qw = location.pose.orientation.w;
-
-    // Forward vector (0,0,-1) rotated by quaternion
-    float fx = 2.0f * (qx * qz + qw * qy);
-    float fy = 2.0f * (qy * qz - qw * qx);
-    float fz = 1.0f - 2.0f * (qx * qx + qy * qy);
-
-    // Project onto screen plane (assuming ~100 degree FOV)
-    // x: positive = right, y: positive = down
-    if (fz < 0.01f) fz = 0.01f; // Avoid division by zero
-    float screenX = fx / fz;
-    float screenY = -fy / fz; // Flip Y (screen Y is down)
-
-    // Map from tangent space to normalized 0-1 coords
-    // tan(50 degrees) ≈ 1.19 for ~100 degree FOV
-    float halfFov = 1.19f;
-    data.x = (screenX / halfFov + 1.0f) * 0.5f;
-    data.y = (screenY / halfFov + 1.0f) * 0.5f;
-
-    // Clamp to valid range
-    data.x = std::fmax(0.0f, std::fmin(1.0f, data.x));
-    data.y = std::fmax(0.0f, std::fmin(1.0f, data.y));
+    // Where the gaze falls in the eye image (fvp_video::gazeInImage, tested).
+    const XrQuaternionf& q = location.pose.orientation;
+    fvp_video::gazeInImage({q.x, q.y, q.z, q.w}, fov, data.x, data.y);
     data.valid = true;
     data.timestamp_ns = (uint64_t)displayTime;
 

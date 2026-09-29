@@ -92,6 +92,25 @@ inline bool sampleUv(float ndcX, float ndcY, const float rot[9], const Tangents&
     return u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f;
 }
 
+/// Where a gaze orientation (view space: OpenXR looks down -Z, +Y up) falls
+/// in an eye's image: `x` 0..1 left to right, `y` 0..1 top to bottom, as
+/// the foveated QP map takes it. Clamped to the image; a gaze at or behind
+/// 90° lands on the edge it points towards.
+inline void gazeInImage(const Quat& gaze, const Tangents& t, float& x, float& y) {
+    // The gaze direction: (0, 0, -1) rotated by `gaze`.
+    float m[9];
+    rotationMatrix(gaze, m);
+    const float dx = -m[2];
+    const float dy = -m[5];
+    float dz = -m[8];
+    if (dz > -1e-3f) dz = -1e-3f;
+    const float tx = dx / -dz;
+    const float ty = dy / -dz;
+    auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
+    x = clamp01((tx - t.left) / (t.right - t.left));
+    y = clamp01((t.up - ty) / (t.up - t.down));
+}
+
 /// `uv` within the eye's image → texture coordinate in the decoded frame.
 inline void frameUv(const UvRect& eye, float u, float v, float& fu, float& fv) {
     fu = eye.u0 + u * (eye.u1 - eye.u0);

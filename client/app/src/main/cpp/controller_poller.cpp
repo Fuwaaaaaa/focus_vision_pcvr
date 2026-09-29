@@ -6,20 +6,24 @@
 // Thumbstick deadzone — values below this magnitude are zeroed to prevent drift
 static constexpr float THUMBSTICK_DEADZONE = 0.1f;
 
-bool ControllerPoller::init(XrInstance instance, XrSession session) {
-    if (!createActionSet(instance)) return false;
-    if (!createActions()) return false;
-    if (!suggestBindings(instance)) return false;
-    if (!attachActionSet(session)) return false;
+XrActionSet ControllerPoller::createActions(XrInstance instance, bool focus3Profile) {
+    if (!createActionSet(instance) || !createActionsInSet()) return XR_NULL_HANDLE;
+    suggestBindings(instance, focus3Profile);
+    return m_actionSet;
+}
 
-    // Create hand spaces for pose tracking
+bool ControllerPoller::createSpaces(XrSession session) {
+    if (m_actionSet == XR_NULL_HANDLE) return false;
+    // Hand spaces for pose tracking
     for (int i = 0; i < 2; i++) {
         XrActionSpaceCreateInfo spaceInfo = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
         spaceInfo.action = m_poseAction;
         spaceInfo.subactionPath = m_handPaths[i];
         spaceInfo.poseInActionSpace.orientation.w = 1.0f;
-        XR_CHECK(xrCreateActionSpace(session, &spaceInfo, &m_handSpaces[i]),
-            "xrCreateActionSpace for hand");
+        if (XR_FAILED(xrCreateActionSpace(session, &spaceInfo, &m_handSpaces[i]))) {
+            LOGE("ControllerPoller: xrCreateActionSpace failed for hand %d", i);
+            return false;
+        }
     }
 
     m_initialized = true;
@@ -46,7 +50,11 @@ bool ControllerPoller::createActionSet(XrInstance instance) {
     strncpy(info.actionSetName, "fvp_input", XR_MAX_ACTION_SET_NAME_SIZE);
     strncpy(info.localizedActionSetName, "FVP Input", XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE);
     info.priority = 0;
-    XR_CHECK(xrCreateActionSet(instance, &info, &m_actionSet), "xrCreateActionSet");
+    if (XR_FAILED(xrCreateActionSet(instance, &info, &m_actionSet))) {
+        LOGE("ControllerPoller: xrCreateActionSet failed");
+        m_actionSet = XR_NULL_HANDLE;
+        return false;
+    }
     return true;
 }
 
@@ -63,7 +71,7 @@ static XrAction createAction(XrActionSet set, const char* name, const char* loca
     return action;
 }
 
-bool ControllerPoller::createActions() {
+bool ControllerPoller::createActionsInSet() {
     m_poseAction = createAction(m_actionSet, "hand_pose", "Hand Pose",
         XR_ACTION_TYPE_POSE_INPUT, m_handPaths, 2);
     m_triggerAction = createAction(m_actionSet, "trigger", "Trigger",
@@ -91,13 +99,15 @@ bool ControllerPoller::createActions() {
     return true;
 }
 
-bool ControllerPoller::suggestBindings(XrInstance instance) {
+void ControllerPoller::suggestBindings(XrInstance instance, bool focus3Profile) {
     auto pathOf = [&](const char* p) -> XrPath {
         XrPath path; xrStringToPath(instance, p, &path); return path;
     };
 
-    // VIVE Focus 3 / Focus Vision controller profile (full input support)
-    {
+    // VIVE Focus 3 / Focus Vision controller profile (full input support).
+    // Its paths exist only with XR_HTC_vive_focus3_controller_interaction
+    // enabled on the instance.
+    if (focus3Profile) {
         XrPath profilePath;
         xrStringToPath(instance,
             "/interaction_profiles/htc/vive_focus3_controller", &profilePath);
@@ -168,28 +178,11 @@ bool ControllerPoller::suggestBindings(XrInstance instance) {
             LOGW("ControllerPoller: Simple profile also failed (result=%d)", (int)result);
         }
     }
-
-    return true;
-}
-
-bool ControllerPoller::attachActionSet(XrSession session) {
-    XrSessionActionSetsAttachInfo attachInfo = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
-    attachInfo.actionSets = &m_actionSet;
-    attachInfo.countActionSets = 1;
-    XR_CHECK(xrAttachSessionActionSets(session, &attachInfo), "xrAttachSessionActionSets");
-    return true;
 }
 
 void ControllerPoller::pollAndSend(XrSession session, XrSpace stageSpace,
                                     XrTime predictedTime, TrackingSender& sender) {
     if (!m_initialized) return;
-
-    // Sync actions
-    XrActiveActionSet activeSet = {m_actionSet, XR_NULL_PATH};
-    XrActionsSyncInfo syncInfo = {XR_TYPE_ACTIONS_SYNC_INFO};
-    syncInfo.activeActionSets = &activeSet;
-    syncInfo.countActiveActionSets = 1;
-    xrSyncActions(session, &syncInfo);
 
     for (int hand = 0; hand < 2; hand++) {
         // Get pose
