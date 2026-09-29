@@ -56,6 +56,12 @@ public:
     bool encode(bool forceIdr, std::vector<uint8_t>& outNalData, bool& outIsIdr);
 
     void requestIdr();
+
+    /// Set a new target bitrate (the engine's adaptive bitrate, sleep mode,
+    /// the headset's CONFIG_UPDATE). Thread-safe; applied before the next
+    /// encode, without an IDR.
+    void requestBitrate(uint32_t bitrateBps);
+
     bool isInitialized() const { return m_initialized; }
 
     /// Update gaze position for foveated encoding.
@@ -89,6 +95,13 @@ private:
     NV_ENC_REGISTERED_PTR m_registeredResource = nullptr;
     NV_ENC_OUTPUT_PTR m_bitstreamBuffer = nullptr;
 
+    // The session's parameters, kept for nvEncReconfigureEncoder.
+    NV_ENC_INITIALIZE_PARAMS m_initParams{};
+    NV_ENC_CONFIG m_encodeConfig{};
+    fvp_nvenc::StreamSettings m_settings;
+    std::atomic<uint32_t> m_pendingBitrate{0};  // 0 = no change requested
+    uint32_t m_reconfigureFailures = 0;
+
     // Encoder state
     Config m_config;
     bool m_initialized = false;
@@ -110,5 +123,6 @@ private:
     bool loadNvencApi();
     bool createEncoderSession();
     bool createResources();
+    void applyPendingBitrate();
     void log(const char* format, ...);
 };

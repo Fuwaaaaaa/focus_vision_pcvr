@@ -198,10 +198,13 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   - The D3D11 side is tested on WARP (no GPU needed): a second device plays
     the compositor, opens the swap textures by handle, fills them under the
     keyed mutex, and the driver's output is read back (left/right eye,
-    scaling, flipped bounds, sRGB, BGRA and float sources). Driver gtests: 63.
+    scaling, flipped bounds, sRGB, BGRA and float sources). Driver gtests: 64.
+  - Runtime bitrate changes reach NVENC. The driver registers the engine's
+    bitrate callback (adaptive bitrate, sleep mode, the headset's
+    CONFIG_UPDATE); the new target is applied before the next encode with
+    `nvEncReconfigureEncoder`, without an IDR or a rate-control reset.
   - Still missing: the right eye (stereo), compositing the layers above the
-    scene (overlays, the dashboard), runtime bitrate changes to NVENC, a
-    controller input profile.
+    scene (overlays, the dashboard), a controller input profile.
 
 ### Fixes
 - **The engine notices a dead link and lets the headset back in** (#18).
@@ -417,8 +420,8 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   hardware-free simulator path is unaffected.
 - **Mono video.** The driver streams the left eye and the headset shows it
   to both eyes; the FOV is a fixed default rather than the headset's.
-  Overlays such as the SteamVR dashboard are not composited, and runtime
-  bitrate changes never reach NVENC (no bitrate callback, no reconfigure).
+  Overlays such as the SteamVR dashboard are not composited, and the
+  controllers have no input profile, so SteamVR has no bindings for them.
   Tracked in TODOS.md.
 
 ## [3.0.0] - 2026-06-01

@@ -24,6 +24,14 @@ static void onGazeUpdate(float gazeX, float gazeY, int valid) {
     }
 }
 
+static void onBitrateChange(uint32_t bitrateBps) {
+    // Called from the engine's frame loop (adaptive bitrate, sleep mode) and
+    // TCP control task (the HMD's CONFIG_UPDATE)
+    if (s_instance) {
+        s_instance->updateBitrate(bitrateBps);
+    }
+}
+
 vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
 {
     s_pDriverContext = pDriverContext;
@@ -72,6 +80,7 @@ vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
     s_instance = this;
     fvp_set_idr_callback(onIdrRequest);
     fvp_set_gaze_callback(onGazeUpdate);
+    fvp_set_bitrate_callback(onBitrateChange);
 
     return vr::VRInitError_None;
 }
@@ -114,6 +123,13 @@ void CServerDriver::updateGaze(float gazeX, float gazeY, bool valid)
 {
     if (m_hmdDevice) {
         m_hmdDevice->updateGaze(gazeX, gazeY, valid);
+    }
+}
+
+void CServerDriver::updateBitrate(uint32_t bitrateBps)
+{
+    if (m_hmdDevice) {
+        m_hmdDevice->updateBitrate(bitrateBps);
     }
 }
 

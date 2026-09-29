@@ -92,6 +92,8 @@ void NvencEncoder::shutdown() {
 bool NvencEncoder::encode(bool forceIdr, std::vector<uint8_t>& outNalData, bool& outIsIdr) {
     if (!m_initialized || !m_encoder) return false;
 
+    applyPendingBitrate();
+
     bool isIdr = forceIdr || s_idrRequested.exchange(false) ||
                  (m_frameCount % m_idrInterval == 0);
     outIsIdr = isIdr;
@@ -175,6 +177,35 @@ bool NvencEncoder::encode(bool forceIdr, std::vector<uint8_t>& outNalData, bool&
 
 void NvencEncoder::requestIdr() {
     s_idrRequested.store(true);
+}
+
+void NvencEncoder::requestBitrate(uint32_t bitrateBps) {
+    if (bitrateBps != 0) m_pendingBitrate.store(bitrateBps);
+}
+
+void NvencEncoder::applyPendingBitrate() {
+    const uint32_t bps = m_pendingBitrate.exchange(0);
+    if (bps == 0 || bps == m_settings.bitrate_bps) return;
+
+    fvp_nvenc::StreamSettings next = m_settings;
+    next.bitrate_bps = bps;
+    NV_ENC_CONFIG config = m_encodeConfig;
+    NV_ENC_RECONFIGURE_PARAMS params = fvp_nvenc::reconfigureParams(m_initParams, config, next);
+    const NVENCSTATUS st = m_nvencFns.nvEncReconfigureEncoder(m_encoder, &params);
+    if (st != NV_ENC_SUCCESS) {
+        // Keep encoding at the old bitrate. Adaptive bitrate asks about once
+        // a second, so log the 1st, 2nd, 4th, 8th... failure only.
+        m_reconfigureFailures++;
+        if ((m_reconfigureFailures & (m_reconfigureFailures - 1)) == 0) {
+            log("NVENC: bitrate change to %u Mbps failed: %d (%u so far)", bps / 1'000'000, st,
+                m_reconfigureFailures);
+        }
+        return;
+    }
+    m_encodeConfig = config;
+    m_initParams.encodeConfig = &m_encodeConfig;
+    m_settings = next;
+    m_config.bitrate_bps = bps;
 }
 
 void NvencEncoder::setGaze(float gazeX, float gazeY, bool valid) {
@@ -270,39 +301,39 @@ bool NvencEncoder::createEncoderSession() {
         return false;
     }
 
-    NV_ENC_CONFIG encConfig = presetConfig.presetCfg;
-    fvp_nvenc::StreamSettings settings;
-    settings.hevc = m_config.use_hevc;
-    settings.bitrate_bps = m_config.bitrate_bps;
-    settings.fps = m_config.fps;
-    settings.full_range = m_config.full_range;
-    settings.qp_delta_map = m_foveatedEnabled;
-    fvp_nvenc::applyStreamSettings(encConfig, settings);
+    m_encodeConfig = presetConfig.presetCfg;
+    m_settings = {};
+    m_settings.hevc = m_config.use_hevc;
+    m_settings.bitrate_bps = m_config.bitrate_bps;
+    m_settings.fps = m_config.fps;
+    m_settings.full_range = m_config.full_range;
+    m_settings.qp_delta_map = m_foveatedEnabled;
+    fvp_nvenc::applyStreamSettings(m_encodeConfig, m_settings);
 
-    NV_ENC_INITIALIZE_PARAMS initParams = {};
-    initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    initParams.encodeGUID = codecGuid;
-    initParams.presetGUID = presetGuid;
-    initParams.tuningInfo = tuning;
-    initParams.encodeWidth = m_config.width;
-    initParams.encodeHeight = m_config.height;
-    initParams.darWidth = m_config.width;
-    initParams.darHeight = m_config.height;
-    initParams.maxEncodeWidth = m_config.width;
-    initParams.maxEncodeHeight = m_config.height;
-    initParams.frameRateNum = m_config.fps;
-    initParams.frameRateDen = 1;
-    initParams.enablePTD = 1; // Picture type decision by encoder
-    initParams.encodeConfig = &encConfig;
+    m_initParams = {};
+    m_initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
+    m_initParams.encodeGUID = codecGuid;
+    m_initParams.presetGUID = presetGuid;
+    m_initParams.tuningInfo = tuning;
+    m_initParams.encodeWidth = m_config.width;
+    m_initParams.encodeHeight = m_config.height;
+    m_initParams.darWidth = m_config.width;
+    m_initParams.darHeight = m_config.height;
+    m_initParams.maxEncodeWidth = m_config.width;
+    m_initParams.maxEncodeHeight = m_config.height;
+    m_initParams.frameRateNum = m_config.fps;
+    m_initParams.frameRateDen = 1;
+    m_initParams.enablePTD = 1; // Picture type decision by encoder
+    m_initParams.encodeConfig = &m_encodeConfig;
 
-    st = m_nvencFns.nvEncInitializeEncoder(m_encoder, &initParams);
+    st = m_nvencFns.nvEncInitializeEncoder(m_encoder, &m_initParams);
     if (st != NV_ENC_SUCCESS) {
         log("NVENC: nvEncInitializeEncoder failed: %d (%s %ux%u)", st,
             m_config.use_hevc ? "HEVC" : "H.264", m_config.width, m_config.height);
         return false;
     }
 
-    m_qpMapActive = settings.qp_delta_map;
+    m_qpMapActive = m_settings.qp_delta_map;
     return true;
 }
 

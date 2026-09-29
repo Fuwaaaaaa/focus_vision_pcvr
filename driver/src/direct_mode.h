@@ -47,6 +47,9 @@ public:
     /// Update gaze for foveated encoding. Thread-safe.
     void updateGaze(float x, float y, bool valid) { m_encoder.setGaze(x, y, valid); }
 
+    /// New target bitrate, applied before the next encode. Thread-safe.
+    void updateBitrate(uint32_t bitrateBps) { m_encoder.requestBitrate(bitrateBps); }
+
     // IVRDriverDirectModeComponent
     void CreateSwapTextureSet(
         uint32_t unPid,
