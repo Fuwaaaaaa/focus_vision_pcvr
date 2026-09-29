@@ -50,6 +50,7 @@ void CControllerDevice::DebugRequest(const char*, char* pchResponseBuffer, uint3
 
 vr::DriverPose_t CControllerDevice::GetPose()
 {
+    std::lock_guard<std::mutex> lock(m_poseMutex);
     return m_pose;
 }
 
@@ -164,30 +165,41 @@ void CControllerDevice::RunFrame()
 
     int32_t result = fvp_get_controller_state(controllerId, &state);
 
+    vr::DriverPose_t pose;
+    {
+        // SteamVR calls GetPose from its own threads.
+        // REGRESSION: it read m_pose while this wrote it (a torn pose).
+        std::lock_guard<std::mutex> lock(m_poseMutex);
+        if (result == 0)
+        {
+            m_pose.poseIsValid = true;
+            m_pose.result = vr::TrackingResult_Running_OK;
+            m_pose.deviceIsConnected = true;
+
+            m_pose.vecPosition[0] = state.position[0];
+            m_pose.vecPosition[1] = state.position[1];
+            m_pose.vecPosition[2] = state.position[2];
+
+            m_pose.qRotation.x = state.orientation[0];
+            m_pose.qRotation.y = state.orientation[1];
+            m_pose.qRotation.z = state.orientation[2];
+            m_pose.qRotation.w = state.orientation[3];
+        }
+        else
+        {
+            m_pose.poseIsValid = false;
+            m_pose.result = vr::TrackingResult_Calibrating_InProgress;
+        }
+        pose = m_pose;
+    }
+
     if (result == 0)
     {
-        // Update pose
-        m_pose.poseIsValid = true;
-        m_pose.result = vr::TrackingResult_Running_OK;
-        m_pose.deviceIsConnected = true;
-
-        m_pose.vecPosition[0] = state.position[0];
-        m_pose.vecPosition[1] = state.position[1];
-        m_pose.vecPosition[2] = state.position[2];
-
-        m_pose.qRotation.x = state.orientation[0];
-        m_pose.qRotation.y = state.orientation[1];
-        m_pose.qRotation.z = state.orientation[2];
-        m_pose.qRotation.w = state.orientation[3];
-
         UpdateInputs(state);
         m_inputsLive = true;
     }
     else
     {
-        m_pose.poseIsValid = false;
-        m_pose.result = vr::TrackingResult_Calibrating_InProgress;
-
         // The controller stopped reporting (untracked, or the session
         // ended). SteamVR keeps the last value of every input, so release
         // them once — otherwise a held trigger or pushed stick stays that
@@ -203,6 +215,6 @@ void CControllerDevice::RunFrame()
     if (m_objectId != vr::k_unTrackedDeviceIndexInvalid)
     {
         vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
-            m_objectId, m_pose, sizeof(m_pose));
+            m_objectId, pose, sizeof(pose));
     }
 }
