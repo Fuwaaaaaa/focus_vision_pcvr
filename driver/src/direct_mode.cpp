@@ -38,10 +38,11 @@ bool CDirectModeComponent::init()
     NvencEncoder::Config enc;
     bool foveated = false;
     if (fvp_get_config(&fvp) == 0) {
-        // encoded_* is the native size until the downscale lands (the
-        // engine's build_fvp_config keeps them equal); EyeBlit scales
-        // whatever SteamVR renders to it.
-        enc.width = fvp.encoded_width;
+        // encoded_* is the native per-eye size until the downscale lands
+        // (the engine's build_fvp_config keeps them equal); EyeBlit scales
+        // whatever SteamVR renders to it. A frame holds both eyes side by
+        // side.
+        enc.eye_width = fvp.encoded_width;
         enc.height = fvp.encoded_height;
         enc.fps = static_cast<uint32_t>(fvp.refresh_rate);
         enc.bitrate_bps = fvp_encode::targetBitrateBps(fvp.bitrate_bps);
@@ -52,9 +53,11 @@ bool CDirectModeComponent::init()
         enc.peripheral_qp_offset = fvp.peripheral_qp_offset;
         foveated = fvp.foveated_enabled != 0;
     } else {
-        driverLog("Streaming engine config unavailable; encoding %ux%u at defaults", enc.width, enc.height);
+        driverLog("Streaming engine config unavailable; encoding %ux%u per eye at defaults",
+                  enc.eye_width, enc.height);
         enc.bitrate_bps = fvp_encode::kDefaultBitrateBps;
     }
+    enc.width = enc.eye_width * 2;
     enc.use_hevc = true;
     m_pacer.setRefreshRate(enc.fps);
     // Sleep granularity is ~15.6 ms by default, longer than a 90 Hz frame;
@@ -63,7 +66,7 @@ bool CDirectModeComponent::init()
                                            TIMER_ALL_ACCESS);
 
     std::string error;
-    if (!m_eyeBlit.init(m_device.Get(), enc.width, enc.height, error)) {
+    if (!m_eyeBlit.init(m_device.Get(), enc.eye_width, enc.height, error)) {
         driverLog("Not streaming video: frame capture failed: %s", error.c_str());
         return true;
     }
@@ -149,13 +152,15 @@ void CDirectModeComponent::GetNextSwapTextureSetIndex(
 
 void CDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 {
-    // One call per layer; the first is the scene. Only its left eye is
-    // streamed for now.
+    // One call per layer; the first is the scene. Layers above it
+    // (overlays, the dashboard) are not composited yet.
     if (m_haveLayer)
         return;
     m_haveLayer = true;
-    m_layerTexture = perEye[0].hTexture;
-    m_layerBounds = perEye[0].bounds;
+    for (int eye = 0; eye < 2; eye++) {
+        m_layerTexture[eye] = perEye[eye].hTexture;
+        m_layerBounds[eye] = perEye[eye].bounds;
+    }
 }
 
 void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
@@ -166,16 +171,18 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
     if (!m_encoderReady || !haveLayer)
         return;
 
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> views[2];
+    DXGI_FORMAT formats[2] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
     {
         std::lock_guard<std::mutex> lock(m_swapMutex);
-        if (const SwapTextureSets::Texture* texture = m_swapSets.find(m_layerTexture)) {
-            view = texture->view;
-            format = texture->format;
+        for (int eye = 0; eye < 2; eye++) {
+            if (const SwapTextureSets::Texture* texture = m_swapSets.find(m_layerTexture[eye])) {
+                views[eye] = texture->view;
+                formats[eye] = texture->format;
+            }
         }
     }
-    if (!view) {
+    if (!views[0] || !views[1]) {
         // Not one of ours, or multisampled (no shader view).
         logSometimes(m_unknownTextures, "Submitted layer texture can't be read; frame skipped");
         return;
@@ -186,8 +193,12 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
         logSometimes(m_syncTimeouts, "Compositor frame not ready in time; frame skipped");
         return;
     }
-    const fvp_blit::UvRect uv{m_layerBounds.uMin, m_layerBounds.vMin, m_layerBounds.uMax, m_layerBounds.vMax};
-    m_eyeBlit.draw(m_context.Get(), view.Get(), format, uv);
+    // Both eyes side by side; often one double-wide texture, each eye's
+    // half named by its bounds.
+    for (int eye = 0; eye < 2; eye++) {
+        const vr::VRTextureBounds_t& b = m_layerBounds[eye];
+        m_eyeBlit.draw(m_context.Get(), views[eye].Get(), formats[eye], {b.uMin, b.vMin, b.uMax, b.vMax}, eye);
+    }
     m_sync.release();
 
     bool isIdr = false;

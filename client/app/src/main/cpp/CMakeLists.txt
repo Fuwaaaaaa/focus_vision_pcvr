@@ -64,7 +64,6 @@ set(CLIENT_SOURCES
     video_receiver.cpp
     tracking_sender.cpp
     controller_poller.cpp
-    timewarp.cpp
     fec_decoder.cpp
     nal_validator.cpp
     eye_tracker.cpp

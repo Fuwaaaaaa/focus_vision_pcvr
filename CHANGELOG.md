@@ -4,6 +4,15 @@ All notable changes to Focus Vision PCVR will be documented in this file.
 
 ## [Unreleased]
 
+### Protocol (breaking: v5 — stereo)
+- **Video frames carry both eyes side by side.** The driver streamed the
+  left eye only and the headset showed it to both eyes. A frame is now twice
+  the per-eye `encoded_w` wide, left eye on the left; STREAM_CONFIG grows
+  25 → 26 bytes with a stereo-layout byte (`stereo_layout`: 0 = mono,
+  1 = side by side). `PROTOCOL_VERSION` is 5 on both sides; a 25-byte
+  payload (a server before v5) is read as mono. The pixel count doubles, so
+  the same `bitrate_mbps` gives each eye about half the bits.
+
 ### Protocol (breaking: v4)
 - **FVP header carries `data_shard_count` (FEC fix).** The HMD derived the
   data/parity split as `total_shards / 1.2`, which is only right at exactly
@@ -167,6 +176,19 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   - USER_GUIDE now describes this flow. It had described a PIN entry
     screen on the headset, APK drag and drop, and a "Deploy" button,
     none of which exist.
+- **Each eye sees its own image, the right way up.** Found by reading the
+  code; the shaders are validated with glslang but not yet run on the
+  headset.
+  - The decoder is sized for the side-by-side frame (v5), and each eye
+    shows its half.
+  - The newest decoded frame is taken once per loop and shown to both
+    eyes. It was taken per eye, so the eyes could show different frames —
+    one new, one reprojected.
+  - The renderer and the timewarp are one shader. The timewarp path drew
+    the image upside down relative to the new-frame path, uploaded its
+    matrix untransposed, assumed +Z forward (OpenXR looks down -Z), and
+    divided per vertex, which bends straight lines. Reprojection is now
+    per pixel; its math (`video_view.h`) is host-tested.
 
 ### SteamVR driver
 - **The video path is wired.** Before, nothing called the encoder's init, the
@@ -186,8 +208,9 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     slot at the refresh rate (`FramePacer`), as ALVR does. Swap-set indices
     are tracked per set rather than read back from SteamVR's arguments.
   - `Present` reads the frame only while holding the compositor's sync
-    texture (keyed mutex), then draws the scene layer's left eye into the
-    encoder's input (`EyeBlit`). A draw instead of `CopyResource`, which
+    texture (keyed mutex), then draws both eyes of the scene layer side by
+    side into the encoder's input (`EyeBlit`), and the foveated QP map
+    gets a fovea in each eye. A draw instead of `CopyResource`, which
     D3D11 skipped between the compositor's R8G8B8A8 and NVENC's B8G8R8A8,
     and which could not scale (SteamVR supersampling), take one eye of a
     double-wide texture, or keep sRGB. The encoder registers that texture;
@@ -200,7 +223,8 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   - The D3D11 side is tested on WARP (no GPU needed): a second device plays
     the compositor, opens the swap textures by handle, fills them under the
     keyed mutex, and the driver's output is read back (left/right eye,
-    scaling, flipped bounds, sRGB, BGRA and float sources). Driver gtests: 74.
+    scaling, flipped bounds, sRGB, BGRA and float sources, both eyes side
+    by side). Driver gtests: 78.
   - Runtime bitrate changes reach NVENC. The driver registers the engine's
     bitrate callback (adaptive bitrate, sleep mode, the headset's
     CONFIG_UPDATE); the new target is applied before the next encode with
@@ -211,8 +235,8 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     render models, X/Y on the left and A/B on the right. Before, the input
     profile pointed at a file that did not exist and SteamVR had no
     bindings for them.
-  - Still missing: the right eye (stereo), compositing the layers above the
-    scene (overlays, the dashboard).
+  - Still missing: the headset's own field of view, compositing the layers
+    above the scene (overlays, the dashboard).
 
 ### Fixes
 - **The engine notices a dead link and lets the headset back in** (#18).
@@ -426,10 +450,10 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   SteamVR driver's video path is wired (its D3D11 side tested on WARP), but
   neither has run on the headset, under SteamVR, or on an NVIDIA GPU. The
   hardware-free simulator path is unaffected.
-- **Mono video.** The driver streams the left eye and the headset shows it
-  to both eyes; the FOV is a fixed default rather than the headset's.
-  Overlays such as the SteamVR dashboard are not composited. Tracked in
-  TODOS.md.
+- **A fixed field of view.** SteamVR renders with a default 100° per eye
+  rather than the headset's, so the image is scaled by however much they
+  differ. Overlays such as the SteamVR dashboard are not composited.
+  Tracked in TODOS.md.
 
 ## [3.0.0] - 2026-06-01
 

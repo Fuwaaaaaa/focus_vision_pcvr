@@ -281,21 +281,23 @@ impl TcpControlServer {
 
     /// Build the STREAM_CONFIG payload.
     ///
-    /// Wire format (little-endian), 25 bytes:
+    /// Wire format (little-endian), 26 bytes:
     /// ```text
-    ///   [0..4]   native render_w  (u32)   ← target/restore resolution
+    ///   [0..4]   native render_w  (u32)   ← per eye, target/restore resolution
     ///   [4..8]   native render_h  (u32)
     ///   [8..12]  bitrate_mbps     (u32)
     ///   [12..16] framerate        (u32)
     ///   [16]     codec            (u8: 0=h264, 1=h265)
-    ///   [17..21] encoded_w        (u32)   ← what is actually encoded/sent
+    ///   [17..21] encoded_w        (u32)   ← per eye, what is actually encoded/sent
     ///   [21..25] encoded_h        (u32)
+    ///   [25]     stereo layout    (u8: stereo_layout, v5)
     /// ```
     /// The first 17 bytes are byte-identical to the legacy layout, so a client
     /// that reads only 17 bytes is unaffected. `encoded_*` is downscaled only
     /// when the client advertises `hello_caps::RESOLUTION_SCALE` AND
     /// `resolution_scale < 1.0`; otherwise it equals native (no silent
-    /// degradation for clients that cannot upscale).
+    /// degradation for clients that cannot upscale). The driver always sends
+    /// both eyes side by side, so a frame is `2 × encoded_w` wide.
     fn encode_stream_config(&self, client_caps: u8) -> Vec<u8> {
         let v = &self.config.video;
         let mut buf = Vec::new();
@@ -322,6 +324,7 @@ impl TcpControlServer {
         };
         buf.extend_from_slice(&enc_w.to_le_bytes());
         buf.extend_from_slice(&enc_h.to_le_bytes());
+        buf.push(fvp_common::protocol::stereo_layout::SIDE_BY_SIDE);
         buf
     }
 
@@ -800,10 +803,12 @@ mod tests {
         config.video.resolution_scale = 0.5;
         let payload = capture_stream_config_via_handshake(
             config, fvp_common::protocol::hello_caps::RESOLUTION_SCALE).await;
-        assert_eq!(payload.len(), 25);
+        assert_eq!(payload.len(), 26);
         assert_eq!(&payload[0..4], &1832u32.to_le_bytes(), "native unchanged");
         assert_eq!(&payload[17..21], &916u32.to_le_bytes(), "encoded_w halved");
         assert_eq!(&payload[21..25], &960u32.to_le_bytes(), "encoded_h halved");
+        assert_eq!(payload[25], fvp_common::protocol::stereo_layout::SIDE_BY_SIDE,
+            "the layout byte goes out on the wire");
     }
 
     #[tokio::test]
@@ -917,7 +922,8 @@ mod tests {
     async fn test_encode_stream_config_layout_matches_spec() {
         // Wire format: res_x_le_u32 | res_y_le_u32 | bitrate_le_u32 |
         //              framerate_le_u32 | codec_byte (0=h264, 1=h265) |
-        //              encoded_x_le_u32 | encoded_y_le_u32. Total: 25 bytes.
+        //              encoded_x_le_u32 | encoded_y_le_u32 | stereo layout.
+        //              Total: 26 bytes.
         // The first 17 bytes are byte-identical to the legacy layout so old
         // clients that read only 17 bytes are unaffected.
         let mut config = crate::config::AppConfig::default();
@@ -928,7 +934,7 @@ mod tests {
         let server = TcpControlServer::new_without_tls(config);
         let bytes = server.encode_stream_config(fvp_common::protocol::hello_caps::RESOLUTION_SCALE);
 
-        assert_eq!(bytes.len(), 25, "STREAM_CONFIG payload size shifted");
+        assert_eq!(bytes.len(), 26, "STREAM_CONFIG payload size shifted");
         assert_eq!(&bytes[0..4], &1920u32.to_le_bytes());
         assert_eq!(&bytes[4..8], &1080u32.to_le_bytes());
         assert_eq!(&bytes[8..12], &100u32.to_le_bytes());
@@ -937,6 +943,8 @@ mod tests {
         // scale defaults to 1.0 → encoded dims equal native.
         assert_eq!(&bytes[17..21], &1920u32.to_le_bytes());
         assert_eq!(&bytes[21..25], &1080u32.to_le_bytes());
+        // v5: the driver sends both eyes side by side.
+        assert_eq!(bytes[25], fvp_common::protocol::stereo_layout::SIDE_BY_SIDE);
     }
 
     #[tokio::test]
@@ -946,7 +954,7 @@ mod tests {
         let config = crate::config::AppConfig::default(); // scale 1.0
         let server = TcpControlServer::new_without_tls(config);
         let bytes = server.encode_stream_config(fvp_common::protocol::hello_caps::RESOLUTION_SCALE);
-        assert_eq!(bytes.len(), 25);
+        assert_eq!(bytes.len(), 26);
         assert_eq!(&bytes[17..21], &bytes[0..4], "encoded_w must equal native");
         assert_eq!(&bytes[21..25], &bytes[4..8], "encoded_h must equal native");
     }

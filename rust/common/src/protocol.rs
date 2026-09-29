@@ -104,7 +104,19 @@ pub mod msg_type {
 /// v3 = TRANSPORT_FEEDBACK, FVP flags bit layout (slice/stream fields), adaptive FEC (v2.2)
 /// v4 = FVP header grows 10 → 12 bytes: `data_shard_count` appended after
 ///      `flags`, payload now starts at byte 24 (v3.0)
-pub const PROTOCOL_VERSION: u16 = 4;
+/// v5 = stereo: each video frame carries both eyes side by side (twice the
+///      per-eye width); STREAM_CONFIG byte 25 says so (`stereo_layout`)
+pub const PROTOCOL_VERSION: u16 = 5;
+
+/// How the eyes are laid out in a video frame — STREAM_CONFIG byte 25.
+/// Absent (a 25-byte payload from an older server) means `MONO`.
+pub mod stereo_layout {
+    /// One image, shown to both eyes (servers before v5).
+    pub const MONO: u8 = 0;
+    /// Left eye in the left half, right eye in the right half; the frame is
+    /// twice the per-eye `encoded_w` wide.
+    pub const SIDE_BY_SIDE: u8 = 1;
+}
 
 /// Parse protocol version from HELLO payload. Returns 1 if payload is empty (v1 client).
 pub fn parse_hello_version(payload: &[u8]) -> u16 {
@@ -467,10 +479,13 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_4() {
-        // v4 = 12-byte FVP header carrying data_shard_count. Must match the
-        // C++ client's fvp_client_protocol::PROTOCOL_VERSION.
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_version_is_5() {
+        // v5 = side-by-side stereo frames (STREAM_CONFIG byte 25). Must match
+        // the C++ client's fvp_client_protocol::PROTOCOL_VERSION and
+        // STEREO_SIDE_BY_SIDE.
+        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(stereo_layout::MONO, 0);
+        assert_eq!(stereo_layout::SIDE_BY_SIDE, 1);
     }
 
     #[test]

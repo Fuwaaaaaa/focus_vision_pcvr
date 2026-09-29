@@ -201,8 +201,10 @@ TcpControlClient::HandshakeResult TcpControlClient::handshake(uint32_t pin, int 
     m_config.codec = cfg.codec;
     m_config.encodedWidth = cfg.encodedWidth;
     m_config.encodedHeight = cfg.encodedHeight;
-    LOGI("Stream config: native %ux%u, encoded %ux%u @ %u Mbps, %u fps, codec=%u",
+    m_config.layout = cfg.layout;
+    LOGI("Stream config: native %ux%u, encoded %ux%u per eye (%s) @ %u Mbps, %u fps, codec=%u",
         m_config.width, m_config.height, m_config.encodedWidth, m_config.encodedHeight,
+        m_config.layout == proto::STEREO_SIDE_BY_SIDE ? "side by side" : "mono",
         m_config.bitrateMbps, m_config.framerate, m_config.codec);
 
     // Paired: this server is the one to trust from now on.

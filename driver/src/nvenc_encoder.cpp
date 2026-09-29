@@ -216,14 +216,14 @@ void NvencEncoder::setGaze(float gazeX, float gazeY, bool valid) {
 
 void NvencEncoder::computeQpDeltaMap(float gazeX, float gazeY) {
     const uint32_t ctuSize = fvp_nvenc::qpMapBlockSize(m_config.use_hevc);
-    computeCtuGrid(m_config.width, m_config.height, ctuSize, m_ctuCols, m_ctuRows);
 
-    // Use preset offsets from config (default: balanced = +5/+15)
-    ::computeQpDeltaMap(
-        gazeX, gazeY, m_ctuCols, m_ctuRows,
+    // Use preset offsets from config (default: balanced = +5/+15). The frame
+    // holds both eyes, so each gets its own fovea around the gaze point.
+    ::computeSideBySideQpDeltaMap(
+        gazeX, gazeY, m_config.eye_width, m_config.height, ctuSize,
         m_config.fovea_radius, m_config.mid_radius,
-        m_config.mid_qp_offset, m_config.peripheral_qp_offset,
-        m_qpDeltaMap);
+        static_cast<int8_t>(m_config.mid_qp_offset), static_cast<int8_t>(m_config.peripheral_qp_offset),
+        m_qpDeltaMap, m_ctuCols, m_ctuRows);
 }
 
 bool NvencEncoder::loadNvencApi() {

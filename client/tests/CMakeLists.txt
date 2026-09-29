@@ -54,6 +54,7 @@ add_executable(client_tests
     test_fec_decoder.cpp
     test_frame_assembler.cpp
     test_launch_request.cpp
+    test_video_view.cpp
     test_session_e2e.cpp
     # NDK sources compiled for the host. Their only platform dependencies
     # (logging, XrResult via xr_utils.h) are stubbed in shim/ below; sockets

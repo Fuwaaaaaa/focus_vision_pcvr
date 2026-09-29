@@ -15,7 +15,7 @@ PC (Windows)                           Wi-Fi               HMD (Focus Vision)
   ┌─────────────────────┐               |          ┌──────────────────┐
   │  Direct Mode        │               |          │  OpenXR App      │
   │  ├─ EyeBlit         │               |          │  ├─ Renderer     │
-  │  └─ NvencEncoder    │               |          │  ├─ Timewarp     │
+  │  └─ NvencEncoder    │               |          │  ├─ Reprojection │
   │     ├─ QP delta map │               |          │  ├─ VideoDecoder │
   │     └─ Foveated     │               |          │  ├─ AudioPlayer  │
   └────────┬────────────┘               |          │  ├─ FecDecoder   │
@@ -119,7 +119,7 @@ focus_vision_psvr/
 │       │   ├── video_receiver.cpp  UDP video thread → frame_assembler.cpp
 │       │   ├── tcp_client.cpp    TLS TCP (MbedTLS)
 │       │   ├── tracking_sender.cpp  UDP head+gaze
-│       │   ├── timewarp.cpp      Rotation correction
+│       │   ├── renderer.cpp      Eye halves + per-pixel reprojection (video_view.h)
 │       │   ├── overlay_renderer.cpp Signal bar overlay
 │       │   └── eye_tracker.cpp   XR_EXT_eye_gaze
 │       └── kotlin/
@@ -140,7 +140,7 @@ focus_vision_psvr/
   │       │                          │          │       │                          │
   │  Swap texture (shared)           │          │  RTP depacketize                 │
   │       │                          │          │       │                          │
-  │  EyeBlit (left eye → BGRA)       │          │  FEC decode (Reed-Solomon)       │
+  │  EyeBlit (both eyes → BGRA)      │          │  FEC decode (Reed-Solomon)       │
   │       │                          │          │       │                          │
   │  NVENC encode (H.265/H.264)      │          │  NAL validate                    │
   │       │  ┌── foveated? ──┐       │          │       │                          │
@@ -150,7 +150,7 @@ focus_vision_psvr/
   │       │                          │          │       │  └────────────────────┘  │
   │  NAL data                        │          │  GL_TEXTURE_EXTERNAL_OES         │
   │       │                          │          │       │                          │
-  │  RTP packetize + FVP header      │          │  Timewarp (rotation correction)  │
+  │  RTP packetize + FVP header      │          │  Eye half + reprojection shader  │
   │       │                          │          │       │                          │
   │  ┌────▼───────────────────┐      │          │  OpenXR swapchain render         │
   │  │ NAL >= 16KB?           │      │          │       │                          │
@@ -171,7 +171,7 @@ focus_vision_psvr/
   ├─ FEC:       1-2ms (slice) / 3-5ms (bulk IDR)
   ├─ Network:   2-5ms (Wi-Fi 6)
   ├─ Decode:    3-8ms (MediaCodec hardware)
-  ├─ Timewarp:  <1ms (GPU shader)
+  ├─ Reproject: <1ms (GPU shader)
   └─ Buffer:    remaining (~30ms)
 ```
 
@@ -406,4 +406,4 @@ multiple crates.
 - [companion-app](docs/CODEMAPS/companion-app.md) — PC GUI (egui): driver install, PIN display, ADB deploy, latency graphs, log export
 - [common](docs/CODEMAPS/common.md) — Shared types and constants: protocol structs, FVP flags, ports/MTU, versioning
 - [driver](docs/CODEMAPS/driver.md) — C++ OpenVR driver DLL: DirectMode, NVENC encoder, QP delta map, GoogleTest
-- [client](docs/CODEMAPS/client.md) — Android OpenXR client: renderer, timewarp, video/audio decode, FEC, TCP/TLS, eye tracking, overlays
+- [client](docs/CODEMAPS/client.md) — Android OpenXR client: renderer (eye halves, reprojection), video/audio decode, FEC, TCP/TLS, eye tracking, overlays

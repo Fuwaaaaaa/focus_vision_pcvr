@@ -29,8 +29,9 @@ public:
         uint32_t bitrateMbps = 0;
         uint32_t framerate = 0;
         uint8_t codec = 1; // 0=H264, 1=H265
-        uint32_t encodedWidth = 0;   // actually-decoded resolution (== native unless downscaled)
+        uint32_t encodedWidth = 0;   // actually-decoded resolution per eye (== native unless downscaled)
         uint32_t encodedHeight = 0;
+        uint8_t layout = 0;          // fvp_client_protocol::STEREO_* (0 = mono, 1 = side by side)
     };
 
     enum class HandshakeResult { Ok, PinRejected, Failed };

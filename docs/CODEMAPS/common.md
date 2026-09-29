@@ -30,7 +30,7 @@ Small pure-data crate with 3 files. No I/O, no threads. All types are
 | `ControllerState` | Per-controller input state (pose / buttons / thumbstick / battery) |
 
 ### Protocol versioning
-- `PROTOCOL_VERSION: u16 = 4` (v4: FVP header 10 → 12 bytes, `data_shard_count` appended; payload at byte 24)
+- `PROTOCOL_VERSION: u16 = 5` (v5: video frames carry both eyes side by side, STREAM_CONFIG byte 25 = `stereo_layout`; v4: FVP header 10 → 12 bytes, `data_shard_count` appended, payload at byte 24)
 - `parse_hello_version(payload) -> u16` — parses HELLO/HELLO_ACK version header (defaults to 1 on missing)
 - `encode_version(v) -> [u8; 2]` — LE encoding for HELLO payload
 

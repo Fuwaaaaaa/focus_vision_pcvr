@@ -5,9 +5,11 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <thread>
 
@@ -39,7 +41,6 @@ void OpenXRApp::initialize(android_app* app) {
     createReferenceSpace();
     createSwapchains();
     m_renderer.init();
-    m_timewarp.init();
     m_overlay.init();
     m_facialTracker.init(m_instance, m_session);
 
@@ -54,12 +55,14 @@ void OpenXRApp::initialize(android_app* app) {
         LOGE("internalDataPath unavailable — pairing will refuse to connect");
     }
 
-    // The decoder starts at the native per-eye size; STREAM_CONFIG may
-    // change the codec or size (resolution_scale) when a session starts.
+    // The decoder starts at the native size, both eyes side by side;
+    // STREAM_CONFIG may change the codec or size (resolution_scale) when a
+    // session starts.
     TcpControlClient::StreamConfig native;
     native.width = native.encodedWidth = 1832;
     native.height = native.encodedHeight = 1920;
     native.codec = 1;
+    native.layout = fvp_client_protocol::STEREO_SIDE_BY_SIDE;  // what a v5 server sends
     configureDecoder(native);
 
     // Video is received on its own thread, bound once; each session points
@@ -96,9 +99,10 @@ void OpenXRApp::withJni(const std::function<void(JNIEnv*)>& fn) {
 
 void OpenXRApp::configureDecoder(const TcpControlClient::StreamConfig& config) {
     auto dims = fvp_client_protocol::decoderInitDims(
-        config.width, config.height, config.encodedWidth, config.encodedHeight);
+        config.width, config.height, config.encodedWidth, config.encodedHeight, config.layout);
     if (dims.width == 0 || dims.height == 0) dims = {1832, 1920};
     const uint8_t codec = config.codec == 0 ? 0 : 1;
+    m_videoLayout = config.layout;
     if (m_videoDecoder.isInitialized() && codec == m_decoderCodec &&
         dims.width == m_decoderWidth && dims.height == m_decoderHeight) {
         m_videoDecoder.flush(); // a new session starts from a keyframe
@@ -596,6 +600,22 @@ void OpenXRApp::renderFrame() {
                  std::chrono::steady_clock::now() - m_videoReceiver.lastPacketTime()).count()
                  > DISCONNECT_TIMEOUT_MS);
 
+        // The newest decoded frame, taken once: both eyes show the same
+        // frame (each its own half). It used to be taken per eye, so the
+        // eyes could show different frames.
+        bool hasNewFrame = false;
+        if (!connectionLost && m_videoDecoder.getDecodedFrame()) {
+            const GLuint texture = m_videoDecoder.getOutputTexture();
+            m_stream.stats().onFrameDecoded(m_videoDecoder.lastDecodeLatencyUs());
+            if (texture != 0) {
+                hasNewFrame = true;
+                m_lastDecodedTexture = texture;
+                m_hasDecodedFrame = true;
+                // Later loops reproject it from where the head is now.
+                m_frameOrientation = views[0].pose.orientation;
+            }
+        }
+
         // Render each eye
         for (uint32_t eye = 0; eye < 2; eye++) {
             uint32_t imgIndex;
@@ -625,35 +645,23 @@ void OpenXRApp::renderFrame() {
                 continue;
             }
 
-            // Rendering decision: new frame or timewarp
-            bool hasNewFrame = m_videoDecoder.getDecodedFrame();
-
-            if (hasNewFrame) {
-                m_lastDecodedTexture = m_videoDecoder.getOutputTexture();
-                m_stream.stats().onFrameDecoded(m_videoDecoder.lastDecodeLatencyUs());
-            }
-
-            if (hasNewFrame && m_lastDecodedTexture != 0) {
-                // Normal path: render the new decoded video frame
-                m_poseHistory.record(m_lastFrameIndex, views[eye].pose,
-                    frameState.predictedDisplayTime);
-                m_renderer.renderVideoFrame(framebuffer, width, height,
-                    m_lastDecodedTexture);
-                m_hasDecodedFrame = true;
-                m_lastFrameIndex++;
-            } else if (m_hasDecodedFrame && m_lastDecodedTexture != 0) {
-                // Timewarp path: re-render previous frame with rotation correction
-                auto record = m_poseHistory.latest();
-                if (record.has_value()) {
-                    m_timewarp.apply(framebuffer, width, height,
-                        m_lastDecodedTexture,
-                        record->pose,       // pose when frame was rendered
-                        views[eye].pose,     // current predicted pose
-                        views[eye].fov);
+            if (m_hasDecodedFrame && m_lastDecodedTexture != 0) {
+                // A new frame is shown as it came; an older one is rotated
+                // by how far the head turned since it was first shown.
+                const XrFovf& fov = views[eye].fov;
+                const fvp_video::Tangents tangents = fvp_video::tangents(
+                    fov.angleLeft, fov.angleRight, fov.angleDown, fov.angleUp);
+                float rotation[9];
+                if (hasNewFrame) {
+                    std::copy(std::begin(fvp_video::kIdentity), std::end(fvp_video::kIdentity), rotation);
                 } else {
-                    m_renderer.renderSolidColor(framebuffer, width, height,
-                        0.05f, 0.05f, 0.2f);
+                    const XrQuaternionf& now = views[eye].pose.orientation;
+                    fvp_video::reprojectionRotation(
+                        {m_frameOrientation.x, m_frameOrientation.y, m_frameOrientation.z, m_frameOrientation.w},
+                        {now.x, now.y, now.z, now.w}, rotation);
                 }
+                m_renderer.renderVideoFrame(framebuffer, width, height, m_lastDecodedTexture,
+                    fvp_video::eyeRect(m_videoLayout, static_cast<int>(eye)), rotation, tangents);
             } else {
                 // No frame yet: solid color
                 m_renderer.renderSolidColor(framebuffer, width, height,

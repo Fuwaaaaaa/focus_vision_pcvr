@@ -65,9 +65,11 @@ bool compile(const char* entry, const char* target, ComPtr<ID3DBlob>& code, std:
 
 }  // namespace
 
-bool EyeBlit::init(ID3D11Device* device, uint32_t width, uint32_t height, std::string& error) {
+bool EyeBlit::init(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight, std::string& error) {
     shutdown();
 
+    const uint32_t width = eyeWidth * 2;  // both eyes side by side
+    const uint32_t height = eyeHeight;
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = width;
     desc.Height = height;
@@ -116,8 +118,8 @@ bool EyeBlit::init(ID3D11Device* device, uint32_t width, uint32_t height, std::s
         shutdown();
         return false;
     }
-    m_width = width;
-    m_height = height;
+    m_eyeWidth = eyeWidth;
+    m_eyeHeight = eyeHeight;
     return true;
 }
 
@@ -128,12 +130,12 @@ void EyeBlit::shutdown() {
     m_vertexShader.Reset();
     m_outputView.Reset();
     m_output.Reset();
-    m_width = m_height = 0;
+    m_eyeWidth = m_eyeHeight = 0;
 }
 
 bool EyeBlit::draw(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source, DXGI_FORMAT format,
-                   const fvp_blit::UvRect& uv) {
-    if (!m_output || !source) return false;
+                   const fvp_blit::UvRect& uv, int eye) {
+    if (!m_output || !source || eye < 0 || eye > 1) return false;
 
     Params params{};
     params.uvRect[0] = uv.u0;
@@ -143,9 +145,10 @@ bool EyeBlit::draw(ID3D11DeviceContext* context, ID3D11ShaderResourceView* sourc
     params.encodeSrgb = fvp_blit::needsSrgbEncode(format) ? 1u : 0u;
     context->UpdateSubresource(m_params.Get(), 0, nullptr, &params, 0, 0);
 
-    D3D11_VIEWPORT viewport{};
-    viewport.Width = static_cast<float>(m_width);
-    viewport.Height = static_cast<float>(m_height);
+    D3D11_VIEWPORT viewport{};  // this eye's half of the output
+    viewport.TopLeftX = static_cast<float>(eye * m_eyeWidth);
+    viewport.Width = static_cast<float>(m_eyeWidth);
+    viewport.Height = static_cast<float>(m_eyeHeight);
     viewport.MaxDepth = 1.0f;
 
     // The device is the driver's own; nothing else sets state on it, so

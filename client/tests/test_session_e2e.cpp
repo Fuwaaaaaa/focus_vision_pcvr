@@ -355,6 +355,8 @@ TEST_F(SessionE2E, PairsAndStreamsVideoFromTheRealEngine) {
     EXPECT_EQ(config.framerate, 60u);
     EXPECT_GT(config.width, 0u);
     EXPECT_GT(config.encodedWidth, 0u);
+    EXPECT_EQ(config.layout, fvp_client_protocol::STEREO_SIDE_BY_SIDE)
+        << "the engine sends both eyes (v5)";
 
     const auto frames = collectFrames(3s);
     // 60 fps for 3 s; up to a GOP (1 s) goes by before the first keyframe.

@@ -95,10 +95,22 @@ uint64_t makeSyncTexture(const Device& compositor, ComPtr<IDXGIKeyedMutex>& mute
     return reinterpret_cast<uint64_t>(handle);
 }
 
+/// The BGRA bytes of eye `eye`'s half of a side-by-side output
+/// (`eyeWidth` × `height` per eye).
+std::vector<uint8_t> eyeHalf(const std::vector<uint8_t>& bgra, uint32_t eyeWidth, uint32_t height, int eye) {
+    std::vector<uint8_t> out;
+    out.reserve(eyeWidth * height * 4);
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t* row = &bgra[(y * eyeWidth * 2 + eye * eyeWidth) * 4];
+        out.insert(out.end(), row, row + eyeWidth * 4);
+    }
+    return out;
+}
+
 /// One frame end to end: the compositor fills a swap texture of `format`
 /// (`width` × `height`, `pixels`) under the sync texture's mutex; the driver
-/// takes the mutex and blits `uv` to a `outWidth` × `outHeight` output.
-/// Returns the output's BGRA bytes.
+/// takes the mutex and blits `uv` into the left eye of an output of two
+/// `outWidth` × `outHeight` eyes. Returns the left eye's BGRA bytes.
 std::vector<uint8_t> runFrame(DXGI_FORMAT format, uint32_t width, uint32_t height,
                               const std::vector<Rgba>& pixels, const fvp_blit::UvRect& uv,
                               uint32_t outWidth, uint32_t outHeight) {
@@ -126,9 +138,9 @@ std::vector<uint8_t> runFrame(DXGI_FORMAT format, uint32_t width, uint32_t heigh
     EXPECT_TRUE(sync.acquire(driver.device.Get(), syncHandle, 1000));
     const SwapTextureSets::Texture* submitted = sets.find(handles[0]);
     EXPECT_NE(submitted, nullptr);
-    EXPECT_TRUE(blit.draw(driver.context.Get(), submitted->view.Get(), format, uv));
+    EXPECT_TRUE(blit.draw(driver.context.Get(), submitted->view.Get(), format, uv, 0));
     sync.release();
-    return readBack(driver, blit.output());
+    return eyeHalf(readBack(driver, blit.output()), outWidth, outHeight, 0);
 }
 
 std::vector<Rgba> halves(uint32_t width, uint32_t height, Rgba left, Rgba right) {
@@ -305,8 +317,44 @@ TEST(EyeBlit, EncodesLinearFloatToSrgb) {
     EyeBlit blit;
     ASSERT_TRUE(blit.init(driver.device.Get(), 8, 8, error)) << error;
     ASSERT_TRUE(blit.draw(driver.context.Get(), sets.find(handles[0])->view.Get(),
-                          DXGI_FORMAT_R16G16B16A16_FLOAT, {}));
-    expectAll(readBack(driver, blit.output()), Rgba{188, 188, 188, 255}, 1, "linear 0.5 → sRGB 188");
+                          DXGI_FORMAT_R16G16B16A16_FLOAT, {}, 0));
+    expectAll(eyeHalf(readBack(driver, blit.output()), 8, 8, 0), Rgba{188, 188, 188, 255}, 1,
+              "linear 0.5 → sRGB 188");
+}
+
+TEST(EyeBlit, PutsBothEyesSideBySide) {
+    // REGRESSION (mono): only the left eye was streamed, and the headset
+    // showed it to both eyes. The compositor's double-wide texture: left
+    // eye orange, right eye blue; each lands in its half of the output.
+    Device driver = makeWarpDevice();
+    Device compositor = makeWarpDevice();
+    SwapTextureSets sets;
+    uint64_t handles[3] = {};
+    std::string error;
+    ASSERT_TRUE(sets.create(driver.device.Get(), 1, 128, 48, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1, handles, error))
+        << error;
+    ComPtr<ID3D11Texture2D> target = openShared(compositor.device.Get(), handles[0]);
+    upload(compositor, target.Get(), 128, halves(128, 48, kOrange, kBlue));
+    compositor.context->Flush();
+
+    EyeBlit blit;
+    ASSERT_TRUE(blit.init(driver.device.Get(), 40, 30, error)) << error;
+    const SwapTextureSets::Texture* layer = sets.find(handles[0]);
+    ASSERT_TRUE(blit.draw(driver.context.Get(), layer->view.Get(), layer->format, {0.0f, 0.0f, 0.5f, 1.0f}, 0));
+    ASSERT_TRUE(blit.draw(driver.context.Get(), layer->view.Get(), layer->format, {0.5f, 0.0f, 1.0f, 1.0f}, 1));
+    const std::vector<uint8_t> frame = readBack(driver, blit.output());
+    ASSERT_EQ(frame.size(), 80u * 30u * 4u) << "two 40-pixel eyes";
+
+    // Inner columns only: linear filtering blends the other eye in at the
+    // source's seam.
+    auto inner = [](const std::vector<uint8_t>& eye) {
+        std::vector<uint8_t> out;
+        for (uint32_t y = 0; y < 30; y++)
+            for (uint32_t x = 2; x < 38; x++) out.insert(out.end(), &eye[(y * 40 + x) * 4], &eye[(y * 40 + x) * 4 + 4]);
+        return out;
+    };
+    expectAll(inner(eyeHalf(frame, 40, 30, 0)), kOrange, 1, "left half = left eye");
+    expectAll(inner(eyeHalf(frame, 40, 30, 1)), kBlue, 1, "right half = right eye");
 }
 
 TEST(EyeBlit, OutputIsWhatNvencRegisters) {
@@ -316,10 +364,10 @@ TEST(EyeBlit, OutputIsWhatNvencRegisters) {
     ASSERT_TRUE(blit.init(driver.device.Get(), 1832, 1920, error)) << error;
     D3D11_TEXTURE2D_DESC desc;
     blit.output()->GetDesc(&desc);
-    EXPECT_EQ(desc.Width, 1832u);
+    EXPECT_EQ(desc.Width, 3664u) << "both eyes side by side";
     EXPECT_EQ(desc.Height, 1920u);
     EXPECT_EQ(desc.Format, DXGI_FORMAT_B8G8R8A8_UNORM) << "NV_ENC_BUFFER_FORMAT_ARGB";
-    EXPECT_FALSE(blit.draw(driver.context.Get(), nullptr, DXGI_FORMAT_R8G8B8A8_UNORM, {}))
+    EXPECT_FALSE(blit.draw(driver.context.Get(), nullptr, DXGI_FORMAT_R8G8B8A8_UNORM, {}, 0))
         << "nothing to draw from";
 }
 

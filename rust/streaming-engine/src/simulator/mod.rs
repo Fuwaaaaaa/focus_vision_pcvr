@@ -354,7 +354,7 @@ where
         return Err(MockClientError::PinRejected);
     }
 
-    // STREAM_CONFIG (25-byte payload, parsed for log only — we don't enforce
+    // STREAM_CONFIG (26-byte payload, parsed for log only — we don't enforce
     // the values match a local expectation, just acknowledge receipt).
     let (mt, payload) = read_message(stream).await?;
     if mt != msg_type::STREAM_CONFIG {
