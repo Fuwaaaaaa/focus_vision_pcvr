@@ -1,73 +1,80 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use tokio_util::sync::CancellationToken;
+
+use crate::config::MemoryMonitorConfig;
+
+/// How long a growth measurement spans.
+const WINDOW: Duration = Duration::from_secs(3600);
 
 /// Process memory usage monitor using OS APIs.
 ///
-/// Polls process RSS at a configurable interval and warns if memory grows
-/// by more than `growth_threshold_mb` within 1 hour. Uses GetProcessMemoryInfo
-/// on Windows and /proc/self/status on Linux/Android.
+/// Takes the process RSS (see [`run`]) and warns if memory grows by more
+/// than `growth_threshold_mb` within 1 hour. Uses GetProcessMemoryInfo on
+/// Windows and /proc/self/status on Linux/Android. The engine runs inside
+/// vrserver.exe, so the figure is SteamVR's process as a whole.
 pub struct MemoryMonitor {
-    poll_interval_secs: u32,
     growth_threshold_mb: u32,
-    baseline_mb: Option<u64>,
-    baseline_time: Option<Instant>,
-    last_poll: Instant,
+    /// The reading the current hour is measured from.
+    baseline: Option<(u64, Instant)>,
 }
 
 impl MemoryMonitor {
-    pub fn new(poll_interval_secs: u32, growth_threshold_mb: u32) -> Self {
-        Self {
-            poll_interval_secs,
-            growth_threshold_mb,
-            baseline_mb: None,
-            baseline_time: None,
-            last_poll: Instant::now(),
-        }
+    pub fn new(growth_threshold_mb: u32) -> Self {
+        Self { growth_threshold_mb, baseline: None }
     }
 
-    /// Check memory usage if the poll interval has elapsed.
-    /// Returns the current RSS in MB, or None if not yet time to poll.
-    pub fn check(&mut self) -> Option<u64> {
-        if self.last_poll.elapsed().as_secs() < self.poll_interval_secs as u64 {
+    /// Take a reading made at `now`. Once an hour has passed since the
+    /// baseline, logs the growth, starts the next hour from this reading,
+    /// and returns the growth if it reached the threshold.
+    pub fn observe(&mut self, rss_mb: u64, now: Instant) -> Option<u64> {
+        let Some((baseline_mb, since)) = self.baseline else {
+            log::info!("Memory monitor: {} MB at start", rss_mb);
+            self.baseline = Some((rss_mb, now));
+            return None;
+        };
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed < WINDOW {
             return None;
         }
-        self.last_poll = Instant::now();
-
-        let rss_mb = get_process_rss_mb();
-        if rss_mb == 0 {
-            return None; // OS API unavailable
+        self.baseline = Some((rss_mb, now));
+        let growth = rss_mb.saturating_sub(baseline_mb);
+        let hours = elapsed.as_secs_f64() / 3600.0;
+        if growth >= u64::from(self.growth_threshold_mb) {
+            log::warn!(
+                "Memory growth warning: {} MB → {} MB (+{} MB in {:.1} h, threshold {} MB/h)",
+                baseline_mb, rss_mb, growth, hours, self.growth_threshold_mb
+            );
+            Some(growth)
+        } else {
+            log::info!("Memory monitor: {} MB ({} MB an hour ago)", rss_mb, baseline_mb);
+            None
         }
-
-        // Set baseline on first successful read
-        if self.baseline_mb.is_none() {
-            self.baseline_mb = Some(rss_mb);
-            self.baseline_time = Some(Instant::now());
-            log::info!("Memory monitor: baseline RSS = {} MB", rss_mb);
-            return Some(rss_mb);
-        }
-
-        let baseline = self.baseline_mb.unwrap();
-        let elapsed_hours = self.baseline_time.unwrap().elapsed().as_secs_f64() / 3600.0;
-
-        // Check for abnormal growth over 1 hour
-        if elapsed_hours >= 1.0 {
-            let growth = rss_mb.saturating_sub(baseline);
-            if growth >= self.growth_threshold_mb as u64 {
-                log::warn!(
-                    "Memory growth warning: {} MB → {} MB (+{} MB in {:.1}h, threshold: {} MB/h)",
-                    baseline, rss_mb, growth, elapsed_hours, self.growth_threshold_mb
-                );
-            }
-            // Reset baseline for next hour
-            self.baseline_mb = Some(rss_mb);
-            self.baseline_time = Some(Instant::now());
-        }
-
-        Some(rss_mb)
     }
 
     /// Get the current RSS without side effects (for session log).
     pub fn current_rss_mb() -> u64 {
         get_process_rss_mb()
+    }
+}
+
+/// Read the process's memory every `poll_interval_seconds` until `cancel`.
+/// REGRESSION: `[memory_monitor]` was read and nothing ran it.
+pub async fn run(config: MemoryMonitorConfig, cancel: CancellationToken) {
+    let mut monitor = MemoryMonitor::new(config.growth_threshold_mb);
+    // validate() keeps the interval at 10 s or more; 0 would panic here.
+    let period = Duration::from_secs(u64::from(config.poll_interval_seconds.max(1)));
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = cancel.cancelled() => return,
+        }
+        let rss_mb = get_process_rss_mb();
+        if rss_mb > 0 {
+            monitor.observe(rss_mb, Instant::now());
+        }
     }
 }
 
@@ -147,26 +154,30 @@ fn get_process_rss_mb() -> u64 {
 mod tests {
     use super::*;
 
+    const MINUTE: Duration = Duration::from_secs(60);
+
     #[test]
-    fn test_memory_monitor_first_check_sets_baseline() {
-        let mut mon = MemoryMonitor::new(0, 50); // 0s interval for immediate check
-        let rss = mon.check();
-        // Should return Some on platforms with OS API support
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        assert!(rss.is_some());
-        // Baseline should be set
-        assert!(mon.baseline_mb.is_some() || rss.is_none());
+    fn test_first_reading_is_the_baseline() {
+        let mut mon = MemoryMonitor::new(50);
+        let t0 = Instant::now();
+        assert_eq!(mon.observe(400, t0), None);
+        assert_eq!(mon.baseline, Some((400, t0)));
     }
 
     #[test]
-    fn test_memory_monitor_respects_interval() {
-        let mut mon = MemoryMonitor::new(3600, 50); // 1 hour interval
-        let rss = mon.check();
-        // First check should work
-        let rss2 = mon.check();
-        // Second check should return None (interval not elapsed)
-        assert!(rss2.is_none());
-        let _ = rss; // suppress unused warning
+    fn test_growth_is_judged_once_an_hour() {
+        let mut mon = MemoryMonitor::new(50);
+        let t0 = Instant::now();
+        mon.observe(400, t0);
+        // Within the hour nothing is judged, however high it goes.
+        assert_eq!(mon.observe(900, t0 + 59 * MINUTE), None);
+        // An hour on: +60 MB reaches the 50 MB threshold.
+        assert_eq!(mon.observe(460, t0 + 60 * MINUTE), Some(60));
+        // The next hour starts from 460: +40 MB is under it.
+        assert_eq!(mon.observe(500, t0 + 120 * MINUTE), None);
+        assert_eq!(mon.baseline, Some((500, t0 + 120 * MINUTE)));
+        // Shrinking is not growth.
+        assert_eq!(mon.observe(300, t0 + 180 * MINUTE), None);
     }
 
     #[test]
@@ -177,17 +188,15 @@ mod tests {
         let _ = rss;
     }
 
-    #[test]
-    fn test_threshold_detection_logic() {
-        // Test the growth detection logic directly
-        let mut mon = MemoryMonitor::new(0, 50);
-        // Simulate baseline
-        mon.baseline_mb = Some(100);
-        mon.baseline_time = Some(Instant::now().checked_sub(std::time::Duration::from_secs(3700))
-            .unwrap_or(Instant::now()));
-        // The check() will use the real RSS, but the growth logic is what matters
-        // Since we can't control OS RSS, we verify the struct state
-        assert_eq!(mon.growth_threshold_mb, 50);
-        assert_eq!(mon.baseline_mb, Some(100));
+    #[tokio::test]
+    async fn test_run_stops_when_cancelled() {
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run(MemoryMonitorConfig::default(), cancel.clone()));
+        tokio::time::sleep(Duration::from_millis(50)).await; // the first reading
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the monitor must stop on cancel")
+            .unwrap();
     }
 }

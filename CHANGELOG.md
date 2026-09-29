@@ -315,6 +315,22 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   `ipd` and `seconds_from_vsync_to_photons` took NaN or 0. Each is now
   checked like the other settings (reset with a warning, or rounded down
   to even).
+- **Settings that did nothing now take effect.** See `docs/CONFIG.md`.
+  - `[audio] bitrate_kbps` (the companion's Audio slider) sets the Opus
+    bitrate; every stream was 128 kbps.
+  - `[pairing] max_attempts` and `lockout_seconds` set the lockout; the
+    constants (5, 300 s) always applied. They are bounded to 1-10 attempts
+    and 300-3600 s, at most twice the default's guess rate.
+  - `[memory_monitor]` runs: vrserver.exe's memory goes to engine.log every
+    hour, as a warning when it grew by `growth_threshold_mb` or more.
+    Nothing ran the monitor before.
+  - Session logs are written, as README said: a line of stats every 10 s
+    while streaming, to `%APPDATA%\FocusVisionPCVR\sessions\*.jsonl`, kept
+    7 days. Export Logs adds the newest five. Nothing created the logger.
+  - `[audio] frame_size_ms`, `sample_rate` and `channels` are not settings:
+    the stream is always 10 ms frames of 48 kHz stereo Opus (the headset
+    decodes nothing else). They are gone from `default.toml`; files that
+    list them still load, and another value is logged as ignored.
 - **The engine notices a dead link and lets the headset back in** (#18).
   - A control connection silent for 3 s (six missed heartbeats) is dropped.
     A Wi-Fi drop that lost the FIN/RST left the session streaming to nobody

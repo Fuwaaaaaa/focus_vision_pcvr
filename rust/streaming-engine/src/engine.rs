@@ -364,6 +364,15 @@ impl StreamingEngine {
             }
         });
 
+        if config.memory_monitor.enabled {
+            spawn_named(
+                runtime.handle(),
+                "memory-monitor",
+                crate::metrics::memory::run(config.memory_monitor.clone(), cancel_token.clone()),
+            );
+        }
+        crate::metrics::session_log::purge_old_logs(&session_log_dir(), SESSION_LOG_RETENTION_DAYS);
+
         // Purge old recordings before opening today's file. Runs even when
         // recording is disabled this session so retention is honoured
         // regardless of the current on/off toggle.
@@ -943,10 +952,10 @@ fn resolve_synthetic_source(
 /// Spawn the audio capture → Opus encode → UDP send pipeline.
 /// Audio is optional: if capture or encoding fails, streaming continues without audio.
 ///
-/// `audio_config` selects the capture source: production always uses real
-/// WASAPI; under the `simulator` feature, `[audio] synthetic_source` can
-/// substitute a generated source so the engine emits real Opus over UDP with
-/// no audio hardware present.
+/// `audio_config` sets the Opus bitrate (`bitrate_kbps`) and selects the
+/// capture source: production always uses real WASAPI; under the `simulator`
+/// feature, `[audio] synthetic_source` can substitute a generated source so
+/// the engine emits real Opus over UDP with no audio hardware present.
 fn spawn_audio_pipeline(
     target: SocketAddr,
     cancel: CancellationToken,
@@ -999,18 +1008,18 @@ fn spawn_audio_pipeline(
         }
     }
     #[cfg(not(feature = "simulator"))]
-    {
-        let _ = &audio_config; // only consulted under the simulator feature
-        spawn_real_capture(audio_tx, cancel.clone());
-    }
+    spawn_real_capture(audio_tx, cancel.clone());
 
     // Spawn async task: accumulate raw chunks into 10ms frames, encode, send.
     // Accumulation happens here (not in the real-time callback) to avoid Mutex.
     const OPUS_FRAME_SAMPLES: usize = 480; // 10ms at 48kHz
     const STEREO_FRAME_SIZE: usize = OPUS_FRAME_SAMPLES * 2;
+    // REGRESSION: 128 kbps whatever `bitrate_kbps` (and the companion's
+    // slider) said. Validation keeps it within 32..=512.
+    let bitrate_bps = audio_config.bitrate_kbps.saturating_mul(1000);
 
     spawn_named(&tokio::runtime::Handle::current(), "audio-encoder", async move {
-        let mut encoder = match AudioEncoder::new(128_000) {
+        let mut encoder = match AudioEncoder::new(bitrate_bps) {
             Ok(e) => e,
             Err(e) => {
                 log::warn!("Opus encoder init failed: {} — no audio", e);
@@ -1297,6 +1306,19 @@ fn recording_output_dir(config: &AppConfig) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("./recordings"))
 }
 
+/// Where each session's stats go: `%APPDATA%/FocusVisionPCVR/sessions`.
+fn session_log_dir() -> std::path::PathBuf {
+    dirs_next::data_dir()
+        .map(|d| d.join("FocusVisionPCVR").join("sessions"))
+        .unwrap_or_else(|| std::path::PathBuf::from("./sessions"))
+}
+
+/// Session logs older than this are deleted when the engine starts.
+const SESSION_LOG_RETENTION_DAYS: u32 = 7;
+
+/// How often a session writes a line of stats to its log.
+const SESSION_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Build a Recorder if config.recording.enabled is true.
 /// Returns None when disabled or when the output file cannot be opened.
 fn init_recorder(config: &AppConfig) -> Option<Arc<StdMutex<crate::recording::Recorder>>> {
@@ -1463,22 +1485,11 @@ fn publish_streaming_status(
     hmd_stats: Option<&HmdStats>,
 ) {
     let latency_us = PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as u64;
-    // Loss% from the most recent HEARTBEAT-reported HMD stats, if any.
-    let packet_loss_pct = hmd_stats
-        .map(|s| {
-            let total = s.packets_received + s.packets_lost;
-            if total == 0 {
-                0.0
-            } else {
-                s.packets_lost as f32 / total as f32 * 100.0
-            }
-        })
-        .unwrap_or(0.0);
     let subsystems = crate::SubsystemStatus {
         ft_active: config.face_tracking.enabled,
         sleep_active: sleeping,
         audio_enabled: is_audio_active(),
-        packet_loss_pct,
+        packet_loss_pct: packet_loss_pct(hmd_stats),
     };
     crate::write_status_file(
         "streaming",
@@ -1489,6 +1500,40 @@ fn publish_streaming_status(
         Some(&subsystems),
         None,
     );
+}
+
+/// Loss% from the most recent HEARTBEAT-reported HMD stats, if any.
+fn packet_loss_pct(hmd_stats: Option<&HmdStats>) -> f32 {
+    hmd_stats
+        .map(|s| {
+            let total = s.packets_received.saturating_add(s.packets_lost);
+            if total == 0 {
+                0.0
+            } else {
+                s.packets_lost as f32 / total as f32 * 100.0
+            }
+        })
+        .unwrap_or(0.0)
+}
+
+/// One line of the session log from the session's current state.
+fn session_record(
+    adaptive: &AdaptiveState,
+    fec_redundancy: f32,
+) -> crate::metrics::session_log::SessionRecord {
+    let stats = adaptive.last_stats.as_ref();
+    let hundredths = |pct: f32| (pct * 100.0).round() / 100.0; // 5.000001 → 5
+    crate::metrics::session_log::SessionRecord {
+        ts: crate::metrics::session_log::SessionRecord::now_ts(),
+        pc_latency_us: PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed),
+        bitrate_mbps: adaptive.bitrate_ctrl.current_bitrate_mbps(),
+        loss_pct: hundredths(packet_loss_pct(stats)),
+        fec_pct: hundredths(fec_redundancy * 100.0),
+        hmd_fps: stats.map_or(0, |s| s.fps),
+        hmd_decode_us: stats.map_or(0, |s| s.avg_decode_us),
+        sleeping: adaptive.sleep_detector.is_sleeping(),
+        rss_mb: crate::metrics::memory::MemoryMonitor::current_rss_mb(),
+    }
 }
 
 /// How often status.json is rewritten while the engine is alive. The
@@ -1942,8 +1987,29 @@ impl StreamingLoop {
         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         status_tick.tick().await; // first tick is immediate; we just published
 
+        // A line of stats every 10 s, for looking at a session afterwards
+        // (the diagnostics zip carries the newest logs). REGRESSION: the
+        // logger existed, and README advertised it, but nothing created one.
+        let mut session_log = match crate::metrics::session_log::SessionLogger::new(&session_log_dir()) {
+            Ok(logger) => Some(logger),
+            Err(e) => {
+                log::warn!("Session log unavailable: {}", e);
+                None
+            }
+        };
+        let mut session_log_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + SESSION_LOG_INTERVAL,
+            SESSION_LOG_INTERVAL,
+        );
+        session_log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
+                _ = session_log_tick.tick(), if session_log.is_some() => {
+                    if let Some(logger) = session_log.as_mut() {
+                        logger.record(session_record(&adaptive, video.fec_encoder.redundancy()));
+                    }
+                }
                 _ = status_tick.tick() => {
                     // `update_latency_atomics` (frame branch) keeps
                     // PC_TOTAL_LATENCY_US current; this reads it.

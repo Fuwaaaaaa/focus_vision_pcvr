@@ -14,7 +14,7 @@ pub struct AudioEncoder {
 impl AudioEncoder {
     /// Create a new Opus encoder.
     /// `bitrate`: target bitrate in bps (e.g., 128000 for 128kbps).
-    pub fn new(bitrate: i32) -> Result<Self, String> {
+    pub fn new(bitrate: u32) -> Result<Self, String> {
         let mut encoder = Encoder::new(
             SampleRate::Hz48000,
             Channels::Stereo,
@@ -22,8 +22,9 @@ impl AudioEncoder {
         )
         .map_err(|e| format!("Failed to create Opus encoder: {e}"))?;
 
+        let bps = i32::try_from(bitrate).map_err(|_| format!("Bitrate {bitrate} bps out of range"))?;
         encoder
-            .set_bitrate(Bitrate::BitsPerSecond(bitrate))
+            .set_bitrate(Bitrate::BitsPerSecond(bps))
             .map_err(|e| format!("Failed to set bitrate: {e}"))?;
 
         encoder
@@ -59,6 +60,14 @@ impl AudioEncoder {
             .map_err(|e| format!("Opus encode error: {e}"))?;
 
         Ok(self.encode_buf[..len].to_vec())
+    }
+
+    /// The target bitrate the encoder is set to, in bps.
+    pub fn bitrate(&self) -> Option<u32> {
+        match self.encoder.bitrate() {
+            Ok(Bitrate::BitsPerSecond(bps)) => u32::try_from(bps).ok(),
+            _ => None,
+        }
     }
 }
 
@@ -136,5 +145,33 @@ mod tests {
         // Tone should generally produce a larger packet than silence
         assert!(tone_pkt.len() >= silence_pkt.len(),
             "tone={} bytes, silence={} bytes", tone_pkt.len(), silence_pkt.len());
+    }
+
+    /// Bytes for one second (100 frames) of full-band noise at `bitrate`.
+    fn bytes_per_second_of_noise(bitrate: u32) -> usize {
+        let mut encoder = AudioEncoder::new(bitrate).unwrap();
+        assert_eq!(encoder.bitrate(), Some(bitrate));
+        let mut state: u32 = 0x1234_5678;
+        let mut total = 0;
+        for _ in 0..100 {
+            let pcm: Vec<f32> = (0..960)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+                })
+                .collect();
+            total += encoder.encode(&pcm).unwrap().len();
+        }
+        total
+    }
+
+    #[test]
+    fn test_bitrate_sets_the_packet_size() {
+        // REGRESSION: the engine made every encoder 128 kbps, whatever
+        // `[audio] bitrate_kbps` said.
+        let low = bytes_per_second_of_noise(64_000);
+        let high = bytes_per_second_of_noise(256_000);
+        assert!((6_000..=10_000).contains(&low), "64 kbps gave {low} B/s");
+        assert!((26_000..=36_000).contains(&high), "256 kbps gave {high} B/s");
     }
 }

@@ -85,8 +85,8 @@ impl TcpControlServer {
         };
 
         Self {
+            pairing: Arc::new(Mutex::new(PairingState::with_limits((&config.pairing).into()))),
             config,
-            pairing: Arc::new(Mutex::new(PairingState::new())),
             connected: Arc::new(Mutex::new(false)),
             tls_acceptor,
             allow_plaintext: false,
@@ -100,8 +100,8 @@ impl TcpControlServer {
     #[cfg(test)]
     pub(crate) fn new_without_tls(config: AppConfig) -> Self {
         Self {
+            pairing: Arc::new(Mutex::new(PairingState::with_limits((&config.pairing).into()))),
             config,
-            pairing: Arc::new(Mutex::new(PairingState::new())),
             connected: Arc::new(Mutex::new(false)),
             tls_acceptor: None,
             allow_plaintext: true,
@@ -1216,6 +1216,27 @@ mod tests {
             .expect("accept loop must return")
             .unwrap()
             .expect("reconnect must succeed");
+    }
+
+    #[tokio::test]
+    async fn test_pairing_limits_come_from_the_config() {
+        // REGRESSION: `[pairing] max_attempts` / `lockout_seconds` were
+        // ignored; 5 misses and 300 s always applied.
+        let mut config = crate::config::AppConfig::default();
+        config.network.tcp_port = free_tcp_port();
+        config.pairing.max_attempts = 1;
+        let target: SocketAddr = format!("127.0.0.1:{}", config.network.tcp_port).parse().unwrap();
+        let server = Arc::new(TcpControlServer::new_without_tls(config).with_timeouts(short_timeouts()));
+        let pin = server.current_pin().await;
+        let s = Arc::clone(&server);
+        let accept_task = tokio::spawn(async move { s.listen_and_accept().await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(100)).await; // let it bind
+
+        assert_eq!(plain_handshake(target, (pin + 1) % 1_000_000).await, 0x00);
+        let new_pin = server.current_pin().await;
+        assert_ne!(new_pin, pin, "the lockout issues a new PIN");
+        assert_eq!(plain_handshake(target, new_pin).await, 0x00, "one miss locks pairing out");
+        accept_task.abort();
     }
 
     #[tokio::test]

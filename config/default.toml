@@ -21,12 +21,11 @@ resolution_scale = 1.0       # 0.5-1.0; encode resolution scale (1.0 = native). 
 ipd = 0.063
 seconds_from_vsync_to_photons = 0.011
 
+# The stream is always 10 ms frames of 48 kHz stereo Opus (capture converts
+# the output device's own format); only the bitrate is a setting.
 [audio]
 enabled = true
-bitrate_kbps = 128
-frame_size_ms = 10
-sample_rate = 48000
-channels = 2
+bitrate_kbps = 128           # Opus bitrate, 32-512
 
 [foveated]
 enabled = false
@@ -48,14 +47,16 @@ timeout_seconds = 300       # 5 minutes of inactivity → sleep
 motion_threshold = 0.002    # meters per frame (~0.18m/s at 90fps)
 sleep_bitrate_mbps = 8      # reduced bitrate during sleep
 
+# Logs vrserver.exe's memory to engine.log every hour, as a warning when it
+# grew by growth_threshold_mb or more (a leak's first sign).
 [memory_monitor]
 enabled = true
-poll_interval_seconds = 60
+poll_interval_seconds = 60   # 10-3600
 growth_threshold_mb = 50     # Warn if RSS grows by 50+ MB in 1 hour
 
 [pairing]
-max_attempts = 5
-lockout_seconds = 300
+max_attempts = 5             # wrong PINs before the lockout, 1-10
+lockout_seconds = 300        # 300-3600
 
 # Session Recording (optional). When enabled, each streaming session is captured
 # to disk as raw Annex B video (.h265/.h264) plus 16-bit PCM WAV audio.

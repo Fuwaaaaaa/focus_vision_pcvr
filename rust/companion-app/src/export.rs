@@ -389,6 +389,23 @@ pub(crate) fn system_info() -> String {
 /// gets (vrcompositor), this run's and the last.
 const STEAMVR_LOGS: [&str; 4] = ["vrserver.txt", "vrserver.previous.txt", "vrcompositor.txt", "vrcompositor.previous.txt"];
 
+/// How many of the engine's session logs (`sessions/*.jsonl`, a line of
+/// stats every 10 s) go in the zip, newest first.
+const SESSION_LOGS_IN_ZIP: usize = 5;
+
+/// The `n` most recently written `.jsonl` files in `dir`, newest first.
+fn newest_session_logs(dir: &std::path::Path, n: usize) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
+        .filter_map(|path| Some((std::fs::metadata(&path).and_then(|m| m.modified()).ok()?, path)))
+        .collect();
+    logs.sort_by_key(|&(modified, _)| std::cmp::Reverse(modified));
+    logs.into_iter().take(n).map(|(_, path)| path).collect()
+}
+
 /// Add `path` to the zip as `name`, with PII masked; a file that can't be
 /// read leaves `name.error.txt` saying why. Missing files are skipped.
 fn add_log<W: Write + std::io::Seek>(
@@ -430,7 +447,7 @@ pub fn export_logs(adb_path: Option<&str>, device_serial: Option<&str>) -> Resul
     zip.write_all(system_info().as_bytes()).map_err(|e| e.to_string())?;
 
     // 2. PC side: the engine's log (engine.log, engine.prev.log), status.json,
-    // and the companion's settings overrides
+    // the companion's settings overrides, and the newest session logs
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let log_dir = PathBuf::from(appdata).join("FocusVisionPCVR");
         if let Ok(entries) = std::fs::read_dir(&log_dir) {
@@ -444,6 +461,11 @@ pub fn export_logs(adb_path: Option<&str>, device_serial: Option<&str>) -> Resul
             }
         }
         add_log(&mut zip, options, &log_dir.join("config").join("local.toml"), "pc/config/local.toml");
+        for path in newest_session_logs(&log_dir.join("sessions"), SESSION_LOGS_IN_ZIP) {
+            if let Some(fname) = path.file_name() {
+                add_log(&mut zip, options, &path, &format!("pc/sessions/{}", fname.to_string_lossy()));
+            }
+        }
     }
 
     // 2b. SteamVR's logs: the driver writes to vrserver.txt
@@ -535,6 +557,28 @@ mod tests {
         let mut text = String::new();
         std::io::Read::read_to_string(&mut archive.by_name("steamvr/vrserver.txt").unwrap(), &mut text).unwrap();
         assert_eq!(text, "Focus Vision: connected to [REDACTED_IP]\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_newest_session_logs_are_picked() {
+        let dir = std::env::temp_dir().join(format!("fvp-export-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now();
+        for (name, age_s) in [("a.jsonl", 300), ("b.jsonl", 100), ("c.jsonl", 200), ("notes.txt", 0)] {
+            let path = dir.join(name);
+            std::fs::write(&path, "{}\n").unwrap();
+            let mtime = now - std::time::Duration::from_secs(age_s);
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(mtime).unwrap();
+        }
+
+        let names = |n| -> Vec<String> {
+            newest_session_logs(&dir, n).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(names(2), ["b.jsonl", "c.jsonl"]);
+        assert_eq!(names(10), ["b.jsonl", "c.jsonl", "a.jsonl"], "only .jsonl files");
+        assert!(newest_session_logs(&dir.join("missing"), 5).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

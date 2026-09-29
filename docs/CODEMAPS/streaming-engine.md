@@ -145,8 +145,8 @@ Module declarations: `src/lib.rs:1-14` (14 modules).
 | File | Key items |
 |---|---|
 | `latency.rs` | `FrameTimestamps` / `LatencyTracker` (encode/network/decode/render) |
-| `session_log.rs` | `SessionLogger` (JSONL, 60 s flush, 7-day rotation, single write_all) |
-| `memory.rs` | `MemoryMonitor` (GetProcessMemoryInfo / /proc/self/status, 1-hour delta threshold) |
+| `session_log.rs` | `SessionLogger` (one JSONL file per session in `%APPDATA%/FocusVisionPCVR/sessions`, a `SessionRecord` every 10 s from `run_session`, 60 s flush, single write_all), `purge_old_logs` (7 days, at engine start) |
+| `memory.rs` | `MemoryMonitor::observe` (1-hour delta threshold), `run` (the engine's `memory-monitor` task, `[memory_monitor]`; GetProcessMemoryInfo / /proc/self/status) |
 
 ---
 

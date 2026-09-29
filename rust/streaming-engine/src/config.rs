@@ -74,14 +74,19 @@ fn default_retention_days() -> u32 { 30 }
 pub struct AudioConfig {
     #[serde(default = "default_audio_enabled")]
     pub enabled: bool,
+    /// Opus target bitrate.
     #[serde(default = "default_audio_bitrate")]
     pub bitrate_kbps: u32,
-    #[serde(default = "default_audio_frame_size")]
-    pub frame_size_ms: u32,
-    #[serde(default = "default_audio_sample_rate")]
-    pub sample_rate: u32,
-    #[serde(default = "default_audio_channels")]
-    pub channels: u16,
+    /// Not settings: the stream is always 10 ms Opus frames of 48 kHz
+    /// stereo (the headset decodes nothing else; capture converts the
+    /// device's own format). Still parsed so config files that list them
+    /// load, and `validate` warns when one asks for something else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_size_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u16>,
     /// Simulator-only: source of synthetic audio when no real WASAPI device is
     /// available. `"off"` uses real capture (production default); `"silence"`,
     /// `"sine"`, and `"wav"` are honoured only in `simulator`-feature builds —
@@ -155,8 +160,11 @@ fn default_resolution_scale() -> f32 { 1.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairingConfig {
+    /// Wrong PINs before the lockout (1-10).
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u8,
+    /// How long the lockout lasts (300-3600 s). With the attempts' bound,
+    /// a LAN attacker gets at most twice the default's guesses (5 per 300 s).
     #[serde(default = "default_lockout_seconds")]
     pub lockout_seconds: u64,
 }
@@ -329,6 +337,9 @@ fn default_thermal_limit_celsius() -> u32 { 85 }
 fn default_thermal_emergency_celsius() -> u32 { 90 }
 fn default_thermal_recovery_seconds() -> u32 { 30 }
 
+/// Watches the memory of the process the engine runs in (vrserver.exe) and
+/// logs a warning when it grows too fast — a leak's first sign in a long
+/// session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryMonitorConfig {
     #[serde(default = "default_memory_monitor_enabled")]
@@ -374,9 +385,6 @@ fn default_ipd() -> f32 { 0.063 }
 fn default_vsync_to_photons() -> f32 { 0.011 }
 fn default_audio_enabled() -> bool { true }
 fn default_audio_bitrate() -> u32 { 128 }
-fn default_audio_frame_size() -> u32 { 10 }
-fn default_audio_sample_rate() -> u32 { 48000 }
-fn default_audio_channels() -> u16 { 2 }
 fn default_audio_synthetic_source() -> String { "off".to_string() }
 fn default_max_attempts() -> u8 { fvp_common::MAX_PIN_ATTEMPTS }
 fn default_lockout_seconds() -> u64 { fvp_common::PIN_LOCKOUT_SECONDS }
@@ -416,9 +424,9 @@ impl Default for AudioConfig {
         Self {
             enabled: default_audio_enabled(),
             bitrate_kbps: default_audio_bitrate(),
-            frame_size_ms: default_audio_frame_size(),
-            sample_rate: default_audio_sample_rate(),
-            channels: default_audio_channels(),
+            frame_size_ms: None,
+            sample_rate: None,
+            channels: None,
             synthetic_source: default_audio_synthetic_source(),
             synthetic_wav_path: String::new(),
         }
@@ -722,12 +730,30 @@ impl AppConfig {
             self.sleep_mode.motion_threshold = 0.002;
         }
 
-        // Audio
-        if self.audio.sample_rate != 48000 {
-            errors.push(ConfigError { field: "audio.sample_rate", message: format!("{} unsupported, clamped to 48000", self.audio.sample_rate) });
-            self.audio.sample_rate = 48000;
+        // Audio. REGRESSION: frame_size_ms and channels were taken and ignored.
+        let fixed_audio = [
+            ("audio.frame_size_ms", self.audio.frame_size_ms.take(), 10),
+            ("audio.sample_rate", self.audio.sample_rate.take(), 48_000),
+            ("audio.channels", self.audio.channels.take().map(u32::from), 2),
+        ];
+        for (field, set, fixed) in fixed_audio {
+            if let Some(value) = set.filter(|&v| v != fixed) {
+                errors.push(ConfigError {
+                    field,
+                    message: format!("{value} ignored: not a setting, the stream is always {fixed} (10 ms frames of 48 kHz stereo Opus)"),
+                });
+            }
         }
         validate_range(&mut self.audio.bitrate_kbps, 32, 512, 128, "audio.bitrate_kbps", &mut errors);
+
+        // Pairing. The bounds keep brute force within twice the default's
+        // guess rate (see PairingConfig).
+        validate_range(&mut self.pairing.max_attempts, 1, 10, default_max_attempts(), "pairing.max_attempts", &mut errors);
+        validate_range(&mut self.pairing.lockout_seconds, 300, 3600, default_lockout_seconds(), "pairing.lockout_seconds", &mut errors);
+
+        // Memory monitor. 0 s would make its timer panic.
+        validate_range(&mut self.memory_monitor.poll_interval_seconds, 10, 3600, default_memory_poll_seconds(), "memory_monitor.poll_interval_seconds", &mut errors);
+        validate_range(&mut self.memory_monitor.growth_threshold_mb, 1, 100_000, default_memory_growth_threshold_mb(), "memory_monitor.growth_threshold_mb", &mut errors);
         // Synthetic source (simulator-only knob, but validated unconditionally
         // so an over-the-wire / TOML typo is corrected rather than silently
         // disabling audio in a scenario). Unknown values fall back to "off".
@@ -858,7 +884,7 @@ mod tests {
         assert_eq!(cfg.video.bitrate_mbps, 80);
         assert_eq!(cfg.video.resolution_per_eye, [1832, 1920]);
         assert_eq!(cfg.video.framerate, 90);
-        assert_eq!(cfg.audio.sample_rate, 48000);
+        assert_eq!(cfg.audio.bitrate_kbps, 128);
         assert_eq!(cfg.pairing.max_attempts, 5);
     }
 
@@ -1107,12 +1133,62 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_audio_sample_rate() {
-        let mut cfg = AppConfig::default();
-        cfg.audio.sample_rate = 44100; // unsupported
+    fn test_fixed_audio_format_keys_load_and_are_reported_only_when_different() {
+        // Config files from before (default.toml listed all three) keep
+        // loading; only a value the stream can't have is reported.
+        let mut cfg: AppConfig = toml::from_str(r#"
+            [audio]
+            frame_size_ms = 10
+            sample_rate = 48000
+            channels = 2
+        "#).unwrap();
+        assert_eq!(cfg.audio.sample_rate, Some(48000));
+        assert!(cfg.validate().is_empty());
+        assert_eq!((cfg.audio.frame_size_ms, cfg.audio.sample_rate, cfg.audio.channels), (None, None, None));
+
+        let mut cfg: AppConfig = toml::from_str(r#"
+            [audio]
+            frame_size_ms = 20
+            sample_rate = 44100
+            channels = 6
+        "#).unwrap();
         let errors = cfg.validate();
-        assert!(errors.iter().any(|e| e.field == "audio.sample_rate"));
-        assert_eq!(cfg.audio.sample_rate, 48000);
+        for field in ["audio.frame_size_ms", "audio.sample_rate", "audio.channels"] {
+            assert!(errors.iter().any(|e| e.field == field), "{field} not reported: {errors:?}");
+        }
+        assert_eq!((cfg.audio.frame_size_ms, cfg.audio.sample_rate, cfg.audio.channels), (None, None, None));
+    }
+
+    #[test]
+    fn test_validate_pairing_bounds() {
+        let mut cfg = AppConfig::default();
+        cfg.pairing.max_attempts = 10;
+        cfg.pairing.lockout_seconds = 3600;
+        assert!(cfg.validate().is_empty(), "the bounds are inclusive");
+
+        // 0 attempts would lock out before the first try; 100 per 5 minutes,
+        // or 5 per 10 s, would make brute force 20-30× faster.
+        for (attempts, lockout) in [(0, 300), (100, 300), (5, 10), (5, 86_400)] {
+            let mut cfg = AppConfig::default();
+            cfg.pairing.max_attempts = attempts;
+            cfg.pairing.lockout_seconds = lockout;
+            let errors = cfg.validate();
+            assert!(!errors.is_empty(), "{attempts} per {lockout} s accepted");
+            assert_eq!((cfg.pairing.max_attempts, cfg.pairing.lockout_seconds), (5, 300));
+        }
+    }
+
+    #[test]
+    fn test_validate_memory_monitor_interval() {
+        // REGRESSION (would-be): 0 s makes tokio's interval panic.
+        let mut cfg = AppConfig::default();
+        cfg.memory_monitor.poll_interval_seconds = 0;
+        cfg.memory_monitor.growth_threshold_mb = 0;
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|e| e.field == "memory_monitor.poll_interval_seconds"));
+        assert!(errors.iter().any(|e| e.field == "memory_monitor.growth_threshold_mb"));
+        assert_eq!(cfg.memory_monitor.poll_interval_seconds, 60);
+        assert_eq!(cfg.memory_monitor.growth_threshold_mb, 50);
     }
 
     #[test]
@@ -1331,9 +1407,6 @@ mod tests {
         // audio
         assert_eq!(from_default.audio.enabled, from_serde.audio.enabled);
         assert_eq!(from_default.audio.bitrate_kbps, from_serde.audio.bitrate_kbps);
-        assert_eq!(from_default.audio.frame_size_ms, from_serde.audio.frame_size_ms);
-        assert_eq!(from_default.audio.sample_rate, from_serde.audio.sample_rate);
-        assert_eq!(from_default.audio.channels, from_serde.audio.channels);
         assert_eq!(from_default.audio.synthetic_source, from_serde.audio.synthetic_source);
         assert_eq!(from_default.audio.synthetic_wav_path, from_serde.audio.synthetic_wav_path);
         // pairing
