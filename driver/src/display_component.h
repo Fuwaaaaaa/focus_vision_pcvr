@@ -1,6 +1,7 @@
 #pragma once
 
 #include <openvr_driver.h>
+#include <mutex>
 #include "display_geometry.h"
 
 /**
@@ -11,11 +12,23 @@
  */
 class CDisplayComponent : public vr::IVRDisplayComponent {
 public:
-    /// `fov` is the left eye's; the right eye mirrors it.
+    /// Eye size and the default field of view: the left eye's `fov`, the
+    /// right eye mirroring it.
     void configure(uint32_t eyeWidth, uint32_t eyeHeight, const fvp_display::Fov& fov) {
+        std::lock_guard<std::mutex> lock(m_mutex);
         m_eyeWidth = eyeWidth;
         m_eyeHeight = eyeHeight;
-        m_fov = fov;
+        m_fov[0] = fov;
+        m_fov[1] = {-fov.right, -fov.left, fov.up, fov.down};
+    }
+
+    /// The headset's own fields of view (VIEW_CONFIG). The HMD also tells
+    /// SteamVR with SetDisplayProjectionRaw; this keeps GetProjectionRaw in
+    /// step.
+    void setFov(const fvp_display::Fov& left, const fvp_display::Fov& right) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_fov[0] = left;
+        m_fov[1] = right;
     }
 
     void GetWindowBounds(int32_t* pnX, int32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight) override {
@@ -45,8 +58,11 @@ public:
 
     void GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, float* pfTop,
                           float* pfBottom) override {
-        fvp_display::Fov fov = m_fov;
-        if (eEye == vr::Eye_Right) fov = {-m_fov.right, -m_fov.left, m_fov.up, m_fov.down};
+        fvp_display::Fov fov;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            fov = m_fov[eEye == vr::Eye_Left ? 0 : 1];
+        }
         const fvp_display::ProjectionRaw p = fvp_display::projectionRaw(fov);
         *pfLeft = p.left;
         *pfRight = p.right;
@@ -66,7 +82,9 @@ public:
     }
 
 private:
+    // SteamVR queries from its threads; setFov comes from the HMD's RunFrame.
+    std::mutex m_mutex;
     uint32_t m_eyeWidth = 1832;
     uint32_t m_eyeHeight = 1920;
-    fvp_display::Fov m_fov = fvp_display::kDefaultFov;
+    fvp_display::Fov m_fov[2] = {fvp_display::kDefaultFov, fvp_display::kDefaultFov};
 };

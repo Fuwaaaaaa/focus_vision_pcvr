@@ -5,6 +5,7 @@
 // host-buildable and unit-testable (see client/tests/). Wire formats here MUST
 // match the Rust side (rust/common/src/protocol.rs).
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -33,6 +34,7 @@ namespace msg {
     inline constexpr uint8_t STREAM_START = 0x07;
     inline constexpr uint8_t HEARTBEAT = 0x10;
     inline constexpr uint8_t HEARTBEAT_ACK = 0x11;
+    inline constexpr uint8_t VIEW_CONFIG = 0x22;
     inline constexpr uint8_t IDR_REQUEST = 0x30;
     inline constexpr uint8_t FACE_DATA = 0x35;
     inline constexpr uint8_t HAPTIC_EVENT = 0x38;
@@ -65,6 +67,39 @@ inline void writeU32Le(uint8_t* p, uint32_t v) {
 
 inline void writeU64Le(uint8_t* p, uint64_t v) {
     for (int i = 0; i < 8; i++) p[i] = static_cast<uint8_t>(v >> (8 * i));
+}
+
+inline void writeF32Le(uint8_t* p, float v) {
+    uint32_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    writeU32Le(p, bits);
+}
+
+// One eye's field of view as OpenXR reports it (XrFovf): radians from
+// straight ahead, `left` and `down` negative.
+struct EyeFov {
+    float left = 0.0f;
+    float right = 0.0f;
+    float up = 0.0f;
+    float down = 0.0f;
+};
+
+inline constexpr size_t VIEW_CONFIG_PAYLOAD_LEN = 36;
+using ViewConfigPayload = std::array<uint8_t, VIEW_CONFIG_PAYLOAD_LEN>;
+
+// VIEW_CONFIG payload — must match Rust encode_view_config(): little-endian
+// f32 left eye (left, right, up, down), right eye (same), IPD in metres. The
+// PC renders SteamVR's views with these. The IPD is rounded to 0.1 mm so that
+// tracking noise in the eye positions doesn't make every frame a change.
+inline ViewConfigPayload buildViewConfigPayload(const EyeFov& left, const EyeFov& right, float ipdM) {
+    ViewConfigPayload p{};
+    const float values[9] = {
+        left.left, left.right, left.up, left.down,
+        right.left, right.right, right.up, right.down,
+        std::round(ipdM * 10000.0f) / 10000.0f,
+    };
+    for (size_t i = 0; i < 9; i++) writeF32Le(p.data() + i * 4, values[i]);
+    return p;
 }
 
 // HMD statistics carried in every HEARTBEAT, for one report interval.

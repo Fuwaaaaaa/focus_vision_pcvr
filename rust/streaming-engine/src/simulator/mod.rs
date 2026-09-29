@@ -91,6 +91,9 @@ pub struct MockClientConfig {
     /// it after its silence limit; `MockClientStats::control_closed_after`
     /// says when it did.
     pub silent_after: Option<Duration>,
+    /// If `Some`, sent as VIEW_CONFIG right after STREAM_START, as the
+    /// headset reports its field of view and IPD.
+    pub view_config: Option<fvp_common::protocol::ViewConfig>,
 }
 
 impl MockClientConfig {
@@ -117,6 +120,7 @@ impl MockClientConfig {
             receive_audio: false,
             abrupt_close: false,
             silent_after: None,
+            view_config: None,
         }
     }
 }
@@ -458,6 +462,11 @@ where
     // heartbeats and synthetic FACE_DATA. tokio's split keeps both
     // halves backed by the same underlying stream via an internal lock.
     let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp);
+
+    if let Some(view) = &config.view_config {
+        let payload = fvp_common::protocol::encode_view_config(view);
+        send_message(&mut tcp_write, msg_type::VIEW_CONFIG, &payload).await?;
+    }
 
     // Inbound TCP reader: counts HEARTBEAT_ACKs, notes when the engine
     // closes the connection, and captures the HAPTIC_EVENT messages the

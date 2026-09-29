@@ -29,6 +29,9 @@ public:
     /// Forward a new target bitrate from the engine to the NVENC encoder.
     void updateBitrate(uint32_t bitrateBps);
 
+    /// Forward the headset's fields of view and IPD to the HMD device.
+    void updateViewConfig(const FvpViewConfig& view);
+
 private:
     std::unique_ptr<CHmdDevice> m_hmdDevice;
     std::unique_ptr<CControllerDevice> m_leftController;

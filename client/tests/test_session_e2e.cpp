@@ -388,6 +388,33 @@ TEST_F(SessionE2E, PairsAndStreamsVideoFromTheRealEngine) {
     EXPECT_EQ(pinned.size(), 64u);
 }
 
+TEST_F(SessionE2E, SendsTheHeadsetsViewToTheEngine) {
+    // VIEW_CONFIG: the engine logs what it got (and hands it to the driver,
+    // which sets SteamVR's projection). Set before the session, as the app
+    // does from its first frame: it goes out once the session starts.
+    constexpr float kDeg = 3.14159265358979f / 180.0f;
+    const fvp_client_protocol::EyeFov left{-52 * kDeg, 45 * kDeg, 41 * kDeg, -49 * kDeg};
+    const fvp_client_protocol::EyeFov right{-45 * kDeg, 52 * kDeg, 41 * kDeg, -49 * kDeg};
+    const auto view = fvp_client_protocol::buildViewConfigPayload(left, right, 0.064f);
+    session.setViewConfig(view);
+    session.start(settings(pin));
+    ASSERT_TRUE(waitUntil([&] { return session.isStreaming(); }, 15s));
+
+    auto engineGot = [&](const char* text) {
+        return waitUntil([&] { return engine.log().find(text) != std::string::npos; }, 5s);
+    };
+    EXPECT_TRUE(engineGot("VIEW_CONFIG: left eye -52.0/45.0/41.0/-49.0"))
+        << engine.log();
+    EXPECT_TRUE(engineGot("right eye -45.0/52.0/41.0/-49.0"))
+        << engine.log();
+    EXPECT_TRUE(engineGot("IPD 64.0 mm")) << engine.log();
+
+    // The same view again sends nothing new; a changed IPD goes out.
+    session.setViewConfig(view);
+    session.setViewConfig(fvp_client_protocol::buildViewConfigPayload(left, right, 0.066f));
+    EXPECT_TRUE(engineGot("IPD 66.0 mm")) << engine.log();
+}
+
 TEST_F(SessionE2E, WrongPinIsRejectedAndNotRetried) {
     session.start(settings((pin + 1) % 1000000));
     ASSERT_TRUE(waitUntil([&] {
