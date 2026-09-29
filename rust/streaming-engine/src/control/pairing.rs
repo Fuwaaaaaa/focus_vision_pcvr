@@ -3,39 +3,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use fvp_common::{MAX_PIN_ATTEMPTS, PIN_LIFETIME_SECONDS, PIN_LOCKOUT_SECONDS};
 
-/// Override for `PIN_LOCKOUT_SECONDS` used by simulator-based tests so a
-/// pin_lockout scenario can verify the full lock → wait → unlock cycle in
-/// seconds instead of the production five-minute window. Always 0 (no
-/// override) outside the simulator feature, where the setters do not exist.
-#[cfg(feature = "simulator")]
-static PIN_LOCKOUT_OVERRIDE_SECS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+use crate::config::PairingConfig;
 
-/// Test-only: shorten the lockout window. Pass `0` to clear the override.
-/// Production builds (no `simulator` feature) compile the override out
-/// entirely, so the constant is the only path.
-#[cfg(feature = "simulator")]
-pub fn set_pin_lockout_override(seconds: u64) {
-    PIN_LOCKOUT_OVERRIDE_SECS.store(seconds, std::sync::atomic::Ordering::Relaxed);
+/// How many wrong PINs lock pairing out, and for how long: `[pairing]`
+/// in the config (validated there), the constants by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingLimits {
+    pub max_attempts: u8,
+    pub lockout: Duration,
 }
 
-/// Test-only: read the override (mostly for assertion in unit tests).
-#[cfg(feature = "simulator")]
-pub fn pin_lockout_override() -> u64 {
-    PIN_LOCKOUT_OVERRIDE_SECS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Resolve the effective lockout window. Production always returns
-/// `PIN_LOCKOUT_SECONDS`; simulator builds honor a runtime override.
-fn effective_lockout_secs() -> u64 {
-    #[cfg(feature = "simulator")]
-    {
-        let v = PIN_LOCKOUT_OVERRIDE_SECS.load(std::sync::atomic::Ordering::Relaxed);
-        if v > 0 {
-            return v;
-        }
+impl Default for PairingLimits {
+    fn default() -> Self {
+        Self { max_attempts: MAX_PIN_ATTEMPTS, lockout: Duration::from_secs(PIN_LOCKOUT_SECONDS) }
     }
-    PIN_LOCKOUT_SECONDS
+}
+
+impl From<&PairingConfig> for PairingLimits {
+    fn from(config: &PairingConfig) -> Self {
+        Self { max_attempts: config.max_attempts, lockout: Duration::from_secs(config.lockout_seconds) }
+    }
 }
 
 /// Serializable form of lockout state, written to disk so the lockout window
@@ -119,6 +106,7 @@ fn now_unix_us() -> u64 {
 pub struct PairingState {
     pin: u32,
     attempts: u8,
+    limits: PairingLimits,
     lockout_until: Option<Instant>,
     paired: bool,
     issued_at: Instant,
@@ -133,6 +121,12 @@ impl Default for PairingState {
 
 impl PairingState {
     pub fn new() -> Self {
+        Self::with_limits(PairingLimits::default())
+    }
+
+    /// REGRESSION: `[pairing] max_attempts` and `lockout_seconds` were
+    /// read and ignored; the constants always applied.
+    pub fn with_limits(limits: PairingLimits) -> Self {
         let pin = generate_pin();
         log::info!("Pairing PIN: {:06}", pin);
 
@@ -160,6 +154,7 @@ impl PairingState {
         Self {
             pin,
             attempts: 0,
+            limits,
             lockout_until,
             paired: false,
             issued_at: Instant::now(),
@@ -236,12 +231,13 @@ impl PairingState {
             log::info!("Pairing successful");
             Ok(())
         } else {
-            self.attempts += 1;
-            log::warn!("PIN incorrect (attempt {}/{})", self.attempts, MAX_PIN_ATTEMPTS);
+            self.attempts = self.attempts.saturating_add(1);
+            let max_attempts = self.limits.max_attempts;
+            log::warn!("PIN incorrect (attempt {}/{})", self.attempts, max_attempts);
 
-            if self.attempts >= MAX_PIN_ATTEMPTS {
-                let lockout_secs = effective_lockout_secs();
-                let lockout_duration = Duration::from_secs(lockout_secs);
+            if self.attempts >= max_attempts {
+                let lockout_duration = self.limits.lockout;
+                let lockout_secs = lockout_duration.as_secs();
                 self.lockout_until = Some(Instant::now() + lockout_duration);
                 self.rotate_pin();
                 PersistedLockout {
@@ -253,7 +249,7 @@ impl PairingState {
                 Err(PairingError::LockedOut)
             } else {
                 Err(PairingError::WrongPin {
-                    remaining: MAX_PIN_ATTEMPTS - self.attempts,
+                    remaining: max_attempts - self.attempts,
                 })
             }
         }
@@ -313,39 +309,28 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "simulator")]
-    fn test_pin_lockout_override_affects_duration() {
-        // Set override to 1 second, trigger lockout, and verify the resulting
-        // lockout_until is roughly +1s rather than the production 5-minute
-        // window. Use a generous tolerance so timer jitter doesn't flake.
+    fn test_configured_limits_apply() {
         let _guard = TempPersist::new();
-        set_pin_lockout_override(1);
+        let config = PairingConfig { max_attempts: 3, lockout_seconds: 900 };
+        let mut state = PairingState::with_limits((&config).into());
+        let wrong = (state.get_pin() + 1) % 1_000_000;
 
-        let mut state = PairingState::new();
-        let wrong = state.get_pin().wrapping_add(1);
-        for _ in 0..MAX_PIN_ATTEMPTS {
-            let _ = state.verify(wrong);
-        }
-        assert!(state.is_locked());
-        let until = state.lockout_until.expect("lockout active");
-        let remaining = until.saturating_duration_since(Instant::now());
-        assert!(
-            remaining < Duration::from_secs(5),
-            "override should produce <5s lockout, got {:?}",
-            remaining
-        );
+        assert!(matches!(state.verify(wrong), Err(PairingError::WrongPin { remaining: 2 })));
+        assert!(matches!(state.verify(wrong), Err(PairingError::WrongPin { remaining: 1 })));
+        assert!(matches!(state.verify(wrong), Err(PairingError::LockedOut)), "the 3rd miss locks out");
 
-        set_pin_lockout_override(0); // restore default
+        let remaining = state.lockout_until.expect("locked").saturating_duration_since(Instant::now());
+        assert!(remaining > Duration::from_secs(890) && remaining <= Duration::from_secs(900),
+            "lockout_seconds = 900 gave {remaining:?}");
+        let persisted = PersistedLockout::load().lockout_until_unix_us.saturating_sub(now_unix_us());
+        assert!(persisted > 890_000_000, "the lockout on disk is the configured one too");
     }
 
     #[test]
-    #[cfg(feature = "simulator")]
-    fn test_pin_lockout_override_zero_falls_back_to_default() {
-        set_pin_lockout_override(0);
-        assert_eq!(effective_lockout_secs(), PIN_LOCKOUT_SECONDS);
-        set_pin_lockout_override(7);
-        assert_eq!(effective_lockout_secs(), 7);
-        set_pin_lockout_override(0);
+    fn test_default_limits_are_the_constants() {
+        assert_eq!(PairingLimits::default(), (&PairingConfig::default()).into());
+        assert_eq!(PairingLimits::default().max_attempts, MAX_PIN_ATTEMPTS);
+        assert_eq!(PairingLimits::default().lockout, Duration::from_secs(PIN_LOCKOUT_SECONDS));
     }
 
     #[test]

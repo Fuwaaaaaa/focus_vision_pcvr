@@ -76,12 +76,10 @@ together with the scale if the goal is to save bandwidth.
 | Field | Type | Default | Range | Description |
 |-------|------|---------|-------|-------------|
 | `enabled` | bool | true | — | Enable audio streaming (WASAPI loopback → Opus → UDP) |
-| `bitrate_kbps` | u32 | 128 | 32-512 | Opus encoder bitrate in kbps |
-| `frame_size_ms` | u32 | 10 | — | Opus frame size in milliseconds |
-| `sample_rate` | u32 | 48000 | 48000 only | Must be 48000 (Opus requirement) |
-| `channels` | u16 | 2 | — | Audio channels (stereo) |
+| `bitrate_kbps` | u32 | 128 | 32-512 | Opus encoder bitrate in kbps (the companion's Audio slider) |
+| `frame_size_ms`, `sample_rate`, `channels` | — | — | — | **Not settings.** The stream is always 10 ms frames of 48 kHz stereo Opus: the headset decodes nothing else, and capture converts the output device's own rate and channels. Files that list them still load; a value other than 10 / 48000 / 2 is logged as ignored |
 
-**Validation:** sample_rate must be 48000 (Opus compatibility). bitrate_kbps clamped to [32-512].
+**Validation:** bitrate_kbps outside [32-512] is reset to 128.
 
 ## `[foveated]`
 
@@ -118,7 +116,33 @@ together with the scale if the goal is to save bandwidth.
 
 ## `[pairing]`
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_attempts` | u8 | 5 | PIN entry attempts before lockout |
-| `lockout_seconds` | u64 | 300 | Lockout duration after max attempts (5 minutes) |
+| Field | Type | Default | Range | Description |
+|-------|------|---------|-------|-------------|
+| `max_attempts` | u8 | 5 | 1-10 | Wrong PINs before the lockout. The lockout also issues a new PIN |
+| `lockout_seconds` | u64 | 300 | 300-3600 | How long the lockout lasts. It survives an engine restart (`lockout.json`) |
+
+**Validation:** a value outside its range is reset to the default. The bounds
+keep a LAN attacker at no more than twice the default's guesses (5 per 300 s);
+see `SECURITY.md`.
+
+## `[memory_monitor]`
+
+| Field | Type | Default | Range | Description |
+|-------|------|---------|-------|-------------|
+| `enabled` | bool | true | — | Watch the memory of the process the engine runs in (vrserver.exe) |
+| `poll_interval_seconds` | u32 | 60 | 10-3600 | How often it is read |
+| `growth_threshold_mb` | u32 | 50 | 1-100000 | Growth within an hour that is logged as a warning |
+
+Every hour `engine.log` gets the figure (`Memory monitor: … MB`), or a
+`Memory growth warning` when it grew by the threshold or more — a leak's first
+sign in a long session. The figure covers all of vrserver.exe, SteamVR included.
+
+## Session logs (no settings)
+
+While streaming, the engine writes a line of stats every 10 s to
+`%APPDATA%\FocusVisionPCVR\sessions\session_<UTC start>.jsonl`: the PC side's
+latency (`pc_latency_us`), `bitrate_mbps`, the headset's `loss_pct`, `fec_pct`,
+the headset's `hmd_fps` and `hmd_decode_us`, `sleeping`, and vrserver.exe's
+memory (`rss_mb`). Lines are written a minute at a time and when the session
+ends. Files older than 7 days are deleted when the engine starts. The
+companion's **Export Logs** puts the newest five in the zip.
