@@ -115,7 +115,8 @@ Module declarations: `src/lib.rs:1-14` (14 modules).
 
 | File | Key items |
 |---|---|
-| `capture.rs` | `AudioCapture` (cpal WASAPI loopback) |
+| `capture.rs` | `AudioCapture` (cpal WASAPI loopback, in the device's own format) |
+| `convert.rs` | `ToOpusFormat`: fold quad / 5.1 / 7.1 to stereo, `Resampler` (windowed sinc) to 48 kHz — pure, tested |
 | `encoder.rs` | `AudioEncoder` (libopus, 48 kHz stereo, 10 ms frames) |
 
 ---

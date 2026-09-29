@@ -2,8 +2,10 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use tokio::sync::mpsc;
 
-/// Audio samples captured from WASAPI loopback.
-/// Always normalized to f32, interleaved stereo, 48kHz.
+use super::convert::{ToOpusFormat, OUTPUT_RATE};
+
+/// Audio samples captured from WASAPI loopback, in the device's format,
+/// delivered as f32, interleaved stereo, 48kHz (`convert`).
 pub struct AudioCapture {
     stream: Option<Stream>,
     sample_rate: u32,
@@ -41,57 +43,39 @@ impl AudioCapture {
             }
         };
 
-        let device_sample_rate = config.sample_rate().0;
+        // The device's own format: in shared mode WASAPI opens a loopback
+        // only in its mix format, and cpal asks for no conversion.
+        // REGRESSION: 48 kHz was forced, so a 44.1 / 96 kHz device failed to
+        // open (no audio), and 5.1 / 7.1 samples went out as if stereo.
+        let sample_rate = config.sample_rate().0;
         let channels = config.channels();
         let sample_format = config.sample_format();
-
-        // Force 48kHz to match Opus encoder. WASAPI handles resampling internally
-        // when the requested rate differs from the device's native rate.
-        // This prevents sample rate mismatch (e.g., 44.1kHz device → 48kHz Opus).
-        let sample_rate = 48000u32;
         let stream_config = cpal::StreamConfig {
             channels,
             sample_rate: cpal::SampleRate(sample_rate),
             buffer_size: cpal::BufferSize::Default,
         };
 
-        if device_sample_rate != sample_rate {
-            log::info!(
-                "Audio capture: device native {}Hz, requesting {}Hz (WASAPI resample)",
-                device_sample_rate, sample_rate
-            );
-        }
-
         log::info!(
-            "Audio capture config: {}Hz, {} ch, {:?}",
-            sample_rate, channels, sample_format
+            "Audio capture config: {}Hz, {} ch, {:?}{}",
+            sample_rate,
+            channels,
+            sample_format,
+            if sample_rate != OUTPUT_RATE || channels != 2 { " (converted to 48000Hz stereo)" } else { "" }
         );
 
         let err_fn = |err: cpal::StreamError| {
             log::error!("Audio capture stream error: {}", err);
         };
 
-        // Lock-free: callback sends raw chunks directly via try_send (never blocks).
-        let ch = channels;
-        let tx_f32 = chunk_tx.clone();
-        let tx_i16 = chunk_tx;
-
+        // Lock-free: callback sends converted chunks directly via try_send
+        // (never blocks).
+        let mut convert = ToOpusFormat::new(sample_rate, channels);
         let stream_result = match sample_format {
             SampleFormat::F32 => device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let chunk = if ch == 1 {
-                        // Mono → stereo: duplicate each sample
-                        let mut stereo = Vec::with_capacity(data.len() * 2);
-                        for &s in data {
-                            stereo.push(s);
-                            stereo.push(s);
-                        }
-                        stereo
-                    } else {
-                        data.to_vec()
-                    };
-                    let _ = tx_f32.try_send(chunk);
+                    let _ = chunk_tx.try_send(convert.convert(data));
                 },
                 err_fn,
                 None,
@@ -99,18 +83,8 @@ impl AudioCapture {
             SampleFormat::I16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let chunk: Vec<f32> = if ch == 1 {
-                        let mut stereo = Vec::with_capacity(data.len() * 2);
-                        for &s in data {
-                            let f = s as f32 / 32768.0;
-                            stereo.push(f);
-                            stereo.push(f);
-                        }
-                        stereo
-                    } else {
-                        data.iter().map(|&s| s as f32 / 32768.0).collect()
-                    };
-                    let _ = tx_i16.try_send(chunk);
+                    let samples: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
+                    let _ = chunk_tx.try_send(convert.convert(&samples));
                 },
                 err_fn,
                 None,

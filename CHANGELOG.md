@@ -266,6 +266,16 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     send, and go out as one TLS record each, with `TCP_NODELAY`.
   - The mock client sends real HEARTBEATs (loss, received count, fps), so
     the E2E tests cover the adaptive path and the engine's ACKs.
+- **PC audio from any output device.** Capture asked WASAPI for 48 kHz,
+  which its shared mode refuses unless it is the device's own rate (cpal
+  asks for no conversion), so a 44.1 or 96 kHz device gave no audio at
+  all. A 5.1 / 7.1 output's samples went out as if they were stereo.
+  - The loopback opens in the device's own format, and `audio/convert.rs`
+    turns it into the 48 kHz stereo Opus takes: quad / 5.1 / 7.1 fold to
+    stereo (centre and surrounds at −3 dB, no LFE), then a windowed-sinc
+    resampler (Blackman, 16 zero crossings; tones within 0.1 % of ideal,
+    −70 dB of what 48 kHz can't carry when going down).
+  - Checked with unit tests; not yet on a 44.1 kHz or surround device.
 - **The companion draws Japanese and fits its window** (#19).
   - Japanese text was boxes (no loaded font had kana or kanji). The OS's
     Japanese font (Yu Gothic Medium, else Meiryo or MS Gothic) follows Geist,
