@@ -184,6 +184,41 @@ TEST(SwapTextureSets, HandlesAreRealSharedHandlesTheCompositorCanOpen) {
     }
 }
 
+TEST(SwapTextureSets, EachSetAdvancesThroughItsTextures) {
+    // GetNextSwapTextureSetIndex: the driver tracks each set's index rather
+    // than trusting the values SteamVR passes in.
+    Device driver = makeWarpDevice();
+    SwapTextureSets sets;
+    uint64_t left[3] = {}, right[3] = {};
+    std::string error;
+    ASSERT_TRUE(sets.create(driver.device.Get(), 1, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, 1, left, error));
+    ASSERT_TRUE(sets.create(driver.device.Get(), 1, 16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, 1, right, error));
+
+    // One set per eye: each advances once per frame, 1, 2, 0, ...
+    uint32_t indices[2] = {77, 77};
+    const uint64_t perEye[2] = {left[0], right[0]};
+    for (uint32_t expected : {1u, 2u, 0u, 1u}) {
+        sets.nextIndices(perEye, indices);
+        EXPECT_EQ(indices[0], expected);
+        EXPECT_EQ(indices[1], expected);
+    }
+
+    // Both eyes in one set (a double-wide texture): it advances once.
+    uint64_t shared[3] = {};
+    ASSERT_TRUE(sets.create(driver.device.Get(), 1, 32, 16, DXGI_FORMAT_R8G8B8A8_UNORM, 1, shared, error));
+    const uint64_t sameSet[2] = {shared[1], shared[2]};
+    sets.nextIndices(sameSet, indices);
+    EXPECT_EQ(indices[0], 1u);
+    EXPECT_EQ(indices[1], 1u) << "not advanced a second time for the other eye";
+
+    // An unknown handle leaves its entry alone.
+    const uint64_t unknown[2] = {12345, left[0]};
+    uint32_t kept[2] = {9, 9};
+    sets.nextIndices(unknown, kept);
+    EXPECT_EQ(kept[0], 9u);
+    EXPECT_EQ(kept[1], 2u);
+}
+
 TEST(SwapTextureSets, AnyHandleDestroysItsWholeSet) {
     // REGRESSION: DestroySwapTextureSet removed one texture of the three.
     Device driver = makeWarpDevice();

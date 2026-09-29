@@ -28,6 +28,8 @@ loads on boot. The driver opens the Rust streaming engine, registers HMD
 | `src/sync_texture.cpp` / `.h` | `SyncTexture` — the compositor's keyed mutex, held while Present reads the frame | 30 + 30 |
 | `src/nvenc_encoder.cpp` / `.h` | NVENC session on EyeBlit's output, QP delta map, `encode()` | 330 + 110 |
 | `src/driver_log.h` | `driverLog()` → SteamVR's vrserver.txt | 25 |
+| `src/frame_pacer.h` | `FramePacer` — PostPresent waits out each frame's slot at the refresh rate — pure, tested | 45 |
+| `src/touch_profile.h` | Oculus Touch identity, input paths and button mapping for the controllers — pure, tested | 110 |
 | `src/qp_map.h` | `computeQpDeltaMap()` (foveated QP offsets) — testable pure function | ~110 |
 
 Note: NVENC types come from the official `nvEncodeAPI.h` in
@@ -57,8 +59,7 @@ CHmdDevice::Activate()
     EyeBlit output (encoded size), NvencEncoder on it (failure logged:
     SteamVR runs, nothing streams)
   → properties: display, Prop_GraphicsAdapterLuid_Uint64,
-    Prop_DriverDirectModeSendsVsyncEvents_Bool
-  → vsync thread: VsyncEvent() every refresh interval
+    Prop_DriverDirectModeSendsVsyncEvents_Bool = false (SteamVR times vsync)
 
 per-frame (driven by SteamVR compositor):
   → CServerDriver::RunFrame → CHmdDevice / CControllerDevice pull
@@ -68,6 +69,8 @@ per-frame (driven by SteamVR compositor):
     → SyncTexture::acquire (the compositor's keyed mutex)
     → EyeBlit::draw(left eye of the layer) → release
     → NvencEncoder::encode() → fvp_submit_encoded_nal()
+  → CDirectModeComponent::PostPresent() — FramePacer: wait out the frame's
+    slot at the refresh rate (as ALVR does)
 
 CServerDriver::Cleanup()
   → fvp_shutdown()          (no more IDR / gaze callbacks)
@@ -89,15 +92,17 @@ CServerDriver::Cleanup()
 - Sets `Prop_DisplayFrequency_Float` from `FvpConfig::refresh_rate`
 - Sets `Prop_UserIpdMeters_Float` from `FvpConfig::ipd`
 - Sets `Prop_GraphicsAdapterLuid_Uint64` so the compositor renders on the
-  driver's GPU, and sends vsync events itself
+  driver's GPU
 - Provides `GetPose()` that returns the latest tracking data
 - `GetComponent()` returns `CDirectModeComponent` and `CDisplayComponent`
 
 ### `CControllerDevice` (controller_device.h)
-- Two instances (left / right) distinguished by `m_role`
-- Updates SteamVR inputs via `VRDriverInput()->UpdateBooleanComponent` etc.
-- Battery % via `Prop_DeviceBatteryPercentage_Float`
-- `TriggerHapticPulse()` → `fvp_haptic_event(role, 10ms, 200Hz, 1.0)` (amplitude hardcoded for now)
+- Two instances (left / right) distinguished by `m_isLeft`
+- Presented as Oculus Touch (Quest 2) so games' Touch bindings apply —
+  identity, input paths and button mapping in `touch_profile.h` (tested)
+- Updates SteamVR inputs via `VRDriverInput()->UpdateBooleanComponent` etc.;
+  releases them once when the controller stops reporting
+- `TriggerHaptic()` → `fvp_haptic_event(id, duration, frequency, amplitude)`
 
 ### `CDirectModeComponent` (direct_mode.h)
 - `init()`: D3D11 device (`fvp_gpu::createDevice`), `EyeBlit`, `NvencEncoder`
@@ -125,7 +130,7 @@ CServerDriver::Cleanup()
 
 ---
 
-## Tests (64 GoogleTest cases)
+## Tests (74 GoogleTest cases)
 
 `driver/tests/test_qp_map.cpp`:
 - `ComputeQpDeltaMap_centerGaze_fovealZero` — gaze at (0,0) produces zero QP offset in fovea

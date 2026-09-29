@@ -3,9 +3,7 @@ extern "C" {
 #include "streaming_engine.h"
 }
 #include "driver_log.h"
-#include <chrono>
 #include <cstring>
-#include <windows.h>
 
 CHmdDevice::CHmdDevice()
 {
@@ -22,7 +20,6 @@ CHmdDevice::CHmdDevice()
 
 CHmdDevice::~CHmdDevice()
 {
-    stopVsync();
 }
 
 vr::EVRInitError CHmdDevice::Activate(uint32_t unObjectId)
@@ -33,7 +30,6 @@ vr::EVRInitError CHmdDevice::Activate(uint32_t unObjectId)
     // Before the properties: they name the device's GPU.
     m_directMode.init();
     SetupProperties();
-    startVsync();
 
     driverLog("HMD Activated");
     return vr::VRInitError_None;
@@ -41,7 +37,6 @@ vr::EVRInitError CHmdDevice::Activate(uint32_t unObjectId)
 
 void CHmdDevice::Deactivate()
 {
-    stopVsync();
     driverLog("HMD Deactivated");
     m_objectId = vr::k_unTrackedDeviceIndexInvalid;
 }
@@ -113,50 +108,6 @@ void CHmdDevice::RunFrame()
     }
 }
 
-void CHmdDevice::startVsync()
-{
-    if (m_vsyncRunning.exchange(true))
-        return;
-    const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>(1.0 / (m_refreshRate > 0.0f ? m_refreshRate : 90.0f)));
-    m_vsyncThread = std::thread([this, period] {
-        // A high-resolution waitable timer: the default sleep granularity
-        // (~15.6 ms) is longer than a 90 Hz frame.
-        HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                              TIMER_ALL_ACCESS);
-        auto next = std::chrono::steady_clock::now() + period;
-        while (m_vsyncRunning.load()) {
-            const auto wait = next - std::chrono::steady_clock::now();
-            if (wait > std::chrono::steady_clock::duration::zero()) {
-                const auto ticks100ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wait).count() / 100;
-                LARGE_INTEGER due;
-                due.QuadPart = -static_cast<LONGLONG>(ticks100ns);  // negative: relative
-                if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
-                    WaitForSingleObject(timer, INFINITE);
-                } else {
-                    std::this_thread::sleep_until(next);
-                }
-            }
-            vr::VRServerDriverHost()->VsyncEvent(0.0);
-            next += period;
-            // After a stall (debugger, suspended process), restart from now
-            // rather than firing the missed events back to back.
-            if (std::chrono::steady_clock::now() > next + period) {
-                next = std::chrono::steady_clock::now() + period;
-            }
-        }
-        if (timer) CloseHandle(timer);
-    });
-}
-
-void CHmdDevice::stopVsync()
-{
-    if (!m_vsyncRunning.exchange(false))
-        return;
-    if (m_vsyncThread.joinable())
-        m_vsyncThread.join();
-}
-
 void CHmdDevice::SetupProperties()
 {
     auto props = vr::VRProperties();
@@ -181,7 +132,6 @@ void CHmdDevice::SetupProperties()
     {
         driverLog("Using default display config");
     }
-    m_refreshRate = refreshRate;
     m_display.configure(eyeWidth, eyeHeight, fvp_display::kDefaultFov);
 
     // Device identification
@@ -210,13 +160,14 @@ void CHmdDevice::SetupProperties()
         vr::Prop_IsOnDesktop_Bool, false);
 
     // Direct mode: the compositor renders on the driver's GPU (the swap
-    // textures live there) and takes vsync from the driver's events.
+    // textures live there). SteamVR times vsync itself; PostPresent paces
+    // the frames (FramePacer), as ALVR does.
     props->SetBoolProperty(m_propertyContainer,
         vr::Prop_HasDisplayComponent_Bool, true);
     props->SetBoolProperty(m_propertyContainer,
         vr::Prop_HasDriverDirectModeComponent_Bool, true);
     props->SetBoolProperty(m_propertyContainer,
-        vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, true);
+        vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, false);
     if (m_directMode.adapterLuid() != 0)
     {
         props->SetUint64Property(m_propertyContainer,

@@ -6,6 +6,7 @@ extern "C" {
 #include "encode_params.h"
 #include "gpu_adapter.h"
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -19,6 +20,7 @@ CDirectModeComponent::~CDirectModeComponent()
     m_encoder.shutdown();
     m_eyeBlit.shutdown();
     m_sync.reset();
+    if (m_pacingTimer) CloseHandle(m_pacingTimer);
 }
 
 bool CDirectModeComponent::init()
@@ -54,6 +56,11 @@ bool CDirectModeComponent::init()
         enc.bitrate_bps = fvp_encode::kDefaultBitrateBps;
     }
     enc.use_hevc = true;
+    m_pacer.setRefreshRate(enc.fps);
+    // Sleep granularity is ~15.6 ms by default, longer than a 90 Hz frame;
+    // a high-resolution timer (Windows 10 1803+) waits to the millisecond.
+    m_pacingTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                           TIMER_ALL_ACCESS);
 
     std::string error;
     if (!m_eyeBlit.init(m_device.Get(), enc.width, enc.height, error)) {
@@ -128,13 +135,16 @@ void CDirectModeComponent::DestroyAllSwapTextureSets(uint32_t unPid)
 }
 
 void CDirectModeComponent::GetNextSwapTextureSetIndex(
-    vr::SharedTextureHandle_t /*sharedTextureHandles*/[2],
+    vr::SharedTextureHandle_t sharedTextureHandles[2],
     uint32_t (*pIndices)[2])
 {
-    // pIndices holds each eye's current index; the next one follows it.
-    for (int eye = 0; eye < 2; eye++) {
-        (*pIndices)[eye] = ((*pIndices)[eye] + 1) % SwapTextureSets::kTexturesPerSet;
-    }
+    if (!pIndices)
+        return;
+    // Each set's index is tracked here rather than read from pIndices,
+    // which the header does not promise to fill in (ALVR does the same).
+    const uint64_t handles[2] = {sharedTextureHandles[0], sharedTextureHandles[1]};
+    std::lock_guard<std::mutex> lock(m_swapMutex);
+    m_swapSets.nextIndices(handles, *pIndices);
 }
 
 void CDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
@@ -197,6 +207,22 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
     );
     if (result != 0) {
         logSometimes(m_submitFailures, "fvp_submit_encoded_nal failed");
+    }
+}
+
+void CDirectModeComponent::PostPresent(const Throttling_t* /*pThrottling*/)
+{
+    const FramePacer::Clock::time_point now = FramePacer::Clock::now();
+    const FramePacer::Clock::duration wait = m_pacer.deadline(now) - now;
+    if (wait <= FramePacer::Clock::duration::zero())
+        return;
+    const long long ticks100ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wait).count() / 100;
+    LARGE_INTEGER due;
+    due.QuadPart = -static_cast<LONGLONG>(ticks100ns);  // negative: relative
+    if (m_pacingTimer && SetWaitableTimer(m_pacingTimer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(m_pacingTimer, INFINITE);
+    } else {
+        std::this_thread::sleep_for(wait);
     }
 }
 

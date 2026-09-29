@@ -60,6 +60,8 @@ add_executable(driver_tests
     tests/test_nvenc_config.cpp
     tests/test_encode_params.cpp
     tests/test_display_geometry.cpp
+    tests/test_touch_profile.cpp
+    tests/test_frame_pacer.cpp
     # The D3D11 side of direct mode, run on WARP (no GPU needed).
     tests/test_d3d_pipeline.cpp
     src/swap_textures.cpp

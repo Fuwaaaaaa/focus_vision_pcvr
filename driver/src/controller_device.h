@@ -8,7 +8,8 @@ extern "C" {
 }
 
 /**
- * Controller tracked device (left or right hand).
+ * Controller tracked device (left or right hand), presented to SteamVR as an
+ * Oculus Touch controller (touch_profile.h).
  * Receives input state from the Rust streaming engine (which gets it from the real HMD).
  */
 class CControllerDevice : public vr::ITrackedDeviceServerDriver
@@ -53,10 +54,9 @@ private:
     vr::VRInputComponentHandle_t m_hGrip = vr::k_ulInvalidInputComponentHandle;
     vr::VRInputComponentHandle_t m_hJoystickX = vr::k_ulInvalidInputComponentHandle;
     vr::VRInputComponentHandle_t m_hJoystickY = vr::k_ulInvalidInputComponentHandle;
-    vr::VRInputComponentHandle_t m_hA = vr::k_ulInvalidInputComponentHandle; // A or X
-    vr::VRInputComponentHandle_t m_hB = vr::k_ulInvalidInputComponentHandle; // B or Y
-    vr::VRInputComponentHandle_t m_hMenu = vr::k_ulInvalidInputComponentHandle;
-    vr::VRInputComponentHandle_t m_hSystem = vr::k_ulInvalidInputComponentHandle;
+    vr::VRInputComponentHandle_t m_hPrimary = vr::k_ulInvalidInputComponentHandle;   // X (left) / A (right)
+    vr::VRInputComponentHandle_t m_hSecondary = vr::k_ulInvalidInputComponentHandle; // Y (left) / B (right)
+    vr::VRInputComponentHandle_t m_hSystem = vr::k_ulInvalidInputComponentHandle;    // menu / system
     vr::VRInputComponentHandle_t m_hThumbstickClick = vr::k_ulInvalidInputComponentHandle;
     vr::VRInputComponentHandle_t m_hTriggerTouch = vr::k_ulInvalidInputComponentHandle;
     vr::VRInputComponentHandle_t m_hThumbstickTouch = vr::k_ulInvalidInputComponentHandle;

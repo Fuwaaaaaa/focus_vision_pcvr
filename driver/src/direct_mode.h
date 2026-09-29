@@ -7,6 +7,7 @@
 #include <mutex>
 #include <vector>
 #include "eye_blit.h"
+#include "frame_pacer.h"
 #include "nvenc_encoder.h"
 #include "swap_textures.h"
 #include "sync_texture.h"
@@ -65,6 +66,11 @@ public:
     void SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2]) override;
     void Present(vr::SharedTextureHandle_t syncTexture) override;
 
+    /// Waits out the rest of the frame's slot at the refresh rate
+    /// (FramePacer): SteamVR times vsync itself and renders the next frame
+    /// when this returns.
+    void PostPresent(const Throttling_t* pThrottling) override;
+
     void GetFrameTiming(vr::DriverDirectMode_FrameTiming* pFrameTiming) override;
 
 private:
@@ -85,6 +91,8 @@ private:
     SyncTexture m_sync;
     NvencEncoder m_encoder;
     bool m_encoderReady = false;
+    FramePacer m_pacer;
+    void* m_pacingTimer = nullptr;  // high-resolution waitable timer (HANDLE)
 
     // The first layer submitted since the last Present: the scene.
     bool m_haveLayer = false;

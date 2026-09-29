@@ -44,9 +44,16 @@ public:
     /// Destroy every set of process `pid`.
     void destroyAll(uint32_t pid);
 
+    /// GetNextSwapTextureSetIndex: advance the set of each eye's handle to
+    /// its next texture and write that index to `indices`. The compositor
+    /// starts on index 0. Both eyes in one set advance it once; an unknown
+    /// handle leaves its entry as it was.
+    void nextIndices(const uint64_t (&handles)[2], uint32_t (&indices)[2]);
+
     size_t size() const { return m_textures.size(); }
 
 private:
     std::vector<Texture> m_textures;
+    std::vector<std::pair<uint32_t, uint32_t>> m_current;  // (setId, index in use)
     uint32_t m_nextSetId = 0;
 };
