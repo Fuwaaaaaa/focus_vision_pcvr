@@ -6,6 +6,7 @@
 #include <openxr/openxr_platform.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -566,6 +567,21 @@ void OpenXRApp::renderFrame() {
 
         XR_CHECK(xrLocateViews(m_session, &locateInfo, &viewState, 2, &viewCount, views.data()),
                  "xrLocateViews");
+
+        // The PC renders SteamVR's views with the same fields of view and
+        // IPD (VIEW_CONFIG). The session sends it once per connection and
+        // when it changes (the IPD dial), not every frame.
+        if (viewCount == 2 && (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
+            auto eyeFov = [](const XrFovf& f) {
+                return fvp_client_protocol::EyeFov{f.angleLeft, f.angleRight, f.angleUp, f.angleDown};
+            };
+            const XrVector3f& a = views[0].pose.position;
+            const XrVector3f& b = views[1].pose.position;
+            const float ipd = std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) +
+                                        (a.z - b.z) * (a.z - b.z));
+            m_stream.setViewConfig(fvp_client_protocol::buildViewConfigPayload(
+                eyeFov(views[0].fov), eyeFov(views[1].fov), ipd));
+        }
 
         // Poll eye gaze and send head tracking + gaze data to PC
         auto gaze = m_eyeTracker.poll(frameState.predictedDisplayTime);

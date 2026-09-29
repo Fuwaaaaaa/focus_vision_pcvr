@@ -60,6 +60,26 @@
 #define ACK_REJECTED 0
 
 /**
+ * The headset's view (VIEW_CONFIG), handed to the C++ driver so SteamVR
+ * renders what the headset displays. Angles in radians from straight
+ * ahead, OpenXR's `XrFovf` convention: `left` and `down` negative.
+ */
+typedef struct FvpViewConfig {
+    /**
+     * Left eye: angle left, right, up, down.
+     */
+    float left_eye[4];
+    /**
+     * Right eye: angle left, right, up, down.
+     */
+    float right_eye[4];
+    /**
+     * Distance between the eyes, in metres.
+     */
+    float ipd_m;
+} FvpViewConfig;
+
+/**
  * Tracking data sent from HMD to PC
  */
 typedef struct TrackingData {
@@ -152,6 +172,14 @@ void fvp_set_gaze_callback(void (*callback)(float, float, int32_t));
  * `bitrate_bps`: new target bitrate in bits per second.
  */
 void fvp_set_bitrate_callback(void (*callback)(uint32_t));
+
+/**
+ * Register a callback for the headset's view (VIEW_CONFIG): each eye's
+ * field of view and the IPD, sent by the headset when a session starts
+ * and whenever they change. Called from C++ on init; the callback runs on
+ * the engine's control task and must only store the values.
+ */
+void fvp_set_view_config_callback(void (*callback)(const struct FvpViewConfig*));
 
 /**
  * Queue a haptic vibration event for delivery to HMD controller.

@@ -12,6 +12,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -105,6 +106,11 @@ public:
     /// Ask for a keyframe. Requests made while one is queued are merged.
     void requestIdr();
 
+    /// The headset's view (VIEW_CONFIG: each eye's field of view and the
+    /// IPD). Sent when a session starts and whenever it changes; calling
+    /// with the same payload every frame sends nothing more.
+    void setViewConfig(const fvp_client_protocol::ViewConfigPayload& payload);
+
     /// Take the oldest server event, if any.
     bool pollEvent(ServerEvent& out);
 
@@ -149,4 +155,6 @@ private:
     TcpControlClient::StreamConfig m_config;
     std::deque<Outgoing> m_outbox;
     std::deque<ServerEvent> m_events;
+    std::optional<fvp_client_protocol::ViewConfigPayload> m_view;
+    bool m_viewUnsent = false;  // m_view changed, or a session started, since it was sent
 };

@@ -66,8 +66,60 @@ vr::DriverPose_t CHmdDevice::GetPose()
     return m_pose;
 }
 
+void CHmdDevice::updateViewConfig(const FvpViewConfig& view)
+{
+    std::lock_guard<std::mutex> lock(m_viewMutex);
+    m_pendingView = view;
+}
+
+void CHmdDevice::applyViewConfig(const FvpViewConfig& view)
+{
+    const fvp_display::Fov left = fvp_display::fovFromRadians(
+        view.left_eye[0], view.left_eye[1], view.left_eye[2], view.left_eye[3]);
+    const fvp_display::Fov right = fvp_display::fovFromRadians(
+        view.right_eye[0], view.right_eye[1], view.right_eye[2], view.right_eye[3]);
+    m_display.setFov(left, right);
+
+    auto rect = [](const fvp_display::Fov& fov) {
+        const fvp_display::ProjectionRaw p = fvp_display::projectionRaw(fov);
+        vr::HmdRect2_t r{};
+        r.vTopLeft.v[0] = p.left;
+        r.vTopLeft.v[1] = p.top;
+        r.vBottomRight.v[0] = p.right;
+        r.vBottomRight.v[1] = p.bottom;
+        return r;
+    };
+    auto matrix = [](const fvp_display::EyeToHead& e) {
+        vr::HmdMatrix34_t m{};
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 4; c++) m.m[r][c] = e.m[r][c];
+        return m;
+    };
+    auto host = vr::VRServerDriverHost();
+    host->SetDisplayProjectionRaw(m_objectId, rect(left), rect(right));
+    host->SetDisplayEyeToHead(m_objectId, matrix(fvp_display::eyeToHead(-view.ipd_m / 2)),
+                              matrix(fvp_display::eyeToHead(view.ipd_m / 2)));
+    vr::VRProperties()->SetFloatProperty(m_propertyContainer, vr::Prop_UserIpdMeters_Float, view.ipd_m);
+
+    driverLog("Headset view: left eye %.1f/%.1f/%.1f/%.1f, right eye %.1f/%.1f/%.1f/%.1f degrees "
+              "(left/right/up/down), IPD %.1f mm",
+              left.left, left.right, left.up, left.down, right.left, right.right, right.up, right.down,
+              view.ipd_m * 1000.0f);
+}
+
 void CHmdDevice::RunFrame()
 {
+    // A new headset view (a session started, or the IPD dial moved)
+    std::optional<FvpViewConfig> view;
+    {
+        std::lock_guard<std::mutex> lock(m_viewMutex);
+        view.swap(m_pendingView);
+    }
+    if (view && m_objectId != vr::k_unTrackedDeviceIndexInvalid)
+    {
+        applyViewConfig(*view);
+    }
+
     // Try to get tracking data from the Rust streaming engine
     TrackingData trackingData;
     int32_t result = fvp_get_tracking_data(&trackingData);

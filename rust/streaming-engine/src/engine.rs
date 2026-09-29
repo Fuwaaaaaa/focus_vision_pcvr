@@ -26,6 +26,12 @@ static GAZE_CALLBACK: std::sync::RwLock<Option<extern "C" fn(f32, f32, i32)>> = 
 /// Set via fvp_set_bitrate_callback() from C++.
 static BITRATE_CALLBACK: std::sync::RwLock<Option<extern "C" fn(u32)>> = std::sync::RwLock::new(None);
 
+/// Callback for the headset's view (VIEW_CONFIG) — the driver sets
+/// SteamVR's projection and eye positions from it.
+/// Set via fvp_set_view_config_callback() from C++.
+static VIEW_CONFIG_CALLBACK: std::sync::RwLock<Option<extern "C" fn(*const crate::FvpViewConfig)>> =
+    std::sync::RwLock::new(None);
+
 type HapticSlot = std::sync::RwLock<Option<mpsc::Sender<HapticEvent>>>;
 
 /// Channel for sending haptic events to the TCP control writer.
@@ -207,6 +213,21 @@ fn notify_bitrate_change(bitrate_bps: u32) {
     if let Ok(guard) = BITRATE_CALLBACK.read() {
         if let Some(cb) = *guard {
             cb(bitrate_bps);
+        }
+    }
+}
+
+pub fn set_view_config_callback(cb: extern "C" fn(*const crate::FvpViewConfig)) {
+    if let Ok(mut guard) = VIEW_CONFIG_CALLBACK.write() {
+        *guard = Some(cb);
+    }
+}
+
+fn notify_view_config(view: &fvp_common::protocol::ViewConfig) {
+    if let Ok(guard) = VIEW_CONFIG_CALLBACK.read() {
+        if let Some(cb) = *guard {
+            let ffi = crate::FvpViewConfig::from(view);
+            cb(&ffi);
         }
     }
 }
@@ -740,6 +761,22 @@ async fn handle_tcp_control(
                                 {
                                     log::warn!("Failed to send CONFIG_UPDATE_ACK: {}", e);
                                 }
+                            }
+                        }
+                        fvp_common::protocol::msg_type::VIEW_CONFIG => {
+                            match fvp_common::protocol::parse_view_config(payload) {
+                                Some(view) => {
+                                    let deg = |a: f32| a.to_degrees();
+                                    let [l, r] = view.eyes;
+                                    log::info!(
+                                        "VIEW_CONFIG: left eye {:.1}/{:.1}/{:.1}/{:.1}°, right eye {:.1}/{:.1}/{:.1}/{:.1}° (left/right/up/down), IPD {:.1} mm",
+                                        deg(l.left), deg(l.right), deg(l.up), deg(l.down),
+                                        deg(r.left), deg(r.right), deg(r.up), deg(r.down),
+                                        view.ipd_m * 1000.0,
+                                    );
+                                    notify_view_config(&view);
+                                }
+                                None => log::warn!("VIEW_CONFIG rejected: implausible or short ({}B)", payload.len()),
                             }
                         }
                         fvp_common::protocol::msg_type::DISCONNECT => {

@@ -50,14 +50,24 @@ Small pure-data crate with 3 files. No I/O, no threads. All types are
 - `VideoCodec { H264, H265 }` (`#[repr(u8)]`, exported via cbindgen)
 
 ### Message type namespace (`msg_type` module)
-`HELLO = 0x01`, `HELLO_ACK = 0x02`, `PIN_REQUEST = 0x10`, `PIN_RESPONSE = 0x11`,
-`PIN_RESULT = 0x12`, `STREAM_CONFIG = 0x20`, `STREAM_START = 0x21`,
-`HEARTBEAT = 0x30`, `HEARTBEAT_ACK = 0x31`, `IDR_REQUEST = 0x32`,
-`TRANSPORT_FEEDBACK = 0x12` (collision note: numeric reuse intentional,
-different direction), `FACE_DATA = 0x35`, `HAPTIC_EVENT = 0x38`,
-`SLEEP_ENTER = 0x40`, `SLEEP_EXIT = 0x41`, `CONFIG_UPDATE = 0x55`,
-`CONFIG_UPDATE_ACK = 0x56`, `CALIBRATE_START = 0x60`, `CALIBRATE_STATUS = 0x61`,
-`DISCONNECT = 0x70`.
+`HELLO = 0x01`, `HELLO_ACK = 0x02`, `PIN_REQUEST = 0x03`, `PIN_RESPONSE = 0x04`,
+`PIN_RESULT = 0x05`, `STREAM_CONFIG = 0x06`, `STREAM_START = 0x07`,
+`HEARTBEAT = 0x10`, `HEARTBEAT_ACK = 0x11`, `TRANSPORT_FEEDBACK = 0x12`,
+`TRACKING_DATA = 0x20`, `CONTROLLER_DATA = 0x21`, `VIEW_CONFIG = 0x22`,
+`IDR_REQUEST = 0x30`, `FACE_DATA = 0x35`, `HAPTIC_EVENT = 0x38`,
+`AUDIO_CONFIG = 0x40`, `AUDIO_START = 0x41`, `SLEEP_ENTER = 0x50`,
+`SLEEP_EXIT = 0x51`, `CONFIG_UPDATE = 0x55`, `CONFIG_UPDATE_ACK = 0x56`,
+`CALIBRATE_START = 0x60`, `CALIBRATE_STATUS = 0x61`,
+`FT_MIRROR_REQUEST = 0x65`, `FT_MIRROR_FRAME = 0x66`, `DISCONNECT = 0xFF`.
+
+### VIEW_CONFIG (HMD → PC)
+`ViewConfig { eyes: [EyeFov; 2], ipd_m }`, `EyeFov { left, right, up, down }`
+(OpenXR `XrFovf` radians). `encode_view_config` / `parse_view_config`: 36
+bytes, f32 LE — left eye (left, right, up, down), right eye, IPD. Parsing
+rejects a short payload, non-finite values, half-angles past 85°, left ≥
+right, down ≥ up and an IPD outside 40–90 mm. The engine hands it to the
+driver (`fvp_set_view_config_callback`), which sets SteamVR's projection
+and eye positions.
 
 ---
 

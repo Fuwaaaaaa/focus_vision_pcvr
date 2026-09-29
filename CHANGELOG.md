@@ -12,6 +12,12 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   1 = side by side). `PROTOCOL_VERSION` is 5 on both sides; a 25-byte
   payload (a server before v5) is read as mono. The pixel count doubles, so
   the same `bitrate_mbps` gives each eye about half the bits.
+- **VIEW_CONFIG (0x22, HMD → PC): the headset's field of view and IPD.**
+  36 bytes, f32 LE: each eye's `XrFovf` angles (left, right, up, down) and
+  the IPD in metres. The client sends it once per session and whenever it
+  changes (the IPD is rounded to 0.1 mm so tracking noise isn't a change);
+  the engine rejects implausible values (non-finite, past 85°, reversed
+  edges, an IPD outside 40–90 mm). An older engine logs it as unknown.
 
 ### Protocol (breaking: v4)
 - **FVP header carries `data_shard_count` (FEC fix).** The HMD derived the
@@ -235,8 +241,15 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     render models, X/Y on the left and A/B on the right. Before, the input
     profile pointed at a file that did not exist and SteamVR had no
     bindings for them.
-  - Still missing: the headset's own field of view, compositing the layers
-    above the scene (overlays, the dashboard).
+  - SteamVR renders with the headset's own field of view and IPD: the
+    driver takes VIEW_CONFIG from the engine (`fvp_set_view_config_callback`)
+    and calls `SetDisplayProjectionRaw` / `SetDisplayEyeToHead`. The fixed
+    100° per eye is used only until the first connection. The raw
+    projection's `top` / `bottom` now follow OpenVR's convention (`top` is
+    the lower edge's tangent, as `ComposeProjection` and ALVR use it); they
+    were swapped, which turns an asymmetric field of view upside down.
+  - Still missing: compositing the layers above the scene (overlays, the
+    dashboard).
 
 ### Fixes
 - **The engine notices a dead link and lets the headset back in** (#18).
@@ -450,10 +463,9 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   SteamVR driver's video path is wired (its D3D11 side tested on WARP), but
   neither has run on the headset, under SteamVR, or on an NVIDIA GPU. The
   hardware-free simulator path is unaffected.
-- **A fixed field of view.** SteamVR renders with a default 100° per eye
-  rather than the headset's, so the image is scaled by however much they
-  differ. Overlays such as the SteamVR dashboard are not composited.
-  Tracked in TODOS.md.
+- **Overlays are not shown.** The driver streams the scene layer only, so
+  the SteamVR dashboard and other overlays don't reach the headset. Tracked
+  in TODOS.md.
 
 ## [3.0.0] - 2026-06-01
 

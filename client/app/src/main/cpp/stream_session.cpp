@@ -57,6 +57,13 @@ void StreamSession::requestIdr() {
     if (isStreaming()) m_idrPending = true;
 }
 
+void StreamSession::setViewConfig(const fvp_client_protocol::ViewConfigPayload& payload) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_view == payload) return;
+    m_view = payload;
+    m_viewUnsent = true;
+}
+
 bool StreamSession::pollEvent(ServerEvent& out) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_events.empty()) return false;
@@ -183,6 +190,11 @@ void StreamSession::runStreaming() {
     uint32_t heartbeatSequence = 0;
     std::vector<uint8_t> payload;
     m_stats.takeSnapshot(0); // start this session's counts from zero
+    {
+        // Every session gets the headset's view: the PC may have restarted.
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_viewUnsent = m_view.has_value();
+    }
 
     while (!m_stop) {
         if (m_dropForTest.exchange(false)) {
@@ -194,6 +206,10 @@ void StreamSession::runStreaming() {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             outbox.swap(m_outbox);
+            if (m_viewUnsent && m_view) {
+                outbox.push_back({proto::msg::VIEW_CONFIG, std::vector<uint8_t>(m_view->begin(), m_view->end())});
+                m_viewUnsent = false;
+            }
         }
         for (const auto& m : outbox) {
             if (!m_client.sendMessage(m.type, m.payload.data(), static_cast<int>(m.payload.size()))) {

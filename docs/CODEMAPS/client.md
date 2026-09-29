@@ -56,7 +56,7 @@ tracker, pairing state, dashboard state.
 ### Networking
 | File | Class | Role |
 |---|---|---|
-| `stream_session.h/.cpp` | `StreamSession` | The connection, on its own thread: connect → TLS → PIN → STREAM_CONFIG → STREAM_START → stream (500 ms HEARTBEAT, server messages as `ServerEvent`s, liveness) → reconnect with backoff (`ClientSession` policy). The only thread touching the TLS connection; others queue with `send()` |
+| `stream_session.h/.cpp` | `StreamSession` | The connection, on its own thread: connect → TLS → PIN → STREAM_CONFIG → STREAM_START → stream (500 ms HEARTBEAT, VIEW_CONFIG on each session and change, server messages as `ServerEvent`s, liveness) → reconnect with backoff (`ClientSession` policy). The only thread touching the TLS connection; others queue with `send()` |
 | `tcp_client.h/.cpp` | `TcpControlClient` | MbedTLS TLS 1.3 control channel: connect/handshake with timeouts (non-blocking socket + `mbedtls_net_poll`), framing, TOFU pin after pairing. Owned by `StreamSession` |
 | `video_receiver.h/.cpp` | `VideoReceiver` | UDP video receive thread (server address only) → `FrameAssembler` → ordered frame queue for the render thread |
 | `frame_assembler.h/.cpp` | `FrameAssembler` | Packets → complete frames in send order (bulk + sliced), IDR request + skip to keyframe on loss, RTP-gap loss stats. No sockets: unit-tested |

@@ -81,6 +81,7 @@ pub mod msg_type {
     pub const HEARTBEAT_ACK: u8 = 0x11;
     pub const TRACKING_DATA: u8 = 0x20;
     pub const CONTROLLER_DATA: u8 = 0x21;
+    pub const VIEW_CONFIG: u8 = 0x22; // HMD → PC: each eye's field of view + IPD
     pub const IDR_REQUEST: u8 = 0x30;
     pub const FACE_DATA: u8 = 0x35;
     pub const HAPTIC_EVENT: u8 = 0x38;
@@ -210,6 +211,69 @@ pub mod fvp_flags {
     pub fn slice_index(flags: u16) -> u8 { ((flags & SLICE_INDEX_MASK) >> SLICE_INDEX_SHIFT) as u8 }
     pub fn slice_count(flags: u16) -> u8 { ((flags & SLICE_COUNT_MASK) >> SLICE_COUNT_SHIFT) as u8 }
     pub fn stream_id(flags: u16) -> u8 { ((flags & STREAM_ID_MASK) >> STREAM_ID_SHIFT) as u8 }
+}
+
+/// One eye's field of view as OpenXR reports it (`XrFovf`): angles in
+/// radians from straight ahead, `left` and `down` negative.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EyeFov {
+    pub left: f32,
+    pub right: f32,
+    pub up: f32,
+    pub down: f32,
+}
+
+/// VIEW_CONFIG: what the headset displays each eye with, so SteamVR renders
+/// the same view — otherwise the image is scaled by however much the fields
+/// of view differ.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewConfig {
+    /// Left eye, then right eye.
+    pub eyes: [EyeFov; 2],
+    /// Distance between the eyes, in metres.
+    pub ipd_m: f32,
+}
+
+/// VIEW_CONFIG payload length: 9 × f32.
+pub const VIEW_CONFIG_PAYLOAD_LEN: usize = 36;
+
+/// Widest half-angle accepted from the headset: 85°. Tangents grow without
+/// bound towards 90°.
+const MAX_FOV_HALF_ANGLE: f32 = 85.0 * std::f32::consts::PI / 180.0;
+
+/// VIEW_CONFIG payload, little-endian f32: left eye (angle_left,
+/// angle_right, angle_up, angle_down), right eye (same), ipd_m.
+pub fn encode_view_config(c: &ViewConfig) -> [u8; VIEW_CONFIG_PAYLOAD_LEN] {
+    let mut out = [0u8; VIEW_CONFIG_PAYLOAD_LEN];
+    let values = [
+        c.eyes[0].left, c.eyes[0].right, c.eyes[0].up, c.eyes[0].down,
+        c.eyes[1].left, c.eyes[1].right, c.eyes[1].up, c.eyes[1].down,
+        c.ipd_m,
+    ];
+    for (chunk, v) in out.chunks_exact_mut(4).zip(values) {
+        chunk.copy_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// Parse a VIEW_CONFIG payload. `None` for a short payload or values no
+/// headset reports: not finite, a half-angle past 85°, left not left of
+/// right or down not below up, an IPD outside 40–90 mm.
+pub fn parse_view_config(payload: &[u8]) -> Option<ViewConfig> {
+    if payload.len() < VIEW_CONFIG_PAYLOAD_LEN {
+        return None;
+    }
+    let f = |i: usize| f32::from_le_bytes([payload[i * 4], payload[i * 4 + 1], payload[i * 4 + 2], payload[i * 4 + 3]]);
+    let eye = |base: usize| EyeFov { left: f(base), right: f(base + 1), up: f(base + 2), down: f(base + 3) };
+    let config = ViewConfig { eyes: [eye(0), eye(4)], ipd_m: f(8) };
+
+    let plausible_eye = |e: &EyeFov| {
+        [e.left, e.right, e.up, e.down].iter().all(|a| a.is_finite() && a.abs() < MAX_FOV_HALF_ANGLE)
+            && e.left < e.right
+            && e.down < e.up
+    };
+    let plausible_ipd = config.ipd_m.is_finite() && (0.040..=0.090).contains(&config.ipd_m);
+    (config.eyes.iter().all(plausible_eye) && plausible_ipd).then_some(config)
 }
 
 /// Transport feedback: per-packet receive timestamps for delay-based bandwidth estimation.
@@ -476,6 +540,65 @@ mod tests {
     fn transport_feedback_rejects_too_short() {
         assert!(parse_transport_feedback(&[]).is_none());
         assert!(parse_transport_feedback(&[0]).is_none());
+    }
+
+    fn focus_like_view() -> ViewConfig {
+        // Asymmetric, as headsets report them: wider down and towards the nose.
+        let deg = std::f32::consts::PI / 180.0;
+        ViewConfig {
+            eyes: [
+                EyeFov { left: -52.0 * deg, right: 45.0 * deg, up: 41.0 * deg, down: -49.0 * deg },
+                EyeFov { left: -45.0 * deg, right: 52.0 * deg, up: 41.0 * deg, down: -49.0 * deg },
+            ],
+            ipd_m: 0.064,
+        }
+    }
+
+    #[test]
+    fn view_config_round_trips() {
+        let c = focus_like_view();
+        let bytes = encode_view_config(&c);
+        assert_eq!(bytes.len(), VIEW_CONFIG_PAYLOAD_LEN);
+        assert_eq!(parse_view_config(&bytes), Some(c));
+    }
+
+    #[test]
+    fn view_config_byte_layout() {
+        // Pinned for the C++ client (client_protocol.h buildViewConfigPayload).
+        let c = focus_like_view();
+        let bytes = encode_view_config(&c);
+        assert_eq!(&bytes[0..4], &c.eyes[0].left.to_le_bytes(), "left eye, angle_left first");
+        assert_eq!(&bytes[8..12], &c.eyes[0].up.to_le_bytes());
+        assert_eq!(&bytes[16..20], &c.eyes[1].left.to_le_bytes(), "then the right eye");
+        assert_eq!(&bytes[32..36], &0.064f32.to_le_bytes(), "ipd last");
+    }
+
+    #[test]
+    fn view_config_rejects_implausible_values() {
+        let good = focus_like_view();
+        assert!(parse_view_config(&encode_view_config(&good)[..35]).is_none(), "short");
+
+        let mut c = good;
+        c.eyes[0].up = f32::NAN;
+        assert!(parse_view_config(&encode_view_config(&c)).is_none(), "NaN");
+
+        let mut c = good;
+        c.eyes[1].right = 1.5; // 86°
+        assert!(parse_view_config(&encode_view_config(&c)).is_none(), "past 85°");
+
+        let mut c = good;
+        std::mem::swap(&mut c.eyes[0].left, &mut c.eyes[0].right);
+        assert!(parse_view_config(&encode_view_config(&c)).is_none(), "left right of right");
+
+        let mut c = good;
+        std::mem::swap(&mut c.eyes[1].up, &mut c.eyes[1].down);
+        assert!(parse_view_config(&encode_view_config(&c)).is_none(), "upside down");
+
+        for ipd in [0.0, 0.03, 0.12, f32::INFINITY] {
+            let mut c = good;
+            c.ipd_m = ipd;
+            assert!(parse_view_config(&encode_view_config(&c)).is_none(), "ipd {ipd}");
+        }
     }
 
     #[test]

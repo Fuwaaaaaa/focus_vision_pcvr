@@ -95,6 +95,8 @@ CServerDriver::Cleanup()
   driver's GPU
 - Provides `GetPose()` that returns the latest tracking data
 - `GetComponent()` returns `CDirectModeComponent` and `CDisplayComponent`
+- `updateViewConfig()` (the engine's VIEW_CONFIG callback) → next `RunFrame`:
+  `SetDisplayProjectionRaw`, `SetDisplayEyeToHead`, `Prop_UserIpdMeters_Float`
 
 ### `CControllerDevice` (controller_device.h)
 - Two instances (left / right) distinguished by `m_isLeft`
@@ -130,7 +132,7 @@ CServerDriver::Cleanup()
 
 ---
 
-## Tests (78 GoogleTest cases)
+## Tests (80 GoogleTest cases)
 
 `driver/tests/test_qp_map.cpp`:
 - `ComputeQpDeltaMap_centerGaze_fovealZero` — gaze at (0,0) produces zero QP offset in fovea
@@ -170,8 +172,8 @@ against `streaming_engine.lib` (cdylib import lib).
 ## Known issues (from audit)
 
 - Nothing of this pipeline has run under SteamVR or on an NVIDIA GPU yet
-- The FOV is a fixed default
-  (`display_geometry.h`) until the headset reports its own
+- SteamVR starts with a fixed default FOV
+  (`display_geometry.h`) until the headset reports its own (VIEW_CONFIG, first connection)
 - Overlay layers (SteamVR dashboard) are not composited
 - NVENC runs only on a driver that supports NVENC API 12.2+ (official header in `third_party/nvenc`)
 

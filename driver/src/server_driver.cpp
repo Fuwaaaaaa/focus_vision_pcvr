@@ -32,6 +32,14 @@ static void onBitrateChange(uint32_t bitrateBps) {
     }
 }
 
+static void onViewConfig(const FvpViewConfig* view) {
+    // Called from the engine's TCP control task when the HMD reports its
+    // fields of view and IPD (VIEW_CONFIG)
+    if (s_instance && view) {
+        s_instance->updateViewConfig(*view);
+    }
+}
+
 vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
 {
     s_pDriverContext = pDriverContext;
@@ -81,6 +89,7 @@ vr::EVRInitError CServerDriver::Init(vr::IVRDriverContext* pDriverContext)
     fvp_set_idr_callback(onIdrRequest);
     fvp_set_gaze_callback(onGazeUpdate);
     fvp_set_bitrate_callback(onBitrateChange);
+    fvp_set_view_config_callback(onViewConfig);
 
     return vr::VRInitError_None;
 }
@@ -130,6 +139,13 @@ void CServerDriver::updateBitrate(uint32_t bitrateBps)
 {
     if (m_hmdDevice) {
         m_hmdDevice->updateBitrate(bitrateBps);
+    }
+}
+
+void CServerDriver::updateViewConfig(const FvpViewConfig& view)
+{
+    if (m_hmdDevice) {
+        m_hmdDevice->updateViewConfig(view);
     }
 }
 

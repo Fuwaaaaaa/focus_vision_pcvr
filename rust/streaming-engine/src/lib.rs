@@ -165,6 +165,27 @@ static INIT: Once = Once::new();
 static ENGINE: RwLock<Option<StreamingEngine>> = RwLock::new(None);
 static CONFIG: RwLock<Option<config::AppConfig>> = RwLock::new(None);
 
+/// The headset's view (VIEW_CONFIG), handed to the C++ driver so SteamVR
+/// renders what the headset displays. Angles in radians from straight
+/// ahead, OpenXR's `XrFovf` convention: `left` and `down` negative.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FvpViewConfig {
+    /// Left eye: angle left, right, up, down.
+    pub left_eye: [f32; 4],
+    /// Right eye: angle left, right, up, down.
+    pub right_eye: [f32; 4],
+    /// Distance between the eyes, in metres.
+    pub ipd_m: f32,
+}
+
+impl From<&fvp_common::protocol::ViewConfig> for FvpViewConfig {
+    fn from(v: &fvp_common::protocol::ViewConfig) -> Self {
+        let eye = |e: &fvp_common::protocol::EyeFov| [e.left, e.right, e.up, e.down];
+        Self { left_eye: eye(&v.eyes[0]), right_eye: eye(&v.eyes[1]), ipd_m: v.ipd_m }
+    }
+}
+
 /// Configuration values exported to C++ driver.
 #[repr(C)]
 pub struct FvpConfig {
@@ -314,6 +335,16 @@ pub extern "C" fn fvp_set_gaze_callback(callback: extern "C" fn(f32, f32, i32)) 
 pub extern "C" fn fvp_set_bitrate_callback(callback: extern "C" fn(u32)) {
     engine::set_bitrate_callback(callback);
     log::info!("Bitrate callback registered");
+}
+
+/// Register a callback for the headset's view (VIEW_CONFIG): each eye's
+/// field of view and the IPD, sent by the headset when a session starts
+/// and whenever they change. Called from C++ on init; the callback runs on
+/// the engine's control task and must only store the values.
+#[no_mangle]
+pub extern "C" fn fvp_set_view_config_callback(callback: extern "C" fn(*const FvpViewConfig)) {
+    engine::set_view_config_callback(callback);
+    log::info!("View config callback registered");
 }
 
 /// Queue a haptic vibration event for delivery to HMD controller.

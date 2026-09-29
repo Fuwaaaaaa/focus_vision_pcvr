@@ -303,6 +303,57 @@ fn spawn_tracking(target: SocketAddr, mode: PoseMode, cancel: CancellationToken)
     })
 }
 
+/// What the driver's view-config callback last received.
+static DRIVER_VIEW: std::sync::Mutex<Option<streaming_engine::FvpViewConfig>> = std::sync::Mutex::new(None);
+
+extern "C" fn record_driver_view(view: *const streaming_engine::FvpViewConfig) {
+    // SAFETY: the engine passes a pointer to a live FvpViewConfig for the
+    // duration of the call.
+    let view = unsafe { *view };
+    *DRIVER_VIEW.lock().unwrap() = Some(view);
+}
+
+/// The headset's field of view and IPD (VIEW_CONFIG) reach the driver, which
+/// sets SteamVR's projection from them. REGRESSION: SteamVR rendered with a
+/// fixed 100° per eye whatever the headset displayed.
+#[test]
+fn headless_e2e_view_config_reaches_the_driver() {
+    use fvp_common::protocol::{EyeFov, ViewConfig};
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .is_test(true).try_init();
+
+    streaming_engine::engine::set_view_config_callback(record_driver_view);
+    *DRIVER_VIEW.lock().unwrap() = None;
+    delete_stale_status();
+    let (tcp_port, udp_port) = pick_free_ports();
+    let mut config = sim_test_config(tcp_port, udp_port);
+    config.video.framerate = 60;
+    let engine = StreamingEngine::new(config).expect("engine new");
+    let pin = wait_for_pin(Duration::from_secs(3)).expect("engine never published a PIN");
+
+    let deg = std::f32::consts::PI / 180.0;
+    let view = ViewConfig {
+        eyes: [
+            EyeFov { left: -52.0 * deg, right: 45.0 * deg, up: 41.0 * deg, down: -49.0 * deg },
+            EyeFov { left: -45.0 * deg, right: 52.0 * deg, up: 41.0 * deg, down: -49.0 * deg },
+        ],
+        ipd_m: 0.0635,
+    };
+    let mut hmd = MockClientConfig::from_ports(IpAddr::V4(Ipv4Addr::LOCALHOST), tcp_port, udp_port, pin);
+    hmd.duration = Some(Duration::from_millis(1500));
+    hmd.view_config = Some(view);
+    let hmd = spawn_mock_client(hmd);
+    let mut stream = SyntheticNalStream::new(VideoCodec::H265, 60);
+    pump_frames(&engine, &mut stream, Duration::from_millis(1700), || {});
+    hmd.join().unwrap().expect("session");
+    engine.shutdown();
+
+    let received = DRIVER_VIEW.lock().unwrap().expect("the driver never got the headset's view");
+    assert_eq!(received, streaming_engine::FvpViewConfig::from(&view));
+    assert_eq!(received.left_eye[0], -52.0 * deg, "left eye, angle left first");
+    assert_eq!(received.right_eye[1], 52.0 * deg);
+}
+
 /// REGRESSION: the engine kept the HMD's last input forever. A controller
 /// that lost tracking, or a session that ended, left its trigger held and
 /// its stick pushed in SteamVR — and the headset's last pose valid.

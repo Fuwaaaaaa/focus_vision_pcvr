@@ -119,6 +119,32 @@ TEST(ClientProtocol, DecoderInitDimsFallsBackToNativeWhenEncodedUnset) {
     EXPECT_EQ(d.height, 1920u);
 }
 
+TEST(ClientProtocol, ViewConfigPayloadMatchesTheEngine) {
+    // Rust encode_view_config / view_config_byte_layout: f32 LE, left eye
+    // (left, right, up, down), right eye, IPD.
+    const EyeFov left{-0.9f, 0.8f, 0.7f, -0.85f};
+    const EyeFov right{-0.8f, 0.9f, 0.7f, -0.85f};
+    const auto p = buildViewConfigPayload(left, right, 0.06354f);
+    ASSERT_EQ(p.size(), 36u);
+    auto f32At = [&](size_t offset) {
+        float v;
+        std::memcpy(&v, p.data() + offset, 4);  // the host tests run little-endian
+        return v;
+    };
+    EXPECT_FLOAT_EQ(f32At(0), -0.9f) << "left eye, angle left first";
+    EXPECT_FLOAT_EQ(f32At(4), 0.8f);
+    EXPECT_FLOAT_EQ(f32At(8), 0.7f) << "up before down";
+    EXPECT_FLOAT_EQ(f32At(12), -0.85f);
+    EXPECT_FLOAT_EQ(f32At(16), -0.8f) << "then the right eye";
+    EXPECT_FLOAT_EQ(f32At(32), 0.0635f) << "IPD, rounded to 0.1 mm";
+}
+
+TEST(ClientProtocol, ViewConfigIgnoresIpdNoiseBelowATenthOfAMillimetre) {
+    const EyeFov eye{-0.9f, 0.9f, 0.8f, -0.8f};
+    EXPECT_EQ(buildViewConfigPayload(eye, eye, 0.063501f), buildViewConfigPayload(eye, eye, 0.063498f));
+    EXPECT_NE(buildViewConfigPayload(eye, eye, 0.0635f), buildViewConfigPayload(eye, eye, 0.0637f));
+}
+
 TEST(ClientProtocol, DecoderInitDimsHoldBothEyesSideBySide) {
     // REGRESSION (mono): the decoder was sized for one eye, and the one
     // image went to both eyes.
