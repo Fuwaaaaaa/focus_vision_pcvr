@@ -351,6 +351,17 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   - Checked with unit tests and the headless E2E (frames at 60/s with the
     setting at 120 read as ~60); the encode time on a real NVENC is not
     yet seen.
+- **Recordings survive a crash and a quick reconnect.**
+  - The WAV's sizes were written only when it closed, so a recording whose
+    vrserver.exe crashed or was killed read as empty. They are now
+    updated every second of audio.
+  - Recording files are named to the second, and `File::create` truncated
+    an existing one: a session reconnecting within the same second (likely
+    in the 5 s hold) wiped the previous session's audio. A taken name now
+    gets `-2`, `-3`…; the retention purge reads those names too.
+  - Past 4 GB (about 6 hours) the WAV's sizes saturated and no longer
+    described the file; the audio recording now stops there, with a log
+    line.
 - **The engine notices a dead link and lets the headset back in** (#18).
   - A control connection silent for 3 s (six missed heartbeats) is dropped.
     A Wi-Fi drop that lost the FIN/RST left the session streaming to nobody

@@ -1,8 +1,10 @@
 //! Audio session recording as 16-bit PCM WAV.
 //!
 //! Writes a minimal RIFF/WAVE header up-front with placeholder sizes, then
-//! appends PCM samples as they arrive. On Drop/close, seeks back and patches
-//! in the final data and RIFF chunk sizes so the file is valid.
+//! appends PCM samples as they arrive. Every second of audio, and on
+//! Drop/close, it seeks back and patches in the data and RIFF chunk sizes,
+//! so the file is valid up to the last second even if the process dies
+//! (vrserver.exe crashing or being killed) before it closes.
 //!
 //! Converts incoming f32 samples to i16 (×32767 saturation) for maximum
 //! compatibility; any ordinary player (VLC, Audacity, Windows Media Player,
@@ -12,6 +14,10 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// The most PCM a WAV can hold: its sizes are u32, and the RIFF size is the
+/// data's plus 36. About 6 hours of 48 kHz stereo.
+const MAX_DATA_BYTES: u32 = u32::MAX - 36;
+
 pub struct AudioRecorder {
     path: PathBuf,
     writer: Option<BufWriter<File>>,
@@ -19,22 +25,21 @@ pub struct AudioRecorder {
     channels: u16,
     /// Count of PCM bytes written (excluding header).
     data_bytes: u32,
+    /// `data_bytes` when the header's sizes were last written.
+    patched_bytes: u32,
+    /// Where the recording stops (`MAX_DATA_BYTES`; lower in tests).
+    max_data_bytes: u32,
     poisoned: bool,
 }
 
 impl AudioRecorder {
-    /// Open a WAV file at `path`. The header is pre-written with placeholder
-    /// sizes; they are patched on close/drop.
+    /// Open a WAV file at `path` (or next to it, with a `-2`… suffix, if that
+    /// file exists: see [`Self::path`]). The header is pre-written with
+    /// placeholder sizes; they are patched every second and on close/drop.
     pub fn open(path: impl Into<PathBuf>, sample_rate: u32, channels: u16) -> Option<Self> {
         let path = path.into();
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                log::warn!("audio recorder: cannot create dir {:?}: {}", parent, e);
-                return None;
-            }
-        }
-        let file = match File::create(&path) {
-            Ok(f) => f,
+        let (file, path) = match super::create_new_file(&path) {
+            Ok(created) => created,
             Err(e) => {
                 log::warn!("audio recorder: cannot open {:?}: {}", path, e);
                 return None;
@@ -46,6 +51,8 @@ impl AudioRecorder {
             sample_rate,
             channels,
             data_bytes: 0,
+            patched_bytes: 0,
+            max_data_bytes: MAX_DATA_BYTES,
             poisoned: false,
         };
         if !rec.write_header() {
@@ -89,13 +96,9 @@ impl AudioRecorder {
 
     /// Append interleaved f32 samples. Values outside [-1.0, 1.0] are clipped.
     pub fn write_pcm_f32(&mut self, samples: &[f32]) {
-        if self.poisoned || samples.is_empty() {
+        if self.poisoned || samples.is_empty() || self.writer.is_none() {
             return;
         }
-        let w = match self.writer.as_mut() {
-            Some(w) => w,
-            None => return,
-        };
         // Convert f32 → i16 with saturation, write little-endian.
         // 4 KB chunk avoids large intermediate allocations.
         const CHUNK: usize = 1024;
@@ -110,44 +113,65 @@ impl AudioRecorder {
                 buf[off + 1] = bytes[1];
                 off += 2;
             }
+            // REGRESSION: past 4 GB the sizes saturated and the header no
+            // longer described the file.
+            if off as u32 > self.max_data_bytes - self.data_bytes {
+                log::warn!("audio recording reached the WAV size limit ({} bytes, about 6 h at 48 kHz stereo); stopped → {:?}",
+                    self.data_bytes, self.path);
+                self.close();
+                return;
+            }
+            let Some(w) = self.writer.as_mut() else { return };
             if let Err(e) = w.write_all(&buf[..off]) {
                 log::warn!("audio recorder: write error: {}", e);
                 self.poisoned = true;
                 return;
             }
-            self.data_bytes = self.data_bytes.saturating_add(off as u32);
+            self.data_bytes += off as u32;
+        }
+        // REGRESSION: the sizes were written only on close, so a recording
+        // whose process died (vrserver.exe crashing or killed) read as empty.
+        let second = self.sample_rate.saturating_mul(u32::from(self.channels)).saturating_mul(2);
+        if self.data_bytes - self.patched_bytes >= second {
+            self.patch_sizes();
+        }
+    }
+
+    /// Write the header's sizes for what has been written so far, leaving
+    /// the file positioned at its end.
+    fn patch_sizes(&mut self) {
+        let Some(w) = self.writer.as_mut() else { return };
+        // RIFF chunk size = total file size - 8 (the "RIFF" + size fields).
+        // Header is 44 bytes, so RIFF size = 44 - 8 + data_bytes = 36 + data_bytes.
+        let riff_size = 36 + self.data_bytes;
+        let result = w.flush().and_then(|()| {
+            let file = w.get_mut();
+            // RIFF size at offset 4
+            file.seek(SeekFrom::Start(4))?;
+            file.write_all(&riff_size.to_le_bytes())?;
+            // data size at offset 40 (8 RIFF + 4 WAVE + 8 fmt hdr + 16 fmt + 4 "data")
+            file.seek(SeekFrom::Start(40))?;
+            file.write_all(&self.data_bytes.to_le_bytes())?;
+            file.seek(SeekFrom::End(0)).map(|_| ())
+        });
+        match result {
+            Ok(()) => self.patched_bytes = self.data_bytes,
+            Err(e) => {
+                log::warn!("audio recorder: header update failed: {}", e);
+                self.poisoned = true;
+            }
         }
     }
 
     /// Patch header sizes and close the file.
     pub fn close(&mut self) {
-        if let Some(mut w) = self.writer.take() {
-            if let Err(e) = w.flush() {
-                log::warn!("audio recorder: flush error: {}", e);
-                return;
-            }
-            // RIFF chunk size = total file size - 8 (the "RIFF" + size fields).
-            // Header is 44 bytes, so RIFF size = 44 - 8 + data_bytes = 36 + data_bytes.
-            let riff_size = 36u32.saturating_add(self.data_bytes);
-            // Recover the underlying file and seek-patch the two size fields.
-            let mut file = match w.into_inner() {
-                Ok(f) => f,
-                Err(e) => {
-                    log::warn!("audio recorder: into_inner failed: {}", e);
-                    return;
-                }
-            };
-            // RIFF size at offset 4
-            if file.seek(SeekFrom::Start(4)).is_ok() {
-                let _ = file.write_all(&riff_size.to_le_bytes());
-            }
-            // data size at offset 40 (8 RIFF + 4 WAVE + 8 fmt hdr + 16 fmt + 4 "data")
-            if file.seek(SeekFrom::Start(40)).is_ok() {
-                let _ = file.write_all(&self.data_bytes.to_le_bytes());
-            }
-            log::info!("audio recording closed → {:?} ({} data bytes)",
-                self.path, self.data_bytes);
+        if self.writer.is_none() {
+            return;
         }
+        self.patch_sizes();
+        self.writer = None;
+        log::info!("audio recording closed → {:?} ({} data bytes)",
+            self.path, self.data_bytes);
     }
 
     pub fn path(&self) -> &Path { &self.path }
@@ -238,6 +262,64 @@ mod tests {
         assert_eq!(&data[46..48], &[0x01, 0x80]);
         assert_eq!(&data[48..50], &[0x00, 0x00]);
         let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_sizes_are_kept_current_for_a_process_that_dies() {
+        // REGRESSION: sizes were written only on close, so vrserver.exe
+        // crashing left a WAV that read as empty.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("crash.wav");
+        let mut rec = AudioRecorder::open(&p, 48000, 2).unwrap();
+        let frame = vec![0.25f32; 960]; // 10 ms of 48 kHz stereo
+        for _ in 0..150 {
+            rec.write_pcm_f32(&frame);
+        }
+        // The process dies: the buffered samples may still reach the file,
+        // the closing header update never happens.
+        drop(rec.writer.take());
+        drop(rec);
+
+        let data = fs::read(&p).unwrap();
+        let one_second = 48000 * 2 * 2;
+        assert_eq!(data.len(), 44 + one_second as usize * 3 / 2);
+        assert_eq!(read_u32_le(&data, 40), one_second, "the header covers each whole second written");
+        assert_eq!(read_u32_le(&data, 4), 36 + one_second);
+    }
+
+    #[test]
+    fn test_recording_stops_at_the_wav_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("full.wav");
+        {
+            let mut rec = AudioRecorder::open(&p, 48000, 1).unwrap();
+            rec.max_data_bytes = 100;
+            rec.write_pcm_f32(&[0.5; 40]); // 80 bytes
+            assert!(rec.is_open());
+            rec.write_pcm_f32(&[0.5; 20]); // 40 more would pass 100
+            assert!(!rec.is_open(), "stopped at the limit");
+            assert_eq!(rec.data_bytes(), 80);
+            rec.write_pcm_f32(&[0.5; 1]);
+            assert_eq!(rec.data_bytes(), 80, "nothing after the stop");
+        }
+        let data = fs::read(&p).unwrap();
+        assert_eq!(data.len(), 44 + 80);
+        assert_eq!(read_u32_le(&data, 40), 80);
+    }
+
+    #[test]
+    fn test_same_second_session_keeps_the_previous_recording() {
+        // REGRESSION: File::create truncated the file a session reconnecting
+        // in the same second had just written.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("recording_2026-04-24T01-59-03.wav");
+        {
+            let mut first = AudioRecorder::open(&p, 48000, 2).unwrap();
+            first.write_pcm_f32(&[0.5; 960]);
+        }
+        let second = AudioRecorder::open(&p, 48000, 2).unwrap();
+        assert_eq!(second.path(), dir.path().join("recording_2026-04-24T01-59-03-2.wav"));
+        assert_eq!(read_u32_le(&fs::read(&p).unwrap(), 40), 1920, "the first recording is intact");
     }
 
     #[test]
