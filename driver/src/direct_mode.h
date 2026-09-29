@@ -3,11 +3,14 @@
 #include <openvr_driver.h>
 #include <d3d11.h>
 #include <wrl/client.h>
+#include <array>
 #include <cstdint>
 #include <mutex>
 #include <vector>
+#include "display_geometry.h"
 #include "eye_blit.h"
 #include "frame_pacer.h"
+#include "layer_compose.h"
 #include "nvenc_encoder.h"
 #include "swap_textures.h"
 #include "sync_texture.h"
@@ -18,15 +21,16 @@
  * Present hands the frame over:
  *
  *   CreateSwapTextureSet -> shareable textures, DXGI shared handles
- *   SubmitLayer          -> remember the frame's first layer (the scene)
+ *   SubmitLayer          -> collect the frame's layers: the scene first,
+ *                           then overlays and the dashboard
  *   Present              -> with the sync texture held: EyeBlit (both
- *                           eyes side by side -> encoder input)
+ *                           eyes side by side, the layers above the scene
+ *                           blended on -> encoder input)
  *                           -> NvencEncoder -> fvp_submit_encoded_nal()
  *   PostPresent          -> wait out the frame's slot (FramePacer)
  *
  * NVENC encoding runs in C++; only NAL byte arrays cross the C ABI into
- * Rust. Not yet: compositing the layers above the scene (overlays, the
- * SteamVR dashboard) — see TODOS.md.
+ * Rust.
  */
 class CDirectModeComponent : public vr::IVRDriverDirectModeComponent
 {
@@ -51,6 +55,13 @@ public:
 
     /// New target bitrate, applied before the next encode. Thread-safe.
     void updateBitrate(uint32_t bitrateBps) { m_encoder.requestBitrate(bitrateBps); }
+
+    /// Each eye's field of view SteamVR renders with (the display
+    /// component's), for turning layers to the scene's pose. Thread-safe.
+    void setFov(const fvp_display::Fov& left, const fvp_display::Fov& right);
+
+    /// Layers kept per frame; more are dropped (and logged).
+    static constexpr size_t kMaxLayers = 16;
 
     // IVRDriverDirectModeComponent
     void CreateSwapTextureSet(
@@ -95,13 +106,18 @@ private:
     FramePacer m_pacer;
     void* m_pacingTimer = nullptr;  // high-resolution waitable timer (HANDLE)
 
-    // The first layer submitted since the last Present: the scene, per eye.
-    bool m_haveLayer = false;
-    vr::SharedTextureHandle_t m_layerTexture[2] = {};
-    vr::VRTextureBounds_t m_layerBounds[2] = {};
+    // The layers submitted since the last Present, the scene first.
+    // SubmitLayer and Present come on the same thread.
+    std::vector<std::array<SubmitLayerPerEye_t, 2>> m_layers;
+
+    std::mutex m_fovMutex;
+    fvp_layers::Tangents m_eyeFov[2] = {fvp_layers::tangents(fvp_display::kDefaultFov),
+                                        fvp_layers::tangents(fvp_display::kDefaultFov)};
 
     uint32_t m_frameIndex = 0;
     std::vector<uint8_t> m_nal;
+    uint32_t m_droppedLayers = 0;
+    uint32_t m_unreadableOverlays = 0;
     uint32_t m_unknownTextures = 0;
     uint32_t m_syncTimeouts = 0;
     uint32_t m_encodeFailures = 0;

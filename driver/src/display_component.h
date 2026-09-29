@@ -31,6 +31,12 @@ public:
         m_fov[1] = right;
     }
 
+    /// Eye `eye`'s field of view (0 = left, 1 = right).
+    fvp_display::Fov fov(int eye) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_fov[eye == 0 ? 0 : 1];
+    }
+
     void GetWindowBounds(int32_t* pnX, int32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight) override {
         *pnX = 0;
         *pnY = 0;

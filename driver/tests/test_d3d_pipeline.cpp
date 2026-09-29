@@ -169,6 +169,41 @@ void expectAll(const std::vector<uint8_t>& bgra, Rgba expected, int tolerance, c
 const Rgba kOrange{200, 100, 50, 255};
 const Rgba kBlue{10, 20, 240, 255};
 
+/// A swap texture of `d` (R8G8B8A8_UNORM) holding `pixels`, as the
+/// compositor would leave a layer. Returns its handle: creating another set
+/// moves the textures `find` points to.
+uint64_t layerTexture(const Device& d, SwapTextureSets& sets, uint32_t pid, uint32_t width, uint32_t height,
+                      const std::vector<Rgba>& pixels) {
+    uint64_t handles[SwapTextureSets::kTexturesPerSet] = {};
+    std::string error;
+    EXPECT_TRUE(sets.create(d.device.Get(), pid, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 1, handles, error))
+        << error;
+    d.context->UpdateSubresource(sets.find(handles[0])->texture.Get(), 0, nullptr, pixels.data(), width * 4, 0);
+    return handles[0];
+}
+
+/// The BGRA bytes of columns [x0, x1) and rows [y0, y1) of an image
+/// `width` pixels wide.
+std::vector<uint8_t> region(const std::vector<uint8_t>& bgra, uint32_t width, uint32_t x0, uint32_t x1, uint32_t y0,
+                            uint32_t y1) {
+    std::vector<uint8_t> out;
+    for (uint32_t y = y0; y < y1; y++)
+        out.insert(out.end(), &bgra[(y * width + x0) * 4], &bgra[(y * width + x1) * 4]);
+    return out;
+}
+
+/// A head pose (HmdMatrix34_t layout) turned left by `yawDeg` (about +Y)
+/// and then tilted up by `pitchDeg` (about +X).
+struct Pose {
+    float m[3][4];
+};
+Pose headPose(float yawDeg, float pitchDeg) {
+    const float y = yawDeg * 3.14159265f / 180.0f, p = pitchDeg * 3.14159265f / 180.0f;
+    const float cy = std::cos(y), sy = std::sin(y), cp = std::cos(p), sp = std::sin(p);
+    // Ry · Rx
+    return {{{cy, sy * sp, sy * cp, 0.0f}, {0.0f, cp, -sp, 0.0f}, {-sy, cy * sp, cy * cp, 0.0f}}};
+}
+
 }  // namespace
 
 TEST(SwapTextureSets, HandlesAreRealSharedHandlesTheCompositorCanOpen) {
@@ -355,6 +390,74 @@ TEST(EyeBlit, PutsBothEyesSideBySide) {
     };
     expectAll(inner(eyeHalf(frame, 40, 30, 0)), kOrange, 1, "left half = left eye");
     expectAll(inner(eyeHalf(frame, 40, 30, 1)), kBlue, 1, "right half = right eye");
+}
+
+TEST(EyeBlit, BlendsALayerAboveTheSceneByItsAlpha) {
+    // REGRESSION: only the first layer (the scene) was drawn, so the
+    // SteamVR dashboard and overlays never reached the headset.
+    Device driver = makeWarpDevice();
+    SwapTextureSets sets;
+    // The scene's alpha is zero, as some apps submit it: still opaque.
+    const Rgba clearOrange{kOrange.r, kOrange.g, kOrange.b, 0};
+    const uint64_t sceneHandle = layerTexture(driver, sets, 1, 32, 16, std::vector<Rgba>(32 * 16, clearOrange));
+    // The overlay: half-transparent blue on the left, transparent on the right.
+    const uint64_t overlayHandle = layerTexture(
+        driver, sets, 2, 32, 16, halves(32, 16, Rgba{kBlue.r, kBlue.g, kBlue.b, 128}, Rgba{kBlue.r, kBlue.g, kBlue.b, 0}));
+    const SwapTextureSets::Texture* scene = sets.find(sceneHandle);
+    const SwapTextureSets::Texture* overlay = sets.find(overlayHandle);
+
+    EyeBlit blit;
+    std::string error;
+    ASSERT_TRUE(blit.init(driver.device.Get(), 32, 16, error)) << error;
+    const fvp_layers::Tangents eye = fvp_layers::tangents(fvp_display::kDefaultFov);
+    ASSERT_TRUE(blit.draw(driver.context.Get(), scene->view.Get(), scene->format, {}, 0));
+    ASSERT_TRUE(blit.drawOver(driver.context.Get(), overlay->view.Get(), overlay->format, {}, 0, {}, eye));
+    const std::vector<uint8_t> left = eyeHalf(readBack(driver, blit.output()), 32, 16, 0);
+
+    const float a = 128.0f / 255.0f;
+    auto mix = [a](uint8_t under, uint8_t over) { return static_cast<uint8_t>(std::lround(under * (1 - a) + over * a)); };
+    expectAll(region(left, 32, 0, 14, 0, 16), Rgba{mix(kOrange.r, kBlue.r), mix(kOrange.g, kBlue.g), mix(kOrange.b, kBlue.b), 255},
+              2, "half-transparent overlay");
+    expectAll(region(left, 32, 18, 32, 0, 16), kOrange, 0, "transparent overlay keeps the scene");
+}
+
+TEST(EyeBlit, TurnsALayerToTheScenesHeadPose) {
+    // The overlay was drawn with the head 30° further left (then, 30°
+    // further up). With ±50° eyes, the scene sees it up to 20° right of
+    // centre (x ≈ 0.65), and nothing of it beyond; the rest is the scene.
+    // Turned, the overlay's top and bottom edges are slanted in the scene's
+    // image and cut its corners, so only the middle rows (columns) are
+    // checked for it.
+    Device driver = makeWarpDevice();
+    SwapTextureSets sets;
+    const uint64_t sceneHandle = layerTexture(driver, sets, 1, 64, 64, std::vector<Rgba>(64 * 64, kOrange));
+    const uint64_t overlayHandle = layerTexture(driver, sets, 2, 64, 64, std::vector<Rgba>(64 * 64, kBlue));
+    const SwapTextureSets::Texture* scene = sets.find(sceneHandle);
+    const SwapTextureSets::Texture* overlay = sets.find(overlayHandle);
+    const fvp_layers::Tangents eye = fvp_layers::tangents(fvp_display::kDefaultFov);
+    std::string error;
+
+    {
+        EyeBlit blit;
+        ASSERT_TRUE(blit.init(driver.device.Get(), 64, 64, error)) << error;
+        const fvp_layers::Placement turned = fvp_layers::place(headPose(0, 0).m, headPose(30, 0).m);
+        ASSERT_TRUE(turned.rotated);
+        ASSERT_TRUE(blit.draw(driver.context.Get(), scene->view.Get(), scene->format, {}, 0));
+        ASSERT_TRUE(blit.drawOver(driver.context.Get(), overlay->view.Get(), overlay->format, {}, 0, turned, eye));
+        const std::vector<uint8_t> left = eyeHalf(readBack(driver, blit.output()), 64, 64, 0);
+        expectAll(region(left, 64, 0, 40, 16, 48), kBlue, 0, "left of 20°: the overlay");
+        expectAll(region(left, 64, 44, 64, 0, 64), kOrange, 0, "right of 20°: the scene");
+    }
+    {
+        EyeBlit blit;
+        ASSERT_TRUE(blit.init(driver.device.Get(), 64, 64, error)) << error;
+        const fvp_layers::Placement tilted = fvp_layers::place(headPose(0, 0).m, headPose(0, 30).m);
+        ASSERT_TRUE(blit.draw(driver.context.Get(), scene->view.Get(), scene->format, {}, 0));
+        ASSERT_TRUE(blit.drawOver(driver.context.Get(), overlay->view.Get(), overlay->format, {}, 0, tilted, eye));
+        const std::vector<uint8_t> left = eyeHalf(readBack(driver, blit.output()), 64, 64, 0);
+        expectAll(region(left, 64, 16, 48, 0, 40), kBlue, 0, "above 20° down: the overlay");
+        expectAll(region(left, 64, 0, 64, 44, 64), kOrange, 0, "below 20° down: the scene");
+    }
 }
 
 TEST(EyeBlit, OutputIsWhatNvencRegisters) {

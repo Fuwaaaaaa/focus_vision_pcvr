@@ -8,27 +8,34 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-// A triangle covering the output; each pixel samples the matching point of
-// the source region. uvRect is (u0, v0, u1, v1).
+// A triangle covering the output. Each pixel is a point of the eye image
+// (t: 0..1, y down) and samples the matching point of the source region
+// (uvRect: u0, v0, u1, v1). A layer above the scene is blended by its alpha
+// and, if it was rendered at another head orientation, turned to the
+// scene's: fvp_layers::layerPoint (layer_compose.h), which the tests check.
 const char kShader[] = R"(
 cbuffer Params : register(b0) {
     float4 uvRect;
     uint encodeSrgb;
-    uint3 padding;
+    uint over;          // a layer above the scene: blended, keeps its alpha
+    uint rotated;
+    uint padding;
+    float4 eyeTangents; // left, right, up, down
+    float4 rotation[3]; // rows (xyz): the scene's head frame -> the layer's
 };
 Texture2D source : register(t0);
 SamplerState linearClamp : register(s0);
 
 struct VsOut {
     float4 pos : SV_Position;
-    float2 uv : TEXCOORD0;
+    float2 t : TEXCOORD0;
 };
 
 VsOut vs_main(uint id : SV_VertexID) {
     float2 t = float2((id << 1) & 2, id & 2);  // (0,0) (2,0) (0,2)
     VsOut o;
     o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
-    o.uv = lerp(uvRect.xy, uvRect.zw, t);
+    o.t = t;
     return o;
 }
 
@@ -38,16 +45,31 @@ float3 linearToSrgb(float3 c) {
 }
 
 float4 ps_main(VsOut i) : SV_Target {
-    float3 c = source.Sample(linearClamp, i.uv).rgb;
-    if (encodeSrgb) c = linearToSrgb(c);
-    return float4(c, 1);
+    float2 p = i.t;
+    if (rotated) {
+        float3 d = float3(lerp(eyeTangents.x, eyeTangents.y, p.x), lerp(eyeTangents.z, eyeTangents.w, p.y), -1);
+        float3 r = float3(dot(rotation[0].xyz, d), dot(rotation[1].xyz, d), dot(rotation[2].xyz, d));
+        if (r.z > -1e-4) discard;
+        float2 q = r.xy / -r.z;
+        p = float2((q.x - eyeTangents.x) / (eyeTangents.y - eyeTangents.x),
+                   (eyeTangents.z - q.y) / (eyeTangents.z - eyeTangents.w));
+        if (any(p < 0) || any(p > 1)) discard;  // outside the layer's image
+    }
+    float4 c = source.Sample(linearClamp, lerp(uvRect.xy, uvRect.zw, p));
+    if (encodeSrgb) c.rgb = linearToSrgb(c.rgb);
+    // The scene is opaque: some apps submit it with zero alpha.
+    return float4(c.rgb, over ? c.a : 1);
 }
 )";
 
 struct Params {
     float uvRect[4];
     uint32_t encodeSrgb;
-    uint32_t padding[3];
+    uint32_t over;
+    uint32_t rotated;
+    uint32_t padding;
+    float eyeTangents[4];
+    float rotation[3][4];
 };
 static_assert(sizeof(Params) % 16 == 0, "constant buffers are 16-byte multiples");
 
@@ -112,6 +134,19 @@ bool EyeBlit::init(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight, 
     sampler.MaxLOD = D3D11_FLOAT32_MAX;
     if (SUCCEEDED(hr)) hr = device->CreateSamplerState(&sampler, &m_sampler);
 
+    // Layers above the scene: source over by alpha (straight, as ALVR).
+    D3D11_BLEND_DESC blend{};
+    D3D11_RENDER_TARGET_BLEND_DESC& target = blend.RenderTarget[0];
+    target.BlendEnable = TRUE;
+    target.SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    target.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    target.BlendOp = D3D11_BLEND_OP_ADD;
+    target.SrcBlendAlpha = D3D11_BLEND_ONE;
+    target.DestBlendAlpha = D3D11_BLEND_ZERO;
+    target.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (SUCCEEDED(hr)) hr = device->CreateBlendState(&blend, &m_blendOver);
+
     if (FAILED(hr)) {
         snprintf(buf, sizeof(buf), "blit pipeline (hr=0x%08lx)", static_cast<unsigned long>(hr));
         error = buf;
@@ -124,6 +159,7 @@ bool EyeBlit::init(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight, 
 }
 
 void EyeBlit::shutdown() {
+    m_blendOver.Reset();
     m_sampler.Reset();
     m_params.Reset();
     m_pixelShader.Reset();
@@ -135,6 +171,18 @@ void EyeBlit::shutdown() {
 
 bool EyeBlit::draw(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source, DXGI_FORMAT format,
                    const fvp_blit::UvRect& uv, int eye) {
+    return drawLayer(context, source, format, uv, eye, false, fvp_layers::Placement{}, fvp_layers::Tangents{});
+}
+
+bool EyeBlit::drawOver(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source, DXGI_FORMAT format,
+                       const fvp_blit::UvRect& uv, int eye, const fvp_layers::Placement& placement,
+                       const fvp_layers::Tangents& eyeFov) {
+    return drawLayer(context, source, format, uv, eye, true, placement, eyeFov);
+}
+
+bool EyeBlit::drawLayer(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source, DXGI_FORMAT format,
+                        const fvp_blit::UvRect& uv, int eye, bool over, const fvp_layers::Placement& placement,
+                        const fvp_layers::Tangents& eyeFov) {
     if (!m_output || !source || eye < 0 || eye > 1) return false;
 
     Params params{};
@@ -143,6 +191,14 @@ bool EyeBlit::draw(ID3D11DeviceContext* context, ID3D11ShaderResourceView* sourc
     params.uvRect[2] = uv.u1;
     params.uvRect[3] = uv.v1;
     params.encodeSrgb = fvp_blit::needsSrgbEncode(format) ? 1u : 0u;
+    params.over = over ? 1u : 0u;
+    params.rotated = over && placement.rotated ? 1u : 0u;
+    params.eyeTangents[0] = eyeFov.left;
+    params.eyeTangents[1] = eyeFov.right;
+    params.eyeTangents[2] = eyeFov.up;
+    params.eyeTangents[3] = eyeFov.down;
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) params.rotation[r][c] = placement.rotation.m[r][c];
     context->UpdateSubresource(m_params.Get(), 0, nullptr, &params, 0, 0);
 
     D3D11_VIEWPORT viewport{};  // this eye's half of the output
@@ -154,7 +210,7 @@ bool EyeBlit::draw(ID3D11DeviceContext* context, ID3D11ShaderResourceView* sourc
     // The device is the driver's own; nothing else sets state on it, so
     // the draw sets what it needs and restores nothing.
     context->OMSetRenderTargets(1, m_outputView.GetAddressOf(), nullptr);
-    context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    context->OMSetBlendState(over ? m_blendOver.Get() : nullptr, nullptr, 0xffffffff);
     context->RSSetState(nullptr);
     context->RSSetViewports(1, &viewport);
     context->IASetInputLayout(nullptr);

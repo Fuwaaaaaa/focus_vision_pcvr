@@ -150,42 +150,59 @@ void CDirectModeComponent::GetNextSwapTextureSetIndex(
     m_swapSets.nextIndices(handles, *pIndices);
 }
 
+void CDirectModeComponent::setFov(const fvp_display::Fov& left, const fvp_display::Fov& right)
+{
+    std::lock_guard<std::mutex> lock(m_fovMutex);
+    m_eyeFov[0] = fvp_layers::tangents(left);
+    m_eyeFov[1] = fvp_layers::tangents(right);
+}
+
 void CDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 {
-    // One call per layer; the first is the scene. Layers above it
-    // (overlays, the dashboard) are not composited yet.
-    if (m_haveLayer)
+    // One call per layer, bottom first: the scene, then overlays and the
+    // dashboard.
+    // REGRESSION: only the first was kept, so the dashboard never showed.
+    if (m_layers.size() >= kMaxLayers) {
+        logSometimes(m_droppedLayers, "More layers than the driver composites; the topmost dropped");
         return;
-    m_haveLayer = true;
-    for (int eye = 0; eye < 2; eye++) {
-        m_layerTexture[eye] = perEye[eye].hTexture;
-        m_layerBounds[eye] = perEye[eye].bounds;
     }
+    m_layers.push_back({perEye[0], perEye[1]});
 }
 
 void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
 {
     m_frameIndex++;
-    const bool haveLayer = m_haveLayer;
-    m_haveLayer = false;
-    if (!m_encoderReady || !haveLayer)
+    std::vector<std::array<SubmitLayerPerEye_t, 2>> layers;
+    layers.swap(m_layers);  // this frame's; the next frame's start empty
+    if (!m_encoderReady || layers.empty())
         return;
 
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> views[2];
-    DXGI_FORMAT formats[2] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+    // Each layer's texture per eye. One that isn't ours, or is
+    // multisampled (no shader view), can't be read.
+    struct Source {
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    };
+    std::vector<std::array<Source, 2>> sources(layers.size());
     {
         std::lock_guard<std::mutex> lock(m_swapMutex);
-        for (int eye = 0; eye < 2; eye++) {
-            if (const SwapTextureSets::Texture* texture = m_swapSets.find(m_layerTexture[eye])) {
-                views[eye] = texture->view;
-                formats[eye] = texture->format;
+        for (size_t i = 0; i < layers.size(); i++) {
+            for (int eye = 0; eye < 2; eye++) {
+                if (const SwapTextureSets::Texture* texture = m_swapSets.find(layers[i][eye].hTexture)) {
+                    sources[i][eye] = {texture->view, texture->format};
+                }
             }
         }
     }
-    if (!views[0] || !views[1]) {
-        // Not one of ours, or multisampled (no shader view).
-        logSometimes(m_unknownTextures, "Submitted layer texture can't be read; frame skipped");
+    if (!sources[0][0].view || !sources[0][1].view) {
+        logSometimes(m_unknownTextures, "Submitted scene texture can't be read; frame skipped");
         return;
+    }
+    fvp_layers::Tangents eyeFov[2];
+    {
+        std::lock_guard<std::mutex> lock(m_fovMutex);
+        eyeFov[0] = m_eyeFov[0];
+        eyeFov[1] = m_eyeFov[1];
     }
 
     // Read the frame only once the compositor has finished drawing it.
@@ -194,10 +211,22 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
         return;
     }
     // Both eyes side by side; often one double-wide texture, each eye's
-    // half named by its bounds.
+    // half named by its bounds. The scene, then each layer above it turned
+    // to the scene's head pose and blended on.
+    auto uv = [](const vr::VRTextureBounds_t& b) { return fvp_blit::UvRect{b.uMin, b.vMin, b.uMax, b.vMax}; };
     for (int eye = 0; eye < 2; eye++) {
-        const vr::VRTextureBounds_t& b = m_layerBounds[eye];
-        m_eyeBlit.draw(m_context.Get(), views[eye].Get(), formats[eye], {b.uMin, b.vMin, b.uMax, b.vMax}, eye);
+        const SubmitLayerPerEye_t& scene = layers[0][eye];
+        m_eyeBlit.draw(m_context.Get(), sources[0][eye].view.Get(), sources[0][eye].format, uv(scene.bounds), eye);
+        for (size_t i = 1; i < layers.size(); i++) {
+            const Source& source = sources[i][eye];
+            if (!source.view) {
+                logSometimes(m_unreadableOverlays, "Submitted overlay texture can't be read; overlay skipped");
+                continue;
+            }
+            const SubmitLayerPerEye_t& layer = layers[i][eye];
+            m_eyeBlit.drawOver(m_context.Get(), source.view.Get(), source.format, uv(layer.bounds), eye,
+                               fvp_layers::place(scene.mHmdPose.m, layer.mHmdPose.m), eyeFov[eye]);
+        }
     }
     m_sync.release();
 

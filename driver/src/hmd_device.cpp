@@ -79,6 +79,7 @@ void CHmdDevice::applyViewConfig(const FvpViewConfig& view)
     const fvp_display::Fov right = fvp_display::fovFromRadians(
         view.right_eye[0], view.right_eye[1], view.right_eye[2], view.right_eye[3]);
     m_display.setFov(left, right);
+    m_directMode.setFov(left, right);
 
     auto rect = [](const fvp_display::Fov& fov) {
         const fvp_display::ProjectionRaw p = fvp_display::projectionRaw(fov);
@@ -185,6 +186,7 @@ void CHmdDevice::SetupProperties()
         driverLog("Using default display config");
     }
     m_display.configure(eyeWidth, eyeHeight, fvp_display::kDefaultFov);
+    m_directMode.setFov(m_display.fov(0), m_display.fov(1));
 
     // Device identification
     props->SetStringProperty(m_propertyContainer,
