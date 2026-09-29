@@ -10,7 +10,7 @@ Focus Vision PCVR communicates over Wi-Fi between a Windows PC and an Android HM
 |--------|-----------|
 | PIN brute-force | 6-digit PIN (1M combinations), 5 attempts then 300s lockout, cryptographic RNG. A PIN also expires 300 s after it is issued (`PIN_LIFETIME_SECONDS`) and is replaced, so a leaked PIN does not stay valid while the engine waits. Every connection must present the PIN: a client that passed the PIN step but did not finish the handshake leaves nothing behind for the next one |
 | Man-in-the-middle | TLS 1.3 on TCP control channel (rustls server, MbedTLS client) + TOFU pinning (below) |
-| PIN eavesdropping | PIN sent only over TLS-encrypted channel; client refuses any plaintext fallback |
+| PIN eavesdropping | PIN sent only over TLS-encrypted channel; client refuses any plaintext fallback, and the server refuses to pair without TLS (a failed TLS setup is retried with the accept loop's backoff, never bypassed) |
 | Server impersonation | TOFU certificate pinning: client computes SHA-256 of the server's leaf cert after the TLS handshake and persists it to `<app internal storage>/server_fingerprint.hex`. Subsequent connections refuse any cert that does not match the pinned hash. To re-pair with a different server, delete the file. The server's certificate + key are persisted to `%APPDATA%/FocusVisionPCVR/tls_identity.bin` and reused across reconnects and engine restarts, so the pinned fingerprint stays valid. |
 | PIN prediction | `rand::random()` (cryptographic CSPRNG) replaces `subsec_nanos()` |
 | CONFIG_UPDATE injection | TLS authentication required + input validation (range checks on bitrate 10-200, codec enum) |

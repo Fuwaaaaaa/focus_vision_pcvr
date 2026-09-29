@@ -57,6 +57,8 @@ pub struct TcpControlServer {
     pairing: Arc<Mutex<PairingState>>,
     connected: Arc<Mutex<bool>>,
     tls_acceptor: Option<TlsAcceptor>,
+    /// Pair without TLS when there is no acceptor: tests only.
+    allow_plaintext: bool,
     cert_fingerprint: String,
     timeouts: HandshakeTimeouts,
 }
@@ -72,7 +74,9 @@ impl TcpControlServer {
                 (Some(acceptor), fp)
             }
             Err(e) => {
-                log::error!("TLS init failed: {}. Running without TLS!", e);
+                // listen_and_accept refuses to run without it, and the
+                // engine's retries build a new server, trying again.
+                log::error!("TLS init failed: {}. Not accepting the headset until it works", e);
                 (None, String::new())
             }
         };
@@ -82,6 +86,7 @@ impl TcpControlServer {
             pairing: Arc::new(Mutex::new(PairingState::new())),
             connected: Arc::new(Mutex::new(false)),
             tls_acceptor,
+            allow_plaintext: false,
             cert_fingerprint,
             timeouts: HandshakeTimeouts::default(),
         }
@@ -95,6 +100,7 @@ impl TcpControlServer {
             pairing: Arc::new(Mutex::new(PairingState::new())),
             connected: Arc::new(Mutex::new(false)),
             tls_acceptor: None,
+            allow_plaintext: true,
             cert_fingerprint: String::new(),
             timeouts: HandshakeTimeouts::default(),
         }
@@ -146,6 +152,14 @@ impl TcpControlServer {
     /// connection, and checked again as each connection comes in; a
     /// handshake in progress keeps the PIN it started with.
     pub async fn listen_and_accept(&self) -> std::io::Result<(Box<dyn AsyncStream>, SocketAddr)> {
+        // REGRESSION: without TLS the server paired in plaintext, so the PIN
+        // and everything after it crossed the network in the clear. The
+        // headset only speaks TLS, so plaintext served no real client.
+        if self.tls_acceptor.is_none() && !self.allow_plaintext {
+            return Err(std::io::Error::other(
+                "TLS is unavailable: refusing plaintext control connections",
+            ));
+        }
         let addr: SocketAddr = format!("0.0.0.0:{}", self.config.network.tcp_port)
             .parse()
             .unwrap();
@@ -216,7 +230,7 @@ impl TcpControlServer {
                     }
                 }
             } else {
-                // Plaintext fallback (dev/test mode)
+                // Plaintext: tests only (`allow_plaintext`)
                 match self.handle_handshake_generic(tcp_stream).await {
                     Ok(stream) => {
                         *self.connected.lock().await = true;
@@ -1212,6 +1226,21 @@ mod tests {
             .expect("accept loop must return")
             .unwrap()
             .expect("accept must succeed");
+    }
+
+    #[tokio::test]
+    async fn without_tls_the_server_refuses_to_pair() {
+        // REGRESSION: when TLS failed to initialise, the server paired in
+        // plaintext — the PIN crossed the network in the clear.
+        let mut config = crate::config::AppConfig::default();
+        config.network.tcp_port = 0;
+        let mut server = TcpControlServer::new_without_tls(config);
+        server.allow_plaintext = false; // what `new` does when TLS fails
+        let result = tokio::time::timeout(Duration::from_secs(2), server.listen_and_accept())
+            .await
+            .expect("refuses at once, without listening");
+        let err = result.err().expect("no connection without TLS");
+        assert!(err.to_string().contains("TLS"), "{err}");
     }
 
     #[tokio::test]
