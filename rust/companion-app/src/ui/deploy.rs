@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::{adb, headset_link, rfd_pick_file, CompanionApp};
+use crate::{adb, file_dialog, headset_link, CompanionApp};
 
 impl CompanionApp {
     pub(crate) fn render_deploy(&mut self, ui: &mut egui::Ui, accent: egui::Color32, text_muted: egui::Color32) {
@@ -70,12 +70,18 @@ impl CompanionApp {
             let prev_apk = self.apk_path.clone();
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut self.apk_path);
-                if ui.button("Browse...").clicked() {
-                    if let Some(path) = rfd_pick_file() {
-                        self.apk_path = path;
-                    }
+                let choosing = self.apk_dialog.is_some();
+                let label = if choosing { "Choosing..." } else { "Browse..." };
+                if ui.add_enabled(!choosing, egui::Button::new(label)).clicked() {
+                    self.apk_dialog = Some(file_dialog::DialogTask::spawn(ui.ctx(), file_dialog::pick_apk));
                 }
             });
+            if let Some(answer) = self.apk_dialog.as_ref().and_then(|d| d.poll()) {
+                self.apk_dialog = None;
+                if let Some(path) = answer {
+                    self.apk_path = path;
+                }
+            }
 
             // Debounced: typing a path saves once the input settles, not on
             // every keystroke.

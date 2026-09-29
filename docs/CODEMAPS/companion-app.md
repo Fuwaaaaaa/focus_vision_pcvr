@@ -14,7 +14,8 @@ engine reads it as its top config layer). Does not link against
 
 | Path | Purpose | LoC |
 |---|---|---|
-| `src/main.rs` | `CompanionApp` struct, `eframe::App` impl, 3-tab UI (Home / Deploy / Settings) | 921 |
+| `src/main.rs` | `CompanionApp` struct, `eframe::App` impl, 3-tab UI (Home / Deploy / Settings) | ~1150 |
+| `src/file_dialog.rs` | Open / save dialogs through PowerShell's Windows Forms, each on its own thread (`DialogTask`); the path comes back as hex of its UTF-8 bytes, since PowerShell 5.1's stdout is in the OEM code page | ~190 |
 | `src/config.rs` | `LocalConfig` (video / sleep_mode / face_tracking / recording overrides). Persists to `%APPDATA%/FocusVisionPCVR/config/local.toml` | 194 |
 | `src/driver.rs` | SteamVR driver install / uninstall. Detects SteamVR via registry lookup | 115 |
 | `src/adb.rs` | `AdbDevice`, `list_devices` / `install_apk` / `dump_logcat` / `launch_app` (blocking `Command::new("adb")`) | 209 |
@@ -81,6 +82,7 @@ up changes on the next SteamVR start (no hot-reload currently).
 | `adb.rs` | 6 | device list parsing, timeout handling |
 | `driver.rs` | ~3 | SteamVR dir detection |
 | `stats_history.rs` | ~3 | ring buffer eviction |
+| `file_dialog.rs` | 5 | Japanese paths through real PowerShell, hex decoding, dialog thread answer |
 | `export.rs` | 0 | **no tests yet** — next PR candidate |
 
 ---

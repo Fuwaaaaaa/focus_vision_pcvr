@@ -8,6 +8,7 @@ mod config;
 mod demo;
 mod driver;
 mod export;
+mod file_dialog;
 mod headset_link;
 mod process;
 #[cfg(feature = "simulator")]
@@ -136,6 +137,11 @@ pub(crate) struct CompanionApp {
     // v1.1: Log export
     pub(crate) export_in_progress: bool,
     pub(crate) export_result: Arc<Mutex<Option<String>>>,
+
+    // Open file dialogs (each on its own thread): Deploy's APK picker, and
+    // the stats SVG's save dialog with the SVG to write.
+    pub(crate) apk_dialog: Option<file_dialog::DialogTask<String>>,
+    pub(crate) svg_dialog: Option<(file_dialog::DialogTask<PathBuf>, String)>,
 
     // v1.2: Subsystem status (read from status.json)
     pub(crate) sub_ft_active: bool,
@@ -282,6 +288,8 @@ impl CompanionApp {
             stats_history: stats_history::StatsHistory::new(),
             export_in_progress: false,
             export_result: Arc::new(Mutex::new(None)),
+            apk_dialog: None,
+            svg_dialog: None,
             sub_ft_active: false,
             sub_sleep_active: false,
             sub_audio_enabled: true,
@@ -916,81 +924,6 @@ impl eframe::App for CompanionApp {
     /// saves it.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_config();
-    }
-}
-
-/// Simple file picker fallback (no rfd crate — uses Windows common dialog via command).
-/// `pub(crate)` so the Deploy tab can invoke it from `ui::deploy`.
-pub(crate) fn rfd_pick_file() -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        let output = process::command("powershell")
-            .args(["-Command", r#"
-                Add-Type -AssemblyName System.Windows.Forms
-                $dialog = New-Object System.Windows.Forms.OpenFileDialog
-                $dialog.Filter = 'APK files (*.apk)|*.apk|All files (*.*)|*.*'
-                $dialog.Title = 'Select APK to install'
-                if ($dialog.ShowDialog() -eq 'OK') { $dialog.FileName }
-            "#])
-            .output()
-            .ok()?;
-
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if path.is_empty() { None } else { Some(path) }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        None
-    }
-}
-
-/// File-save dialog companion to `rfd_pick_file()`. Returns `None` if the
-/// user cancelled, no dialog backend is available, or the call failed.
-/// `default_stem` becomes the suggested filename (no extension); `ext`
-/// is the file extension without a dot. Used by the SVG export button
-/// in the Settings tab.
-pub(crate) fn pick_save_path(default_stem: &str, ext: &str) -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        // Inject the values via env vars rather than concatenating into the
-        // script body — that way a user-supplied stem with quotes or
-        // backticks can't break the PowerShell quoting.
-        let output = process::command("powershell")
-            .env("FVP_SAVE_STEM", default_stem)
-            .env("FVP_SAVE_EXT", ext)
-            .args([
-                "-Command",
-                r#"
-                Add-Type -AssemblyName System.Windows.Forms
-                $stem = $env:FVP_SAVE_STEM
-                $ext = $env:FVP_SAVE_EXT
-                $dialog = New-Object System.Windows.Forms.SaveFileDialog
-                $dialog.Filter = "$ext files (*.$ext)|*.$ext|All files (*.*)|*.*"
-                $dialog.Title = 'Save'
-                $dialog.FileName = "$stem.$ext"
-                $dialog.DefaultExt = $ext
-                $dialog.AddExtension = $true
-                if ($dialog.ShowDialog() -eq 'OK') { $dialog.FileName }
-                "#,
-            ])
-            .output()
-            .ok()?;
-
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if path.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(path))
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        // No native dialog on non-Windows targets — drop the SVG next to
-        // the user's data dir so they can still find it from a script.
-        let _ = (default_stem, ext);
-        None
     }
 }
 
