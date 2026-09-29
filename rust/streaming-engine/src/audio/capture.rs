@@ -1,3 +1,7 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use tokio::sync::mpsc;
@@ -8,8 +12,43 @@ use super::convert::{ToOpusFormat, OUTPUT_RATE};
 /// delivered as f32, interleaved stereo, 48kHz (`convert`).
 pub struct AudioCapture {
     stream: Option<Stream>,
+    device_name: String,
+    /// Set by the stream's error callback (the device went away, say).
+    failed: Arc<AtomicBool>,
     sample_rate: u32,
     channels: u16,
+}
+
+/// The default output device's name now, if there is one.
+pub fn default_output_name() -> Option<String> {
+    cpal::default_host().default_output_device().and_then(|d| d.name().ok())
+}
+
+/// How long to wait before trying a device that failed to open again.
+pub const REOPEN_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether to (re)open the loopback capture, given what is captured now
+/// (`current`: the device and whether its stream reported an error), the
+/// default output device now, and the last attempt that failed.
+///
+/// Windows moves the sound to a new default output (headphones plugged in,
+/// the user picking another device); the loopback of the old one then
+/// hears nothing. REGRESSION: the capture stayed on the device it opened
+/// first, for the whole session, and a session that started with no
+/// output device never got audio.
+pub fn should_reopen(
+    current: Option<(&str, bool)>,
+    default_now: Option<&str>,
+    failed_attempt: Option<(&str, Instant)>,
+    now: Instant,
+) -> bool {
+    let Some(wanted) = default_now else { return false };
+    match current {
+        Some((device, failed)) => failed || device != wanted,
+        None => !failed_attempt.is_some_and(|(device, at)| {
+            device == wanted && now.saturating_duration_since(at) < REOPEN_RETRY
+        }),
+    }
 }
 
 /// Raw audio chunk: variable-length f32 samples from a single callback invocation.
@@ -64,8 +103,14 @@ impl AudioCapture {
             if sample_rate != OUTPUT_RATE || channels != 2 { " (converted to 48000Hz stereo)" } else { "" }
         );
 
-        let err_fn = |err: cpal::StreamError| {
-            log::error!("Audio capture stream error: {}", err);
+        // The capture thread reopens a failed stream (see `should_reopen`);
+        // log only the first error, as cpal may keep reporting.
+        let failed = Arc::new(AtomicBool::new(false));
+        let failed_flag = failed.clone();
+        let err_fn = move |err: cpal::StreamError| {
+            if !failed_flag.swap(true, Ordering::Relaxed) {
+                log::error!("Audio capture stream error: {}", err);
+            }
         };
 
         // Lock-free: callback sends converted chunks directly via try_send
@@ -112,9 +157,16 @@ impl AudioCapture {
 
         Some(Self {
             stream: Some(stream),
+            device_name,
+            failed,
             sample_rate,
             channels,
         })
+    }
+
+    /// The device captured, and whether its stream has reported an error.
+    pub fn state(&self) -> (&str, bool) {
+        (&self.device_name, self.failed.load(Ordering::Relaxed))
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -132,5 +184,43 @@ impl Drop for AudioCapture {
             drop(stream);
             log::info!("Audio capture stopped");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_follows_the_default_output_device() {
+        let now = Instant::now();
+        assert!(!should_reopen(Some(("Speakers", false)), Some("Speakers"), None, now));
+        assert!(should_reopen(Some(("Speakers", false)), Some("Headphones"), None, now),
+            "the default moved to another device");
+        assert!(should_reopen(Some(("Speakers", true)), Some("Speakers"), None, now),
+            "the stream reported an error");
+    }
+
+    #[test]
+    fn test_no_device_now_keeps_what_there_is() {
+        let now = Instant::now();
+        assert!(!should_reopen(Some(("Speakers", false)), None, None, now));
+        assert!(!should_reopen(None, None, None, now));
+    }
+
+    #[test]
+    fn test_a_device_appearing_is_opened() {
+        // A session that started with no output device.
+        assert!(should_reopen(None, Some("Headphones"), None, Instant::now()));
+    }
+
+    #[test]
+    fn test_a_device_that_failed_to_open_is_retried_later() {
+        let t0 = Instant::now();
+        let failed = Some(("Headphones", t0));
+        assert!(!should_reopen(None, Some("Headphones"), failed, t0 + Duration::from_secs(2)));
+        assert!(should_reopen(None, Some("Headphones"), failed, t0 + REOPEN_RETRY));
+        assert!(should_reopen(None, Some("Speakers"), failed, t0 + Duration::from_secs(2)),
+            "another device is tried at once");
     }
 }
