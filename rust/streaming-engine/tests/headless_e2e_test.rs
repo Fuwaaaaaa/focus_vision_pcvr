@@ -354,6 +354,60 @@ fn headless_e2e_view_config_reaches_the_driver() {
     assert_eq!(received.right_eye[1], 52.0 * deg);
 }
 
+static IDR_REQUESTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static DRIVER_BITRATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn record_idr_request() {
+    IDR_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+extern "C" fn record_bitrate(bps: u32) {
+    DRIVER_BITRATE.store(bps, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A session starts clean. REGRESSION: the frames queued while no one was
+/// connected went out first (stale, not a keyframe), the encoder kept the
+/// previous session's bitrate (sleep's, after a nap), and no keyframe was
+/// asked for.
+#[test]
+fn headless_e2e_session_starts_clean() {
+    use std::sync::atomic::Ordering;
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .is_test(true).try_init();
+
+    streaming_engine::engine::set_idr_callback(record_idr_request);
+    streaming_engine::engine::set_bitrate_callback(record_bitrate);
+    delete_stale_status();
+    let (tcp_port, udp_port) = pick_free_ports();
+    let mut config = sim_test_config(tcp_port, udp_port);
+    config.video.bitrate_mbps = 37;
+    let engine = StreamingEngine::new(config).expect("engine new");
+    let pin = wait_for_pin(Duration::from_secs(3)).expect("engine never published a PIN");
+
+    // Frames the driver submitted before the headset connected.
+    let mut stream = SyntheticNalStream::new(VideoCodec::H265, 60);
+    for _ in 0..4 {
+        let synth = stream.next_frame();
+        let _ = engine.submit_frame(EncodedFrame {
+            frame_index: synth.frame_index,
+            nal_data: synth.bytes,
+            is_idr: false,
+            timestamps: FrameTimestamps::new(synth.frame_index),
+        });
+    }
+    IDR_REQUESTS.store(0, Ordering::SeqCst);
+    DRIVER_BITRATE.store(8_000_000, Ordering::SeqCst); // as a nap left it
+
+    let mut hmd = MockClientConfig::from_ports(IpAddr::V4(Ipv4Addr::LOCALHOST), tcp_port, udp_port, pin);
+    hmd.duration = Some(Duration::from_millis(800));
+    let stats = spawn_mock_client(hmd).join().unwrap().expect("session");
+    engine.shutdown();
+
+    assert_eq!(stats.video_packets_received, 0, "the queued frames were stale and are dropped");
+    assert_eq!(DRIVER_BITRATE.load(Ordering::SeqCst), 37_000_000, "the encoder is set to the bitrate setting");
+    assert!(IDR_REQUESTS.load(Ordering::SeqCst) >= 1, "a keyframe is asked for");
+}
+
 /// REGRESSION: the engine kept the HMD's last input forever. A controller
 /// that lost tracking, or a session that ended, left its trigger held and
 /// its stick pushed in SteamVR — and the headset's last pose valid.

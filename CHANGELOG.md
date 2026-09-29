@@ -291,6 +291,12 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     send, and go out as one TLS record each, with `TCP_NODELAY`.
   - The mock client sends real HEARTBEATs (loss, received count, fps), so
     the E2E tests cover the adaptive path and the engine's ACKs.
+- **A session starts clean.** The frames the driver submitted while no one
+  was connected (up to four, stale and not keyframes) went out first; the
+  encoder kept the previous session's bitrate (sleep's 8 Mbps after a nap)
+  until the controller's first change; and nothing asked for a keyframe.
+  At session start the engine now drops the queue, sets the encoder to the
+  bitrate setting and requests an IDR (`headless_e2e_session_starts_clean`).
 - **PC audio from any output device.** Capture asked WASAPI for 48 kHz,
   which its shared mode refuses unless it is the device's own rate (cpal
   asks for no conversion), so a 44.1 or 96 kHz device gave no audio at

@@ -1853,6 +1853,15 @@ impl StreamingLoop {
         let mut adaptive = AdaptiveState::new(config);
         let framerate = config.video.framerate as u64;
 
+        // The session starts clean. REGRESSION: the frames queued while no
+        // one was connected (up to 4, from before the session and not a
+        // keyframe) went out first; the encoder kept the previous session's
+        // bitrate (sleep's 8 Mbps after a nap) until the controller's first
+        // change; and nothing asked for a keyframe.
+        while self.frame_rx.try_recv().is_ok() {}
+        notify_bitrate_change(adaptive.bitrate_ctrl.current_bitrate_bps() as u32);
+        notify_idr_request();
+
         // Flip status.json to "streaming" the moment the session is up so the
         // companion shows Connected immediately; refreshed ~1×/sec below.
         publish_streaming_status(
