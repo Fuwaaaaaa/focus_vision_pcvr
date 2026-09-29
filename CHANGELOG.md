@@ -329,6 +329,13 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     send, and go out as one TLS record each, with `TCP_NODELAY`.
   - The mock client sends real HEARTBEATs (loss, received count, fps), so
     the E2E tests cover the adaptive path and the engine's ACKs.
+- **The tracking receiver survives a busy port and junk datagrams.** If its
+  port couldn't be bound at startup, the headset stayed untracked until
+  SteamVR restarted; the engine now retries, 1 s apart doubling to 16 s.
+  Its 256-byte buffer made Windows fail every larger datagram, and each
+  failure was logged — anyone on the LAN could fill the engine log. The
+  buffer takes 2 KB, and receive errors are logged on the 1st, 2nd, 4th,
+  8th… occurrence.
 - **A session starts clean.** The frames the driver submitted while no one
   was connected (up to four, stale and not keyframes) went out first; the
   encoder kept the previous session's bitrate (sleep's 8 Mbps after a nap)

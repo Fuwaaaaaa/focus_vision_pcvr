@@ -339,15 +339,28 @@ impl StreamingEngine {
                     return;
                 }
             };
-            tokio::select! {
-                result = receiver.run(addr) => {
-                    if let Err(e) = result {
-                        log::error!("Tracking receiver error: {}", e);
+            // `run` returns only if it can't bind (the port in use, say):
+            // try again, 1 s apart doubling to 16 s.
+            // REGRESSION: one failed bind left the headset untracked until
+            // SteamVR restarted.
+            let mut delay = std::time::Duration::from_secs(1);
+            loop {
+                tokio::select! {
+                    result = receiver.run(addr) => {
+                        if let Err(e) = result {
+                            log::error!("Tracking receiver can't listen on {}: {} — retrying in {:?}", addr, e, delay);
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        log::info!("Tracking receiver cancelled");
+                        return;
                     }
                 }
-                _ = cancel.cancelled() => {
-                    log::info!("Tracking receiver cancelled");
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => return,
                 }
+                delay = (delay * 2).min(std::time::Duration::from_secs(16));
             }
         });
 
