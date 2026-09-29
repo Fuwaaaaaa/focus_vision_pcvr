@@ -1414,9 +1414,6 @@ impl VideoSender {
         framerate: u64,
         latency_tracker: &Arc<StdMutex<LatencyTracker>>,
     ) {
-        frame.timestamps.mark_encode_start();
-        frame.timestamps.mark_encode_end();
-
         // Multiply first to avoid integer division truncation drift (e.g. 90000/96=937.5)
         let timestamp_90khz = (self.frame_count * fvp_common::RTP_CLOCK_RATE as u64 / framerate) as u32;
 
@@ -1480,6 +1477,7 @@ fn log_periodic_stats(frame_count: u64, framerate: u64) {
 /// stay on "WaitingForPin" for the entire session, even with real hardware.
 fn publish_streaming_status(
     config: &AppConfig,
+    fps: u16,
     bitrate_mbps: u32,
     sleeping: bool,
     hmd_stats: Option<&HmdStats>,
@@ -1495,7 +1493,7 @@ fn publish_streaming_status(
         "streaming",
         None,
         Some(latency_us),
-        Some(config.video.framerate as u16),
+        Some(fps),
         Some(bitrate_mbps),
         Some(&subsystems),
         None,
@@ -1516,16 +1514,45 @@ fn packet_loss_pct(hmd_stats: Option<&HmdStats>) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// Frames a session sent per second, measured between two calls.
+/// REGRESSION: status.json's fps was `video.framerate`, the setting, so
+/// the companion showed 90 fps with SteamVR paused or the encoder failing.
+struct FpsMeter {
+    frames: u64,
+    at: std::time::Instant,
+}
+
+impl FpsMeter {
+    fn new(frames: u64, now: std::time::Instant) -> Self {
+        Self { frames, at: now }
+    }
+
+    /// The rate since the last call (or `new`), given the session's frame
+    /// count now.
+    fn sample(&mut self, frames: u64, now: std::time::Instant) -> u16 {
+        let secs = now.saturating_duration_since(self.at).as_secs_f64();
+        let sent = frames.saturating_sub(self.frames);
+        self.frames = frames;
+        self.at = now;
+        if secs <= 0.0 {
+            return 0;
+        }
+        (sent as f64 / secs).round().min(f64::from(u16::MAX)) as u16
+    }
+}
+
 /// One line of the session log from the session's current state.
 fn session_record(
     adaptive: &AdaptiveState,
     fec_redundancy: f32,
+    pc_fps: u16,
 ) -> crate::metrics::session_log::SessionRecord {
     let stats = adaptive.last_stats.as_ref();
     let hundredths = |pct: f32| (pct * 100.0).round() / 100.0; // 5.000001 → 5
     crate::metrics::session_log::SessionRecord {
         ts: crate::metrics::session_log::SessionRecord::now_ts(),
         pc_latency_us: PC_TOTAL_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed),
+        pc_fps,
         bitrate_mbps: adaptive.bitrate_ctrl.current_bitrate_mbps(),
         loss_pct: hundredths(packet_loss_pct(stats)),
         fec_pct: hundredths(fec_redundancy * 100.0),
@@ -1971,9 +1998,13 @@ impl StreamingLoop {
         notify_idr_request();
 
         // Flip status.json to "streaming" the moment the session is up so the
-        // companion shows Connected immediately; refreshed ~1×/sec below.
+        // companion shows Connected immediately; refreshed ~1×/sec below,
+        // each time with the frames sent since the last.
+        let mut fps_meter = FpsMeter::new(video.frame_count, std::time::Instant::now());
+        let mut fps: u16 = 0;
         publish_streaming_status(
             config,
+            fps,
             adaptive.bitrate_ctrl.current_bitrate_mbps(),
             adaptive.sleep_detector.is_sleeping(),
             adaptive.last_stats.as_ref(),
@@ -2007,14 +2038,16 @@ impl StreamingLoop {
             tokio::select! {
                 _ = session_log_tick.tick(), if session_log.is_some() => {
                     if let Some(logger) = session_log.as_mut() {
-                        logger.record(session_record(&adaptive, video.fec_encoder.redundancy()));
+                        logger.record(session_record(&adaptive, video.fec_encoder.redundancy(), fps));
                     }
                 }
                 _ = status_tick.tick() => {
                     // `update_latency_atomics` (frame branch) keeps
                     // PC_TOTAL_LATENCY_US current; this reads it.
+                    fps = fps_meter.sample(video.frame_count, std::time::Instant::now());
                     publish_streaming_status(
                         config,
+                        fps,
                         adaptive.bitrate_ctrl.current_bitrate_mbps(),
                         adaptive.sleep_detector.is_sleeping(),
                         adaptive.last_stats.as_ref(),
@@ -2124,6 +2157,18 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
     use crate::metrics::latency::FrameTimestamps;
+
+    #[test]
+    fn test_fps_meter_counts_the_frames_sent() {
+        let t0 = std::time::Instant::now();
+        let second = std::time::Duration::from_secs(1);
+        let mut meter = FpsMeter::new(1000, t0);
+        assert_eq!(meter.sample(1090, t0 + second), 90);
+        assert_eq!(meter.sample(1135, t0 + second * 3 / 2), 90, "45 frames in half a second");
+        // SteamVR paused: the session is up, nothing is sent.
+        assert_eq!(meter.sample(1135, t0 + second * 5 / 2), 0);
+        assert_eq!(meter.sample(1135, t0 + second * 5 / 2), 0, "no time passed");
+    }
 
     #[cfg(feature = "simulator")]
     #[test]

@@ -389,13 +389,16 @@ pub unsafe extern "C" fn fvp_submit_encoded_nal(
     is_idr: i32,
 ) -> i32 {
     // SAFETY: forwarded as the caller guarantees it; no orientation.
-    unsafe { fvp_submit_encoded_frame(nal_data_ptr, nal_data_len, frame_index, is_idr, std::ptr::null()) }
+    unsafe { fvp_submit_encoded_frame(nal_data_ptr, nal_data_len, frame_index, is_idr, std::ptr::null(), 0) }
 }
 
 /// [`fvp_submit_encoded_nal`] with the head orientation the frame was
-/// rendered at (`render_orientation`: x, y, z, w, or null if unknown). A
-/// headset that reads it turns the image from there to where its head is
-/// when it shows the frame (protocol v6).
+/// rendered at (`render_orientation`: x, y, z, w, or null if unknown) and
+/// how long the driver took to compose and encode it (`encode_us`: from
+/// the compositor's frame being ready to NVENC's output, 0 if unknown). A
+/// headset that reads the orientation turns the image from there to where
+/// its head is when it shows the frame (protocol v6); the encode time is
+/// the "encode" of the latency the engine reports.
 ///
 /// # Safety
 /// As [`fvp_submit_encoded_nal`]; `render_orientation`, if not null, must
@@ -407,6 +410,7 @@ pub unsafe extern "C" fn fvp_submit_encoded_frame(
     frame_index: u32,
     is_idr: i32,
     render_orientation: *const f32,
+    encode_us: u32,
 ) -> i32 {
     /// Upper bound on a single encoded frame. A 4K120 I-frame at extreme
     /// quality rarely exceeds ~8 MB; 32 MB is a generous cap that still
@@ -460,7 +464,13 @@ pub unsafe extern "C" fn fvp_submit_encoded_frame(
         std::mem::take(&mut *b)
     });
 
-    let timestamps = FrameTimestamps::new(frame_index);
+    // REGRESSION: the engine timed an empty span as the encode (~0 µs) and
+    // left NVENC's time out of the PC latency.
+    let timestamps = if encode_us > 0 {
+        FrameTimestamps::encoded(frame_index, std::time::Duration::from_micros(encode_us.into()))
+    } else {
+        FrameTimestamps::new(frame_index)
+    };
     // SAFETY: the caller guarantees 4 floats behind a non-null pointer.
     let render_orientation = (!render_orientation.is_null())
         .then(|| unsafe { [*render_orientation, *render_orientation.add(1), *render_orientation.add(2), *render_orientation.add(3)] })

@@ -9,8 +9,10 @@ use std::time::{Duration, Instant, SystemTime};
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionRecord {
     pub ts: String,
-    /// The PC side's average latency (frame submitted → sent).
+    /// The PC side's average latency (frame ready → encoded → sent).
     pub pc_latency_us: u32,
+    /// Frames the engine sent in the last second.
+    pub pc_fps: u16,
     pub bitrate_mbps: u32,
     /// From the newest HEARTBEAT; the HMD's figures are 0 until one arrives.
     pub loss_pct: f32,
@@ -156,6 +158,7 @@ mod tests {
         SessionRecord {
             ts: "2026-04-09T12:00:00Z".into(),
             pc_latency_us: 3500,
+            pc_fps: 90,
             bitrate_mbps: 80,
             loss_pct: 0.5,
             fec_pct: 15.0,

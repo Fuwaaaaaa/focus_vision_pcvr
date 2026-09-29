@@ -1,10 +1,12 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 
 /// Per-frame timestamps for latency profiling.
 #[derive(Debug, Clone)]
 pub struct FrameTimestamps {
     pub frame_index: u32,
+    /// When the frame was ready to encode (or, when the encode time is
+    /// unknown, when it reached the engine).
     pub t_present: Instant,
     pub t_encode_start: Option<Instant>,
     pub t_encode_end: Option<Instant>,
@@ -12,12 +14,28 @@ pub struct FrameTimestamps {
 }
 
 impl FrameTimestamps {
+    /// A frame reaching the engine now, its encode time unknown (the
+    /// simulator's synthetic frames).
     pub fn new(frame_index: u32) -> Self {
         Self {
             frame_index,
             t_present: Instant::now(),
             t_encode_start: None,
             t_encode_end: None,
+            t_send: None,
+        }
+    }
+
+    /// A frame reaching the engine now that the driver took `encode` to
+    /// compose and encode: it was ready that long ago.
+    pub fn encoded(frame_index: u32, encode: Duration) -> Self {
+        let now = Instant::now();
+        let start = now.checked_sub(encode).unwrap_or(now);
+        Self {
+            frame_index,
+            t_present: start,
+            t_encode_start: Some(start),
+            t_encode_end: Some(now),
             t_send: None,
         }
     }
@@ -154,6 +172,23 @@ mod tests {
         ts.mark_send();
         assert!(ts.encode_latency_us().is_none());
         assert!(ts.pc_latency_us().is_some()); // present→send still works
+    }
+
+    #[test]
+    fn test_encoded_frame_counts_the_driver_encode() {
+        let mut ts = FrameTimestamps::encoded(7, Duration::from_millis(6));
+        ts.mark_send();
+        let enc = ts.encode_latency_us().unwrap();
+        assert!((5_900..=6_100).contains(&enc), "encode {enc} µs");
+        assert!(ts.pc_latency_us().unwrap() >= enc, "the PC latency includes the encode");
+
+        let mut tracker = LatencyTracker::new(10);
+        tracker.record(ts);
+        let mut synthetic = FrameTimestamps::new(8);
+        synthetic.mark_send();
+        tracker.record(synthetic);
+        let avg = tracker.avg_encode_latency_us().unwrap();
+        assert!((5_900..=6_100).contains(&avg), "a frame without an encode time doesn't count as 0: {avg}");
     }
 
     #[test]

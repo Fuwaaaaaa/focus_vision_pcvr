@@ -26,7 +26,9 @@
  *   Present              -> with the sync texture held: EyeBlit (both
  *                           eyes side by side, the layers above the scene
  *                           blended on -> encoder input)
- *                           -> NvencEncoder -> fvp_submit_encoded_nal()
+ *                           -> NvencEncoder -> fvp_submit_encoded_frame()
+ *                           (with the scene's head orientation and the
+ *                           time from the frame being ready to here)
  *   PostPresent          -> wait out the frame's slot (FramePacer)
  *
  * NVENC encoding runs in C++; only NAL byte arrays cross the C ABI into
