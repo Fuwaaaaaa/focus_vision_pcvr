@@ -41,9 +41,10 @@ void OpenXRApp::initialize(android_app* app) {
     createSession();
     createReferenceSpace();
     createSwapchains();
+    initInput();
     m_renderer.init();
     m_overlay.init();
-    m_facialTracker.init(m_instance, m_session);
+    if (m_extensions.facialTracking) m_facialTracker.init(m_instance, m_session);
 
     // App-private storage (uninstalling or clearing the app's data removes
     // it): the TOFU pin of the paired PC, and the launch request with the
@@ -199,8 +200,7 @@ void OpenXRApp::handleStreamEvents() {
             LOGE("%s", m_pairingMessage.c_str());
             break;
         case ServerEvent::Type::Haptic:
-            // Needs the controller action set (ControllerPoller::init);
-            // until then applyHaptic does nothing.
+            // Does nothing if the controller actions failed (initInput).
             m_controllerPoller.applyHaptic(m_session, e.haptic.controllerId,
                                            e.haptic.durationMs / 1000.0f,
                                            e.haptic.frequency, e.haptic.amplitude);
@@ -234,11 +234,22 @@ void OpenXRApp::createInstance(android_app* app) {
         initLoader((XrLoaderInitInfoBaseHeaderKHR*)&loaderInit);
     }
 
-    // Required extensions
-    const char* extensions[] = {
-        XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
-        XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
-    };
+    // The two required extensions, and each optional one the runtime offers
+    // (Focus 3 controller profile, eye gaze, facial tracking): their
+    // profiles and functions exist only if enabled here.
+    uint32_t extCount = 0;
+    xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
+    std::vector<XrExtensionProperties> props(extCount, {XR_TYPE_EXTENSION_PROPERTIES});
+    xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, props.data());
+    std::vector<std::string> available;
+    for (const auto& p : props) available.emplace_back(p.extensionName);
+    m_extensions = fvp_xr::chooseExtensions(available);
+    if (m_extensions.missingRequired) {
+        LOGE("OpenXR runtime lacks a required extension (OpenGL ES / Android instance)");
+    }
+    LOGI("OpenXR extensions: Focus 3 controller %s, eye gaze %s, facial tracking %s",
+        m_extensions.focus3Controller ? "yes" : "no", m_extensions.eyeGaze ? "yes" : "no",
+        m_extensions.facialTracking ? "yes" : "no");
 
     XrInstanceCreateInfoAndroidKHR androidInfo = {XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
     androidInfo.applicationVM = app->activity->vm;
@@ -246,8 +257,8 @@ void OpenXRApp::createInstance(android_app* app) {
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     createInfo.next = &androidInfo;
-    createInfo.enabledExtensionCount = 2;
-    createInfo.enabledExtensionNames = extensions;
+    createInfo.enabledExtensionCount = static_cast<uint32_t>(m_extensions.names.size());
+    createInfo.enabledExtensionNames = m_extensions.names.data();
     strncpy(createInfo.applicationInfo.applicationName, "FocusVisionPCVR",
         XR_MAX_APPLICATION_NAME_SIZE);
     createInfo.applicationInfo.applicationVersion = 1;
@@ -377,6 +388,49 @@ void OpenXRApp::createReferenceSpace() {
     XR_CHECK(xrCreateReferenceSpace(m_session, &spaceInfo, &m_stageSpace),
         "xrCreateReferenceSpace");
     LOGI("Stage reference space created");
+
+    // The head, where the eye gaze is located.
+    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    XR_CHECK(xrCreateReferenceSpace(m_session, &spaceInfo, &m_viewSpace),
+        "xrCreateReferenceSpace (view)");
+}
+
+void OpenXRApp::initInput() {
+    // REGRESSION: neither the controllers nor the eye tracker were ever
+    // initialized, and each attached its own action set — a session allows
+    // one xrAttachSessionActionSets, so the second always failed.
+    m_actionSets.clear();
+    if (XrActionSet set = m_controllerPoller.createActions(m_instance, m_extensions.focus3Controller)) {
+        m_actionSets.push_back(set);
+    }
+    if (XrActionSet set = m_eyeTracker.createActions(m_instance, m_systemId, m_extensions.eyeGaze)) {
+        m_actionSets.push_back(set);
+    }
+    if (m_actionSets.empty()) {
+        LOGE("No input action sets: controllers are not tracked");
+        return;
+    }
+
+    XrSessionActionSetsAttachInfo attachInfo = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+    attachInfo.actionSets = m_actionSets.data();
+    attachInfo.countActionSets = static_cast<uint32_t>(m_actionSets.size());
+    if (XR_FAILED(xrAttachSessionActionSets(m_session, &attachInfo))) {
+        LOGE("xrAttachSessionActionSets failed: controllers and eye gaze are unavailable");
+        m_actionSets.clear();
+        return;
+    }
+    m_controllerPoller.createSpaces(m_session);
+    m_eyeTracker.createSpace(m_session, m_viewSpace);
+}
+
+void OpenXRApp::syncActions() {
+    if (m_actionSets.empty()) return;
+    std::vector<XrActiveActionSet> active;
+    for (XrActionSet set : m_actionSets) active.push_back({set, XR_NULL_PATH});
+    XrActionsSyncInfo syncInfo = {XR_TYPE_ACTIONS_SYNC_INFO};
+    syncInfo.activeActionSets = active.data();
+    syncInfo.countActiveActionSets = static_cast<uint32_t>(active.size());
+    xrSyncActions(m_session, &syncInfo);
 }
 
 void OpenXRApp::createSwapchains() {
@@ -583,8 +637,15 @@ void OpenXRApp::renderFrame() {
                 eyeFov(views[0].fov), eyeFov(views[1].fov), ipd));
         }
 
-        // Poll eye gaze and send head tracking + gaze data to PC
-        auto gaze = m_eyeTracker.poll(frameState.predictedDisplayTime);
+        // One sync for every action set, then read them.
+        syncActions();
+
+        // Poll eye gaze and send head tracking + gaze data to PC. The gaze
+        // is placed in the left eye's image (the foveated QP map puts it in
+        // the same place in both eyes).
+        const XrFovf& gazeFov = views[0].fov;
+        auto gaze = m_eyeTracker.poll(frameState.predictedDisplayTime,
+            fvp_video::tangents(gazeFov.angleLeft, gazeFov.angleRight, gazeFov.angleDown, gazeFov.angleUp));
         m_trackingSender.sendHeadPose(views[0].pose, frameState.predictedDisplayTime,
                                        gaze.x, gaze.y, gaze.valid);
 
@@ -758,9 +819,17 @@ void OpenXRApp::shutdown() {
     if (m_audioPlayer.isInitialized()) m_audioPlayer.shutdown();
     // Before EGL goes away: the decoder owns a GL texture.
     if (m_eglDisplay != EGL_NO_DISPLAY) m_videoDecoder.shutdown();
+    // Their spaces and action sets belong to the session and instance.
+    m_controllerPoller.shutdown();
+    m_eyeTracker.shutdown();
+    m_actionSets.clear();
     if (m_stageSpace != XR_NULL_HANDLE) {
         xrDestroySpace(m_stageSpace);
         m_stageSpace = XR_NULL_HANDLE;
+    }
+    if (m_viewSpace != XR_NULL_HANDLE) {
+        xrDestroySpace(m_viewSpace);
+        m_viewSpace = XR_NULL_HANDLE;
     }
     for (auto& sc : m_swapchains) sc.destroy();
     if (m_session != XR_NULL_HANDLE) {

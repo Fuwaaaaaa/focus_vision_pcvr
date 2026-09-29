@@ -18,6 +18,7 @@
 #include "eye_tracker.h"
 #include "hmd_profile.h"
 #include "launch_request.h"
+#include "openxr_extensions.h"
 #include "stream_session.h"
 #include "video_receiver.h"
 
@@ -60,6 +61,12 @@ private:
     void createSession();
     void createReferenceSpace();
     void createSwapchains();
+    /// Controllers and eye gaze: create their actions, attach every action
+    /// set in the one xrAttachSessionActionSets a session allows, then
+    /// their spaces.
+    void initInput();
+    /// Sync all action sets, once per frame, before reading any action.
+    void syncActions();
     void pollEvents();
     void pollAndroidEvents(android_app* app);
     void renderFrame();
@@ -88,6 +95,9 @@ private:
     XrSystemId m_systemId = XR_NULL_SYSTEM_ID;
     XrSession m_session = XR_NULL_HANDLE;
     XrSpace m_stageSpace = XR_NULL_HANDLE;
+    XrSpace m_viewSpace = XR_NULL_HANDLE;  // the head, for eye gaze
+    fvp_xr::Extensions m_extensions;        // what the instance enabled
+    std::vector<XrActionSet> m_actionSets;  // attached, synced every frame
 
     // Session state
     XrSessionState m_sessionState = XR_SESSION_STATE_UNKNOWN;

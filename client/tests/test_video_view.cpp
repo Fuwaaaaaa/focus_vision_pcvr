@@ -100,6 +100,37 @@ TEST(VideoView, OnlyTheChangeSinceTheFrameCounts) {
     for (int i = 0; i < 9; i++) EXPECT_NEAR(fromTurned[i], fromLevel[i], 1e-5f) << i;
 }
 
+TEST(VideoView, GazeStraightAheadIsTheCentreOfASymmetricEye) {
+    float x = 0, y = 0;
+    gazeInImage(kLevel, kSymmetric, x, y);
+    EXPECT_NEAR(x, 0.5f, 1e-5f);
+    EXPECT_NEAR(y, 0.5f, 1e-5f);
+}
+
+TEST(VideoView, GazeFollowsTheRealFieldOfView) {
+    // REGRESSION: the gaze was mapped with a fixed tan(50°) and a sign
+    // convention of its own; now the eye's actual tangents, image y down.
+    const Tangents t = tangents(-55 * kDeg, 45 * kDeg, -50 * kDeg, 40 * kDeg);
+    float x = 0, y = 0;
+    gazeInImage(kLevel, t, x, y);
+    EXPECT_NEAR(x, (0.0f - t.left) / (t.right - t.left), 1e-5f) << "straight ahead is off-centre";
+    EXPECT_NEAR(y, (t.up - 0.0f) / (t.up - t.down), 1e-5f);
+
+    gazeInImage(yaw(-10), kSymmetric, x, y);  // looking 10° right
+    EXPECT_NEAR(x, (std::tan(10 * kDeg) - kSymmetric.left) / (kSymmetric.right - kSymmetric.left), 1e-4f);
+    EXPECT_GT(x, 0.5f);
+    gazeInImage(pitch(8), kSymmetric, x, y);  // looking up
+    EXPECT_LT(y, 0.5f) << "up = towards the image's top";
+}
+
+TEST(VideoView, GazeOutsideTheImageStaysOnItsEdge) {
+    float x = 0, y = 0;
+    gazeInImage(yaw(-80), kSymmetric, x, y);
+    EXPECT_FLOAT_EQ(x, 1.0f);
+    gazeInImage(yaw(170), kSymmetric, x, y);  // behind, turned left
+    EXPECT_FLOAT_EQ(x, 0.0f);
+}
+
 TEST(VideoView, DirectionsOutsideTheFrameAreBlack) {
     float rot[9];
     reprojectionRotation(kLevel, yaw(-45), rot);  // 45° right: the right edge is past the frame

@@ -72,7 +72,7 @@ tracker, pairing state, dashboard state.
 | `fec_decoder.h/.cpp` | `FecFrameDecoder` / `SlicedFecFrameDecoder` | Reed-Solomon recovery. Sliced version has 4 independent RS contexts, u32 length prefix, 100 ms timeout. `beginFrame` rejects `dataShards` 0 / > total; each frame is returned by `tryDecode` at most once |
 | `nal_validator.h/.cpp` | `NalValidator` | Sanity-check NAL unit header before feeding MediaCodec |
 | `video_decoder.h/.cpp` | `VideoDecoder` | MediaCodec via JNI + SurfaceTexture zero-copy path |
-| `video_view.h` | `fvp_video::` | Which half of the side-by-side frame each eye shows, and the per-pixel rotational reprojection (pure, host-tested) |
+| `video_view.h` | `fvp_video::` | Which half of the side-by-side frame each eye shows, the per-pixel rotational reprojection, and where a gaze direction falls in an eye image (`gazeInImage`) (pure, host-tested) |
 | `renderer.h/.cpp` | `Renderer` | Draws one eye of the decoded frame (GL_TEXTURE_EXTERNAL_OES) into its swapchain image, reprojecting in the fragment shader (the math in `video_view.h`) |
 
 ### Audio
@@ -83,8 +83,9 @@ tracker, pairing state, dashboard state.
 ### HMD I/O
 | File | Class | Role |
 |---|---|---|
-| `controller_poller.h/.cpp` | `ControllerPoller` | OpenXR action set poll for trigger / grip / thumbstick / touch / battery |
-| `eye_tracker.h/.cpp` | `EyeTracker` | `XR_EXT_eye_gaze_interaction` gaze pose |
+| `openxr_extensions.h` | `fvp_xr::chooseExtensions` | Which instance extensions to enable: the two required ones plus each optional one the runtime offers (Focus 3 controller, eye gaze, facial tracking) (pure, host-tested) |
+| `controller_poller.h/.cpp` | `ControllerPoller` | Controller actions (trigger / grip / thumbstick / touch / battery), bindings for the Focus 3 profile when enabled and the simple controller; the app attaches and syncs its action set (`OpenXRApp::initInput` / `syncActions`) |
+| `eye_tracker.h/.cpp` | `EyeTracker` | `XR_EXT_eye_gaze_interaction` gaze pose located in VIEW space, placed in the left eye image by its field of view (only when the system reports eye gaze support) |
 | `facial_tracker.h/.cpp` | `FacialTracker` | HTC OpenXR facial tracking extension (lip + eye blendshapes → 51 floats) |
 | `hmd_profile.h/.cpp` | `HmdProfile` / `DisplayProfile` / `CodecProfile` | Per-HMD static data (IPD, refresh, supported codecs) |
 

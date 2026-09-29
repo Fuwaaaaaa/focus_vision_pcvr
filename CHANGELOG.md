@@ -160,8 +160,7 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     and Opus audio is received on base+3 (RTP header stripped) and played
     through `AudioPlayer`.
   - **Server messages.** SLEEP_ENTER / EXIT dim the view. HAPTIC_EVENT
-    goes to `ControllerPoller::applyHaptic`, which does nothing until
-    controller input is initialised (not yet). FACE_DATA is queued on the
+    goes to `ControllerPoller::applyHaptic`. FACE_DATA is queued on the
     session.
   - **On exit** the app sends DISCONNECT, so the engine ends the session
     instead of holding it.
@@ -195,6 +194,26 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     matrix untransposed, assumed +Z forward (OpenXR looks down -Z), and
     divided per vertex, which bends straight lines. Reprojection is now
     per pixel; its math (`video_view.h`) is host-tested.
+- **Controllers and eye gaze are switched on.** Found by reading the code;
+  the APK builds, not yet run on the headset.
+  - Neither `ControllerPoller` nor `EyeTracker` was ever initialised, so no
+    controller input or gaze reached the PC. Each would also have attached
+    its own action set, and a session allows one
+    `xrAttachSessionActionSets`.
+  - The instance enabled only the two required extensions. It now also
+    enables each of `XR_HTC_vive_focus3_controller_interaction`,
+    `XR_EXT_eye_gaze_interaction` and `XR_HTC_facial_tracking` the runtime
+    offers (`openxr_extensions.h`, host-tested). Without the Focus 3
+    profile the simple controller binding is still suggested.
+  - `initInput` creates both action sets, attaches them together, and
+    `xrSyncActions` runs once per frame before any action is read.
+  - The gaze is located in the head's VIEW space (which the app never
+    created) and placed in the eye image by that eye's field of view
+    (`gazeInImage`, host-tested). The old math took the rotated +Z as
+    forward, which mirrors the point through the image centre, and assumed
+    a symmetric 100° field of view.
+  - Eye gaze is used only when the system reports eye gaze support, and
+    facial tracking only when its extension is enabled.
 
 ### SteamVR driver
 - **The video path is wired.** Before, nothing called the encoder's init, the
