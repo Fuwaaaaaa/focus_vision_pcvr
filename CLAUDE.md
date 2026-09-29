@@ -28,6 +28,7 @@ Key modules in streaming-engine:
 - `control/reconnect.rs` — Accept-failure / reconnect-attempt counters + exponential backoff
 - `metrics/session_log.rs` — JSONL session logging with rotation
 - `metrics/memory.rs` — Process RSS monitoring (GetProcessMemoryInfo / /proc/self/status)
+- `audio/convert.rs` — loopback audio in the device's own format → 48 kHz stereo for Opus (quad / 5.1 / 7.1 downmix, windowed-sinc resampler)
 - `logging.rs` — engine log file `%APPDATA%/FocusVisionPCVR/engine.log` (+ `engine.prev.log`); vrserver.exe's stderr is kept nowhere
 - `recording/` — Video Annex-B + audio WAV recorders, runtime toggles via CONFIG_UPDATE
 - `simulator.rs` + `bin/headless.rs` + `bin/mock_client.rs` — In-process E2E harness (`--features simulator`)
@@ -46,7 +47,7 @@ cargo test --workspace                              # 500+ Rust tests
 ## Testing
 ```bash
 cargo test --workspace                              # All Rust tests (500+ unit + integration)
-cargo test -p streaming-engine                      # Engine: 380+ tests + integration
+cargo test -p streaming-engine                      # Engine: 450+ tests + integration
 cargo test -p focus-vision-companion --bins         # Companion: 126 tests (config, ADB, export/PII mask + collected logs, status_parser, status state machine, demo, svg_export, ui/settings validator, driver detection (any Steam library) + installer CLI, font check, Japanese font fallback + baseline, headset_link, hidden child process, file dialog paths)
 cargo test -p fvp-common                            # Common: protocol structs / flags / versioning
 cargo bench -p streaming-engine                     # Criterion benchmarks
@@ -72,6 +73,7 @@ FVP_HEADLESS_BIN=target/release/focus-vision-headless.exe ctest --test-dir clien
 cargo run -p focus-vision-companion          # Run the PC companion app
 cargo run -p focus-vision-companion -- --demo  # Demo mode — synthesizes status without engine
 cargo run -p focus-vision-companion --features simulator -- --simulate  # In-process simulation — real engine + mock HMD, no hardware
+focus-vision.exe --register-driver <dir>     # What the installer runs: vrpathreg adddriver on the SteamVR found in any Steam library (exit 0 / 2 no SteamVR / 3 failed); --unregister-driver on uninstall
 ```
 
 `--demo` runs a 60 s scripted cycle (Disconnected → WaitingForPin
