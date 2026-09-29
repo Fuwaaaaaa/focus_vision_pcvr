@@ -19,9 +19,15 @@ loads on boot. The driver opens the Rust streaming engine, registers HMD
 | `src/server_driver.cpp` / `.h` | `CServerDriver` (`IServerTrackedDeviceProvider`) — Init/Cleanup lifecycle + SteamVR interface glue | 240 + 33 |
 | `src/hmd_device.cpp` / `.h` | `CHmdDevice` (`ITrackedDeviceServerDriver`) — pose, IPD, refresh rate, component activation | 180 |
 | `src/controller_device.cpp` / `.h` | `CControllerDevice` (`ITrackedDeviceServerDriver`) — input component, haptic via `fvp_haptic_event` | 180 |
-| `src/direct_mode.cpp` / `.h` | `CDirectModeComponent` (`IVRDriverDirectModeComponent`) — CreateSwapTextureSet, Present, frame lifecycle | 150 + 40 |
-| `src/frame_copy.cpp` / `.h` | D3D11 texture → pinned CPU buffer / CUDA buffer for NVENC input | 130 + 35 |
-| `src/nvenc_encoder.cpp` / `.h` | NVENC session, QP delta map, `EncodeFrame()` → `fvp_submit_encoded_nal` | 470 + 320 |
+| `src/direct_mode.cpp` / `.h` | `CDirectModeComponent` (`IVRDriverDirectModeComponent`) — D3D11 device, swap sets, SubmitLayer / Present → blit → encode | 240 + 100 |
+| `src/display_component.h` | `CDisplayComponent` (`IVRDisplayComponent`) — render size, projection, eye viewports, no distortion | 80 |
+| `src/display_geometry.h` | FOV → raw projection, eye viewports — pure, tested | 60 |
+| `src/gpu_adapter.cpp` / `.h` | Pick the GPU (NVIDIA first), create the D3D11 device, LUID for SteamVR | 70 + 70 |
+| `src/swap_textures.cpp` / `.h` | `SwapTextureSets` — shareable textures + DXGI shared handles for the compositor | 80 + 55 |
+| `src/eye_blit.cpp` / `.h` | `EyeBlit` — draws an eye's region of a layer into NVENC's B8G8R8A8 input (scale, flip, sRGB) | 170 + 80 |
+| `src/sync_texture.cpp` / `.h` | `SyncTexture` — the compositor's keyed mutex, held while Present reads the frame | 30 + 30 |
+| `src/nvenc_encoder.cpp` / `.h` | NVENC session on EyeBlit's output, QP delta map, `encode()` | 330 + 110 |
+| `src/driver_log.h` | `driverLog()` → SteamVR's vrserver.txt | 25 |
 | `src/qp_map.h` | `computeQpDeltaMap()` (foveated QP offsets) — testable pure function | ~110 |
 
 Note: NVENC types come from the official `nvEncodeAPI.h` in
@@ -45,21 +51,28 @@ CServerDriver::Init()
     (fvp_set_bitrate_callback is not registered yet — see TODOS P0 "NVENC")
   → create CHmdDevice + 2x CControllerDevice
   → TrackedDeviceAdded() for each
-  → spawn pose polling thread
+
+CHmdDevice::Activate()
+  → CDirectModeComponent::init(): D3D11 device on the chosen GPU,
+    EyeBlit output (encoded size), NvencEncoder on it (failure logged:
+    SteamVR runs, nothing streams)
+  → properties: display, Prop_GraphicsAdapterLuid_Uint64,
+    Prop_DriverDirectModeSendsVsyncEvents_Bool
+  → vsync thread: VsyncEvent() every refresh interval
 
 per-frame (driven by SteamVR compositor):
-  → CHmdDevice::PoseUpdated via pose thread pulling fvp_get_tracking_data()
-  → CControllerDevice::InputUpdated via pose thread pulling fvp_get_controller_state()
-  → CDirectModeComponent::Present()
-    → FrameCopy::copy(texture)
+  → CServerDriver::RunFrame → CHmdDevice / CControllerDevice pull
+    fvp_get_tracking_data() / fvp_get_controller_state()
+  → CDirectModeComponent::SubmitLayer() per layer (the first, the scene, is kept)
+  → CDirectModeComponent::Present(syncTexture)
+    → SyncTexture::acquire (the compositor's keyed mutex)
+    → EyeBlit::draw(left eye of the layer) → release
     → NvencEncoder::encode() → fvp_submit_encoded_nal()
-    (today Present() returns early: nothing calls initEncoder, so
-     m_encoderReady stays false — see TODOS P0 "NVENC")
 
 CServerDriver::Cleanup()
-  → fvp_shutdown()
-  → stop pose thread
+  → fvp_shutdown()          (no more IDR / gaze callbacks)
   → s_instance = nullptr
+  → destroy devices
 ```
 
 ---
@@ -69,14 +82,16 @@ CServerDriver::Cleanup()
 ### `CServerDriver` (server_driver.h)
 - `vr::IServerTrackedDeviceProvider` implementation
 - Owns: `m_hmd`, `m_leftController`, `m_rightController`, pose thread
-- Static `s_instance` for IDR / gaze callbacks from Rust
-- Known race: callback can fire during `Cleanup()` while `s_instance` goes null — audit flagged
+- Static `s_instance` for IDR / gaze callbacks from Rust; `Cleanup()` stops
+  the engine before clearing it and destroying the devices
 
 ### `CHmdDevice` (hmd_device.h)
 - Sets `Prop_DisplayFrequency_Float` from `FvpConfig::refresh_rate`
 - Sets `Prop_UserIpdMeters_Float` from `FvpConfig::ipd`
+- Sets `Prop_GraphicsAdapterLuid_Uint64` so the compositor renders on the
+  driver's GPU, and sends vsync events itself
 - Provides `GetPose()` that returns the latest tracking data
-- Activates `CDirectModeComponent` via `GetComponent()`
+- `GetComponent()` returns `CDirectModeComponent` and `CDisplayComponent`
 
 ### `CControllerDevice` (controller_device.h)
 - Two instances (left / right) distinguished by `m_role`
@@ -85,27 +100,32 @@ CServerDriver::Cleanup()
 - `TriggerHapticPulse()` → `fvp_haptic_event(role, 10ms, 200Hz, 1.0)` (amplitude hardcoded for now)
 
 ### `CDirectModeComponent` (direct_mode.h)
-- `CreateSwapTextureSet()` allocates D3D11 textures
-- `Present(PresentInfo*)` is the main per-frame hook
-- Calls `FrameCopy` → `NvencEncoder::encode()`
-- Returns present timing info to SteamVR
+- `init()`: D3D11 device (`fvp_gpu::createDevice`), `EyeBlit`, `NvencEncoder`
+- `CreateSwapTextureSet()` → `SwapTextureSets` (real DXGI shared handles)
+- `SubmitLayer()` keeps the frame's first layer; `Present(syncTexture)`
+  blits its left eye under the sync texture's mutex, encodes, submits
+- Not yet: the right eye, compositing overlay layers (TODOS)
 
-### `FrameCopy` (frame_copy.h)
-- Takes D3D11 texture from `m_pendingTexture`
-- Copies to staging buffer (pinned for NVENC) via `ID3D11DeviceContext::CopyResource`
-- Thread safety: `ComPtr` based, no raw pointer escape
+### `SwapTextureSets` / `EyeBlit` / `SyncTexture`
+- D3D11 only, no OpenVR calls — tested on WARP (`tests/test_d3d_pipeline.cpp`)
+  with a second device playing the compositor
+- `EyeBlit` draws rather than copies: `CopyResource` is skipped between
+  format groups (R8G8B8A8 → B8G8R8A8), can't scale (SteamVR supersampling)
+  or pick one eye; sRGB / float sources are encoded to sRGB in the shader
 
 ### `NvencEncoder` (nvenc_encoder.h)
 - Loads `nvEncodeAPI64.dll` + function pointer table
 - Configures preset (low-latency HQ) + RC mode (CBR)
-- Supports H.264 and H.265 (selected via `FvpConfig::codec`)
+- Registers `EyeBlit`'s output as its input (`NV_ENC_BUFFER_FORMAT_ARGB`)
+- `init()` returns false when NVENC is unavailable (logged to vrserver.txt);
+  there is no fake test-pattern stream
 - `setGaze(x, y, valid)` → triggers `computeQpDeltaMap()` for foveated
-- `EncodeFrame(texture)` → bitstream buffer → `fvp_submit_encoded_nal()`
+- `encode()` → bitstream buffer → NAL bytes for `fvp_submit_encoded_nal()`
 - IDR trigger: atomic `s_idrRequested` flipped by Rust callback
 
 ---
 
-## Tests (7 GoogleTest)
+## Tests (63 GoogleTest cases)
 
 `driver/tests/test_qp_map.cpp`:
 - `ComputeQpDeltaMap_centerGaze_fovealZero` — gaze at (0,0) produces zero QP offset in fovea
@@ -119,9 +139,14 @@ CServerDriver::Cleanup()
 Build via `cd driver/build && cmake --build . && ctest`. Run on Windows only
 (NVENC SDK / D3D11 dependencies).
 
-**Not tested**: `NvencEncoder` encode path (needs NVIDIA GPU), `FrameCopy`
-(needs D3D11 device), `CDirectModeComponent` (needs SteamVR). audit item
-#12.
+`driver/tests/test_d3d_pipeline.cpp` (WARP, no GPU needed): shared handles
+the compositor can open, whole-set destroy, left/right eye from a
+double-wide sRGB texture, scaling, flipped bounds, BGRA and float sources,
+the sync texture's keyed mutex. `test_display_geometry.cpp`: projection,
+eye viewports, GPU choice, LUID packing.
+
+**Not tested**: `NvencEncoder` encode path (needs NVIDIA GPU),
+`CDirectModeComponent` / `CHmdDevice` wiring (needs SteamVR).
 
 ---
 
@@ -139,9 +164,10 @@ against `streaming_engine.lib` (cdylib import lib).
 
 ## Known issues (from audit)
 
-- `server_driver.cpp:11,72,93` — `s_instance` nullptr race during shutdown callbacks (audit #10)
-- `nvenc_encoder.cpp:17-18,102,341` — ComPtr `.Get()` for threading surface (audit #9)
-- `direct_mode.cpp:38,48` — terse error handling, missing log detail (audit #30)
+- Nothing of this pipeline has run under SteamVR or on an NVIDIA GPU yet
+- Mono: only the left eye is streamed; the FOV is a fixed default
+  (`display_geometry.h`) until the headset reports its own
+- Overlay layers (SteamVR dashboard) are not composited
 - NVENC runs only on a driver that supports NVENC API 12.2+ (official header in `third_party/nvenc`)
 
 ---

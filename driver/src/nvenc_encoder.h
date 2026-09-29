@@ -20,6 +20,10 @@ using Microsoft::WRL::ComPtr;
 
 class NvencEncoder {
 public:
+    /// Where the encoder's messages go (SteamVR's vrserver.txt in the
+    /// driver). Called with one line, without a trailing newline.
+    using LogFn = void (*)(const char* message);
+
     struct Config {
         uint32_t width = 1832;
         uint32_t height = 1920;
@@ -40,18 +44,19 @@ public:
     NvencEncoder(const NvencEncoder&) = delete;
     NvencEncoder& operator=(const NvencEncoder&) = delete;
 
-    bool init(ID3D11Device* device, const Config& config);
+    /// Open an NVENC session on `device` that encodes `input` (B8G8R8A8,
+    /// config.width × config.height; EyeBlit's output). False — with the
+    /// reason logged — when NVENC is unavailable: not an NVIDIA GPU, an old
+    /// driver, or no free session.
+    bool init(ID3D11Device* device, ID3D11Texture2D* input, const Config& config, LogFn log);
     void shutdown();
 
-    bool encode(ID3D11Texture2D* srcTexture,
-                bool forceIdr,
-                std::vector<uint8_t>& outNalData,
-                bool& outIsIdr);
+    /// Encode what `input` holds now (the caller has queued its draw on the
+    /// same device). The next frame is an IDR if `forceIdr` or requested.
+    bool encode(bool forceIdr, std::vector<uint8_t>& outNalData, bool& outIsIdr);
 
     void requestIdr();
     bool isInitialized() const { return m_initialized; }
-    bool isRealEncoder() const { return m_encoder != nullptr; }
-    ID3D11Device* getDevice() const { return m_device.Get(); }
 
     /// Update gaze position for foveated encoding.
     /// Coordinates are normalized (0-1). Called from tracking data receiver.
@@ -75,8 +80,8 @@ private:
 
     // D3D11 resources
     ComPtr<ID3D11Device> m_device;
-    ComPtr<ID3D11DeviceContext> m_context;
     ComPtr<ID3D11Texture2D> m_inputTexture; // Registered with NVENC
+    LogFn m_log = nullptr;
 
     // NVENC resources
     NV_ENCODE_API_FUNCTION_LIST m_nvencFns{};
@@ -105,5 +110,5 @@ private:
     bool loadNvencApi();
     bool createEncoderSession();
     bool createResources();
-    void generateTestPattern(bool isIdr, std::vector<uint8_t>& outNalData);
+    void log(const char* format, ...);
 };

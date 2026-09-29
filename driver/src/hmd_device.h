@@ -2,7 +2,9 @@
 
 #include <openvr_driver.h>
 #include "direct_mode.h"
+#include "display_component.h"
 #include <atomic>
+#include <thread>
 
 /**
  * HMD tracked device. Represents the virtual HMD that SteamVR sees.
@@ -34,11 +36,21 @@ public:
 
 private:
     void SetupProperties();
+    void startVsync();
+    void stopVsync();
 
     uint32_t m_objectId = vr::k_unTrackedDeviceIndexInvalid;
     vr::PropertyContainerHandle_t m_propertyContainer = vr::k_ulInvalidPropertyContainer;
 
     CDirectModeComponent m_directMode;
+    CDisplayComponent m_display;
+    float m_refreshRate = 90.0f;
+
+    // Direct mode has no display to take vsync from, so the driver sends
+    // SteamVR a vsync event every refresh interval
+    // (Prop_DriverDirectModeSendsVsyncEvents_Bool).
+    std::thread m_vsyncThread;
+    std::atomic<bool> m_vsyncRunning{false};
 
     // Current pose from the streaming engine
     std::atomic<bool> m_poseValid{false};

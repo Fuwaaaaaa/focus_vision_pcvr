@@ -14,7 +14,7 @@ PC (Windows)                           Wi-Fi               HMD (Focus Vision)
     |                                    |              |
   ┌─────────────────────┐               |          ┌──────────────────┐
   │  Direct Mode        │               |          │  OpenXR App      │
-  │  ├─ FrameCopy       │               |          │  ├─ Renderer     │
+  │  ├─ EyeBlit         │               |          │  ├─ Renderer     │
   │  └─ NvencEncoder    │               |          │  ├─ Timewarp     │
   │     ├─ QP delta map │               |          │  ├─ VideoDecoder │
   │     └─ Foveated     │               |          │  ├─ AudioPlayer  │
@@ -138,9 +138,9 @@ focus_vision_psvr/
   │                                  │          │                                  │
   │  SteamVR compositor              │          │  UDP recv (port 9946)            │
   │       │                          │          │       │                          │
-  │  D3D11 texture (BGRA)            │          │  RTP depacketize                 │
+  │  Swap texture (shared)           │          │  RTP depacketize                 │
   │       │                          │          │       │                          │
-  │  FrameCopy (GPU copy)            │          │  FEC decode (Reed-Solomon)       │
+  │  EyeBlit (left eye → BGRA)       │          │  FEC decode (Reed-Solomon)       │
   │       │                          │          │       │                          │
   │  NVENC encode (H.265/H.264)      │          │  NAL validate                    │
   │       │  ┌── foveated? ──┐       │          │       │                          │

@@ -168,7 +168,66 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     screen on the headset, APK drag and drop, and a "Deploy" button,
     none of which exist.
 
+### SteamVR driver
+- **The video path is wired.** Before, nothing called the encoder's init, the
+  driver had no D3D11 device, and the swap textures' "shared handles" were a
+  counter, so SteamVR's compositor could not render for the headset and
+  `Present()` returned before encoding. Not yet run under SteamVR or on an
+  NVIDIA GPU.
+  - The driver creates its D3D11 device on the NVIDIA GPU (else the largest
+    hardware GPU) and names it in `Prop_GraphicsAdapterLuid_Uint64`, so the
+    compositor renders on the same adapter.
+  - Swap textures are shareable, and their handles are the DXGI shared
+    handles the compositor opens. Destroying a set destroys all three
+    textures (it removed one).
+  - The HMD has an `IVRDisplayComponent`: render size, projection (a fixed
+    100° per eye until the headset reports its own), eye viewports, no
+    distortion. It sends vsync events itself.
+  - `Present` reads the frame only while holding the compositor's sync
+    texture (keyed mutex), then draws the scene layer's left eye into the
+    encoder's input (`EyeBlit`). A draw instead of `CopyResource`, which
+    D3D11 skipped between the compositor's R8G8B8A8 and NVENC's B8G8R8A8,
+    and which could not scale (SteamVR supersampling), take one eye of a
+    double-wide texture, or keep sRGB. The encoder registers that texture;
+    the full-range and foveation settings now reach it.
+  - When NVENC is unavailable the driver logs why in vrserver.txt and
+    streams nothing. It used to stream a made-up NAL pattern (IDR header +
+    `0xAB`) and report the failure only to `OutputDebugString`.
+  - `Cleanup` stops the engine before destroying the devices, so a late IDR
+    or gaze callback can't reach a destroyed HMD.
+  - The D3D11 side is tested on WARP (no GPU needed): a second device plays
+    the compositor, opens the swap textures by handle, fills them under the
+    keyed mutex, and the driver's output is read back (left/right eye,
+    scaling, flipped bounds, sRGB, BGRA and float sources). Driver gtests: 63.
+  - Still missing: the right eye (stereo), compositing the layers above the
+    scene (overlays, the dashboard), runtime bitrate changes to NVENC, a
+    controller input profile.
+
 ### Fixes
+- **The engine notices a dead link and lets the headset back in** (#18).
+  - A control connection silent for 3 s (six missed heartbeats) is dropped.
+    A Wi-Fi drop that lost the FIN/RST left the session streaming to nobody
+    and refusing the headset's reconnects.
+  - The headset's input is released when it goes away: the session end
+    clears the head pose and controllers, a controller silent for 250 ms
+    reads as gone, and the driver releases its buttons and sticks, which
+    otherwise stayed pressed in SteamVR.
+  - `accept()` errors no longer stop the engine. Anyone on the LAN could
+    stop it until SteamVR restarted by connecting and resetting six times.
+  - Control messages are read without losing half a message to a haptic
+    send, and go out as one TLS record each, with `TCP_NODELAY`.
+  - The mock client sends real HEARTBEATs (loss, received count, fps), so
+    the E2E tests cover the adaptive path and the engine's ACKs.
+- **The companion draws Japanese and fits its window** (#19).
+  - Japanese text was boxes (no loaded font had kana or kanji). The OS's
+    Japanese font (Yu Gothic Medium, else Meiryo or MS Gothic) follows Geist,
+    moved onto Geist's baseline.
+  - Every tab scrolls; at 480×640 Settings' codec, Export Logs and Reset
+    were below the window.
+  - No console window in the release exe (closing it lost the last
+    settings change); adb, PowerShell and wmic start without one.
+  - A window closed while minimized reopened as an 80×103 sliver (eframe
+    saved it as 0×0); eframe's window persistence is off.
 - **The Android client starts.** Found by reading the code; not yet run on
   the headset.
   - The manifest had no `android.app.lib_name`, so `NativeActivity` looked
@@ -351,21 +410,16 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   - TODOS.md records the open findings of the 2026-09-28 code audit.
 
 ### Known issues
-- **The Android client never connects to the PC.** There is no source for
-  the server address, no PIN entry, and nothing calls the TCP connect /
-  handshake, the UDP receiver or the tracking sender, so the app renders
-  nothing but its idle loop. The session state machine
-  (`client_session.h`) is tested but not wired to real I/O. Tracked as P0
-  in TODOS.md.
-- **The SteamVR driver never initializes NVENC, so the real VR path sends no
-  video.** Nothing calls `CDirectModeComponent::initEncoder`, the driver
-  creates no D3D11 device, and the swap-texture "shared handles" are
-  counters rather than DXGI shared handles, so `Present()` returns before
-  encoding. Runtime bitrate changes also never reach NVENC (the bitrate
-  callback is not registered and there is no reconfigure path). The
-  hardware-free simulator path is unaffected. Found by code review; it
-  needs an NVIDIA GPU + SteamVR to fix and verify — tracked as P0 in
-  TODOS.md.
+- **Nothing has run on the real hardware yet.** The Android client now
+  connects and receives (tested against the engine on the host), and the
+  SteamVR driver's video path is wired (its D3D11 side tested on WARP), but
+  neither has run on the headset, under SteamVR, or on an NVIDIA GPU. The
+  hardware-free simulator path is unaffected.
+- **Mono video.** The driver streams the left eye and the headset shows it
+  to both eyes; the FOV is a fixed default rather than the headset's.
+  Overlays such as the SteamVR dashboard are not composited, and runtime
+  bitrate changes never reach NVENC (no bitrate callback, no reconfigure).
+  Tracked in TODOS.md.
 
 ## [3.0.0] - 2026-06-01
 

@@ -25,7 +25,7 @@ if(DRIVER_SOURCES)
     # fails with LNK2019 __imp_RoGetActivationFactory.
     target_link_libraries(driver_focus_vision_pcvr PRIVATE
         "${RUST_TARGET_DIR}/streaming_engine.lib"
-        ws2_32 userenv ntdll bcrypt d3d11 dxgi propsys ole32 oleaut32 runtimeobject)
+        ws2_32 userenv ntdll bcrypt d3d11 dxgi d3dcompiler propsys ole32 oleaut32 runtimeobject)
     # SteamVR loads the DLL from <driver>/bin/win64/. A multi-config
     # generator (Visual Studio, used by CI and build.bat) appends a
     # per-config folder (bin/win64/Release/) unless the path contains a
@@ -59,9 +59,15 @@ add_executable(driver_tests
     tests/test_nvenc_vui.cpp
     tests/test_nvenc_config.cpp
     tests/test_encode_params.cpp
+    tests/test_display_geometry.cpp
+    # The D3D11 side of direct mode, run on WARP (no GPU needed).
+    tests/test_d3d_pipeline.cpp
+    src/swap_textures.cpp
+    src/eye_blit.cpp
+    src/sync_texture.cpp
 )
 target_include_directories(driver_tests PRIVATE src ${NVENC_INCLUDE_DIR})
-target_link_libraries(driver_tests PRIVATE GTest::gtest_main)
+target_link_libraries(driver_tests PRIVATE GTest::gtest_main d3d11 dxgi d3dcompiler)
 if(MSVC)
     target_compile_options(driver_tests PRIVATE /utf-8)
 endif()

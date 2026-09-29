@@ -2,68 +2,83 @@
 extern "C" {
 #include "streaming_engine.h"
 }
+#include "driver_log.h"
 #include "encode_params.h"
-#include <cstring>
-#include <algorithm>
+#include "gpu_adapter.h"
+#include <string>
 
-CDirectModeComponent::CDirectModeComponent()
-{
-}
+namespace {
+
+/// How long Present waits for the compositor to finish the frame.
+constexpr uint32_t kSyncTimeoutMs = 10;
+
+}  // namespace
 
 CDirectModeComponent::~CDirectModeComponent()
 {
     m_encoder.shutdown();
-    m_frameCopy.shutdown();
+    m_eyeBlit.shutdown();
+    m_sync.reset();
 }
 
-bool CDirectModeComponent::initEncoder(ID3D11Device* device, uint32_t width, uint32_t height)
+bool CDirectModeComponent::init()
 {
-    // Read config from Rust streaming engine (single source of truth)
-    FvpConfig fvpCfg = {};
-    NvencEncoder::Config encConfig;
-    if (fvp_get_config(&fvpCfg) == 0) {
-        // Encode at the engine-resolved encoded dimensions. The engine applies a
-        // SAFETY GUARD (build_fvp_config) that keeps encoded_* == native until
-        // per-session caps gating + the T7 downscale blit land, so this is
-        // always native today and matches the native m_frameCopy surface below.
-        // STREAM_CONFIG still negotiates scaled dims on the wire (separate path).
-        encConfig.width = fvpCfg.encoded_width;
-        encConfig.height = fvpCfg.encoded_height;
-        encConfig.fps = (uint32_t)fvpCfg.refresh_rate;
-        encConfig.bitrate_bps = fvp_encode::targetBitrateBps(fvpCfg.bitrate_bps);
-        encConfig.use_hevc = true;
+    std::string description;
+    if (!fvp_gpu::createDevice(m_device, m_adapterLuid, description)) {
+        driverLog("No GPU for SteamVR to render on: %s", description.c_str());
+        return false;
+    }
+    m_device->GetImmediateContext(&m_context);
+    driverLog("Rendering on %s", description.c_str());
+
+    // The engine's config is the single source of truth for the stream.
+    FvpConfig fvp{};
+    NvencEncoder::Config enc;
+    bool foveated = false;
+    if (fvp_get_config(&fvp) == 0) {
+        // encoded_* is the native size until the downscale lands (the
+        // engine's build_fvp_config keeps them equal); EyeBlit scales
+        // whatever SteamVR renders to it.
+        enc.width = fvp.encoded_width;
+        enc.height = fvp.encoded_height;
+        enc.fps = static_cast<uint32_t>(fvp.refresh_rate);
+        enc.bitrate_bps = fvp_encode::targetBitrateBps(fvp.bitrate_bps);
+        enc.full_range = fvp.full_range != 0;
+        enc.fovea_radius = fvp.fovea_radius;
+        enc.mid_radius = fvp.mid_radius;
+        enc.mid_qp_offset = fvp.mid_qp_offset;
+        enc.peripheral_qp_offset = fvp.peripheral_qp_offset;
+        foveated = fvp.foveated_enabled != 0;
     } else {
-        // Fallback if engine not initialized yet
-        encConfig.width = width;
-        encConfig.height = height;
-        encConfig.fps = 90;
-        encConfig.bitrate_bps = fvp_encode::kDefaultBitrateBps;
-        encConfig.use_hevc = true;
+        driverLog("Streaming engine config unavailable; encoding %ux%u at defaults", enc.width, enc.height);
+        enc.bitrate_bps = fvp_encode::kDefaultBitrateBps;
     }
+    enc.use_hevc = true;
 
-    if (!m_frameCopy.init(device, width, height)) {
-        vr::VRDriverLog()->Log("Focus Vision PCVR: FrameCopy init failed\n");
-        return false;
+    std::string error;
+    if (!m_eyeBlit.init(m_device.Get(), enc.width, enc.height, error)) {
+        driverLog("Not streaming video: frame capture failed: %s", error.c_str());
+        return true;
     }
-
-    // Enable foveated encoding if configured
-    if (fvpCfg.foveated_enabled) {
-        m_encoder.setFoveatedEnabled(true);
+    m_encoder.setFoveatedEnabled(foveated);
+    m_encoderReady = m_encoder.init(m_device.Get(), m_eyeBlit.output(), enc, driverLogMessage);
+    if (!m_encoderReady) {
+        driverLog("Not streaming video: the encoder could not start (reason above)");
     }
-
-    if (!m_encoder.init(device, encConfig)) {
-        vr::VRDriverLog()->Log("Focus Vision PCVR: NvencEncoder init failed\n");
-        return false;
-    }
-
-    m_encoderReady = true;
-    vr::VRDriverLog()->Log("Focus Vision PCVR: Encoder initialized\n");
     return true;
 }
 
 void CDirectModeComponent::requestIdr()
 {
     m_encoder.requestIdr();
+}
+
+void CDirectModeComponent::logSometimes(uint32_t& count, const char* what)
+{
+    count++;
+    if ((count & (count - 1)) == 0) {
+        driverLog("%s (%u so far)", what, count);
+    }
 }
 
 void CDirectModeComponent::CreateSwapTextureSet(
@@ -73,177 +88,115 @@ void CDirectModeComponent::CreateSwapTextureSet(
 {
     if (!pOutSwapTextureSet || !pSwapTextureSetDesc)
         return;
-
-    // Create real D3D11 textures that SteamVR's compositor will render into.
-    // Triple-buffered: 3 textures per swap set, rotated by GetNextSwapTextureSetIndex.
-    D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width = pSwapTextureSetDesc->nWidth;
-    desc.Height = pSwapTextureSetDesc->nHeight;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = static_cast<DXGI_FORMAT>(pSwapTextureSetDesc->nFormat);
-    desc.SampleDesc.Count = pSwapTextureSetDesc->nSampleCount > 0 ? pSwapTextureSetDesc->nSampleCount : 1;
-    desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-
-    ID3D11Device* device = m_encoder.getDevice();
-    if (!device) {
-        vr::VRDriverLog()->Log("Focus Vision PCVR: CreateSwapTextureSet — no D3D11 device\n");
+    if (!m_device) {
+        driverLog("CreateSwapTextureSet: no D3D11 device");
         return;
     }
 
-    uint32_t setId = m_nextSetId++;
-    size_t swapStartIdx = m_swapTextures.size();
-    for (uint32_t i = 0; i < 3; i++)
+    uint64_t handles[SwapTextureSets::kTexturesPerSet] = {};
+    std::string error;
+    bool created;
     {
-        vr::SharedTextureHandle_t handle = m_nextHandle++;
-
-        SwapTextureEntry entry;
-        entry.handle = handle;
-        entry.pid = unPid;
-        entry.setId = setId;
-        entry.indexInSet = i;
-
-        HRESULT hr = device->CreateTexture2D(&desc, nullptr, &entry.texture);
-        if (FAILED(hr)) {
-            char buf[128];
-            snprintf(buf, sizeof(buf),
-                "Focus Vision PCVR: CreateTexture2D failed for swap set (hr=0x%08lx)\n", hr);
-            vr::VRDriverLog()->Log(buf);
-            // Clean up partially created textures for this set
-            m_swapTextures.erase(m_swapTextures.begin() + swapStartIdx, m_swapTextures.end());
-            return;
-        }
-
-        pOutSwapTextureSet->rSharedTextureHandles[i] = handle;
-        m_swapTextures.push_back(std::move(entry));
+        std::lock_guard<std::mutex> lock(m_swapMutex);
+        created = m_swapSets.create(m_device.Get(), unPid, pSwapTextureSetDesc->nWidth,
+                                    pSwapTextureSetDesc->nHeight,
+                                    static_cast<DXGI_FORMAT>(pSwapTextureSetDesc->nFormat),
+                                    pSwapTextureSetDesc->nSampleCount, handles, error);
     }
-    m_swapSetIndices.push_back({setId, 0});
-
-    char buf[128];
-    snprintf(buf, sizeof(buf),
-        "Focus Vision PCVR: CreateSwapTextureSet %ux%u (3 textures)\n",
-        pSwapTextureSetDesc->nWidth, pSwapTextureSetDesc->nHeight);
-    vr::VRDriverLog()->Log(buf);
+    if (!created) {
+        driverLog("CreateSwapTextureSet failed: %s", error.c_str());
+        return;
+    }
+    for (int i = 0; i < SwapTextureSets::kTexturesPerSet; i++) {
+        pOutSwapTextureSet->rSharedTextureHandles[i] = handles[i];
+    }
+    driverLog("Swap texture set %ux%u, format %u, %u samples",
+              pSwapTextureSetDesc->nWidth, pSwapTextureSetDesc->nHeight,
+              pSwapTextureSetDesc->nFormat, pSwapTextureSetDesc->nSampleCount);
 }
 
 void CDirectModeComponent::DestroySwapTextureSet(vr::SharedTextureHandle_t sharedTextureHandle)
 {
-    // Release m_pendingTexture if it points to a texture being destroyed
-    for (const auto& entry : m_swapTextures) {
-        if (entry.handle == sharedTextureHandle && entry.texture.Get() == m_pendingTexture.Get()) {
-            m_pendingTexture.Reset();
-        }
-    }
-    m_swapTextures.erase(
-        std::remove_if(m_swapTextures.begin(), m_swapTextures.end(),
-            [sharedTextureHandle](const SwapTextureEntry& e) { return e.handle == sharedTextureHandle; }),
-        m_swapTextures.end());
+    std::lock_guard<std::mutex> lock(m_swapMutex);
+    m_swapSets.destroySet(sharedTextureHandle);
 }
 
 void CDirectModeComponent::DestroyAllSwapTextureSets(uint32_t unPid)
 {
-    // Release m_pendingTexture if it belongs to the destroyed PID
-    for (const auto& entry : m_swapTextures) {
-        if (entry.pid == unPid && entry.texture.Get() == m_pendingTexture.Get()) {
-            m_pendingTexture.Reset();
-        }
-    }
-    m_swapTextures.erase(
-        std::remove_if(m_swapTextures.begin(), m_swapTextures.end(),
-            [unPid](const SwapTextureEntry& e) { return e.pid == unPid; }),
-        m_swapTextures.end());
+    std::lock_guard<std::mutex> lock(m_swapMutex);
+    m_swapSets.destroyAll(unPid);
 }
 
 void CDirectModeComponent::GetNextSwapTextureSetIndex(
-    vr::SharedTextureHandle_t sharedTextureHandles[2],
+    vr::SharedTextureHandle_t /*sharedTextureHandles*/[2],
     uint32_t (*pIndices)[2])
 {
-    // Per-set round-robin: find the set each handle belongs to and advance its index
+    // pIndices holds each eye's current index; the next one follows it.
     for (int eye = 0; eye < 2; eye++) {
-        uint32_t idx = 0;
-        for (const auto& entry : m_swapTextures) {
-            if (entry.handle == sharedTextureHandles[eye]) {
-                // Find this set's current index
-                for (auto& [setId, curIdx] : m_swapSetIndices) {
-                    if (setId == entry.setId) {
-                        idx = curIdx;
-                        curIdx = (curIdx + 1) % 3;
-                        break;
-                    }
-                }
-                break;
-            }
-        }
-        (*pIndices)[eye] = idx;
+        (*pIndices)[eye] = ((*pIndices)[eye] + 1) % SwapTextureSets::kTexturesPerSet;
     }
 }
 
 void CDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 {
-    // Resolve left-eye SharedTextureHandle_t to ID3D11Texture2D via our map.
-    // The handle was created by CreateSwapTextureSet and maps to a real D3D11 texture.
-    // For v1.0, left eye only (single stream). Right eye ignored.
-    vr::SharedTextureHandle_t leftHandle = perEye[0].hTexture;
-    if (leftHandle == INVALID_SHARED_TEXTURE_HANDLE)
+    // One call per layer; the first is the scene. Only its left eye is
+    // streamed for now.
+    if (m_haveLayer)
         return;
-
-    for (const auto& entry : m_swapTextures) {
-        if (entry.handle == leftHandle) {
-            m_pendingTexture = entry.texture;
-            return;
-        }
-    }
+    m_haveLayer = true;
+    m_layerTexture = perEye[0].hTexture;
+    m_layerBounds = perEye[0].bounds;
 }
 
 void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
 {
     m_frameIndex++;
+    const bool haveLayer = m_haveLayer;
+    m_haveLayer = false;
+    if (!m_encoderReady || !haveLayer)
+        return;
 
-    if (!m_encoderReady) {
-        // Encoder not yet initialized — log periodically as before
-        if (m_frameIndex % 900 == 0) {
-            char buf[128];
-            snprintf(buf, sizeof(buf),
-                "Focus Vision PCVR: Present() frame %u (encoder not ready)\n", m_frameIndex);
-            vr::VRDriverLog()->Log(buf);
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    {
+        std::lock_guard<std::mutex> lock(m_swapMutex);
+        if (const SwapTextureSets::Texture* texture = m_swapSets.find(m_layerTexture)) {
+            view = texture->view;
+            format = texture->format;
         }
+    }
+    if (!view) {
+        // Not one of ours, or multisampled (no shader view).
+        logSometimes(m_unknownTextures, "Submitted layer texture can't be read; frame skipped");
         return;
     }
 
-    // Encode the frame: copy pending texture, then encode.
-    // m_pendingTexture is set by SubmitLayer() with the left-eye D3D11 resource.
-    // FrameCopy does a sync GPU→GPU copy (double-buffered) so SteamVR can
-    // safely reuse the source texture after Present() returns.
-    // If no texture was submitted (e.g. first frame), fall through to
-    // NvencEncoder's test pattern path.
-    ID3D11Texture2D* encodeInput = nullptr;
-
-    if (m_pendingTexture) {
-        ComPtr<ID3D11DeviceContext> ctx;
-        m_encoder.getDevice()->GetImmediateContext(&ctx);
-        encodeInput = m_frameCopy.copyFrame(ctx.Get(), m_pendingTexture.Get());
-        m_pendingTexture.Reset(); // Consumed
+    // Read the frame only once the compositor has finished drawing it.
+    if (!m_sync.acquire(m_device.Get(), syncTexture, kSyncTimeoutMs)) {
+        logSometimes(m_syncTimeouts, "Compositor frame not ready in time; frame skipped");
+        return;
     }
+    const fvp_blit::UvRect uv{m_layerBounds.uMin, m_layerBounds.vMin, m_layerBounds.uMax, m_layerBounds.vMax};
+    m_eyeBlit.draw(m_context.Get(), view.Get(), format, uv);
+    m_sync.release();
 
-    std::vector<uint8_t> nalData;
     bool isIdr = false;
-
-    if (!m_encoder.encode(encodeInput, false, nalData, isIdr)) {
+    if (!m_encoder.encode(false, m_nal, isIdr)) {
+        logSometimes(m_encodeFailures, "Encode failed; frame skipped");
         return;
     }
+    if (m_nal.empty())
+        return;
 
     // Submit encoded NAL data to Rust streaming engine for RTP packetization
-    int32_t result = fvp_submit_encoded_nal(
-        nalData.data(),
-        static_cast<uint32_t>(nalData.size()),
+    const int32_t result = fvp_submit_encoded_nal(
+        m_nal.data(),
+        static_cast<uint32_t>(m_nal.size()),
         m_frameIndex,
         isIdr ? 1 : 0
     );
-
-    if (result != 0 && m_frameIndex % 900 == 0) {
-        vr::VRDriverLog()->Log("Focus Vision PCVR: fvp_submit_encoded_nal failed\n");
+    if (result != 0) {
+        logSometimes(m_submitFailures, "fvp_submit_encoded_nal failed");
     }
 }
 

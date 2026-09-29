@@ -2,7 +2,10 @@
 extern "C" {
 #include "streaming_engine.h"
 }
+#include "driver_log.h"
+#include <chrono>
 #include <cstring>
+#include <windows.h>
 
 CHmdDevice::CHmdDevice()
 {
@@ -19,6 +22,7 @@ CHmdDevice::CHmdDevice()
 
 CHmdDevice::~CHmdDevice()
 {
+    stopVsync();
 }
 
 vr::EVRInitError CHmdDevice::Activate(uint32_t unObjectId)
@@ -26,15 +30,19 @@ vr::EVRInitError CHmdDevice::Activate(uint32_t unObjectId)
     m_objectId = unObjectId;
     m_propertyContainer = vr::VRProperties()->TrackedDeviceToPropertyContainer(unObjectId);
 
+    // Before the properties: they name the device's GPU.
+    m_directMode.init();
     SetupProperties();
+    startVsync();
 
-    vr::VRDriverLog()->Log("Focus Vision PCVR: HMD Activated\n");
+    driverLog("HMD Activated");
     return vr::VRInitError_None;
 }
 
 void CHmdDevice::Deactivate()
 {
-    vr::VRDriverLog()->Log("Focus Vision PCVR: HMD Deactivated\n");
+    stopVsync();
+    driverLog("HMD Deactivated");
     m_objectId = vr::k_unTrackedDeviceIndexInvalid;
 }
 
@@ -43,6 +51,10 @@ void* CHmdDevice::GetComponent(const char* pchComponentNameAndVersion)
     if (strcmp(pchComponentNameAndVersion, vr::IVRDriverDirectModeComponent_Version) == 0)
     {
         return static_cast<vr::IVRDriverDirectModeComponent*>(&m_directMode);
+    }
+    if (strcmp(pchComponentNameAndVersion, vr::IVRDisplayComponent_Version) == 0)
+    {
+        return static_cast<vr::IVRDisplayComponent*>(&m_display);
     }
 
     return nullptr;
@@ -101,6 +113,50 @@ void CHmdDevice::RunFrame()
     }
 }
 
+void CHmdDevice::startVsync()
+{
+    if (m_vsyncRunning.exchange(true))
+        return;
+    const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / (m_refreshRate > 0.0f ? m_refreshRate : 90.0f)));
+    m_vsyncThread = std::thread([this, period] {
+        // A high-resolution waitable timer: the default sleep granularity
+        // (~15.6 ms) is longer than a 90 Hz frame.
+        HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                              TIMER_ALL_ACCESS);
+        auto next = std::chrono::steady_clock::now() + period;
+        while (m_vsyncRunning.load()) {
+            const auto wait = next - std::chrono::steady_clock::now();
+            if (wait > std::chrono::steady_clock::duration::zero()) {
+                const auto ticks100ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wait).count() / 100;
+                LARGE_INTEGER due;
+                due.QuadPart = -static_cast<LONGLONG>(ticks100ns);  // negative: relative
+                if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+                    WaitForSingleObject(timer, INFINITE);
+                } else {
+                    std::this_thread::sleep_until(next);
+                }
+            }
+            vr::VRServerDriverHost()->VsyncEvent(0.0);
+            next += period;
+            // After a stall (debugger, suspended process), restart from now
+            // rather than firing the missed events back to back.
+            if (std::chrono::steady_clock::now() > next + period) {
+                next = std::chrono::steady_clock::now() + period;
+            }
+        }
+        if (timer) CloseHandle(timer);
+    });
+}
+
+void CHmdDevice::stopVsync()
+{
+    if (!m_vsyncRunning.exchange(false))
+        return;
+    if (m_vsyncThread.joinable())
+        m_vsyncThread.join();
+}
+
 void CHmdDevice::SetupProperties()
 {
     auto props = vr::VRProperties();
@@ -110,17 +166,23 @@ void CHmdDevice::SetupProperties()
     float ipd = 0.063f;
     float refreshRate = 90.0f;
     float vsyncToPhotons = 0.011f;
+    uint32_t eyeWidth = 1832;
+    uint32_t eyeHeight = 1920;
     if (fvp_get_config(&fvpConfig) == 0)
     {
         ipd = fvpConfig.ipd;
         refreshRate = fvpConfig.refresh_rate;
         vsyncToPhotons = fvpConfig.seconds_from_vsync_to_photons;
-        vr::VRDriverLog()->Log("Focus Vision PCVR: Config loaded from streaming engine\n");
+        eyeWidth = fvpConfig.render_width;
+        eyeHeight = fvpConfig.render_height;
+        driverLog("Config loaded from streaming engine");
     }
     else
     {
-        vr::VRDriverLog()->Log("Focus Vision PCVR: Using default display config\n");
+        driverLog("Using default display config");
     }
+    m_refreshRate = refreshRate;
+    m_display.configure(eyeWidth, eyeHeight, fvp_display::kDefaultFov);
 
     // Device identification
     props->SetStringProperty(m_propertyContainer,
@@ -146,6 +208,20 @@ void CHmdDevice::SetupProperties()
     // Report as a VR HMD (not a controller or tracker)
     props->SetBoolProperty(m_propertyContainer,
         vr::Prop_IsOnDesktop_Bool, false);
+
+    // Direct mode: the compositor renders on the driver's GPU (the swap
+    // textures live there) and takes vsync from the driver's events.
+    props->SetBoolProperty(m_propertyContainer,
+        vr::Prop_HasDisplayComponent_Bool, true);
+    props->SetBoolProperty(m_propertyContainer,
+        vr::Prop_HasDriverDirectModeComponent_Bool, true);
+    props->SetBoolProperty(m_propertyContainer,
+        vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, true);
+    if (m_directMode.adapterLuid() != 0)
+    {
+        props->SetUint64Property(m_propertyContainer,
+            vr::Prop_GraphicsAdapterLuid_Uint64, m_directMode.adapterLuid());
+    }
 
     // Firmware version
     props->SetUint64Property(m_propertyContainer,

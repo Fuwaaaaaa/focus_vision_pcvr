@@ -80,17 +80,18 @@ void CServerDriver::Cleanup()
 {
     vr::VRDriverLog()->Log("Focus Vision PCVR: Driver Cleanup\n");
 
+    // SAFETY: stop the engine first. fvp_shutdown() cancels the Tokio
+    // runtime, whose tasks (TCP control, tracking receiver) call the IDR and
+    // gaze callbacks — and those reach m_hmdDevice through s_instance. With
+    // the engine stopped no callback can fire, so s_instance can be cleared
+    // and the devices destroyed. The other order let a late callback touch a
+    // destroyed HMD.
+    fvp_shutdown();
+    s_instance = nullptr;
+
     m_leftController.reset();
     m_rightController.reset();
     m_hmdDevice.reset();
-
-    // SAFETY: fvp_shutdown() must be called BEFORE clearing s_instance.
-    // fvp_shutdown() cancels the Tokio runtime, which stops the TCP control
-    // reader task. That task is the only caller of the IDR callback (onIdrRequest),
-    // which accesses s_instance. By shutting down Tokio first, we guarantee
-    // no callback can fire after s_instance is nulled.
-    fvp_shutdown();
-    s_instance = nullptr;
 
     vr::CleanupDriverContext();
 }
