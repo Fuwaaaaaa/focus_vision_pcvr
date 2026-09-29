@@ -357,6 +357,12 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   (CONFIG_UPDATE) goes to the controller as the new setting; it was set on
   the encoder directly, and the next adjustment undid it. The thermal cap
   and the wake from sleep follow the current setting too.
+- **The adaptive controller sees every loss report, at its own size.**
+  Heartbeats come every 500 ms and the controller ticks every second; each
+  heartbeat replaced the last, so half the loss reports never counted.
+  They are now added up until the tick. The burst detector was fed the
+  estimator's smoothed loss, which a single bad second barely moves after
+  good ones; it now gets the loss of that interval.
 - **The companion draws Japanese and fits its window** (#19).
   - Japanese text was boxes (no loaded font had kana or kanji). The OS's
     Japanese font (Yu Gothic Medium, else Meiryo or MS Gothic) follows Geist,

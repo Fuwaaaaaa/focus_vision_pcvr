@@ -1139,7 +1139,18 @@ impl AdaptiveState {
     fn on_event(&mut self, event: ControlEvent, sent_packet_log: &HashMap<u16, u64>) {
         match event {
             ControlEvent::Heartbeat(stats) => {
-                self.pending_stats = Some(stats);
+                // Heartbeats come every 500 ms, ticks every second: add up
+                // the counts until the tick takes them.
+                // REGRESSION: each heartbeat replaced the last, so half the
+                // loss reports never reached the estimator.
+                self.pending_stats = Some(match self.pending_stats {
+                    Some(p) => HmdStats {
+                        packets_received: p.packets_received.saturating_add(stats.packets_received),
+                        packets_lost: p.packets_lost.saturating_add(stats.packets_lost),
+                        ..stats
+                    },
+                    None => stats,
+                });
                 self.last_stats = Some(stats);
             }
             ControlEvent::TransportFeedback(entries) => {
@@ -1171,7 +1182,12 @@ impl AdaptiveState {
         self.bw_estimator.update(stats.packets_received, stats.packets_lost, 0.0);
 
         if self.gcc_enabled {
-            self.burst_detector.record(self.bw_estimator.loss_rate());
+            // This interval's loss: a burst is what the smoothed figure hides.
+            // REGRESSION: the estimator's EWMA went in, so a burst showed up
+            // at a third of its size, a tick late.
+            let total = u64::from(stats.packets_received) + u64::from(stats.packets_lost);
+            let interval_loss = if total == 0 { 0.0 } else { f64::from(stats.packets_lost) / total as f64 };
+            self.burst_detector.record(interval_loss);
             if self.bitrate_ctrl.adjust(&self.bw_estimator, &self.gcc_estimator, &self.burst_detector) {
                 notify_bitrate_change(self.bitrate_ctrl.current_bitrate_bps() as u32);
             }
@@ -2737,6 +2753,37 @@ mod tests {
         let before = adaptive.bw_estimator.loss_rate();
         adaptive.tick(&mut fec); // no new heartbeat: nothing to learn from
         assert_eq!(adaptive.bw_estimator.loss_rate(), before);
+    }
+
+    #[test]
+    fn both_heartbeats_of_a_tick_count() {
+        // REGRESSION: heartbeats come every 500 ms and the tick every
+        // second; the second replaced the first, whose losses were lost.
+        let mut adaptive = AdaptiveState::new(&AppConfig::default());
+        let mut fec = pipeline::FrameFecEncoder::new(0.2, true, 4);
+        adaptive.on_event(heartbeat(500, 100), &HashMap::new());
+        adaptive.on_event(heartbeat(600, 0), &HashMap::new());
+        adaptive.tick(&mut fec);
+        // The first tick takes the loss as it is: 100 of 1200.
+        assert!((adaptive.bw_estimator.loss_rate() - 100.0 / 1200.0).abs() < 1e-9,
+            "loss {}", adaptive.bw_estimator.loss_rate());
+        assert_eq!(adaptive.last_stats.map(|s| s.packets_lost), Some(0), "status shows the newest");
+    }
+
+    #[test]
+    fn a_burst_is_seen_at_its_own_size() {
+        // REGRESSION: the burst detector got the smoothed loss, which a
+        // single bad second barely moves after good ones.
+        let mut adaptive = AdaptiveState::new(&AppConfig::default());
+        let mut fec = pipeline::FrameFecEncoder::new(0.2, true, 4);
+        for _ in 0..5 {
+            adaptive.on_event(heartbeat(1000, 0), &HashMap::new());
+            adaptive.tick(&mut fec);
+        }
+        adaptive.on_event(heartbeat(930, 70), &HashMap::new()); // 7 %, over the 5 % threshold
+        adaptive.tick(&mut fec);
+        assert!(adaptive.bw_estimator.loss_rate() < 0.05, "smoothed: {}", adaptive.bw_estimator.loss_rate());
+        assert_eq!(adaptive.burst_detector.pattern(), crate::adaptive::burst_detector::LossPattern::Burst);
     }
 
     #[tokio::test]
