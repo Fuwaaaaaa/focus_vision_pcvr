@@ -123,3 +123,46 @@ TEST(LayerCompose, APoseWithTranslationStillTurns) {
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++) EXPECT_FLOAT_EQ(moved.rotation.m[r][c], turned.rotation.m[r][c]);
 }
+
+TEST(LayerCompose, APoseBecomesTheQuaternionOfItsRotation) {
+    // The orientation sent with each frame (v6).
+    float q[4];
+    ASSERT_TRUE(fvp_layers::orientationOf(yaw(0.0f).m, q));
+    EXPECT_NEAR(q[3], 1.0f, 1e-6f);
+    EXPECT_NEAR(q[0], 0.0f, 1e-6f);
+
+    ASSERT_TRUE(fvp_layers::orientationOf(yaw(40.0f).m, q));
+    EXPECT_NEAR(q[0], 0.0f, 1e-6f);
+    EXPECT_NEAR(q[1], std::sin(20.0f * kDegToRad), 1e-6f) << "turned left: about +Y";
+    EXPECT_NEAR(q[2], 0.0f, 1e-6f);
+    EXPECT_NEAR(q[3], std::cos(20.0f * kDegToRad), 1e-6f);
+
+    ASSERT_TRUE(fvp_layers::orientationOf(pitch(-30.0f).m, q));
+    EXPECT_NEAR(q[0], std::sin(-15.0f * kDegToRad), 1e-6f) << "tilted down: about -X";
+    EXPECT_NEAR(q[3], std::cos(-15.0f * kDegToRad), 1e-6f);
+
+    // Turned right round (trace -1): the other branches.
+    ASSERT_TRUE(fvp_layers::orientationOf(yaw(180.0f).m, q));
+    EXPECT_NEAR(std::fabs(q[1]), 1.0f, 1e-5f);
+    EXPECT_NEAR(q[3], 0.0f, 1e-5f);
+
+    const Pose zero{};
+    EXPECT_FALSE(fvp_layers::orientationOf(zero.m, q)) << "no pose, no orientation";
+}
+
+TEST(LayerCompose, TheQuaternionRotatesLikeThePose) {
+    // Any rotation: rotating a vector with q equals the pose's matrix.
+    const Pose p = rotation(0.36f, 0.48f, -0.8f, -0.8f, 0.6f, 0.0f, 0.48f, 0.64f, 0.6f);
+    float q[4];
+    ASSERT_TRUE(fvp_layers::orientationOf(p.m, q));
+    const float v[3] = {0.3f, -0.5f, 0.8f};
+    // v' = v + 2w (u × v) + 2 u × (u × v), u = (x, y, z)
+    const float u[3] = {q[0], q[1], q[2]};
+    const float uv[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+    const float uuv[3] = {u[1] * uv[2] - u[2] * uv[1], u[2] * uv[0] - u[0] * uv[2], u[0] * uv[1] - u[1] * uv[0]};
+    for (int i = 0; i < 3; i++) {
+        const float byQ = v[i] + 2.0f * q[3] * uv[i] + 2.0f * uuv[i];
+        const float byM = p.m[i][0] * v[0] + p.m[i][1] * v[1] + p.m[i][2] * v[2];
+        EXPECT_NEAR(byQ, byM, 1e-5f) << "component " << i;
+    }
+}

@@ -169,7 +169,7 @@ TcpControlClient::HandshakeResult TcpControlClient::handshake(uint32_t pin, int 
 
     // HELLO: protocol version (u16 LE) + capability byte.
     auto hello = proto::buildHelloPayload(proto::PROTOCOL_VERSION,
-                                          proto::hello_caps::RESOLUTION_SCALE);
+                                          proto::hello_caps::RESOLUTION_SCALE | proto::hello_caps::FRAME_POSE);
     if (!sendMessage(proto::msg::HELLO, hello.data(), static_cast<int>(hello.size()))) {
         return HandshakeResult::Failed;
     }
@@ -202,10 +202,12 @@ TcpControlClient::HandshakeResult TcpControlClient::handshake(uint32_t pin, int 
     m_config.encodedWidth = cfg.encodedWidth;
     m_config.encodedHeight = cfg.encodedHeight;
     m_config.layout = cfg.layout;
-    LOGI("Stream config: native %ux%u, encoded %ux%u per eye (%s) @ %u Mbps, %u fps, codec=%u",
+    m_config.framePose = cfg.framePose;
+    LOGI("Stream config: native %ux%u, encoded %ux%u per eye (%s) @ %u Mbps, %u fps, codec=%u%s",
         m_config.width, m_config.height, m_config.encodedWidth, m_config.encodedHeight,
         m_config.layout == proto::STEREO_SIDE_BY_SIDE ? "side by side" : "mono",
-        m_config.bitrateMbps, m_config.framerate, m_config.codec);
+        m_config.bitrateMbps, m_config.framerate, m_config.codec,
+        m_config.framePose ? ", frames carry their render pose" : "");
 
     // Paired: this server is the one to trust from now on.
     if (!pinPeerFingerprint()) return HandshakeResult::Failed;

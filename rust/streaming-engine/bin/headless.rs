@@ -164,11 +164,15 @@ fn main() -> ExitCode {
         }
 
         let synth = stream.next_frame();
+        // As if rendered with the head turning left 0.01 rad a frame, so a
+        // client can check the render pose arrives (v6).
+        let half_yaw = synth.frame_index as f32 * 0.005;
         let frame = EncodedFrame {
             frame_index: synth.frame_index,
             nal_data: synth.bytes,
             is_idr: synth.is_idr,
             timestamps: FrameTimestamps::new(synth.frame_index),
+            render_orientation: Some([0.0, half_yaw.sin(), 0.0, half_yaw.cos()]),
         };
         if engine.submit_frame(frame) {
             frames_sent += 1;

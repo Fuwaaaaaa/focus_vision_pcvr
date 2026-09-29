@@ -105,6 +105,8 @@ void OpenXRApp::configureDecoder(const TcpControlClient::StreamConfig& config) {
     if (dims.width == 0 || dims.height == 0) dims = {1832, 1920};
     const uint8_t codec = config.codec == 0 ? 0 : 1;
     m_videoLayout = config.layout;
+    m_framePose = config.framePose;
+    m_renderPoses.clear();
     if (m_videoDecoder.isInitialized() && codec == m_decoderCodec &&
         dims.width == m_decoderWidth && dims.height == m_decoderHeight) {
         m_videoDecoder.flush(); // a new session starts from a keyframe
@@ -515,6 +517,21 @@ void OpenXRApp::receiveAndDecodeVideo() {
 }
 
 void OpenXRApp::submitDecodedFrame(const uint8_t* nalData, int nalSize, uint32_t frameIndex) {
+    // v6: the orientation the frame was rendered at comes first; kept until
+    // the decoder hands the frame back.
+    if (m_framePose) {
+        fvp_client_protocol::FramePose pose;
+        const size_t prefix = fvp_client_protocol::parseFramePose(nalData, static_cast<size_t>(nalSize), pose);
+        if (prefix == 0) {
+            LOGW("Frame %u has no render pose, waiting for a keyframe", frameIndex);
+            m_videoReceiver.requireKeyframe();
+            return;
+        }
+        m_renderPoses.record(frameIndex, pose);
+        nalData += prefix;
+        nalSize -= static_cast<int>(prefix);
+    }
+
     // Skip Annex B start code: 4-byte (00 00 00 01) or 3-byte (00 00 01)
     const uint8_t* nalStart = nalData;
     int nalLen = nalSize;
@@ -688,8 +705,16 @@ void OpenXRApp::renderFrame() {
                 hasNewFrame = true;
                 m_lastDecodedTexture = texture;
                 m_hasDecodedFrame = true;
-                // Later loops reproject it from where the head is now.
-                m_frameOrientation = views[0].pose.orientation;
+                // Turned from the orientation it was rendered at (v6), or,
+                // not knowing that, from where the head is now: later loops
+                // reproject it from there.
+                float rendered[4];
+                const uint32_t shown = RenderPoseLog::frameIndexOf(
+                    m_videoDecoder.lastPresentationTimeUs(), m_frameDurationUs);
+                m_frameHasRenderPose = m_framePose && m_renderPoses.find(shown, rendered);
+                m_frameOrientation = m_frameHasRenderPose
+                    ? XrQuaternionf{rendered[0], rendered[1], rendered[2], rendered[3]}
+                    : views[0].pose.orientation;
             }
         }
 
@@ -723,13 +748,16 @@ void OpenXRApp::renderFrame() {
             }
 
             if (m_hasDecodedFrame && m_lastDecodedTexture != 0) {
-                // A new frame is shown as it came; an older one is rotated
-                // by how far the head turned since it was first shown.
+                // Rotated by how far the head turned since the frame was
+                // rendered (v6) — or, not knowing that, since it was first
+                // shown, so a new frame is shown as it came.
+                // REGRESSION: the time from rendering to showing a frame
+                // (encode, network, decode) was never corrected for.
                 const XrFovf& fov = views[eye].fov;
                 const fvp_video::Tangents tangents = fvp_video::tangents(
                     fov.angleLeft, fov.angleRight, fov.angleDown, fov.angleUp);
                 float rotation[9];
-                if (hasNewFrame) {
+                if (hasNewFrame && !m_frameHasRenderPose) {
                     std::copy(std::begin(fvp_video::kIdentity), std::end(fvp_video::kIdentity), rotation);
                 } else {
                     const XrQuaternionf& now = views[eye].pose.orientation;

@@ -59,6 +59,9 @@ pub struct TcpControlServer {
     tls_acceptor: Option<TlsAcceptor>,
     cert_fingerprint: String,
     timeouts: HandshakeTimeouts,
+    /// The capability flags (`hello_caps`) of the client that last completed
+    /// the handshake, for the session it starts.
+    client_caps: std::sync::atomic::AtomicU8,
 }
 
 impl TcpControlServer {
@@ -84,6 +87,7 @@ impl TcpControlServer {
             tls_acceptor,
             cert_fingerprint,
             timeouts: HandshakeTimeouts::default(),
+            client_caps: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -97,6 +101,7 @@ impl TcpControlServer {
             tls_acceptor: None,
             cert_fingerprint: String::new(),
             timeouts: HandshakeTimeouts::default(),
+            client_caps: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -105,6 +110,12 @@ impl TcpControlServer {
     pub(crate) fn with_timeouts(mut self, timeouts: HandshakeTimeouts) -> Self {
         self.timeouts = timeouts;
         self
+    }
+
+    /// Whether the client that last completed the handshake reads the
+    /// render pose at the start of each frame (`hello_caps::FRAME_POSE`).
+    pub fn client_reads_frame_pose(&self) -> bool {
+        self.client_caps.load(std::sync::atomic::Ordering::Relaxed) & fvp_common::protocol::hello_caps::FRAME_POSE != 0
     }
 
     /// Get the TLS certificate fingerprint (SHA-256 hex) for TOFU pinning.
@@ -239,6 +250,7 @@ impl TcpControlServer {
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let client_caps = step_hello_exchange(&mut stream, self.timeouts.step).await?;
+        self.client_caps.store(client_caps, std::sync::atomic::Ordering::Relaxed);
         self.step_pin_pairing(&mut stream).await?;
         step_stream_config(&mut stream, &self.encode_stream_config(client_caps)).await?;
         step_stream_start(&mut stream, self.timeouts.step).await?;
@@ -281,7 +293,7 @@ impl TcpControlServer {
 
     /// Build the STREAM_CONFIG payload.
     ///
-    /// Wire format (little-endian), 26 bytes:
+    /// Wire format (little-endian), 27 bytes:
     /// ```text
     ///   [0..4]   native render_w  (u32)   ← per eye, target/restore resolution
     ///   [4..8]   native render_h  (u32)
@@ -291,6 +303,9 @@ impl TcpControlServer {
     ///   [17..21] encoded_w        (u32)   ← per eye, what is actually encoded/sent
     ///   [21..25] encoded_h        (u32)
     ///   [25]     stereo layout    (u8: stereo_layout, v5)
+    ///   [26]     frame pose       (u8: 1 = each frame starts with a
+    ///                              `frame_pose` prefix, v6; only for a
+    ///                              client with hello_caps::FRAME_POSE)
     /// ```
     /// The first 17 bytes are byte-identical to the legacy layout, so a client
     /// that reads only 17 bytes is unaffected. `encoded_*` is downscaled only
@@ -325,6 +340,7 @@ impl TcpControlServer {
         buf.extend_from_slice(&enc_w.to_le_bytes());
         buf.extend_from_slice(&enc_h.to_le_bytes());
         buf.push(fvp_common::protocol::stereo_layout::SIDE_BY_SIDE);
+        buf.push(u8::from(client_caps & fvp_common::protocol::hello_caps::FRAME_POSE != 0));
         buf
     }
 
@@ -803,7 +819,7 @@ mod tests {
         config.video.resolution_scale = 0.5;
         let payload = capture_stream_config_via_handshake(
             config, fvp_common::protocol::hello_caps::RESOLUTION_SCALE).await;
-        assert_eq!(payload.len(), 26);
+        assert_eq!(payload.len(), 27);
         assert_eq!(&payload[0..4], &1832u32.to_le_bytes(), "native unchanged");
         assert_eq!(&payload[17..21], &916u32.to_le_bytes(), "encoded_w halved");
         assert_eq!(&payload[21..25], &960u32.to_le_bytes(), "encoded_h halved");
@@ -922,8 +938,9 @@ mod tests {
     async fn test_encode_stream_config_layout_matches_spec() {
         // Wire format: res_x_le_u32 | res_y_le_u32 | bitrate_le_u32 |
         //              framerate_le_u32 | codec_byte (0=h264, 1=h265) |
-        //              encoded_x_le_u32 | encoded_y_le_u32 | stereo layout.
-        //              Total: 26 bytes.
+        //              encoded_x_le_u32 | encoded_y_le_u32 | stereo layout |
+        //              frame pose.
+        //              Total: 27 bytes.
         // The first 17 bytes are byte-identical to the legacy layout so old
         // clients that read only 17 bytes are unaffected.
         let mut config = crate::config::AppConfig::default();
@@ -934,7 +951,7 @@ mod tests {
         let server = TcpControlServer::new_without_tls(config);
         let bytes = server.encode_stream_config(fvp_common::protocol::hello_caps::RESOLUTION_SCALE);
 
-        assert_eq!(bytes.len(), 26, "STREAM_CONFIG payload size shifted");
+        assert_eq!(bytes.len(), 27, "STREAM_CONFIG payload size shifted");
         assert_eq!(&bytes[0..4], &1920u32.to_le_bytes());
         assert_eq!(&bytes[4..8], &1080u32.to_le_bytes());
         assert_eq!(&bytes[8..12], &100u32.to_le_bytes());
@@ -945,6 +962,10 @@ mod tests {
         assert_eq!(&bytes[21..25], &1080u32.to_le_bytes());
         // v5: the driver sends both eyes side by side.
         assert_eq!(bytes[25], fvp_common::protocol::stereo_layout::SIDE_BY_SIDE);
+        // v6: no frame pose prefix for a client that didn't ask for it.
+        assert_eq!(bytes[26], 0);
+        let with_pose = server.encode_stream_config(fvp_common::protocol::hello_caps::FRAME_POSE);
+        assert_eq!(with_pose[26], 1, "a FRAME_POSE client is told each frame starts with its pose");
     }
 
     #[tokio::test]
@@ -954,7 +975,7 @@ mod tests {
         let config = crate::config::AppConfig::default(); // scale 1.0
         let server = TcpControlServer::new_without_tls(config);
         let bytes = server.encode_stream_config(fvp_common::protocol::hello_caps::RESOLUTION_SCALE);
-        assert_eq!(bytes.len(), 26);
+        assert_eq!(bytes.len(), 27);
         assert_eq!(&bytes[17..21], &bytes[0..4], "encoded_w must equal native");
         assert_eq!(&bytes[21..25], &bytes[4..8], "encoded_h must equal native");
     }

@@ -68,7 +68,8 @@ tracker, pairing state, dashboard state.
 ### Video pipeline
 | File | Class | Role |
 |---|---|---|
-| `client_protocol.h` | `parseFvpHeader` / `FvpHeaderView` | Parses + validates the 12-byte FVP header (v4). `dataShards` comes from the header's `data_shard_count` — never derived from the total |
+| `client_protocol.h` | `parseFvpHeader` / `FvpHeaderView` | Parses + validates the 12-byte FVP header (v4). `dataShards` comes from the header's `data_shard_count` — never derived from the total. `parseFramePose`: the render orientation at the start of each frame (v6) |
+| `render_pose_log.h` | `RenderPoseLog` | Render poses of the frames sent to the decoder, found again by the decoder's presentation timestamp (pure, host-tested) |
 | `fec_decoder.h/.cpp` | `FecFrameDecoder` / `SlicedFecFrameDecoder` | Reed-Solomon recovery. Sliced version has 4 independent RS contexts, u32 length prefix, 100 ms timeout. `beginFrame` rejects `dataShards` 0 / > total; each frame is returned by `tryDecode` at most once |
 | `nal_validator.h/.cpp` | `NalValidator` | Sanity-check NAL unit header before feeding MediaCodec |
 | `video_decoder.h/.cpp` | `VideoDecoder` | MediaCodec via JNI + SurfaceTexture zero-copy path |

@@ -505,6 +505,7 @@ pub fn run_scenario(scenario: &Scenario) -> Result<ScenarioReport, ScenarioError
             nal_data: synth.bytes,
             is_idr: synth.is_idr,
             timestamps: FrameTimestamps::new(synth.frame_index),
+            render_orientation: None,
         };
         let _ = engine.submit_frame(frame);
         // InjectFrameLatency stimulus stretches each frame's effective
