@@ -2,6 +2,7 @@
 
 #include <openvr_driver.h>
 #include <cstdint>
+#include <mutex>
 
 extern "C" {
 #include "streaming_engine.h"
@@ -45,6 +46,8 @@ private:
     bool m_isLeft;
     uint32_t m_objectId = vr::k_unTrackedDeviceIndexInvalid;
     vr::PropertyContainerHandle_t m_propertyContainer = vr::k_ulInvalidPropertyContainer;
+    // RunFrame writes the pose, GetPose (SteamVR's threads) reads it.
+    std::mutex m_poseMutex;
     vr::DriverPose_t m_pose{};
     /// Inputs currently hold values from the engine (vs. released).
     bool m_inputsLive = false;

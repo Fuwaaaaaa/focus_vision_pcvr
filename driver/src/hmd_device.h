@@ -61,7 +61,9 @@ private:
     CDirectModeComponent m_directMode;
     CDisplayComponent m_display;
 
-    // Current pose from the streaming engine
+    // Current pose from the streaming engine; RunFrame writes it, GetPose
+    // (SteamVR's threads) reads it.
+    std::mutex m_poseMutex;
     std::atomic<bool> m_poseValid{false};
     vr::DriverPose_t m_pose{};
 };

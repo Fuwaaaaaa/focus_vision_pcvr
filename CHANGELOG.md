@@ -281,6 +281,9 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     newer pose when an app falls behind) is turned to the scene's, per
     pixel, with the eye's field of view (`layer_compose.h`, host-tested;
     the shader is checked on WARP).
+  - The HMD's and controllers' poses are read under a lock: SteamVR calls
+    `GetPose` from its own threads while `RunFrame` writes the pose, so it
+    could read a torn one (half the old orientation, half the new).
 
 ### Fixes
 - **Config values that broke the engine are corrected at startup.**
