@@ -53,6 +53,12 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   next LAN client paired with any PIN — ignoring lockout and PIN rotation —
   and became the authorized peer (video, pose and controller input).
   `verify` now always checks the PIN.
+- **No plaintext pairing when TLS fails to start.** If the engine couldn't
+  set up TLS (say, an unreadable identity file), the control server paired
+  in plaintext, so the PIN crossed the network in the clear. The headset
+  only speaks TLS, so plaintext served no real client. The server now
+  refuses to listen without TLS; the accept loop's backoff builds a new
+  server and tries TLS again.
 - **Dependency advisories.** rustls 0.23.37 → 0.23.45 (RUSTSEC-2026-0285,
   TLS 1.3 handshake messages accepted across encryption levels),
   rustls-webpki → 0.103.15, crossbeam-epoch → 0.9.21, quick-xml → 0.41.0
