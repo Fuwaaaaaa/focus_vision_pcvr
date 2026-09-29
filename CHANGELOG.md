@@ -333,6 +333,15 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     logs to vrserver.txt.
   - System info names Windows and each GPU with its driver version,
     through CIM: the GPU came from wmic, which Windows 11 24H2 removed.
+- **SteamVR in another Steam library gets the driver.** The installer
+  looked for vrpathreg only in the Steam folder itself, so a SteamVR on
+  `D:\SteamLibrary` was never registered, and the `driver/install.bat` it
+  pointed to was not shipped. The companion's Install Driver had the same
+  blind spot. Both now find SteamVR through `openvrpaths.vrpath`'s runtime
+  and every library in `libraryfolders.vdf`; the installer and uninstaller
+  call the companion (`focus-vision.exe --register-driver` /
+  `--unregister-driver`), which runs that SteamVR's vrpathreg. Without
+  SteamVR, the installer says to start SteamVR once and run it again.
 - **The Android client starts.** Found by reading the code; not yet run on
   the headset.
   - The manifest had no `android.app.lib_name`, so `NativeActivity` looked

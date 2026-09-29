@@ -48,7 +48,13 @@ fn parse_flags<I: IntoIterator<Item = String>>(args: I) -> (bool, bool) {
 fn main() -> eframe::Result {
     env_logger::init();
 
-    let (demo_mode, simulate) = parse_flags(std::env::args().skip(1));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // The installer registers the driver through us: we find SteamVR in any
+    // Steam library, which its script could not.
+    if let Some(code) = driver::run_cli(&args) {
+        std::process::exit(code);
+    }
+    let (demo_mode, simulate) = parse_flags(args);
 
     let title = if demo_mode {
         "Focus Vision PCVR — DEMO MODE"

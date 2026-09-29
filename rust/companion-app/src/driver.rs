@@ -38,74 +38,127 @@ fn read_steam_install_path_from_registry() -> Option<PathBuf> {
     None
 }
 
-/// Find the SteamVR driver directory.
-/// Lookup order (most reliable first):
-///   1. Windows registry — `HKLM\...\Valve\Steam\InstallPath`
-///   2. Hard-coded common paths (Program Files x86/x64, D: drive)
-///   3. libraryfolders.vdf parsing for users with Steam libraries on
-///      other drives configured via Steam's UI
-pub fn find_steamvr_drivers_dir() -> Option<PathBuf> {
-    // 1. Registry lookup — works for custom install locations on any drive.
-    if let Some(steam_root) = read_steam_install_path_from_registry() {
-        let driver_dir = steam_root
-            .join("steamapps").join("common").join("SteamVR").join("drivers");
-        if driver_dir.exists() {
-            return Some(driver_dir);
-        }
-        // The registry InstallPath was real but SteamVR isn't installed.
-        // Don't fall through to the hard-coded list — that would just race
-        // back to a different Steam install. Return None so the UI can
-        // prompt "install SteamVR first" instead of silently picking the
-        // wrong copy.
-        return None;
-    }
+/// SteamVR's install directory (`…\steamapps\common\SteamVR`), in whichever
+/// Steam library it is:
+///   1. `runtime` in `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`, which
+///      SteamVR writes when it first starts
+///   2. every library in `libraryfolders.vdf` of the Steam install (the
+///      registry's `InstallPath`, else the default locations), the Steam
+///      folder itself first
+///
+/// Only a directory holding `bin\win64\vrpathreg.exe` counts.
+/// REGRESSION: only the Steam folder itself was searched when the registry
+/// had it, so SteamVR in another library (D:\SteamLibrary…) was never found.
+pub fn find_steamvr_dir() -> Option<PathBuf> {
+    let steam_roots: Vec<PathBuf> = read_steam_install_path_from_registry()
+        .into_iter()
+        .chain([PathBuf::from(r"C:\Program Files (x86)\Steam"), PathBuf::from(r"C:\Program Files\Steam")])
+        .collect();
+    steamvr_candidates(read_vrpath().as_deref(), &steam_roots).into_iter().find(|dir| is_steamvr(dir))
+}
 
-    // 2. Hard-coded common paths — for the (rare) case where Steam's
-    //    registry entry is missing or unreadable but the install dir is
-    //    still in the usual place.
-    let candidates = [
-        "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\drivers",
-        "C:\\Program Files\\Steam\\steamapps\\common\\SteamVR\\drivers",
-        "D:\\Steam\\steamapps\\common\\SteamVR\\drivers",
-        "D:\\SteamLibrary\\steamapps\\common\\SteamVR\\drivers",
-    ];
+/// Where SteamVR may be, most reliable first: the vrpath's `runtime`
+/// entries, then `steamapps\common\SteamVR` in each Steam root and each
+/// library its `libraryfolders.vdf` lists.
+fn steamvr_candidates(vrpath_json: Option<&str>, steam_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let from_vrpath = vrpath_json.map(|json| vrpath_list(json, "runtime")).unwrap_or_default();
+    let from_libraries = steam_roots.iter().flat_map(|root| {
+        let vdf = fs::read_to_string(root.join("steamapps").join("libraryfolders.vdf")).unwrap_or_default();
+        std::iter::once(root.clone())
+            .chain(library_paths(&vdf))
+            .map(|library| library.join("steamapps").join("common").join("SteamVR"))
+            .collect::<Vec<_>>()
+    });
+    from_vrpath.into_iter().chain(from_libraries).collect()
+}
 
-    for path in &candidates {
-        let p = Path::new(path);
-        if p.exists() {
-            return Some(p.to_path_buf());
-        }
-    }
+fn is_steamvr(dir: &Path) -> bool {
+    vrpathreg(dir).is_file()
+}
 
-    // 3. libraryfolders.vdf — for Steam-managed libraries on non-default
-    //    drives. We only consult this if neither the registry nor the
-    //    common paths panned out, since they would be cheaper.
-    let vdf_paths = [
-        "C:\\Program Files (x86)\\Steam\\steamapps\\libraryfolders.vdf",
-        "C:\\Program Files\\Steam\\steamapps\\libraryfolders.vdf",
-    ];
+fn vrpathreg(steamvr: &Path) -> PathBuf {
+    steamvr.join("bin").join("win64").join("vrpathreg.exe")
+}
 
-    for vdf_path in &vdf_paths {
-        if let Ok(content) = fs::read_to_string(vdf_path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.starts_with("\"path\"") {
-                    if let Some(path) = line.split('"').nth(3) {
-                        let driver_path = PathBuf::from(path)
-                            .join("steamapps")
-                            .join("common")
-                            .join("SteamVR")
-                            .join("drivers");
-                        if driver_path.exists() {
-                            return Some(driver_path);
-                        }
-                    }
-                }
+/// The libraries listed in a `libraryfolders.vdf`: each `"path"` value,
+/// with the VDF's escaped backslashes (`D:\\SteamLibrary`) undone.
+fn library_paths(vdf: &str) -> Vec<PathBuf> {
+    vdf.lines()
+        .filter_map(|line| {
+            let mut quoted = line.split('"').skip(1).step_by(2);
+            if quoted.next()? != "path" {
+                return None;
             }
-        }
-    }
+            Some(PathBuf::from(quoted.next()?.replace(r"\\", r"\")))
+        })
+        .collect()
+}
 
-    None
+/// Find the SteamVR driver directory (SteamVR's `drivers`), in any Steam
+/// library: see [`find_steamvr_dir`].
+pub fn find_steamvr_drivers_dir() -> Option<PathBuf> {
+    find_steamvr_dir().map(|d| d.join("drivers")).filter(|d| d.is_dir())
+}
+
+/// How registering our driver with SteamVR failed.
+#[derive(Debug)]
+pub enum RegisterError {
+    /// No SteamVR in any Steam library.
+    SteamVrNotFound,
+    /// vrpathreg couldn't run, or refused.
+    Vrpathreg(String),
+}
+
+/// Register (`adddriver`) or unregister (`removedriver`) `driver_dir` with
+/// SteamVR through its vrpathreg, as `vrpathreg <command> <driver_dir>`.
+pub fn vrpathreg_driver(command: &str, driver_dir: &Path) -> Result<PathBuf, RegisterError> {
+    let steamvr = find_steamvr_dir().ok_or(RegisterError::SteamVrNotFound)?;
+    let tool = vrpathreg(&steamvr);
+    let status = crate::process::command(&tool)
+        .arg(command)
+        .arg(driver_dir)
+        .status()
+        .map_err(|e| RegisterError::Vrpathreg(format!("{}: {e}", tool.display())))?;
+    if status.success() {
+        Ok(steamvr)
+    } else {
+        Err(RegisterError::Vrpathreg(format!("{} {command} exited with {status}", tool.display())))
+    }
+}
+
+/// Exit codes of `--register-driver` / `--unregister-driver`, which the
+/// installer reads.
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_STEAMVR_NOT_FOUND: i32 = 2;
+pub const EXIT_VRPATHREG_FAILED: i32 = 3;
+
+/// The installer's command line: `--register-driver <dir>` or
+/// `--unregister-driver <dir>` runs vrpathreg and returns the exit code;
+/// `None` for any other command line (the app starts).
+pub fn run_cli(args: &[String]) -> Option<i32> {
+    let command = match args.first()?.as_str() {
+        "--register-driver" => "adddriver",
+        "--unregister-driver" => "removedriver",
+        _ => return None,
+    };
+    let Some(dir) = args.get(1) else {
+        log::error!("{} needs the driver directory", args[0]);
+        return Some(EXIT_VRPATHREG_FAILED);
+    };
+    Some(match vrpathreg_driver(command, Path::new(dir)) {
+        Ok(steamvr) => {
+            log::info!("vrpathreg {command} {dir}: done (SteamVR at {})", steamvr.display());
+            EXIT_OK
+        }
+        Err(RegisterError::SteamVrNotFound) => {
+            log::error!("SteamVR not found in any Steam library");
+            EXIT_STEAMVR_NOT_FOUND
+        }
+        Err(RegisterError::Vrpathreg(e)) => {
+            log::error!("{e}");
+            EXIT_VRPATHREG_FAILED
+        }
+    })
 }
 
 const DRIVER_DLL: &str = "driver_focus_vision_pcvr.dll";
@@ -303,5 +356,103 @@ mod tests {
         install_driver(&steamvr.0, &source.0).unwrap();
         assert!(is_driver_installed(&steamvr.0));
         assert!(steamvr.0.join("focus_vision_pcvr").join("driver.vrdrivermanifest").exists());
+    }
+
+    const LIBRARYFOLDERS: &str = r#""libraryfolders"
+{
+	"0"
+	{
+		"path"		"C:\\Program Files (x86)\\Steam"
+		"label"		""
+		"contentid"		"4512345678901234567"
+		"apps"
+		{
+			"228980"		"123456"
+		}
+	}
+	"1"
+	{
+		"path"		"D:\\SteamLibrary"
+		"label"		""
+		"apps"
+		{
+			"250820"		"5678901234"
+		}
+	}
+	"2"
+	{
+		"path"		"E:\\ゲーム\\Steam"
+	}
+}
+"#;
+
+    #[test]
+    fn libraries_come_from_libraryfolders_vdf() {
+        assert_eq!(
+            library_paths(LIBRARYFOLDERS),
+            vec![
+                PathBuf::from(r"C:\Program Files (x86)\Steam"),
+                PathBuf::from(r"D:\SteamLibrary"),
+                PathBuf::from(r"E:\ゲーム\Steam"),
+            ]
+        );
+        assert!(library_paths("").is_empty());
+    }
+
+    /// A fake Steam install at `root` whose libraryfolders.vdf lists
+    /// `libraries`.
+    fn fake_steam(root: &Path, libraries: &[&Path]) {
+        let mut vdf = String::from("\"libraryfolders\"\n{\n");
+        for (i, library) in libraries.iter().enumerate() {
+            let escaped = library.to_string_lossy().replace('\\', r"\\");
+            vdf.push_str(&format!("\t\"{i}\"\n\t{{\n\t\t\"path\"\t\t\"{escaped}\"\n\t}}\n"));
+        }
+        vdf.push_str("}\n");
+        fs::create_dir_all(root.join("steamapps")).unwrap();
+        fs::write(root.join("steamapps").join("libraryfolders.vdf"), vdf).unwrap();
+    }
+
+    fn fake_steamvr(library: &Path) -> PathBuf {
+        let steamvr = library.join("steamapps").join("common").join("SteamVR");
+        fs::create_dir_all(steamvr.join("bin").join("win64")).unwrap();
+        fs::write(vrpathreg(&steamvr), b"").unwrap();
+        steamvr
+    }
+
+    #[test]
+    fn steamvr_in_another_library_is_found() {
+        // REGRESSION: with Steam in the registry, only its own folder was
+        // searched, so SteamVR on D:\SteamLibrary was never found.
+        let steam = TempDriverDir::new("steam-root", false);
+        let library = TempDriverDir::new("steam-library", false);
+        fake_steam(&steam.0, &[&steam.0, &library.0]);
+        let steamvr = fake_steamvr(&library.0);
+        let found = steamvr_candidates(None, std::slice::from_ref(&steam.0)).into_iter().find(|d| is_steamvr(d));
+        assert_eq!(found, Some(steamvr));
+    }
+
+    #[test]
+    fn the_vrpath_runtime_comes_first() {
+        let steam = TempDriverDir::new("steam-root2", false);
+        let elsewhere = TempDriverDir::new("runtime", false);
+        fake_steam(&steam.0, &[&steam.0]);
+        fake_steamvr(&steam.0);
+        let runtime = fake_steamvr(&elsewhere.0);
+        let json = serde_json::json!({ "runtime": [runtime.to_string_lossy()], "version": 1 }).to_string();
+        let found = steamvr_candidates(Some(&json), std::slice::from_ref(&steam.0)).into_iter().find(|d| is_steamvr(d));
+        assert_eq!(found, Some(runtime));
+    }
+
+    #[test]
+    fn a_folder_without_vrpathreg_is_not_steamvr() {
+        let dir = TempDriverDir::new("not-steamvr", false);
+        assert!(!is_steamvr(&dir.0));
+    }
+
+    #[test]
+    fn only_the_installers_arguments_run_the_cli() {
+        assert_eq!(run_cli(&[]), None);
+        assert_eq!(run_cli(&["--demo".to_string()]), None, "the app starts");
+        assert_eq!(run_cli(&["--register-driver".to_string()]), Some(EXIT_VRPATHREG_FAILED), "no directory");
     }
 }
