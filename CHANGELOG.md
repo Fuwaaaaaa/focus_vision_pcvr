@@ -4,6 +4,27 @@ All notable changes to Focus Vision PCVR will be documented in this file.
 
 ## [Unreleased]
 
+### Protocol (v6 — each frame's render pose)
+- **A frame carries the head orientation it was rendered at.** The
+  headset could only turn a frame by how far the head moved after the
+  frame first appeared, so the time from SteamVR rendering it to the
+  headset showing it (encode, network, decode) was never corrected for —
+  the image lagged the head by that much.
+  - The driver takes the scene's head pose from `SubmitLayer` (`mHmdPose`)
+    and hands it to the engine with the frame (`fvp_submit_encoded_frame`).
+  - For a client that advertises `hello_caps::FRAME_POSE`, the engine puts
+    it ahead of the frame's data: `protocol::frame_pose`, 20 bytes ("FP",
+    version, flags, orientation x, y, z, w). STREAM_CONFIG grows to 27
+    bytes; byte 26 says the prefix is there. An older client gets no
+    prefix; `PROTOCOL_VERSION` is 6.
+  - The client strips it before decoding, finds it again by the decoder's
+    presentation timestamp (`render_pose_log.h`), and turns every frame —
+    new ones too — from that orientation to the eye's pose now.
+  - Checked: host tests (quaternion from a pose, prefix parsing, the pose
+    log), `headless_e2e_frames_carry_their_render_pose`, and the C++
+    client against the real engine (`SessionE2E` reads each frame's
+    orientation). Not yet on the headset.
+
 ### Protocol (breaking: v5 — stereo)
 - **Video frames carry both eyes side by side.** The driver streamed the
   left eye only and the headset showed it to both eyes. A frame is now twice

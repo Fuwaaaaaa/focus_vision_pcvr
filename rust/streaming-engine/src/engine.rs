@@ -248,6 +248,9 @@ pub struct EncodedFrame {
     pub nal_data: Vec<u8>,
     pub is_idr: bool,
     pub timestamps: FrameTimestamps,
+    /// The head orientation (x, y, z, w) SteamVR rendered the frame at, if
+    /// known; sent ahead of the frame to a client that reads it (v6).
+    pub render_orientation: Option<[f32; 4]>,
 }
 
 /// The main streaming engine running on a tokio runtime.
@@ -1324,11 +1327,15 @@ struct VideoSender {
     sent_packet_log: HashMap<u16, u64>,
     frame_count: u64,
     latency_skip_count: u64,
+    /// Put each frame's render pose ahead of its data (the client reads
+    /// it, v6).
+    frame_pose: bool,
 }
 
 impl VideoSender {
-    fn new(config: &AppConfig, udp_sender: UdpSender) -> Self {
+    fn new(config: &AppConfig, udp_sender: UdpSender, frame_pose: bool) -> Self {
         Self {
+            frame_pose,
             udp_sender,
             packetizer: RtpPacketizer::new(0x46565000),
             fec_encoder: pipeline::FrameFecEncoder::new(
@@ -1358,8 +1365,18 @@ impl VideoSender {
         // Multiply first to avoid integer division truncation drift (e.g. 90000/96=937.5)
         let timestamp_90khz = (self.frame_count * fvp_common::RTP_CLOCK_RATE as u64 / framerate) as u32;
 
+        // v6: the head orientation the frame was rendered at, ahead of its
+        // data, for a client that reads it.
+        let payload: std::borrow::Cow<[u8]> = if self.frame_pose {
+            let mut data = Vec::with_capacity(fvp_common::protocol::frame_pose::LEN + frame.nal_data.len());
+            data.extend_from_slice(&fvp_common::protocol::frame_pose::encode(frame.render_orientation));
+            data.extend_from_slice(&frame.nal_data);
+            std::borrow::Cow::Owned(data)
+        } else {
+            std::borrow::Cow::Borrowed(&frame.nal_data)
+        };
         let batches = self.fec_encoder.encode(
-            &frame.nal_data,
+            &payload,
             frame.frame_index,
             timestamp_90khz,
             frame.is_idr,
@@ -1666,7 +1683,7 @@ impl StreamingLoop {
             log::info!("HMD connected from {}, starting video stream", peer);
             self.reconnect_state.record_accept_success();
 
-            let reason = match self.run_session(stream, peer).await {
+            let reason = match self.run_session(stream, peer, server.client_reads_frame_pose()).await {
                 SessionEnd::Disconnected(reason) => reason,
                 SessionEnd::SetupFailed => {
                     self.reconnect_state.record_accept_failure();
@@ -1765,7 +1782,8 @@ impl StreamingLoop {
     /// Stream to a connected HMD until it disconnects, the frame source
     /// closes, or the engine shuts down. However it ends, the session's
     /// control task, audio pipeline, haptic route and tracking peer end with it.
-    async fn run_session(&mut self, stream: Box<dyn AsyncStream>, peer: SocketAddr) -> SessionEnd {
+    /// `frame_pose`: the client reads each frame's render pose (v6).
+    async fn run_session(&mut self, stream: Box<dyn AsyncStream>, peer: SocketAddr, frame_pose: bool) -> SessionEnd {
         let config = &self.config;
 
         // Only the HMD that just completed TLS + PIN pairing may feed the
@@ -1861,7 +1879,7 @@ impl StreamingLoop {
         }
 
         // Step 3: Process frames with adaptive bitrate + adaptive FEC
-        let mut video = VideoSender::new(config, udp_sender);
+        let mut video = VideoSender::new(config, udp_sender, frame_pose);
         let mut adaptive = AdaptiveState::new(config);
         let framerate = config.video.framerate as u64;
 
@@ -2078,6 +2096,7 @@ mod tests {
             nal_data: vec![0u8; 100],
             is_idr: true,
             timestamps: FrameTimestamps::new(0),
+            render_orientation: None,
         };
         assert!(engine.submit_frame(frame));
         engine.shutdown();
@@ -2094,6 +2113,7 @@ mod tests {
                 nal_data: vec![0u8; 100],
                 is_idr: i == 0,
                 timestamps: FrameTimestamps::new(i),
+                render_orientation: None,
             };
             assert!(engine.submit_frame(frame), "frame {} should succeed", i);
         }
@@ -2103,6 +2123,7 @@ mod tests {
             nal_data: vec![0u8; 100],
             is_idr: false,
             timestamps: FrameTimestamps::new(4),
+            render_orientation: None,
         };
         assert!(!engine.submit_frame(frame), "frame 4 should fail (channel full)");
         engine.shutdown();

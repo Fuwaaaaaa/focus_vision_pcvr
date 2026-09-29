@@ -133,6 +133,11 @@ pub struct MockClientStats {
     pub frames_decoded: u64,
     /// IDR frames seen (subset of frames_decoded).
     pub idr_frames_seen: u64,
+    /// Frames that started with their render pose (v6; the mock client asks
+    /// for it).
+    pub frames_with_render_pose: u64,
+    /// The render orientation of the newest such frame (`None`: unknown).
+    pub last_render_orientation: Option<[f32; 4]>,
     /// RTP packets received on the video UDP socket.
     pub video_packets_received: u64,
     /// Video packets missing from the RTP sequence — the loss the HEARTBEATs
@@ -227,12 +232,12 @@ pub async fn run(
     let tcp = TcpStream::connect(config.server).await?;
     tcp.set_nodelay(true).ok();
     let mut stream = tls_handshake(tcp, &config.server.ip().to_string()).await?;
-    do_handshake(&mut stream, config.pin).await?;
+    let frame_pose = do_handshake(&mut stream, config.pin).await?;
     let connect_duration = connect_start.elapsed();
     log::info!("mock-client handshake complete in {:?}", connect_duration);
 
     let stream_start = Instant::now();
-    let stats = stream_loop(stream, &config, cancel.clone()).await?;
+    let stats = stream_loop(stream, &config, cancel.clone(), frame_pose).await?;
     let stats = MockClientStats {
         connect_duration,
         stream_duration: stream_start.elapsed(),
@@ -318,7 +323,9 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerifier {
 
 /// HELLO → HELLO_ACK → PIN → PIN_RESULT → STREAM_CONFIG → STREAM_START.
 /// Mirrors the server's `handle_handshake_generic` flow byte for byte.
-async fn do_handshake<S>(stream: &mut S, pin: u32) -> Result<(), MockClientError>
+/// Returns whether each frame starts with its render pose (STREAM_CONFIG
+/// byte 26, v6).
+async fn do_handshake<S>(stream: &mut S, pin: u32) -> Result<bool, MockClientError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -329,7 +336,7 @@ where
     // makes the server send downscaled encoded dims (otherwise gated to native).
     let hello_payload = fvp_common::protocol::encode_hello(
         fvp_common::protocol::PROTOCOL_VERSION,
-        fvp_common::protocol::hello_caps::RESOLUTION_SCALE);
+        fvp_common::protocol::hello_caps::RESOLUTION_SCALE | fvp_common::protocol::hello_caps::FRAME_POSE);
     send_message(stream, msg_type::HELLO, &hello_payload).await?;
 
     let (mt, _payload) = read_message(stream).await?;
@@ -358,8 +365,8 @@ where
         return Err(MockClientError::PinRejected);
     }
 
-    // STREAM_CONFIG (26-byte payload, parsed for log only — we don't enforce
-    // the values match a local expectation, just acknowledge receipt).
+    // STREAM_CONFIG (27 bytes; only byte 26, the frame pose flag, is used —
+    // the rest just acknowledged).
     let (mt, payload) = read_message(stream).await?;
     if mt != msg_type::STREAM_CONFIG {
         return Err(MockClientError::Protocol(
@@ -367,10 +374,11 @@ where
         ));
     }
     log::debug!("STREAM_CONFIG received ({} bytes)", payload.len());
+    let frame_pose = payload.get(26) == Some(&1);
 
     // STREAM_START closes the handshake.
     send_message(stream, msg_type::STREAM_START, &[]).await?;
-    Ok(())
+    Ok(frame_pose)
 }
 
 async fn send_message<S>(stream: &mut S, msg_type: u8, payload: &[u8]) -> Result<(), MockClientError>
@@ -447,6 +455,7 @@ async fn stream_loop<S>(
     tcp: S,
     config: &MockClientConfig,
     cancel: CancellationToken,
+    frame_pose: bool,
 ) -> Result<MockClientStats, MockClientError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -572,6 +581,12 @@ where
                         if let Some(frame) = reassembler.feed(&buf[..n]) {
                             last_completed = Some(frame.frame_index);
                             s.frames_decoded += 1;
+                            if frame_pose {
+                                if let Some((orientation, _nal)) = fvp_common::protocol::frame_pose::parse(&frame.data) {
+                                    s.frames_with_render_pose += 1;
+                                    s.last_render_orientation = orientation;
+                                }
+                            }
                             if frame.is_keyframe {
                                 s.idr_frames_seen += 1;
                             }

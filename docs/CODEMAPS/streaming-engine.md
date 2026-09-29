@@ -14,7 +14,7 @@ through shared types in `rust/common/`.
 | Path | Symbol | Purpose |
 |---|---|---|
 | `src/lib.rs` | `fvp_init` / `fvp_shutdown` | C FFI init / teardown from driver |
-| `src/lib.rs` | `fvp_submit_encoded_nal` | NVENC → engine NAL submission (+ recording tap) |
+| `src/lib.rs` | `fvp_submit_encoded_frame` / `fvp_submit_encoded_nal` | NVENC → engine NAL submission, with the render orientation (v6) or without (+ recording tap) |
 | `src/lib.rs` | `fvp_get_tracking_data` / `fvp_get_controller_state` | pose/controller read from C++ thread |
 | `src/lib.rs` | `fvp_set_*_callback` | register driver-side callbacks (IDR, gaze, bitrate) |
 | `src/lib.rs` | `fvp_haptic_event` | queue haptic from SteamVR → HMD |

@@ -203,7 +203,8 @@ void fvp_haptic_event(uint8_t controller_id,
  * `frame_index`: monotonically increasing frame counter.
  * `is_idr`: 1 if this frame is an IDR keyframe, 0 otherwise.
  *
- * Returns 0 on success, -1 on error.
+ * Returns 0 on success, -1 on error. Sends the frame without its render
+ * pose; see [`fvp_submit_encoded_frame`].
  *
  * # Safety
  * `nal_data_ptr` must be valid for `nal_data_len` bytes (and at most
@@ -213,6 +214,22 @@ int32_t fvp_submit_encoded_nal(const uint8_t *nal_data_ptr,
                                uint32_t nal_data_len,
                                uint32_t frame_index,
                                int32_t is_idr);
+
+/**
+ * [`fvp_submit_encoded_nal`] with the head orientation the frame was
+ * rendered at (`render_orientation`: x, y, z, w, or null if unknown). A
+ * headset that reads it turns the image from there to where its head is
+ * when it shows the frame (protocol v6).
+ *
+ * # Safety
+ * As [`fvp_submit_encoded_nal`]; `render_orientation`, if not null, must
+ * point to 4 floats.
+ */
+int32_t fvp_submit_encoded_frame(const uint8_t *nal_data_ptr,
+                                 uint32_t nal_data_len,
+                                 uint32_t frame_index,
+                                 int32_t is_idr,
+                                 const float *render_orientation);
 
 /**
  * Get the latest tracking data from the connected HMD.

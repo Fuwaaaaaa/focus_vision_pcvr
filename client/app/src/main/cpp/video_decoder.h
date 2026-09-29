@@ -42,6 +42,10 @@ public:
     /// Decode latency of the frame getDecodedFrame() last returned.
     uint32_t lastDecodeLatencyUs() const { return m_lastDecodeUs; }
 
+    /// Presentation timestamp (as submitted) of the frame getDecodedFrame()
+    /// last returned: which frame it is.
+    int64_t lastPresentationTimeUs() const { return m_lastPtsUs; }
+
 private:
     void cleanupSurfaceResources(JNIEnv* env);
 
@@ -67,6 +71,7 @@ private:
     std::deque<std::chrono::steady_clock::time_point> m_submitTimes;
     uint32_t m_avgDecodeUs = 0;
     uint32_t m_lastDecodeUs = 0;
+    int64_t m_lastPtsUs = -1;
     uint32_t m_decodeCount = 0;
     uint64_t m_totalDecodeUs = 0;
 };

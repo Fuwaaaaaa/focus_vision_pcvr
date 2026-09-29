@@ -19,6 +19,7 @@
 #include "video_receiver.h"
 
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -357,6 +358,7 @@ TEST_F(SessionE2E, PairsAndStreamsVideoFromTheRealEngine) {
     EXPECT_GT(config.encodedWidth, 0u);
     EXPECT_EQ(config.layout, fvp_client_protocol::STEREO_SIDE_BY_SIDE)
         << "the engine sends both eyes (v5)";
+    EXPECT_TRUE(config.framePose) << "the engine sends each frame's render pose (v6)";
 
     const auto frames = collectFrames(3s);
     // 60 fps for 3 s; up to a GOP (1 s) goes by before the first keyframe.
@@ -365,7 +367,17 @@ TEST_F(SessionE2E, PairsAndStreamsVideoFromTheRealEngine) {
     bool sawSliced = false;
     bool sawBulk = false;
     for (size_t i = 0; i < frames.size(); i++) {
-        EXPECT_TRUE(startsWithStartCode(frames[i].data)) << "frame " << frames[i].frameIndex;
+        // v6: the render pose first. The headless engine renders as if the
+        // head turns left 0.01 rad a frame.
+        fvp_client_protocol::FramePose pose;
+        const size_t prefix =
+            fvp_client_protocol::parseFramePose(frames[i].data.data(), frames[i].data.size(), pose);
+        ASSERT_EQ(prefix, fvp_client_protocol::FRAME_POSE_LEN) << "frame " << frames[i].frameIndex;
+        EXPECT_TRUE(pose.known);
+        EXPECT_NEAR(pose.orientation[1], std::sin(frames[i].frameIndex * 0.005f), 1e-5f)
+            << "frame " << frames[i].frameIndex;
+        const std::vector<uint8_t> nal(frames[i].data.begin() + prefix, frames[i].data.end());
+        EXPECT_TRUE(startsWithStartCode(nal)) << "frame " << frames[i].frameIndex;
         if (i > 0) {
             EXPECT_GT(frames[i].frameIndex, frames[i - 1].frameIndex) << "out of order";
         }

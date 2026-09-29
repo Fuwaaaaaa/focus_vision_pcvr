@@ -13,10 +13,12 @@
 namespace fvp_client_protocol {
 
 // Protocol version — must match Rust PROTOCOL_VERSION. The client implements the
-// v5 wire format: v3 FVP slice/stream flags (see fec_decoder.h fvp_flags), the
-// 12-byte FVP header carrying data_shard_count (parseFvpHeader below, v4), and
-// side-by-side stereo frames (STREAM_CONFIG byte 25, v5).
-inline constexpr uint16_t PROTOCOL_VERSION = 5;
+// v6 wire format: v3 FVP slice/stream flags (see fec_decoder.h fvp_flags), the
+// 12-byte FVP header carrying data_shard_count (parseFvpHeader below, v4),
+// side-by-side stereo frames (STREAM_CONFIG byte 25, v5), and each frame's
+// render pose ahead of its data (parseFramePose below, STREAM_CONFIG byte 26,
+// v6).
+inline constexpr uint16_t PROTOCOL_VERSION = 6;
 
 // How the eyes are laid out in a video frame — must match Rust
 // protocol::stereo_layout.
@@ -134,7 +136,43 @@ namespace hello_caps {
     // deliberately handles a sub-native (downscaled) stream. The server only
     // downscales for clients that advertise this bit.
     inline constexpr uint8_t RESOLUTION_SCALE = 0x01;
+    // The client reads each frame's render pose (parseFramePose). The server
+    // adds it only for a client that advertises this bit (v6).
+    inline constexpr uint8_t FRAME_POSE = 0x02;
 }  // namespace hello_caps
+
+// The head orientation a video frame was rendered at, ahead of the frame's
+// data (v6; Rust protocol::frame_pose): the client turns the image from
+// there to where the head is when it shows it.
+// 20 bytes, little-endian: [0..2] "FP", [2] version 1, [3] flags (bit 0:
+// orientation known), [4..20] orientation x, y, z, w (f32).
+inline constexpr size_t FRAME_POSE_LEN = 20;
+
+struct FramePose {
+    bool known = false;
+    float orientation[4] = {0.0f, 0.0f, 0.0f, 1.0f};  // x, y, z, w
+};
+
+// Parse the prefix at the start of a frame. Returns its length (the frame's
+// data starts there), or 0 if `frame` doesn't start with one. A pose that
+// isn't finite reads as unknown.
+inline size_t parseFramePose(const uint8_t* frame, size_t len, FramePose& out) {
+    if (len < FRAME_POSE_LEN || frame[0] != 'F' || frame[1] != 'P' || frame[2] != 1) {
+        return 0;
+    }
+    out = FramePose{};
+    if (frame[3] & 0x01) {
+        for (int i = 0; i < 4; i++) {
+            float v;
+            std::memcpy(&v, frame + 4 + i * 4, sizeof v);  // little-endian host
+            out.orientation[i] = v;
+        }
+        out.known = std::isfinite(out.orientation[0]) && std::isfinite(out.orientation[1]) &&
+                    std::isfinite(out.orientation[2]) && std::isfinite(out.orientation[3]);
+        if (!out.known) out = FramePose{};
+    }
+    return FRAME_POSE_LEN;
+}
 
 // Build the HELLO payload: protocol version (u16 LE) followed by a capability
 // byte. Mirrors Rust encode_hello(): [ver_lo, ver_hi, caps].
@@ -168,12 +206,14 @@ struct StreamConfigView {
     uint32_t encodedWidth = 0;
     uint32_t encodedHeight = 0;
     uint8_t layout = STEREO_MONO;
+    bool framePose = false;  // each frame starts with its render pose (v6)
 };
 
 // Parse a STREAM_CONFIG payload. Layout (little-endian) — see Rust
 // encode_stream_config():
 //   [0..4] render_w | [4..8] render_h | [8..12] bitrate | [12..16] framerate |
-//   [16] codec | [17..21] encoded_w | [21..25] encoded_h | [25] stereo layout
+//   [16] codec | [17..21] encoded_w | [21..25] encoded_h | [25] stereo layout |
+//   [26] frame pose (1: each frame starts with parseFramePose's prefix, v6)
 // A payload of >= 25 bytes carries explicit encoded dims; a legacy 17..24-byte
 // payload (old server) has none, so encoded falls back to native. Without byte
 // 25 (a server before v5) the stream is mono. Returns false for a payload
@@ -196,6 +236,7 @@ inline bool parseStreamConfig(const uint8_t* payload, size_t len, StreamConfigVi
         out.encodedHeight = out.height;
     }
     out.layout = len >= 26 && payload[25] == STEREO_SIDE_BY_SIDE ? STEREO_SIDE_BY_SIDE : STEREO_MONO;
+    out.framePose = len >= 27 && payload[26] == 1;
     return true;
 }
 

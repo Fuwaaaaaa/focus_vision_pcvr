@@ -193,6 +193,7 @@ bool VideoDecoder::getDecodedFrame() {
     ssize_t bufIdx = AMediaCodec_dequeueOutputBuffer(m_codec, &info, 0); // non-blocking
 
     if (bufIdx >= 0) {
+        m_lastPtsUs = info.presentationTimeUs;
         // Measure submit-to-output decode latency
         if (!m_submitTimes.empty()) {
             auto latency = std::chrono::steady_clock::now() - m_submitTimes.front();

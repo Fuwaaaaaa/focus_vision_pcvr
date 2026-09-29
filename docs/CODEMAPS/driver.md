@@ -25,7 +25,7 @@ loads on boot. The driver opens the Rust streaming engine, registers HMD
 | `src/gpu_adapter.cpp` / `.h` | Pick the GPU (NVIDIA first), create the D3D11 device, LUID for SteamVR | 70 + 70 |
 | `src/swap_textures.cpp` / `.h` | `SwapTextureSets` — shareable textures + DXGI shared handles for the compositor | 80 + 55 |
 | `src/eye_blit.cpp` / `.h` | `EyeBlit` — draws an eye's region of a layer into NVENC's B8G8R8A8 input (scale, flip, sRGB); `drawOver` blends a layer above the scene, turned to its head pose | 230 + 90 |
-| `src/layer_compose.h` | Turning a layer rendered at another head pose to the scene's (rotation, ray lookup) — pure, tested, mirrored by EyeBlit's shader | 100 |
+| `src/layer_compose.h` | Turning a layer rendered at another head pose to the scene's (rotation, ray lookup), and a pose's quaternion (`orientationOf`, sent with each frame, v6) — pure, tested, mirrored by EyeBlit's shader | 135 |
 | `src/sync_texture.cpp` / `.h` | `SyncTexture` — the compositor's keyed mutex, held while Present reads the frame | 30 + 30 |
 | `src/nvenc_encoder.cpp` / `.h` | NVENC session on EyeBlit's output, QP delta map, `encode()` | 330 + 110 |
 | `src/driver_log.h` | `driverLog()` → SteamVR's vrserver.txt | 25 |
@@ -69,7 +69,7 @@ per-frame (driven by SteamVR compositor):
   → CDirectModeComponent::Present(syncTexture)
     → SyncTexture::acquire (the compositor's keyed mutex)
     → EyeBlit::draw(each eye of the layer → its half of the frame) → release
-    → NvencEncoder::encode() → fvp_submit_encoded_nal()
+    → NvencEncoder::encode() → fvp_submit_encoded_frame() (with the scene's head orientation)
   → CDirectModeComponent::PostPresent() — FramePacer: wait out the frame's
     slot at the refresh rate (as ALVR does)
 
@@ -129,7 +129,7 @@ CServerDriver::Cleanup()
 - `init()` returns false when NVENC is unavailable (logged to vrserver.txt);
   there is no fake test-pattern stream
 - `setGaze(x, y, valid)` → triggers `computeQpDeltaMap()` for foveated
-- `encode()` → bitstream buffer → NAL bytes for `fvp_submit_encoded_nal()`
+- `encode()` → bitstream buffer → NAL bytes for `fvp_submit_encoded_frame()`
 - IDR trigger: atomic `s_idrRequested` flipped by Rust callback
 
 ---

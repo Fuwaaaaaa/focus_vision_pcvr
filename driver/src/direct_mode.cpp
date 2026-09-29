@@ -229,6 +229,8 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
         }
     }
     m_sync.release();
+    // The scene's head pose (both eyes share it).
+    const vr::HmdMatrix34_t sceneHmdPose = layers[0][0].mHmdPose;
 
     bool isIdr = false;
     if (!m_encoder.encode(false, m_nal, isIdr)) {
@@ -238,15 +240,20 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
     if (m_nal.empty())
         return;
 
-    // Submit encoded NAL data to Rust streaming engine for RTP packetization
-    const int32_t result = fvp_submit_encoded_nal(
+    // Submit encoded NAL data to Rust streaming engine for RTP packetization,
+    // with the head orientation the scene was rendered at: the headset turns
+    // the image from there to where the head is when it shows it (v6).
+    float orientation[4];
+    const bool known = fvp_layers::orientationOf(sceneHmdPose.m, orientation);
+    const int32_t result = fvp_submit_encoded_frame(
         m_nal.data(),
         static_cast<uint32_t>(m_nal.size()),
         m_frameIndex,
-        isIdr ? 1 : 0
+        isIdr ? 1 : 0,
+        known ? orientation : nullptr
     );
     if (result != 0) {
-        logSometimes(m_submitFailures, "fvp_submit_encoded_nal failed");
+        logSometimes(m_submitFailures, "fvp_submit_encoded_frame failed");
     }
 }
 

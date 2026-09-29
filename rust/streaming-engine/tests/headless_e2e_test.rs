@@ -145,6 +145,7 @@ fn headless_e2e_basic_video_flow() {
             nal_data: synth.bytes,
             is_idr: synth.is_idr,
             timestamps: FrameTimestamps::new(synth.frame_index),
+            render_orientation: None,
         };
         frames_offered += 1;
         if engine.submit_frame(frame) {
@@ -265,6 +266,7 @@ fn pump_frames(
             nal_data: synth.bytes,
             is_idr: synth.is_idr,
             timestamps: FrameTimestamps::new(synth.frame_index),
+            render_orientation: None,
         };
         let _ = engine.submit_frame(frame);
         tick();
@@ -393,6 +395,7 @@ fn headless_e2e_session_starts_clean() {
             nal_data: synth.bytes,
             is_idr: false,
             timestamps: FrameTimestamps::new(synth.frame_index),
+            render_orientation: None,
         });
     }
     IDR_REQUESTS.store(0, Ordering::SeqCst);
@@ -406,6 +409,57 @@ fn headless_e2e_session_starts_clean() {
     assert_eq!(stats.video_packets_received, 0, "the queued frames were stale and are dropped");
     assert_eq!(DRIVER_BITRATE.load(Ordering::SeqCst), 37_000_000, "the encoder is set to the bitrate setting");
     assert!(IDR_REQUESTS.load(Ordering::SeqCst) >= 1, "a keyframe is asked for");
+}
+
+/// Each frame reaches the headset with the head orientation it was rendered
+/// at (v6), so the headset can turn it to where the head is when shown.
+/// REGRESSION: the protocol had no way to tie a frame to its pose.
+#[test]
+fn headless_e2e_frames_carry_their_render_pose() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .is_test(true).try_init();
+
+    delete_stale_status();
+    let (tcp_port, udp_port) = pick_free_ports();
+    let mut config = sim_test_config(tcp_port, udp_port);
+    config.video.framerate = 60;
+    let engine = StreamingEngine::new(config).expect("engine new");
+    let pin = wait_for_pin(Duration::from_secs(3)).expect("engine never published a PIN");
+
+    let mut hmd = MockClientConfig::from_ports(IpAddr::V4(Ipv4Addr::LOCALHOST), tcp_port, udp_port, pin);
+    hmd.duration = Some(Duration::from_millis(1500));
+    let hmd = spawn_mock_client(hmd);
+
+    let mut stream = SyntheticNalStream::new(VideoCodec::H265, 60);
+    let turn = |i: u32| {
+        let half = i as f32 * 0.005;
+        [0.0, half.sin(), 0.0, half.cos()]
+    };
+    let mut last_sent = None;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(1700) {
+        let synth = stream.next_frame();
+        let q = turn(synth.frame_index);
+        if engine.submit_frame(EncodedFrame {
+            frame_index: synth.frame_index,
+            nal_data: synth.bytes,
+            is_idr: synth.is_idr,
+            timestamps: FrameTimestamps::new(synth.frame_index),
+            render_orientation: Some(q),
+        }) {
+            last_sent = Some(q);
+        }
+        std::thread::sleep(Duration::from_secs_f64(1.0 / 60.0));
+    }
+    let stats = hmd.join().unwrap().expect("session");
+    engine.shutdown();
+
+    assert!(stats.frames_decoded > 30, "frames flowed: {}", stats.frames_decoded);
+    assert_eq!(stats.frames_with_render_pose, stats.frames_decoded, "every frame starts with its pose");
+    let got = stats.last_render_orientation.expect("a known orientation");
+    // The newest frame the client completed is one of the last ones sent.
+    let sent = last_sent.unwrap();
+    assert!((got[1] - sent[1]).abs() < 0.05 && got[0] == 0.0 && got[2] == 0.0, "{got:?} vs {sent:?}");
 }
 
 /// REGRESSION: the engine kept the HMD's last input forever. A controller

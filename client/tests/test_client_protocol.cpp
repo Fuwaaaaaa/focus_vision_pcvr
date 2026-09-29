@@ -23,9 +23,11 @@ void put_u32(std::vector<uint8_t>& v, uint32_t x) {
 }  // namespace
 
 TEST(ClientProtocol, ProtocolVersionMatchesServer) {
-    // Must match Rust PROTOCOL_VERSION = 5 (side-by-side stereo) and
-    // protocol::stereo_layout.
-    EXPECT_EQ(PROTOCOL_VERSION, 5);
+    // Must match Rust PROTOCOL_VERSION = 6 (each frame's render pose),
+    // protocol::stereo_layout, hello_caps and frame_pose::LEN.
+    EXPECT_EQ(PROTOCOL_VERSION, 6);
+    EXPECT_EQ(hello_caps::FRAME_POSE, 0x02);
+    EXPECT_EQ(FRAME_POSE_LEN, 20u);
     EXPECT_EQ(STEREO_MONO, 0);
     EXPECT_EQ(STEREO_SIDE_BY_SIDE, 1);
 }
@@ -34,7 +36,7 @@ TEST(ClientProtocol, BuildHelloPayloadAdvertisesVersionAndCaps) {
     auto p = buildHelloPayload(PROTOCOL_VERSION, hello_caps::RESOLUTION_SCALE);
     // Layout mirrors Rust encode_hello(): [ver_lo, ver_hi, caps].
     ASSERT_EQ(p.size(), 3u);
-    EXPECT_EQ(p[0], 5);     // version low byte (v5)
+    EXPECT_EQ(p[0], 6);     // version low byte (v6)
     EXPECT_EQ(p[1], 0);     // version high byte
     EXPECT_EQ(p[2], 0x01);  // RESOLUTION_SCALE
 }
@@ -83,6 +85,68 @@ TEST(ClientProtocol, ParseStreamConfig26ByteReadsTheStereoLayout) {
     p[25] = 7;  // unknown layout: show it as one image rather than guess
     ASSERT_TRUE(parseStreamConfig(p.data(), p.size(), c));
     EXPECT_EQ(c.layout, STEREO_MONO);
+}
+
+TEST(ClientProtocol, ParseStreamConfig27ByteSaysFramesCarryTheirPose) {
+    std::vector<uint8_t> p;
+    put_u32(p, 1832); put_u32(p, 1920);
+    put_u32(p, 80);   put_u32(p, 90);
+    p.push_back(1);
+    put_u32(p, 1832); put_u32(p, 1920);
+    p.push_back(STEREO_SIDE_BY_SIDE);
+    StreamConfigView c;
+    ASSERT_TRUE(parseStreamConfig(p.data(), p.size(), c));
+    EXPECT_FALSE(c.framePose) << "a v5 server sends no render pose";
+    p.push_back(1);
+    ASSERT_TRUE(parseStreamConfig(p.data(), p.size(), c));
+    EXPECT_TRUE(c.framePose);
+    p[26] = 0;
+    ASSERT_TRUE(parseStreamConfig(p.data(), p.size(), c));
+    EXPECT_FALSE(c.framePose);
+}
+
+namespace {
+// What Rust protocol::frame_pose::encode writes.
+std::vector<uint8_t> framePosePrefix(const float* q) {
+    std::vector<uint8_t> p = {'F', 'P', 1, static_cast<uint8_t>(q ? 1 : 0)};
+    for (int i = 0; i < 4; i++) {
+        uint8_t b[4] = {};
+        if (q) std::memcpy(b, &q[i], 4);
+        p.insert(p.end(), b, b + 4);
+    }
+    return p;
+}
+}  // namespace
+
+TEST(ClientProtocol, ParseFramePoseReadsTheOrientationAndSkipsThePrefix) {
+    const float q[4] = {0.1f, -0.2f, 0.3f, 0.927f};
+    std::vector<uint8_t> frame = framePosePrefix(q);
+    const uint8_t nal[] = {0, 0, 0, 1, 0x40};
+    frame.insert(frame.end(), nal, nal + sizeof nal);
+
+    FramePose pose;
+    ASSERT_EQ(parseFramePose(frame.data(), frame.size(), pose), FRAME_POSE_LEN);
+    EXPECT_TRUE(pose.known);
+    for (int i = 0; i < 4; i++) EXPECT_EQ(pose.orientation[i], q[i]);
+    EXPECT_EQ(frame[FRAME_POSE_LEN + 3], 1) << "the NAL follows";
+
+    const std::vector<uint8_t> unknown = framePosePrefix(nullptr);
+    ASSERT_EQ(parseFramePose(unknown.data(), unknown.size(), pose), FRAME_POSE_LEN);
+    EXPECT_FALSE(pose.known);
+}
+
+TEST(ClientProtocol, ParseFramePoseRejectsWhatIsNotOne) {
+    FramePose pose;
+    const uint8_t bareNal[] = {0, 0, 0, 1, 0x40, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    EXPECT_EQ(parseFramePose(bareNal, sizeof bareNal, pose), 0u);
+    std::vector<uint8_t> p = framePosePrefix(nullptr);
+    EXPECT_EQ(parseFramePose(p.data(), 19, pose), 0u) << "short";
+    p[2] = 9;
+    EXPECT_EQ(parseFramePose(p.data(), p.size(), pose), 0u) << "unknown version";
+    const float nan[4] = {std::nanf(""), 0.0f, 0.0f, 1.0f};
+    p = framePosePrefix(nan);
+    ASSERT_EQ(parseFramePose(p.data(), p.size(), pose), FRAME_POSE_LEN);
+    EXPECT_FALSE(pose.known) << "not finite: unknown";
 }
 
 TEST(ClientProtocol, ParseStreamConfigLegacy17ByteEncodedEqualsNative) {

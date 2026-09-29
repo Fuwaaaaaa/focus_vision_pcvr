@@ -107,7 +107,10 @@ pub mod msg_type {
 ///      `flags`, payload now starts at byte 24 (v3.0)
 /// v5 = stereo: each video frame carries both eyes side by side (twice the
 ///      per-eye width); STREAM_CONFIG byte 25 says so (`stereo_layout`)
-pub const PROTOCOL_VERSION: u16 = 5;
+/// v6 = each video frame starts with the head orientation it was rendered
+///      at (`frame_pose`), for a client advertising `hello_caps::FRAME_POSE`;
+///      STREAM_CONFIG byte 26 says so
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// How the eyes are laid out in a video frame — STREAM_CONFIG byte 25.
 /// Absent (a 25-byte payload from an older server) means `MONO`.
@@ -141,6 +144,53 @@ pub mod hello_caps {
     /// decoder from the STREAM_CONFIG encoded dimensions and handles a half-res
     /// stream deliberately (Phase 0 = bilinear stretch, Phase 1 = GLSL upscaler).
     pub const RESOLUTION_SCALE: u8 = 0x01;
+    /// Client reads a [`super::frame_pose`] prefix at the start of each video
+    /// frame (v6). The server adds it only for such a client, and says so in
+    /// STREAM_CONFIG byte 26.
+    pub const FRAME_POSE: u8 = 0x02;
+}
+
+/// The head orientation a video frame was rendered at, at the start of the
+/// frame's data (v6): the headset turns the image from there to where the
+/// head is when it shows it. Without it, it could only correct for the head
+/// turning after the frame first appeared.
+///
+/// 20 bytes, little-endian: `[0..2]` "FP", `[2]` version (1), `[3]` flags
+/// (bit 0: the orientation is known), `[4..20]` orientation x, y, z, w (f32,
+/// the tracking space the headset reports its pose in).
+pub mod frame_pose {
+    pub const LEN: usize = 20;
+    const MAGIC: [u8; 2] = *b"FP";
+    const VERSION: u8 = 1;
+    const ORIENTATION_KNOWN: u8 = 0x01;
+
+    pub fn encode(orientation: Option<[f32; 4]>) -> [u8; LEN] {
+        let mut out = [0u8; LEN];
+        out[0..2].copy_from_slice(&MAGIC);
+        out[2] = VERSION;
+        if let Some(q) = orientation {
+            out[3] = ORIENTATION_KNOWN;
+            for (i, v) in q.iter().enumerate() {
+                out[4 + i * 4..8 + i * 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// The orientation (`None` if unknown or not finite) and the frame's
+    /// data after the prefix; `None` if `frame` doesn't start with one.
+    pub fn parse(frame: &[u8]) -> Option<(Option<[f32; 4]>, &[u8])> {
+        if frame.len() < LEN || frame[0..2] != MAGIC || frame[2] != VERSION {
+            return None;
+        }
+        let rest = &frame[LEN..];
+        if frame[3] & ORIENTATION_KNOWN == 0 {
+            return Some((None, rest));
+        }
+        let f = |i: usize| f32::from_le_bytes([frame[4 + i * 4], frame[5 + i * 4], frame[6 + i * 4], frame[7 + i * 4]]);
+        let q = [f(0), f(1), f(2), f(3)];
+        Some((q.iter().all(|v| v.is_finite()).then_some(q), rest))
+    }
 }
 
 /// Parse HELLO capability flags from the payload. Returns 0 when the capability
@@ -602,13 +652,40 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_5() {
-        // v5 = side-by-side stereo frames (STREAM_CONFIG byte 25). Must match
-        // the C++ client's fvp_client_protocol::PROTOCOL_VERSION and
-        // STEREO_SIDE_BY_SIDE.
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn protocol_version_is_6() {
+        // v6 = the render pose at the start of each frame (frame_pose,
+        // STREAM_CONFIG byte 26). Must match the C++ client's
+        // fvp_client_protocol::PROTOCOL_VERSION, STEREO_SIDE_BY_SIDE and
+        // hello_caps::FRAME_POSE.
+        assert_eq!(PROTOCOL_VERSION, 6);
         assert_eq!(stereo_layout::MONO, 0);
         assert_eq!(stereo_layout::SIDE_BY_SIDE, 1);
+        assert_eq!(hello_caps::FRAME_POSE, 0x02);
+        assert_eq!(frame_pose::LEN, 20);
+    }
+
+    #[test]
+    fn a_frame_pose_round_trips_and_leaves_the_frame() {
+        let q = [0.1, -0.2, 0.3, 0.927];
+        let mut frame = frame_pose::encode(Some(q)).to_vec();
+        frame.extend_from_slice(&[0, 0, 0, 1, 0x40]);
+        let (orientation, rest) = frame_pose::parse(&frame).expect("prefix");
+        assert_eq!(orientation, Some(q));
+        assert_eq!(rest, &[0, 0, 0, 1, 0x40]);
+
+        let unknown = frame_pose::encode(None);
+        assert_eq!(frame_pose::parse(&unknown), Some((None, &[][..])));
+    }
+
+    #[test]
+    fn a_frame_without_the_prefix_is_not_parsed_as_one() {
+        assert_eq!(frame_pose::parse(&[0, 0, 0, 1, 0x40, 0x01]), None, "a bare NAL");
+        let mut wrong_version = frame_pose::encode(None);
+        wrong_version[2] = 9;
+        assert_eq!(frame_pose::parse(&wrong_version), None);
+        assert_eq!(frame_pose::parse(&frame_pose::encode(None)[..19]), None, "short");
+        let nan = frame_pose::encode(Some([f32::NAN, 0.0, 0.0, 1.0]));
+        assert_eq!(frame_pose::parse(&nan), Some((None, &[][..])), "not finite: unknown");
     }
 
     #[test]

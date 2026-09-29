@@ -145,6 +145,7 @@ pub(crate) fn start() -> Result<SimHandle, String> {
                     nal_data: synth.bytes,
                     is_idr: synth.is_idr,
                     timestamps: FrameTimestamps::new(synth.frame_index),
+                    render_orientation: None,
                 });
                 // Drift-free pacing, but cap the sleep so cancellation is
                 // observed within ~one frame.

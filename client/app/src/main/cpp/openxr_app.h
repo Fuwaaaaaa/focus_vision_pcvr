@@ -19,6 +19,7 @@
 #include "hmd_profile.h"
 #include "launch_request.h"
 #include "openxr_extensions.h"
+#include "render_pose_log.h"
 #include "stream_session.h"
 #include "video_receiver.h"
 
@@ -157,6 +158,11 @@ private:
     // reprojected from the head orientation it was first shown at.
     GLuint m_lastDecodedTexture = 0;
     XrQuaternionf m_frameOrientation{0.0f, 0.0f, 0.0f, 1.0f};
+    // Frames start with the orientation they were rendered at (v6): the
+    // shown frame is turned from there, new or not.
+    bool m_framePose = false;
+    RenderPoseLog m_renderPoses;
+    bool m_frameHasRenderPose = false;
     bool m_hasDecodedFrame = false;
     uint8_t m_videoLayout = 0;  // fvp_client_protocol::STEREO_* of the stream
 

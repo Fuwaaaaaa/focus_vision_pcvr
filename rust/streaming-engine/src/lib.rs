@@ -375,7 +375,8 @@ pub extern "C" fn fvp_haptic_event(
 /// `frame_index`: monotonically increasing frame counter.
 /// `is_idr`: 1 if this frame is an IDR keyframe, 0 otherwise.
 ///
-/// Returns 0 on success, -1 on error.
+/// Returns 0 on success, -1 on error. Sends the frame without its render
+/// pose; see [`fvp_submit_encoded_frame`].
 ///
 /// # Safety
 /// `nal_data_ptr` must be valid for `nal_data_len` bytes (and at most
@@ -386,6 +387,26 @@ pub unsafe extern "C" fn fvp_submit_encoded_nal(
     nal_data_len: u32,
     frame_index: u32,
     is_idr: i32,
+) -> i32 {
+    // SAFETY: forwarded as the caller guarantees it; no orientation.
+    unsafe { fvp_submit_encoded_frame(nal_data_ptr, nal_data_len, frame_index, is_idr, std::ptr::null()) }
+}
+
+/// [`fvp_submit_encoded_nal`] with the head orientation the frame was
+/// rendered at (`render_orientation`: x, y, z, w, or null if unknown). A
+/// headset that reads it turns the image from there to where its head is
+/// when it shows the frame (protocol v6).
+///
+/// # Safety
+/// As [`fvp_submit_encoded_nal`]; `render_orientation`, if not null, must
+/// point to 4 floats.
+#[no_mangle]
+pub unsafe extern "C" fn fvp_submit_encoded_frame(
+    nal_data_ptr: *const u8,
+    nal_data_len: u32,
+    frame_index: u32,
+    is_idr: i32,
+    render_orientation: *const f32,
 ) -> i32 {
     /// Upper bound on a single encoded frame. A 4K120 I-frame at extreme
     /// quality rarely exceeds ~8 MB; 32 MB is a generous cap that still
@@ -440,12 +461,17 @@ pub unsafe extern "C" fn fvp_submit_encoded_nal(
     });
 
     let timestamps = FrameTimestamps::new(frame_index);
+    // SAFETY: the caller guarantees 4 floats behind a non-null pointer.
+    let render_orientation = (!render_orientation.is_null())
+        .then(|| unsafe { [*render_orientation, *render_orientation.add(1), *render_orientation.add(2), *render_orientation.add(3)] })
+        .filter(|q| q.iter().all(|v| v.is_finite()));
 
     let frame = EncodedFrame {
         frame_index,
         nal_data,
         is_idr: is_idr != 0,
         timestamps,
+        render_orientation,
     };
 
     if engine.submit_frame(frame) { 0 } else { -1 }

@@ -32,6 +32,7 @@ public:
         uint32_t encodedWidth = 0;   // actually-decoded resolution per eye (== native unless downscaled)
         uint32_t encodedHeight = 0;
         uint8_t layout = 0;          // fvp_client_protocol::STEREO_* (0 = mono, 1 = side by side)
+        bool framePose = false;      // each frame starts with its render pose (v6)
     };
 
     enum class HandshakeResult { Ok, PinRejected, Failed };
