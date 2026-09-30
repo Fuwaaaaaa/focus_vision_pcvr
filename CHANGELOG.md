@@ -711,7 +711,9 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   the same messages however the stream is split; face data all the way to
   the OSC packets (finite, 0..1, whatever came in); and FrameFecEncoder →
   FecFrameReassembler for bulk, sliced and unprotected frames, with a data
-  packet lost from each code word that has parity.
+  packet lost from each code word that has parity. The nightly fuzz and
+  long-run jobs no longer `continue-on-error`: whatever they found, every
+  run stayed green (coverage keeps it — its failures are the tooling's).
 - **`run_streaming` split, adaptive state without locks.** The ~440-line
   loop is now `StreamingLoop::{run, accept, run_session, hold}`. The TCP
   control task no longer shares `Arc<Mutex<…>>` state with the frame loop:
