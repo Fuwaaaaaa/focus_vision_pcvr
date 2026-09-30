@@ -59,6 +59,32 @@ use std::path::{Path, PathBuf};
 /// Annex B start code prefix (4-byte variant). Precedes every NAL unit.
 const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 
+/// Create a new file at `path`, creating its directory; if a file is there
+/// already, at `<stem>-2.<ext>`, `-3`… instead. Returns the file and where
+/// it is.
+///
+/// REGRESSION: `File::create` truncated an existing file, and the names
+/// only go down to the second, so a session reconnecting within the same
+/// second (the 5 s hold makes that likely) wiped the previous one's audio.
+fn create_new_file(path: &Path) -> std::io::Result<(File, PathBuf)> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut candidate = path.to_path_buf();
+    for n in 2..=100 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => return Ok((file, candidate)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                candidate = path.with_file_name(format!("{stem}-{n}{ext}"));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "100 recordings with this name already"))
+}
+
 /// Raw Annex B NAL stream writer.
 ///
 /// Call `write_nal()` per encoded frame / NAL. Drop or call `close()` to
@@ -76,18 +102,13 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Open a new recording at `path`. Creates parent directories as needed.
-    /// Returns None if the file cannot be created.
+    /// Open a new recording at `path` (or next to it, with a `-2`… suffix,
+    /// if that file exists: see [`Self::path`]). Creates parent directories
+    /// as needed. Returns None if the file cannot be created.
     pub fn open(path: impl Into<PathBuf>) -> Option<Self> {
         let path = path.into();
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                log::warn!("recorder: cannot create dir {:?}: {}", parent, e);
-                return None;
-            }
-        }
-        let file = match File::create(&path) {
-            Ok(f) => f,
+        let (file, path) = match create_new_file(&path) {
+            Ok(created) => created,
             Err(e) => {
                 log::warn!("recorder: cannot open {:?}: {}", path, e);
                 return None;
@@ -182,16 +203,25 @@ pub fn default_filename(codec_ext: &str) -> String {
 }
 
 /// Parse the `YYYY-MM-DDTHH-MM-SS` timestamp embedded in a filename produced
-/// by [`default_filename`] / [`audio::default_audio_filename`]. Returns `None`
+/// by [`default_filename`] / [`audio::default_audio_filename`] (with the
+/// `-N` a same-second name gets, see [`create_new_file`]). Returns `None`
 /// for names that don't match the convention so unrelated files in the same
 /// directory are left untouched by the purge.
 fn parse_recording_timestamp(file_name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let stem = file_name.strip_prefix("recording_")?;
     // Strip the extension (`.h264|.h265|.wav` are the producers we ship).
-    let ts = stem
+    let name = stem
         .strip_suffix(".h265")
         .or_else(|| stem.strip_suffix(".h264"))
         .or_else(|| stem.strip_suffix(".wav"))?;
+    const TS_LEN: usize = "YYYY-MM-DDTHH-MM-SS".len();
+    let (ts, rest) = name.split_at_checked(TS_LEN)?;
+    let numbered = rest
+        .strip_prefix('-')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    if !rest.is_empty() && !numbered {
+        return None;
+    }
     let naive = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H-%M-%S").ok()?;
     Some(naive.and_utc())
 }
@@ -437,6 +467,30 @@ mod tests {
     fn test_parse_recording_timestamp_h264_and_wav() {
         assert!(parse_recording_timestamp("recording_2026-01-15T10-30-45.h264").is_some());
         assert!(parse_recording_timestamp("recording_2026-01-15T10-30-45.wav").is_some());
+    }
+
+    #[test]
+    fn test_parse_recording_timestamp_with_same_second_number() {
+        let plain = parse_recording_timestamp("recording_2026-01-15T10-30-45.wav").unwrap();
+        assert_eq!(parse_recording_timestamp("recording_2026-01-15T10-30-45-2.wav"), Some(plain));
+        assert_eq!(parse_recording_timestamp("recording_2026-01-15T10-30-45-17.h265"), Some(plain));
+        assert!(parse_recording_timestamp("recording_2026-01-15T10-30-45-.wav").is_none());
+        assert!(parse_recording_timestamp("recording_2026-01-15T10-30-45-x.wav").is_none());
+        assert!(parse_recording_timestamp("recording_2026-01-15T10-30-45 copy.wav").is_none());
+    }
+
+    #[test]
+    fn test_open_never_overwrites_a_recording() {
+        // REGRESSION: a second session in the same second truncated the
+        // first one's file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recording_2026-01-15T10-30-45.h265");
+        let first = Recorder::open(&path).unwrap();
+        let second = Recorder::open(&path).unwrap();
+        let third = Recorder::open(&path).unwrap();
+        assert_eq!(first.path(), path);
+        assert_eq!(second.path(), dir.path().join("recording_2026-01-15T10-30-45-2.h265"));
+        assert_eq!(third.path(), dir.path().join("recording_2026-01-15T10-30-45-3.h265"));
     }
 
     #[test]
