@@ -4,8 +4,10 @@ use audiopus::{Application, Channels, SampleRate, Bitrate};
 /// Opus audio encoder for low-latency VR streaming.
 ///
 /// Encodes 10ms frames (480 samples/ch @ 48kHz) of stereo f32 audio
-/// into Opus packets. Uses LowDelay mode for minimum latency
-/// with Opus in-band FEC for packet loss resilience.
+/// into Opus packets. Uses LowDelay mode (`RESTRICTED_LOWDELAY`: CELT
+/// only) for minimum latency. CELT has no in-band FEC (that is SILK's), so
+/// a lost packet is concealed on the headset (`AudioSequence` → Opus PLC);
+/// the expected loss only makes CELT lean less on the previous frame.
 pub struct AudioEncoder {
     encoder: Encoder,
     encode_buf: Vec<u8>,
@@ -27,15 +29,13 @@ impl AudioEncoder {
             .set_bitrate(Bitrate::BitsPerSecond(bps))
             .map_err(|e| format!("Failed to set bitrate: {e}"))?;
 
-        encoder
-            .set_inband_fec(true)
-            .map_err(|e| format!("Failed to enable FEC: {e}"))?;
-
+        // REGRESSION: in-band FEC was switched on and logged as enabled,
+        // though this mode has none.
         encoder
             .set_packet_loss_perc(5)
             .map_err(|e| format!("Failed to set packet loss: {e}"))?;
 
-        log::info!("Opus encoder: 48kHz stereo, {}kbps, FEC enabled", bitrate / 1000);
+        log::info!("Opus encoder: 48kHz stereo, {}kbps, low delay (CELT)", bitrate / 1000);
 
         Ok(Self {
             encoder,
@@ -79,6 +79,21 @@ mod tests {
     fn test_encoder_creation() {
         let encoder = AudioEncoder::new(128_000);
         assert!(encoder.is_ok());
+    }
+
+    #[test]
+    fn test_low_delay_mode_has_no_inband_fec() {
+        // What the headset's loss concealment is there for: this mode
+        // doesn't do FEC even when asked, so asking was only misleading.
+        let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Stereo, Application::LowDelay).unwrap();
+        assert_eq!(encoder.application().unwrap(), Application::LowDelay);
+        encoder.set_inband_fec(true).unwrap();
+        let mut out = [0u8; 4000];
+        let tone: Vec<i16> = (0..960).map(|i| ((i as f32 * 0.05).sin() * 8000.0) as i16).collect();
+        let len = encoder.encode(&tone, &mut out).unwrap();
+        // TOC config 16..=31 is CELT-only (RFC 6716 §3.1): no SILK layer to
+        // carry FEC.
+        assert!(out[..len][0] >> 3 >= 16, "TOC config {}", out[0] >> 3);
     }
 
     #[test]

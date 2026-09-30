@@ -98,14 +98,33 @@ bool AudioPlayer::submitOpusPacket(const uint8_t* data, int size) {
         data, size,
         m_decodeBuffer.data(),
         FRAME_SIZE,
-        0 // no FEC for now
+        0 // no in-band FEC to use: the engine's low-delay Opus has none
     );
 
     if (samplesDecoded < 0) {
         LOGW("AudioPlayer: opus_decode error: %s", opus_strerror(samplesDecoded));
         return false;
     }
+    appendDecoded(samplesDecoded);
+    return true;
+}
 
+void AudioPlayer::concealLoss(int packets) {
+    if (!m_initialized || !m_opusDecoder) return;
+    for (int i = 0; i < packets; i++) {
+        // No data: the decoder extrapolates a packet's worth from what it
+        // heard last, fading out over a longer loss.
+        const int samplesDecoded = opus_decode(m_opusDecoder, nullptr, 0,
+                                               m_decodeBuffer.data(), FRAME_SIZE, 0);
+        if (samplesDecoded < 0) {
+            LOGW("AudioPlayer: loss concealment failed: %s", opus_strerror(samplesDecoded));
+            return;
+        }
+        appendDecoded(samplesDecoded);
+    }
+}
+
+void AudioPlayer::appendDecoded(int samplesDecoded) {
     // Append decoded samples to jitter buffer
     int totalSamples = samplesDecoded * m_channels;
     {
@@ -124,8 +143,6 @@ bool AudioPlayer::submitOpusPacket(const uint8_t* data, int size) {
             m_decodeBuffer.data(),
             m_decodeBuffer.data() + totalSamples);
     }
-
-    return true;
 }
 
 void AudioPlayer::pump() {

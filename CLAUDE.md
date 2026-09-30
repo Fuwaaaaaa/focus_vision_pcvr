@@ -62,7 +62,7 @@ cd driver/build && cmake --build . --config Release
 ctest --test-dir driver/build --build-config Release --output-on-failure  # 92 gtest cases (D3D11 ones on WARP, no GPU needed)
 # Android client host tests (hardware-independent logic, no NDK — host toolchain):
 cmake -S client/tests -B client/tests/build && cmake --build client/tests/build --config Release
-ctest --test-dir client/tests/build --build-config Release --output-on-failure  # 88 gtest cases: client_protocol (incl. FVP header parse, stereo layout, VIEW_CONFIG, frame pose), render_pose_log, session, fec_decoder (golden RS vectors), frame_assembler, launch_request, video_view (eye halves + reprojection + gaze math), openxr_extensions; host shims in client/tests/shim/ (FVP_TEST_LOG=1 prints the client's log)
+ctest --test-dir client/tests/build --build-config Release --output-on-failure  # 93 gtest cases: client_protocol (incl. FVP header parse, stereo layout, VIEW_CONFIG, frame pose), render_pose_log, audio_sequence (lost packets → Opus PLC), session, fec_decoder (golden RS vectors), frame_assembler, launch_request, video_view (eye halves + reprojection + gaze math), openxr_extensions; host shims in client/tests/shim/ (FVP_TEST_LOG=1 prints the client's log)
 # C++ client vs the real engine (test_session_e2e.cpp; skipped without the binary; CI job client-e2e):
 cargo build --release -p streaming-engine --features simulator --bins
 FVP_HEADLESS_BIN=target/release/focus-vision-headless.exe ctest --test-dir client/tests/build --build-config Release -R SessionE2E --output-on-failure

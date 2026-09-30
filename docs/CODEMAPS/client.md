@@ -79,7 +79,8 @@ tracker, pairing state, dashboard state.
 ### Audio
 | File | Class | Role |
 |---|---|---|
-| `audio_player.h/.cpp` | `AudioPlayer` | Opus decode (libopus) + AAudio low-latency output |
+| `audio_player.h/.cpp` | `AudioPlayer` | Opus decode (libopus) + AAudio low-latency output; `concealLoss` fills lost packets with Opus PLC |
+| `audio_sequence.h` | `AudioSequence` | Lost / late audio packets from the RTP sequence numbers (pure, host-tested) |
 
 ### HMD I/O
 | File | Class | Role |

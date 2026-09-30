@@ -49,6 +49,7 @@ enable_testing()
 set(CLIENT_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/cpp)
 
 add_executable(client_tests
+    test_audio_sequence.cpp
     test_client_protocol.cpp
     test_client_session.cpp
     test_fec_decoder.cpp
