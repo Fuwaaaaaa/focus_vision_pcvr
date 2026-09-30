@@ -434,6 +434,18 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   They are now added up until the tick. The burst detector was fed the
   estimator's smoothed loss, which a single bad second barely moves after
   good ones; it now gets the loss of that interval.
+- **The installer waits for SteamVR to close, and build.bat stops on a
+  failed driver build.**
+  - While SteamVR runs, vrserver.exe has the driver DLL loaded (and the
+    companion's exe is in use while it runs), so they can't be replaced:
+    the installer went ahead, left the locked files and stopped on a
+    "cannot write" box. The installer and the uninstaller now check for
+    both and ask for them to be closed (Retry / Cancel; a silent install
+    cancels). Built by CI; not yet run against a live SteamVR.
+  - build.bat checked `%ERRORLEVEL%` inside the driver step's `( )`
+    block, where it is expanded before the commands run: a failed CMake
+    configure or driver build printed "Driver build OK." It uses
+    `if errorlevel 1` throughout.
 - **Stopping the simulation doesn't freeze the window, and demo mode
   doesn't touch SteamVR.** "■ Stop Simulation" joined the engine and the
   mock headset on the UI thread, freezing the window while the engine shut
