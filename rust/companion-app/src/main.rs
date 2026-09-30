@@ -94,6 +94,8 @@ pub(crate) struct CompanionApp {
     pub(crate) apk_path: String,
     pub(crate) deploy_status: String,
     pub(crate) last_device_scan: Instant,
+    /// The `adb devices` running in the background, if one is.
+    device_scan: Option<std::thread::JoinHandle<Vec<adb::AdbDevice>>>,
 
     // Streaming state
     pub(crate) pin_code: String,
@@ -272,6 +274,7 @@ impl CompanionApp {
             apk_path: cfg.deploy.apk_path.clone(),
             deploy_status: String::new(),
             last_device_scan: Instant::now() - Duration::from_secs(10),
+            device_scan: None,
             pin_code: "----".to_string(),
             connection_status: ConnectionStatus::Disconnected,
             latency_ms: 0.0,
@@ -598,8 +601,17 @@ impl CompanionApp {
         }
     }
 
+    /// Refresh the device list every 3 s. `adb devices` runs on a thread of
+    /// its own and its answer is picked up on a later frame.
+    /// REGRESSION: it ran on the UI thread every 3 s, so a slow adb (its
+    /// server starting, a device not answering) froze the window.
     pub(crate) fn scan_devices(&mut self) {
-        if self.last_device_scan.elapsed() < Duration::from_secs(3) {
+        if self.device_scan.as_ref().is_some_and(|scan| scan.is_finished()) {
+            if let Some(Ok(devices)) = self.device_scan.take().map(|scan| scan.join()) {
+                self.devices = devices;
+            }
+        }
+        if self.device_scan.is_some() || self.last_device_scan.elapsed() < Duration::from_secs(3) {
             return;
         }
         self.last_device_scan = Instant::now();
@@ -612,8 +624,11 @@ impl CompanionApp {
             return;
         }
 
-        if let Some(ref adb) = self.adb_path {
-            self.devices = adb::list_devices(adb);
+        if let Some(adb) = self.adb_path.clone() {
+            self.device_scan = std::thread::Builder::new()
+                .name("fvp-adb-devices".into())
+                .spawn(move || adb::list_devices(&adb))
+                .ok();
         }
     }
 
@@ -741,11 +756,12 @@ impl CompanionApp {
     }
 
     /// Start the headset app over adb pointed at this PC with the current
-    /// PIN (headset_link). Prefers a device adb reports as a VIVE headset.
+    /// PIN (headset_link), on a device adb reports as a VIVE headset.
+    /// REGRESSION: with none, it went to the first device, a phone say.
     pub(crate) fn send_pin_to_headset(&mut self) {
         let (Some(adb), Some(device)) = (
             self.adb_path.clone(),
-            self.devices.iter().find(|d| d.is_focus_vision).or(self.devices.first()).cloned(),
+            self.devices.iter().find(|d| d.is_focus_vision).cloned(),
         ) else {
             return;
         };

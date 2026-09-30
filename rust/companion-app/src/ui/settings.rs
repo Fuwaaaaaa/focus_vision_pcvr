@@ -272,7 +272,8 @@ impl CompanionApp {
                 if ui.button(label).clicked() {
                     self.export_in_progress = true;
                     let adb = self.adb_path.clone();
-                    let serial = self.devices.first().map(|d| d.serial.clone());
+                    // The headset's logcat (not a phone's that happens to be first).
+                    let serial = self.devices.iter().find(|d| d.is_focus_vision).map(|d| d.serial.clone());
                     let result = self.export_result.clone();
                     thread::Builder::new()
                         .name("fvp-export".into())

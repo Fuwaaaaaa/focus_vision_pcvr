@@ -56,6 +56,8 @@ impl CompanionApp {
                         ui.label(format!("{} ({})", device.model, device.serial));
                         if device.is_focus_vision {
                             ui.label(egui::RichText::new("Focus Vision").color(accent).size(11.0));
+                        } else {
+                            ui.label(egui::RichText::new("not a VIVE headset — skipped").color(text_muted).size(11.0));
                         }
                     });
                 }
@@ -93,18 +95,21 @@ impl CompanionApp {
 
         ui.add_space(8.0);
 
-        // Deploy button
+        // Deploy button: the VIVE headsets only (adb::deploy_targets).
+        let targets = adb::deploy_targets(&self.devices);
         let can_deploy = self.adb_path.is_some()
-            && !self.devices.is_empty()
+            && !targets.is_empty()
             && !self.apk_path.is_empty()
             && std::path::Path::new(&self.apk_path).exists();
 
         let deploy_enabled = can_deploy && !self.deploy_in_progress;
         ui.add_enabled_ui(deploy_enabled, |ui| {
             let label = if self.deploy_in_progress {
-                "Installing..."
+                "Installing...".to_string()
+            } else if targets.len() > 1 {
+                format!("Install APK on {} Headsets", targets.len())
             } else {
-                "Install APK on All Devices"
+                "Install APK on the Headset".to_string()
             };
             if ui.button(
                 egui::RichText::new(label).size(16.0)
@@ -114,7 +119,7 @@ impl CompanionApp {
 
                 let adb = self.adb_path.clone().unwrap();
                 let apk = self.apk_path.clone();
-                let devices: Vec<_> = self.devices.iter().map(|d| d.serial.clone()).collect();
+                let devices = targets.clone();
                 let result = self.deploy_result.clone();
                 // With the engine waiting for a PIN, start the app pointed at
                 // this PC right away; otherwise just start it.

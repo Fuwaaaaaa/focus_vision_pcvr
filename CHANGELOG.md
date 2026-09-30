@@ -434,6 +434,17 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   They are now added up until the tick. The burst detector was fed the
   estimator's smoothed loss, which a single bad second barely moves after
   good ones; it now gets the loss of that interval.
+- **Deploy installs on the headset only, and adb can't hang the
+  companion.** "Install APK on All Devices" installed the app on, and
+  started it on, every device adb listed — a phone plugged in to charge,
+  another headset; "Send PIN to headset" fell back to the first device,
+  and Export Logs took the first device's logcat. All three now take only
+  devices adb names as VIVE headsets (by model, product or device); the
+  others are listed as skipped. No adb command had a timeout, so a device
+  that stopped answering left Deploy on "Installing..." for good; each now
+  gives up (install 3 min, others 10-30 s) and says why. `adb devices`
+  ran on the UI thread every 3 s and froze the window when adb was slow;
+  it runs on its own thread.
 - **Home's "Install Driver" works where the companion is installed.** It
   shows when the driver isn't registered (the installer ran before
   SteamVR was there), and it looked for `driver\build\…` under the working
