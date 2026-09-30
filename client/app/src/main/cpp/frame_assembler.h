@@ -40,7 +40,9 @@ public:
 
     using Clock = std::chrono::steady_clock;
 
-    /// Longest a frame may stay incomplete before it counts as lost.
+    /// Longest an incomplete frame may go without a packet before it counts
+    /// as lost. From the frame's last packet read, not its first: a receive
+    /// thread held up mid-frame finds the rest of it queued in the socket.
     static constexpr auto kFrameTimeout = std::chrono::milliseconds(100);
     /// While waiting for a keyframe, repeat the IDR request this often (the
     /// engine rate-limits them to one per 500 ms).
@@ -54,7 +56,8 @@ public:
     /// Feed one received UDP payload.
     void onPacket(const uint8_t* packet, size_t len, Clock::time_point now, Output& out);
 
-    /// Check the frame in progress for a timeout. Call when no packet came.
+    /// Check the frame in progress for a timeout. Call regularly, packet or
+    /// not (VideoReceiver does after every receive).
     void onTick(Clock::time_point now, Output& out);
 
     /// Drop non-key frames until the next keyframe (the frame queue
@@ -84,7 +87,7 @@ private:
     uint32_t m_frameIndex = 0;    // the newest frame seen
     bool m_frameSliced = false;
     bool m_frameFinished = false; // delivered or lost
-    Clock::time_point m_frameStart;
+    Clock::time_point m_lastFramePacket; // the frame in progress's newest
 
     bool m_waitingForKeyframe = true;
     bool m_idrAsked = false;

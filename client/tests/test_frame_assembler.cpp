@@ -250,6 +250,30 @@ TEST(FrameAssembler, StalledFrameTimesOut) {
     EXPECT_TRUE(h.assembler.waitingForKeyframe());
 }
 
+TEST(FrameAssembler, AReceiverPausedMidFrameKeepsTheFrame) {
+    // REGRESSION: the timeout ran from the frame's first packet, so a
+    // receive thread held up for over 100 ms mid-frame (a busy CI runner; a
+    // scheduling hiccup on the headset) threw away a frame whose remaining
+    // packets were already waiting in the socket, and then skipped frames
+    // until the next keyframe.
+    Harness h;
+    Sender tx;
+    h.feed(tx.bulk(1, true, bytes(9, 1)));
+    const auto frame = tx.bulk(2, false, bytes(20, 2));
+    h.feed(frame[0]);
+    h.tick();
+
+    h.now += 150ms; // the thread was paused; the rest was queued meanwhile
+    h.feed(frame[1]);
+    h.tick();       // what VideoReceiver does after each packet
+    h.feed(frame[2]);
+    h.tick();
+    EXPECT_EQ(h.assembler.framesLost(), 0u);
+    ASSERT_EQ(h.frames.size(), 2u);
+    EXPECT_EQ(h.frames[1].frameIndex, 2u);
+    EXPECT_EQ(h.idrRequests, 0);
+}
+
 TEST(FrameAssembler, IdrRequestsAreRateLimited) {
     Harness h;
     Sender tx;

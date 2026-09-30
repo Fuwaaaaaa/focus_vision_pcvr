@@ -386,10 +386,10 @@ TEST_F(SessionE2E, PairsAndStreamsVideoFromTheRealEngine) {
     }
     EXPECT_TRUE(sawSliced) << "no sliced (IDR-sized) frame came through";
     EXPECT_TRUE(sawBulk) << "no bulk (P-frame-sized) frame came through";
-    // Loopback UDP loses nothing, but a busy CI runner can pause the
-    // receiver past the assembler's 100 ms timeout; that has cost 4 and 12
-    // frames of ~180. A tenth still catches a receive path that drops
-    // frames for real.
+    // Loopback UDP loses nothing. A busy CI runner pausing the receiver
+    // cost 4, 12 and 26 frames of ~180 while the assembler timed a frame
+    // from its first packet (fixed: from its last). A tenth still catches a
+    // receive path that drops frames for real.
     EXPECT_LE(receiver.framesLost(), frames.size() / 10);
 
     const auto events = drainEvents();

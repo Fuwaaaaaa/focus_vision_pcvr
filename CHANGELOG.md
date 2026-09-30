@@ -119,6 +119,13 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   replaced it.
 
 ### Android client
+- **A receive thread held up mid-frame no longer loses the frame.** The
+  frame assembler timed an incomplete frame from its first packet, so a
+  receive thread paused over 100 ms in the middle of a frame (a scheduling
+  hiccup) threw it away though its remaining packets were waiting in the
+  socket, then froze the picture until the next keyframe (up to 1 s). It
+  now times from the frame's last packet. This was the cause of the
+  client-vs-engine E2E failing now and then on CI (4, 12 and 26 frames).
 - **A connection layer, tested against the real engine.** The client had
   the pieces (TLS client, FEC decoder, a session state machine), but
   nothing ran them, and they had never talked to the engine. New portable
