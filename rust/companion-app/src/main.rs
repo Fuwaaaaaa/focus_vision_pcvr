@@ -210,6 +210,9 @@ pub(crate) struct CompanionApp {
     // frame when launched with `--simulate`.
     #[cfg(feature = "simulator")]
     pub(crate) sim: Option<sim::SimHandle>,
+    /// A stopped simulation still shutting down, on a thread of its own.
+    #[cfg(feature = "simulator")]
+    sim_stopping: Option<std::thread::JoinHandle<()>>,
     #[cfg(feature = "simulator")]
     pub(crate) sim_error: Option<String>,
     pub(crate) sim_autostart: bool,
@@ -327,6 +330,8 @@ impl CompanionApp {
             pin_expires_observed_at: None,
             #[cfg(feature = "simulator")]
             sim: None,
+            #[cfg(feature = "simulator")]
+            sim_stopping: None,
             #[cfg(feature = "simulator")]
             sim_error: None,
             // Demo wins over simulate (already enforced in parse_flags), so a
@@ -564,8 +569,8 @@ impl CompanionApp {
     /// feature is not compiled in.
     #[cfg(feature = "simulator")]
     pub(crate) fn start_sim(&mut self) {
-        if self.sim.is_some() {
-            return; // already running
+        if self.sim.is_some() || self.sim_stopping.is_some() {
+            return; // already running, or the last one still stopping
         }
         // Refuse to start if a real engine appears alive — two writers racing
         // on the single shared status.json would confuse the UI.
@@ -588,11 +593,32 @@ impl CompanionApp {
         }
     }
 
-    /// Stop the in-process simulation. No-op stub when the feature is off.
+    /// Stop the in-process simulation. The engine and the mock client shut
+    /// down on a thread of their own; [`Self::reap_sim_stop`] notices when
+    /// they are done. No-op stub when the feature is off.
+    /// REGRESSION: they were joined on the UI thread, which froze the window
+    /// for as long as the engine took to shut down (seconds).
     #[cfg(feature = "simulator")]
     pub(crate) fn stop_sim(&mut self) {
-        if let Some(h) = self.sim.take() {
-            h.stop();
+        let Some(h) = self.sim.take() else { return };
+        // If the thread can't start, the closure (and the handle in it) is
+        // dropped here, which stops the simulation in place.
+        match std::thread::Builder::new().name("fvp-sim-stop".into()).spawn(move || h.stop()) {
+            Ok(stopping) => {
+                self.sim_stopping = Some(stopping);
+                self.log("Simulation stopping...");
+            }
+            Err(_) => self.log("Simulation stopped"),
+        }
+    }
+
+    /// Finish a stop once its thread is done.
+    #[cfg(feature = "simulator")]
+    fn reap_sim_stop(&mut self) {
+        if self.sim_stopping.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Some(h) = self.sim_stopping.take() {
+                let _ = h.join();
+            }
             self.log("Simulation stopped");
         }
     }
@@ -601,6 +627,12 @@ impl CompanionApp {
     #[cfg(feature = "simulator")]
     pub(crate) fn is_simulating(&self) -> bool {
         self.sim.is_some()
+    }
+
+    /// Whether a stopped simulation is still shutting down.
+    #[cfg(feature = "simulator")]
+    pub(crate) fn is_sim_stopping(&self) -> bool {
+        self.sim_stopping.is_some()
     }
 
     #[cfg(not(feature = "simulator"))]
@@ -862,6 +894,10 @@ impl eframe::App for CompanionApp {
             if let Some(e) = err {
                 self.sim_error = Some(e);
             }
+            self.reap_sim_stop();
+            if self.is_sim_stopping() {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
         }
 
         // Request repaint every second for live stats
@@ -971,6 +1007,11 @@ impl eframe::App for CompanionApp {
     /// saves it.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_config();
+        // Let a simulation that is stopping finish (it removes status.json).
+        #[cfg(feature = "simulator")]
+        if let Some(stopping) = self.sim_stopping.take() {
+            let _ = stopping.join();
+        }
     }
 }
 
@@ -1191,6 +1232,33 @@ mod tests {
         assert!(a.config_dirty_since.is_some());
         let notes: Vec<&str> = a.pending_save_notes.iter().map(|(_, n)| n.as_str()).collect();
         assert_eq!(notes, vec!["Audio: 96", "Codec h264"]);
+    }
+
+    /// REGRESSION: Stop Simulation joined the engine on the UI thread.
+    /// Starts a real in-process engine; writes status.json like the other
+    /// simulation tests (run with `--test-threads=1`).
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn stopping_the_simulation_does_not_block_the_ui() {
+        let mut a = app();
+        a.start_sim();
+        assert!(a.is_simulating(), "{:?}", a.sim_error);
+        std::thread::sleep(Duration::from_millis(500)); // let it get going
+
+        let started = Instant::now();
+        a.stop_sim();
+        assert!(started.elapsed() < Duration::from_millis(200), "stop took {:?}", started.elapsed());
+        assert!(!a.is_simulating() && a.is_sim_stopping());
+        a.start_sim();
+        assert!(!a.is_simulating(), "no new start while the last one stops");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while a.is_sim_stopping() && Instant::now() < deadline {
+            a.reap_sim_stop();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!a.is_sim_stopping(), "the simulation never finished stopping");
+        assert!(a.status_log.lock().unwrap().iter().any(|l| l.contains("Simulation stopped")));
     }
 
     #[test]

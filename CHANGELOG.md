@@ -434,6 +434,13 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   They are now added up until the tick. The burst detector was fed the
   estimator's smoothed loss, which a single bad second barely moves after
   good ones; it now gets the loss of that interval.
+- **Stopping the simulation doesn't freeze the window, and demo mode
+  doesn't touch SteamVR.** "■ Stop Simulation" joined the engine and the
+  mock headset on the UI thread, freezing the window while the engine shut
+  down; they now stop on a thread of their own, with the button showing
+  "Stopping..." until they are done (Start waits for it). In demo mode,
+  Install Driver and Uninstall Driver registered and removed the real
+  driver; they are disabled there.
 - **The companion's Settings save what you set, only that, and keep
   trying.**
   - egui clamps a slider's value every frame by default, and the sliders
