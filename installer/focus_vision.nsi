@@ -128,10 +128,57 @@ https://aka.ms/vs/17/release/vc_redist.x64.exe"
     Abort
 FunctionEnd
 
+; ---- Function: SteamVR and the companion must be closed --------------------
+;
+; While SteamVR runs, vrserver.exe has the driver DLL loaded; while the
+; companion runs, its exe is in use. Neither can be replaced or removed
+; then. REGRESSION: the install went ahead regardless: RMDir quietly left the
+; locked files and File stopped on a "cannot write" error box.
+; `find` exits 0 when tasklist listed the process. Both are called from
+; $SYSDIR: a `find` from Git for Windows early in PATH is another program.
+!macro CLOSED_APPS_CHECK UN
+Function ${UN}WaitForClosedApps
+    Push $0
+    Push $1
+
+  check_steamvr:
+    nsExec::ExecToStack '"$SYSDIR\cmd.exe" /c $SYSDIR\tasklist.exe /NH /FI "IMAGENAME eq vrserver.exe" | $SYSDIR\find.exe /I "vrserver.exe"'
+    Pop $0  ; exit code
+    Pop $1  ; output
+    ${If} $0 == 0
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION \
+            "SteamVR が起動しています。$\n$\n\
+SteamVR の実行中はドライバのファイルを置き換えられません。$\n\
+SteamVR を終了してから「再試行」を押してください。" \
+            /SD IDCANCEL IDRETRY check_steamvr
+        Abort "SteamVR が起動していたため中止しました"
+    ${EndIf}
+
+  check_companion:
+    nsExec::ExecToStack '"$SYSDIR\cmd.exe" /c $SYSDIR\tasklist.exe /NH /FI "IMAGENAME eq ${APP_EXE}" | $SYSDIR\find.exe /I "${APP_EXE}"'
+    Pop $0
+    Pop $1
+    ${If} $0 == 0
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION \
+            "${APP_NAME} のコンパニオンアプリが起動しています。$\n$\n\
+閉じてから「再試行」を押してください。" \
+            /SD IDCANCEL IDRETRY check_companion
+        Abort "コンパニオンアプリが起動していたため中止しました"
+    ${EndIf}
+
+    Pop $1
+    Pop $0
+FunctionEnd
+!macroend
+!insertmacro CLOSED_APPS_CHECK ""
+!insertmacro CLOSED_APPS_CHECK "un."
+
 ; ---- Section: main install -------------------------------------------------
 
 Section "Focus Vision PCVR (必須)" SecMain
     SectionIn RO    ; required — cannot deselect
+
+    Call WaitForClosedApps
 
     ; Wipe a prior install at the same target dir so leftover bits from a
     ; previous version (e.g. stale driver DLL with different ABI) don't
@@ -255,6 +302,8 @@ FunctionEnd
 ; ---- Section: uninstall ----------------------------------------------------
 
 Section "Uninstall"
+    Call un.WaitForClosedApps
+
     ; Unregister SteamVR driver BEFORE deleting files — vrpathreg refuses
     ; missing paths but we'd rather it succeed first.
     Call un.UnregisterSteamVRDriver
