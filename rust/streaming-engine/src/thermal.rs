@@ -203,8 +203,10 @@ impl ThermalGovernor {
         }
         #[cfg(not(feature = "nvml"))]
         {
+            // Called only when `[thermal] enabled` is set. REGRESSION: the
+            // user who turned it on was told nothing (debug level).
             let _ = config;
-            log::debug!("NVML feature compiled out — thermal control disabled");
+            log::warn!("[thermal] enabled is set, but this build has no NVML support (the `nvml` feature) — thermal control is off");
             None
         }
     }
