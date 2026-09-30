@@ -80,10 +80,10 @@ VIVE Focus Vision を Wi-Fi 経由で PC につなぎ、SteamVR ゲームをワ�
 2. USB-C ケーブルで HMD を PC に接続
 3. HMD 側で「USB デバッグを許可しますか?」が表示されたら **常に許可** を選択
 4. コンパニオンアプリの **Deploy タブ** で:
-   - **Refresh** ボタンを押すと検出されたデバイスが表示される
+   - **Refresh** ボタンを押すと検出されたデバイスが表示される。VIVE のヘッドセットには `Focus Vision` と出る。それ以外 (充電中のスマホなど) は `not a VIVE headset — skipped` で、APK は入れない
    - **APK File** の **Browse...** で、手順1でダウンロードした `FocusVision-Client-3.0.0.apk` を選ぶ
-   - **Install APK on All Devices** ボタンを押す
-5. デバイスごとに `OK: <シリアル>` と表示されたらインストール完了。**USB ケーブルはまだ外さないでください**（次のステップで使います）
+   - **Install APK on the Headset** ボタンを押す
+5. `OK: <シリアル>` と表示されたらインストール完了。**USB ケーブルはまだ外さないでください**（次のステップで使います）。HMD が応答しないとき (スリープ中、USB デバッグの許可待ちなど) は、3 分で失敗として表示される
 
 ### ステップ 5: HMD で接続
 

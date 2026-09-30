@@ -129,7 +129,7 @@ impl CompanionApp {
         let hint = if !self.driver_installed {
             Some("Next: Install the SteamVR driver above")
         } else if self.connection_status == ConnectionStatus::Disconnected {
-            if self.devices.is_empty() {
+            if !self.devices.iter().any(|d| d.is_focus_vision) {
                 Some("Next: Connect Focus Vision via USB and deploy the APK (Deploy tab)")
             } else {
                 Some("Next: Start SteamVR, then send the PIN to the headset (below)")
@@ -170,7 +170,7 @@ impl CompanionApp {
                 // The headset app has no PIN entry screen yet: the PIN (and
                 // this PC's address) go over USB with the app launch.
                 ui.label(egui::RichText::new("Send this PIN to the headset over USB").size(12.0).color(text_muted));
-                if self.adb_path.is_some() && !self.devices.is_empty() {
+                if self.adb_path.is_some() && self.devices.iter().any(|d| d.is_focus_vision) {
                     ui.add_space(4.0);
                     let label = if self.pairing_in_progress { "Sending..." } else { "Send PIN to headset" };
                     if ui.add_enabled(!self.pairing_in_progress, egui::Button::new(label)).clicked() {

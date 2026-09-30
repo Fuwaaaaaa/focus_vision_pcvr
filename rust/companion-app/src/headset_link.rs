@@ -6,7 +6,7 @@
 //! its connection.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
-use crate::process;
+use crate::adb;
 
 pub const CLIENT_PACKAGE: &str = "com.focusvision.pcvr";
 
@@ -67,10 +67,7 @@ pub fn send_to_headset(
     if !is_pin(pin) {
         return Err("No PIN to send yet: start SteamVR first.".to_string());
     }
-    let output = process::command(adb_path)
-        .args(["-s", serial, "shell", "ip", "-f", "inet", "addr", "show", "wlan0"])
-        .output()
-        .map_err(|e| format!("Failed to run adb: {e}"))?;
+    let output = adb::run(adb_path, &["-s", serial, "shell", "ip", "-f", "inet", "addr", "show", "wlan0"], adb::QUICK)?;
     let headset_ip = parse_wlan_ipv4(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
         "The headset has no Wi-Fi address. Connect it to the same network as this PC.".to_string()
     })?;
@@ -78,10 +75,8 @@ pub fn send_to_headset(
         .ok_or_else(|| format!("This PC has no route to the headset ({headset_ip})."))?;
     let server = SocketAddrV4::new(pc_ip, tcp_port);
 
-    let output = process::command(adb_path)
-        .args(launch_args(serial, server, pin, udp_port))
-        .output()
-        .map_err(|e| format!("Failed to run adb: {e}"))?;
+    let args = launch_args(serial, server, pin, udp_port);
+    let output = adb::run(adb_path, &args.iter().map(String::as_str).collect::<Vec<_>>(), adb::QUICK)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     // `am start` reports a missing app on stdout with exit status 0.

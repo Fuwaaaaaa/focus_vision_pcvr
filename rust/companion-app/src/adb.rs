@@ -1,4 +1,28 @@
+use std::process::Output;
+use std::time::Duration;
+
 use crate::process;
+
+/// How long an adb command may take before it is given up on. adb waits
+/// forever on a device that stopped answering.
+/// REGRESSION: nothing timed out, so a stuck install left Deploy on
+/// "Installing..." for good, and a stuck device scan froze the window.
+pub const QUICK: Duration = Duration::from_secs(10);
+/// An install copies the APK over USB and verifies it.
+pub const INSTALL: Duration = Duration::from_secs(180);
+/// A logcat dump for the diagnostics zip.
+pub const LOGCAT: Duration = Duration::from_secs(30);
+
+/// Run `adb <args>`, killed after `timeout`. The error says why.
+pub fn run(adb_path: &str, args: &[&str], timeout: Duration) -> Result<Output, String> {
+    process::output_with_timeout(process::command(adb_path).args(args), timeout).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            format!("adb got {e} — is the headset awake, still connected, and USB debugging allowed on it?")
+        } else {
+            format!("Failed to run adb: {e}")
+        }
+    })
+}
 
 /// ADB device info
 #[derive(Debug, Clone)]
@@ -11,7 +35,7 @@ pub struct AdbDevice {
 /// Find adb.exe — check PATH, then common install locations.
 pub fn find_adb() -> Option<String> {
     // Check PATH first
-    if process::command("adb").arg("version").output().is_ok() {
+    if run("adb", &["version"], QUICK).is_ok() {
         return Some("adb".to_string());
     }
 
@@ -48,13 +72,18 @@ pub fn parse_device_list(output: &str) -> Vec<AdbDevice> {
         }
 
         let serial = parts[0].to_string();
-        let model = parts.iter()
-            .find(|p| p.starts_with("model:"))
-            .map(|p| p.trim_start_matches("model:").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
+        let field = |key: &str| parts.iter().find_map(|p| p.strip_prefix(key)).map(str::to_string);
+        let model = field("model:").unwrap_or_else(|| "Unknown".to_string());
 
-        let is_focus_vision = model.to_lowercase().contains("focus")
-            || model.to_lowercase().contains("vive");
+        // A VIVE headset by its model, product or device name (the Focus
+        // Vision's exact strings are not yet seen on the hardware).
+        let is_focus_vision = [field("model:"), field("product:"), field("device:")]
+            .iter()
+            .flatten()
+            .any(|name| {
+                let name = name.to_lowercase();
+                name.contains("vive") || name.contains("focus")
+            });
 
         devices.push(AdbDevice { serial, model, is_focus_vision });
     }
@@ -62,24 +91,26 @@ pub fn parse_device_list(output: &str) -> Vec<AdbDevice> {
     devices
 }
 
-/// List connected ADB devices.
+/// List connected ADB devices. Blocks up to `QUICK`: call it off the UI
+/// thread.
 pub fn list_devices(adb_path: &str) -> Vec<AdbDevice> {
-    let output = match process::command(adb_path).arg("devices").arg("-l").output() {
-        Ok(o) => o,
-        Err(_) => return vec![],
-    };
+    match run(adb_path, &["devices", "-l"], QUICK) {
+        Ok(output) => parse_device_list(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => vec![],
+    }
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_device_list(&stdout)
+/// The devices Deploy installs on: the VIVE headsets. REGRESSION: it
+/// installed on (and started the app on) every device adb listed — a phone
+/// plugged in to charge, another headset.
+pub fn deploy_targets(devices: &[AdbDevice]) -> Vec<String> {
+    devices.iter().filter(|d| d.is_focus_vision).map(|d| d.serial.clone()).collect()
 }
 
 /// Install APK on a device via ADB.
 /// Returns Ok(output) on success, Err(error) on failure.
 pub fn install_apk(adb_path: &str, serial: &str, apk_path: &str) -> Result<String, String> {
-    let output = process::command(adb_path)
-        .args(["-s", serial, "install", "-r", apk_path])
-        .output()
-        .map_err(|e| format!("Failed to run adb: {e}"))?;
+    let output = run(adb_path, &["-s", serial, "install", "-r", apk_path], INSTALL)?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -93,10 +124,7 @@ pub fn install_apk(adb_path: &str, serial: &str, apk_path: &str) -> Result<Strin
 
 /// Dump logcat from the device (non-blocking — returns buffered log).
 pub fn dump_logcat(adb_path: &str, serial: &str) -> Result<String, String> {
-    let output = process::command(adb_path)
-        .args(["-s", serial, "logcat", "-d", "-s", "FocusVision:*"])
-        .output()
-        .map_err(|e| format!("Failed to run adb: {e}"))?;
+    let output = run(adb_path, &["-s", serial, "logcat", "-d", "-s", "FocusVision:*"], LOGCAT)?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -108,10 +136,7 @@ pub fn dump_logcat(adb_path: &str, serial: &str) -> Result<String, String> {
 /// Launch the app on the device.
 pub fn launch_app(adb_path: &str, serial: &str, package: &str) -> Result<String, String> {
     let activity = format!("{package}/.MainActivity");
-    let output = process::command(adb_path)
-        .args(["-s", serial, "shell", "am", "start", "-n", &activity])
-        .output()
-        .map_err(|e| format!("Failed to run adb: {e}"))?;
+    let output = run(adb_path, &["-s", serial, "shell", "am", "start", "-n", &activity], QUICK)?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -193,6 +218,27 @@ SERIAL003   device usb:1-3 product:pixel model:Pixel_7 transport_id:3
         assert_eq!(devices[0].serial, "SERIAL001");
         assert_eq!(devices[1].serial, "SERIAL002");
         assert_eq!(devices[2].serial, "SERIAL003");
+    }
+
+    #[test]
+    fn deploy_goes_to_the_vive_headsets_only() {
+        let output = "\
+List of devices attached
+SERIAL001   device usb:1-1 product:vive model:VIVE_Focus_Vision transport_id:1
+SERIAL002   device usb:1-2 product:quest model:Quest_3 transport_id:2
+SERIAL003   device usb:1-3 product:pixel model:Pixel_7 transport_id:3
+";
+        assert_eq!(deploy_targets(&parse_device_list(output)), ["SERIAL001"]);
+        assert!(deploy_targets(&parse_device_list("List of devices attached\nS  device model:Pixel_7\n")).is_empty());
+    }
+
+    #[test]
+    fn a_vive_headset_is_known_by_its_product_or_device_name_too() {
+        let output = "\
+List of devices attached
+SERIAL005   device usb:1-5 product:vive_focus_vision model:HMD device:focusvision transport_id:5
+";
+        assert!(parse_device_list(output)[0].is_focus_vision);
     }
 
     #[test]
