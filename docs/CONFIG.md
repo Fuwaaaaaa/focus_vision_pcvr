@@ -14,8 +14,10 @@ to the driver DLL, not the working directory. Layers, lowest precedence first:
    falling back to `config/default.toml` under the working directory.
 2. **`config/local.toml`** next to that `default.toml` — dev checkouts (gitignored).
 3. **`%APPDATA%\FocusVisionPCVR\config\local.toml`** — per-user overrides. The
-   companion app's Settings tab writes here, and hand-written keys in this file
-   are kept when the companion saves.
+   companion app's Settings tab writes here — only the sections you change —
+   and hand-written keys in this file are kept when the companion saves.
+   Settings → **Reset to defaults** removes the companion's keys, so
+   `default.toml` applies again.
 
 Later layers override earlier ones **key by key** (a `local.toml` only needs the
 keys it changes). Unknown keys and sections are ignored. A layer that fails to

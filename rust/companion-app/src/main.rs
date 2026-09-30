@@ -135,9 +135,12 @@ pub(crate) struct CompanionApp {
     // `mark_config_dirty()` instead of saving directly, so a slider drag or a
     // typed path writes the file once after the input settles rather than on
     // every frame. `pending_save_notes` holds one user-facing log line per
-    // settings group (keyed by group), emitted when the save lands.
+    // settings group (keyed by group — the local.toml section it writes),
+    // emitted when the save lands.
     config_dirty_since: Option<Instant>,
     pending_save_notes: Vec<(&'static str, String)>,
+    /// The last save failed (it is retried; the failure logged once).
+    config_save_failing: bool,
 
     // v1.1: Stats history for sparkline graphs
     pub(crate) stats_history: stats_history::StatsHistory,
@@ -221,6 +224,8 @@ const ENGINE_STALE_THRESHOLD: Duration = Duration::from_secs(5);
 
 /// How long settings must stay unchanged before `local.toml` is written.
 const CONFIG_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+/// How long after a failed save it is tried again.
+const CONFIG_SAVE_RETRY: Duration = Duration::from_secs(5);
 
 /// Whether a debounced save is due: something changed and the last change is
 /// at least `CONFIG_SAVE_DEBOUNCE` old.
@@ -294,6 +299,7 @@ impl CompanionApp {
             selected_codec: cfg.video.codec.clone(),
             config_dirty_since: None,
             pending_save_notes: Vec::new(),
+            config_save_failing: false,
             stats_history: stats_history::StatsHistory::new(),
             export_in_progress: false,
             export_result: Arc::new(Mutex::new(None)),
@@ -335,6 +341,8 @@ impl CompanionApp {
     /// `flush_config_if_due()` once the input has settled; `note` is logged
     /// then (the latest note per `group` wins, so a slider drag logs once).
     pub(crate) fn mark_config_dirty(&mut self, group: &'static str, note: String) {
+        // The group is the section saved; any other name would save nothing.
+        debug_assert!(config::SECTIONS.contains(&group), "{group} is not a local.toml section");
         self.config_dirty_since = Some(Instant::now());
         self.pending_save_notes.retain(|(g, _)| *g != group);
         self.pending_save_notes.push((group, note));
@@ -347,19 +355,36 @@ impl CompanionApp {
     }
 
     /// Write pending settings now (debounce elapsed, app exit, or an action
-    /// that must persist immediately). No-op when nothing is pending.
+    /// that must persist immediately). No-op when nothing is pending. Only
+    /// the sections that changed are written.
     pub(crate) fn flush_config(&mut self) {
+        self.flush_config_with(|config, sections| config.save(sections));
+    }
+
+    fn flush_config_with(&mut self, save: impl FnOnce(&config::LocalConfig, &[&str]) -> Result<(), String>) {
         if self.config_dirty_since.take().is_none() {
             return;
         }
         let notes = std::mem::take(&mut self.pending_save_notes);
-        match self.local_config.save() {
+        let sections: Vec<&str> = notes.iter().map(|(section, _)| *section).collect();
+        match save(&self.local_config, &sections) {
             Ok(()) => {
+                if std::mem::take(&mut self.config_save_failing) {
+                    self.log("Settings saved after all");
+                }
                 for (_, note) in notes {
                     self.log(&note);
                 }
             }
-            Err(e) => self.log(&format!("Failed to save config: {e}")),
+            Err(e) => {
+                // REGRESSION: a failed save (the file locked by an editor or
+                // a scanner) dropped the change. Keep it and try again.
+                if !std::mem::replace(&mut self.config_save_failing, true) {
+                    self.log(&format!("Failed to save config: {e} — retrying every {} s", CONFIG_SAVE_RETRY.as_secs()));
+                }
+                self.pending_save_notes = notes;
+                self.config_dirty_since = Some(Instant::now() + (CONFIG_SAVE_RETRY - CONFIG_SAVE_DEBOUNCE));
+            }
         }
     }
 }
@@ -1076,7 +1101,7 @@ mod tests {
 
     // --- status state machine (no filesystem, no egui context) ---
 
-    use super::{config, config_save_due, CompanionApp, CONFIG_SAVE_DEBOUNCE};
+    use super::{config, config_save_due, CompanionApp, CONFIG_SAVE_DEBOUNCE, CONFIG_SAVE_RETRY};
     use crate::status_parser::{parse_status_json, ConnectionStatus};
     use std::time::{Duration, Instant};
 
@@ -1174,5 +1199,31 @@ mod tests {
         a.flush_config();
         assert!(a.config_dirty_since.is_none());
         assert!(a.status_log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_save_writes_the_changed_sections_and_a_failed_one_is_retried() {
+        let mut a = app();
+        a.mark_config_dirty("audio", "Audio: 96".to_string());
+        a.mark_config_dirty("sleep_mode", "Sleep: 600".to_string());
+
+        // REGRESSION: a failed save dropped the change.
+        a.flush_config_with(|_, _| Err("locked".to_string()));
+        assert_eq!(a.pending_save_notes.len(), 2, "the change is kept");
+        let retry_at = a.config_dirty_since.expect("a retry is pending");
+        assert!(!config_save_due(Some(retry_at), Instant::now() + Duration::from_secs(1)), "not straight away");
+        assert!(config_save_due(Some(retry_at), Instant::now() + CONFIG_SAVE_RETRY + Duration::from_millis(10)));
+        a.flush_config_with(|_, _| Err("locked".to_string()));
+        let failures = a.status_log.lock().unwrap().iter().filter(|l| l.contains("Failed to save")).count();
+        assert_eq!(failures, 1, "the failure is logged once");
+
+        let mut saved = Vec::new();
+        a.flush_config_with(|_, sections| {
+            saved = sections.iter().map(|s| s.to_string()).collect();
+            Ok(())
+        });
+        assert_eq!(saved, ["audio", "sleep_mode"], "only the sections that changed");
+        assert!(a.config_dirty_since.is_none());
+        assert!(!a.config_save_failing);
     }
 }
