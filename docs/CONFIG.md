@@ -137,6 +137,13 @@ Every hour `engine.log` gets the figure (`Memory monitor: … MB`), or a
 `Memory growth warning` when it grew by the threshold or more — a leak's first
 sign in a long session. The figure covers all of vrserver.exe, SteamVR included.
 
+## `[thermal]`
+
+Lowers the bitrate ceiling when the NVIDIA GPU runs hot (`warn_celsius` <
+`limit_celsius` < `emergency_celsius`, back up over `recovery_seconds`).
+**It works only in a build with the `nvml` feature; the released installer's
+is not one**, so there `enabled = true` only logs a warning. Off by default.
+
 ## Session logs (no settings)
 
 While streaming, the engine writes a line of stats every 10 s to

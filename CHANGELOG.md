@@ -662,6 +662,17 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   needless 5 s hold).
 
 ### Docs
+- **TROUBLESHOOTING matches the product.** Checked against the code, it
+  sent users to a "Reinstall driver" button, a bitrate graph and a
+  Foveated switch that don't exist, to `logs\engine.log` for NVENC errors
+  (they are in SteamVR's vrserver.txt), and to NVIDIA driver 528 (551.76
+  is needed). Restarting the companion was said to lift a PIN lockout (it
+  survives restarts), the firewall prompt was said to be the companion's
+  (it is vrserver.exe's), the controllers a VIVE profile (they show as
+  Oculus Touch), and `[thermal]` usable (not in the released build, which
+  now logs a warning when it is set instead of nothing). FAQ's foveated
+  savings (10-30 %) were never measured, and without a gaze there is no
+  centre-fixed foveation; both now say so.
 - **The project status is stated honestly.** The v3.0.0 release notes
   called the release "General Availability", and README and USER_GUIDE
   described a working headset product. Neither P0 below was disclosed.

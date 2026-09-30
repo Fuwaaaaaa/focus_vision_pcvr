@@ -82,20 +82,20 @@ A. プロトコルは TCP + UDP なので**論理的には可能**ですが、�
 
 ### Q. Foveated Encoding は何 % 帯域を削減しますか?
 
-A. プリセットによります:
+A. **まだ計測していません。** NVENC が実機の GPU でまだ動いていないためです (プリセットの削減率は見込みで、実測値ではありません)。プリセットごとの QP の上げ幅は次のとおりです (視線の周り = fovea は 0):
 
-| プリセット | fovea QP offset | peripheral QP offset | 帯域削減 |
-|---------|---|---|---|
-| subtle | +3 | +8 | ~10% |
-| balanced (既定) | +5 | +15 | ~20% |
-| aggressive | +8 | +25 | ~30% |
-| custom | 任意 | 任意 | 設定次第 |
+| プリセット | 中間の領域 (mid) の QP | 周辺 (peripheral) の QP |
+|---------|---|---|
+| subtle | +3 | +8 |
+| balanced (プリセットの既定) | +5 | +15 |
+| aggressive | +8 | +25 |
+| custom | `mid_qp_offset` | `peripheral_qp_offset` |
 
-視線追従 (XR_EXT_eye_gaze_interaction) を使うため、Eye Tracking が無効化された状態では中央固定のフォビーション (画面中心が高画質) になります。
+Foveated Encoding 自体は既定で無効です (`config/local.toml` の `[foveated] enabled = true` で有効)。視線 (XR_EXT_eye_gaze_interaction) が HMD から届いている間だけ効き、一度も届かなければ全体を同じ画質で送ります。途中で届かなくなると、最後の視線の位置のままになります。
 
 ### Q. NVENC ROI は使えますか?
 
-A. **v3.0 では非対応**。実機 (NVENC SDK 12.x 対応 GPU + Focus Vision) で検証できる環境が揃った時点で再着手予定です ([TODOS.md](../TODOS.md))。現状の QP delta map で ~30% 帯域削減を達成しており、実用上の差は小さい範囲です。
+A. **v3.0 では非対応**。実機 (NVENC SDK 12.x 対応 GPU + Focus Vision) で検証できる環境が揃った時点で再着手予定です ([TODOS.md](../TODOS.md))。いまは QP delta map で周辺の画質を下げています (削減量は未計測)。
 
 ---
 

@@ -102,7 +102,8 @@ bool NvencEncoder::encode(bool forceIdr, std::vector<uint8_t>& outNalData, bool&
     // Read gaze data for foveated encoding via per-CTU QP delta map.
     // NVENC ROI capability is intentionally not wired in v3.0 — see TODOS.md
     // for the rationale (cannot validate without specific hardware) and the
-    // re-open condition. The QP delta path achieves ~30% bandwidth reduction.
+    // re-open condition. The QP delta path's saving is not yet measured.
+    // Without a gaze the last map stays (none before the first gaze).
     if (m_foveatedEnabled && m_gazeValid.load()) {
         float gx = m_gazeX.load();
         float gy = m_gazeY.load();

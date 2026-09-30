@@ -193,10 +193,11 @@ pub struct FoveatedConfig {
 pub enum FoveatedPreset {
     /// Subtle: mid +3, peripheral +8 (minimal quality difference)
     Subtle,
-    /// Balanced: mid +5, peripheral +15 (default, ~20% bandwidth reduction)
+    /// Balanced: mid +5, peripheral +15 (default). The saving of each
+    /// preset is not yet measured (NVENC hasn't run on the hardware).
     #[default]
     Balanced,
-    /// Aggressive: mid +8, peripheral +25 (~35% bandwidth reduction)
+    /// Aggressive: mid +8, peripheral +25
     Aggressive,
     /// Custom: use mid_qp_offset and peripheral_qp_offset values directly
     Custom,
