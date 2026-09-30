@@ -117,24 +117,9 @@ impl CompanionApp {
                 ui.label(status_text);
             });
 
-            if !self.driver_installed {
-                if let Some(ref _dir) = self.steamvr_dir {
-                    if ui.button("Install Driver").clicked() {
-                        // Look for built driver in the project's build output
-                        let driver_source = PathBuf::from("driver/build/focus_vision_pcvr");
-                        match driver::install_driver(self.steamvr_dir.as_ref().unwrap(), &driver_source) {
-                            Ok(()) => {
-                                self.driver_installed = true;
-                                self.driver_status = "Driver installed".to_string();
-                                self.log("Driver installed successfully");
-                            }
-                            Err(e) => {
-                                self.driver_status = format!("Install failed: {e}");
-                                self.log(&format!("Driver install failed: {e}"));
-                            }
-                        }
-                    }
-                }
+            // Shown when the installer ran before SteamVR was there.
+            if !self.driver_installed && self.steamvr_dir.is_some() && ui.button("Install Driver").clicked() {
+                self.register_bundled_driver();
             }
         });
 
@@ -369,5 +354,32 @@ impl CompanionApp {
                     });
             }
         });
+    }
+
+    /// Register the driver that came with this exe with SteamVR, as the
+    /// installer does (`vrpathreg adddriver`: per user, no admin).
+    fn register_bundled_driver(&mut self) {
+        let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from));
+        let Some(dir) = exe_dir.as_deref().and_then(driver::bundled_driver_dir) else {
+            self.driver_status = "Driver files not found next to the app".to_string();
+            self.log("Install Driver: no driver next to the app — reinstall Focus Vision PCVR");
+            return;
+        };
+        match driver::vrpathreg_driver("adddriver", &dir) {
+            Ok(_) => {
+                self.log(&format!("Driver registered with SteamVR: {} (restart SteamVR to load it)", dir.display()));
+                self.driver_registered_at = Some(dir);
+                self.driver_installed = true;
+                self.driver_status = "Driver registered with SteamVR".to_string();
+            }
+            Err(driver::RegisterError::SteamVrNotFound) => {
+                self.driver_status = "SteamVR not found".to_string();
+                self.log("Install Driver: SteamVR not found in any Steam library");
+            }
+            Err(driver::RegisterError::Vrpathreg(e)) => {
+                self.driver_status = "Install failed".to_string();
+                self.log(&format!("Install Driver failed: {e}"));
+            }
+        }
     }
 }

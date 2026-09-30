@@ -57,7 +57,7 @@
 
 1. **SteamVR がドライバを認識していない**
    - コンパニオンアプリ Home タブの「SteamVR Driver」が `Installed` か確認。SteamVR 側では、設定の「Startup / Shutdown」→「Manage Add-ons」に Focus Vision PCVR が出ていて有効になっているか
-   - **対処:** インストーラをもう一度実行して (SteamVR を終了した状態で) ドライバを登録し直す → SteamVR を再起動。下の「SteamVR 関連」も参照
+   - **対処:** `Not installed` なら Home タブの「Install Driver」(インストーラと同じく、アプリと一緒に入ったドライバを SteamVR に登録する)、またはインストーラをもう一度実行する → SteamVR を再起動。下の「SteamVR 関連」も参照
 
 2. **NVENC エンコーダ初期化失敗**
    - NVIDIA ドライバが古い / 非対応 GPU。このときドライバは映像を流さない
@@ -195,7 +195,7 @@
 
 1. **ドライバが SteamVR に登録されていない**
    - インストーラは SteamVR (どの Steam ライブラリにあっても) の vrpathreg でドライバを登録する。インストール時に SteamVR が入っていなかった、または SteamVR の実行中だった場合は登録されない
-   - **対処:** SteamVR をインストールして一度起動し、終了してから、インストーラをもう一度実行する
+   - **対処:** SteamVR をインストールして一度起動してから、コンパニオンの Home タブの「Install Driver」を押す (またはインストーラをもう一度実行する)。SteamVR を再起動すると読み込まれる
 
 2. **SteamVR の別バージョン (Beta など) を使っている**
    - **対処:** Steam クライアントで SteamVR を安定版に切り替える
