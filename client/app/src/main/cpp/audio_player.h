@@ -29,6 +29,10 @@ public:
     /// Called from the network receive thread. Thread-safe.
     bool submitOpusPacket(const uint8_t* data, int size);
 
+    /// Fill `packets` lost 10 ms packets with Opus's loss concealment, in
+    /// their place before the next packet (AudioSequence counts them).
+    void concealLoss(int packets);
+
     /// Feed decoded samples from jitter buffer to AAudio output.
     /// Call from the main loop or a dedicated audio thread.
     void pump();
@@ -54,6 +58,9 @@ private:
 
     // Decode workspace (avoids per-packet allocation)
     std::vector<int16_t> m_decodeBuffer;
+
+    /// Queue `samplesDecoded` (per channel) from m_decodeBuffer.
+    void appendDecoded(int samplesDecoded);
 
     static constexpr int FRAME_SIZE = 480; // 10ms at 48kHz
     static constexpr int MAX_BUFFER_MS = 100; // Max jitter buffer depth

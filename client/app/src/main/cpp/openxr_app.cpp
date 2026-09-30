@@ -185,6 +185,7 @@ void OpenXRApp::handleStreamEvents() {
                 m_audioReceiver.init("0.0.0.0", m_udpBasePort + fvp_client_protocol::AUDIO_PORT_OFFSET);
             }
             if (!m_audioPlayer.isInitialized()) m_audioPlayer.init();
+            m_audioSequence.reset(); // each session's audio numbers from 0
             m_sleeping = false;
             m_pairingState = PairingState::Connected;
             LOGI("Streaming from %s", m_serverIp.c_str());
@@ -500,9 +501,14 @@ void OpenXRApp::receiveAudio() {
     for (;;) {
         const int n = m_audioReceiver.receive(m_audioBuffer.data(), static_cast<int>(m_audioBuffer.size()));
         if (n <= 0) break;
-        if (n > kRtpHeader) {
-            m_audioPlayer.submitOpusPacket(m_audioBuffer.data() + kRtpHeader, n - kRtpHeader);
-        }
+        if (n <= kRtpHeader) continue;
+        // REGRESSION: a lost packet left a 10 ms hole (a click), and a late
+        // one played out of order.
+        const uint16_t sequence = static_cast<uint16_t>((m_audioBuffer[2] << 8) | m_audioBuffer[3]);
+        const int missing = m_audioSequence.onPacket(sequence);
+        if (missing < 0) continue;
+        if (missing > 0) m_audioPlayer.concealLoss(missing);
+        m_audioPlayer.submitOpusPacket(m_audioBuffer.data() + kRtpHeader, n - kRtpHeader);
     }
     m_audioPlayer.pump();
 }

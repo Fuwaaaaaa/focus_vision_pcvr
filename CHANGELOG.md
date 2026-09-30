@@ -370,6 +370,15 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   the stream reported an error; a device that failed to open is tried again
   after 30 s. Checked with unit tests and on this PC's device (no needless
   reopening); an actual switch is not yet tried.
+- **A lost audio packet is concealed, not a click.** The engine switched on
+  Opus in-band FEC and logged "FEC enabled", but its low-delay mode is
+  CELT only, which has no FEC (a unit test reads the packets' mode). The
+  setting and the claim are gone. The headset now counts the packets that
+  never arrived from the RTP sequence numbers (`audio_sequence.h`) and
+  fills each missing 10 ms with Opus's loss concealment (up to 50 ms per
+  gap); a late or repeated packet is dropped instead of playing out of
+  order. Checked with host tests and the APK build; not yet heard on the
+  headset.
 - **The engine notices a dead link and lets the headset back in** (#18).
   - A control connection silent for 3 s (six missed heartbeats) is dropped.
     A Wi-Fi drop that lost the FIN/RST left the session streaming to nobody

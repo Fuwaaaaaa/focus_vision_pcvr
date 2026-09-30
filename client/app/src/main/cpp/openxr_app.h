@@ -15,6 +15,7 @@
 #include "tracking_sender.h"
 #include "controller_poller.h"
 #include "audio_player.h"
+#include "audio_sequence.h"
 #include "eye_tracker.h"
 #include "hmd_profile.h"
 #include "launch_request.h"
@@ -142,6 +143,7 @@ private:
 
     // Audio
     AudioPlayer m_audioPlayer;
+    AudioSequence m_audioSequence;  // lost packets → loss concealment
     NetworkReceiver m_audioReceiver;
     std::vector<uint8_t> m_audioBuffer;
 
