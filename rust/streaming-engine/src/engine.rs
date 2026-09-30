@@ -902,24 +902,48 @@ fn spawn_control_task(
 /// spin up a tokio runtime just to wait. Capture failure is non-fatal —
 /// `AUDIO_ACTIVE` is cleared and video streaming continues.
 fn spawn_real_capture(audio_tx: mpsc::Sender<Vec<f32>>, cancel: CancellationToken) {
-    use crate::audio::capture::AudioCapture;
+    use crate::audio::capture::{default_output_name, should_reopen, AudioCapture};
+    /// How often the default output device is checked.
+    const DEVICE_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
     let audio_spawn = std::thread::Builder::new()
         .name("fvp-audio-capture".into())
         .spawn(move || {
-            let _capture = match AudioCapture::start(audio_tx) {
-                Some(c) => {
-                    AUDIO_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
-                    c
-                }
-                None => {
-                    AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
-                    log::info!("Audio capture unavailable — streaming video only");
-                    return;
-                }
-            };
+            let mut capture = AudioCapture::start(audio_tx.clone());
+            AUDIO_ACTIVE.store(capture.is_some(), std::sync::atomic::Ordering::Relaxed);
+            if capture.is_none() {
+                log::info!("Audio capture unavailable — streaming video only until an output device can be opened");
+            }
+            // The device (and when) that last failed to open, to retry later.
+            let mut failed_attempt: Option<(String, std::time::Instant)> = None;
+            let mut last_check = std::time::Instant::now();
             while !cancel.is_cancelled() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
+                if last_check.elapsed() < DEVICE_CHECK {
+                    continue;
+                }
+                last_check = std::time::Instant::now();
+                let default_now = default_output_name();
+                let reopen = should_reopen(
+                    capture.as_ref().map(AudioCapture::state),
+                    default_now.as_deref(),
+                    failed_attempt.as_ref().map(|(device, at)| (device.as_str(), *at)),
+                    last_check,
+                );
+                if !reopen {
+                    continue;
+                }
+                if let (Some(old), Some(new)) = (capture.as_ref().map(|c| c.state().0.to_string()), default_now.as_deref()) {
+                    log::info!("Audio output device: '{}' → '{}', capturing it", old, new);
+                }
+                drop(capture.take()); // release the old loopback first
+                capture = AudioCapture::start(audio_tx.clone());
+                failed_attempt = match (&capture, default_now) {
+                    (None, Some(device)) => Some((device, last_check)),
+                    _ => None,
+                };
+                AUDIO_ACTIVE.store(capture.is_some(), std::sync::atomic::Ordering::Relaxed);
             }
+            drop(capture);
             AUDIO_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
             log::info!("Audio capture released");
         });

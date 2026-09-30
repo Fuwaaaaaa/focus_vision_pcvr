@@ -362,6 +362,14 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   - Past 4 GB (about 6 hours) the WAV's sizes saturated and no longer
     described the file; the audio recording now stops there, with a log
     line.
+- **PC audio follows the default output device.** The loopback stayed on
+  the device it opened first for the whole session, so plugging in
+  headphones (Windows moves the sound to them) silenced the stream, and a
+  session that started with no output device never got audio. The capture
+  thread checks the default output every 2 s and reopens when it changed or
+  the stream reported an error; a device that failed to open is tried again
+  after 30 s. Checked with unit tests and on this PC's device (no needless
+  reopening); an actual switch is not yet tried.
 - **The engine notices a dead link and lets the headset back in** (#18).
   - A control connection silent for 3 s (six missed heartbeats) is dropped.
     A Wi-Fi drop that lost the FIN/RST left the session streaming to nobody
