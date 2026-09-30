@@ -185,6 +185,26 @@ fn registered_driver_in(vrpath_json: &str) -> Option<PathBuf> {
     vrpath_list(vrpath_json, "external_drivers").into_iter().find(|d| has_driver_dll(d))
 }
 
+/// Our driver as shipped with this exe, to register: the installer puts it
+/// at `<install dir>\driver\focus_vision_pcvr` next to the exe; a dev build
+/// has it at `<repo>\driver\build\focus_vision_pcvr` above
+/// `target\{debug,release}`.
+///
+/// REGRESSION: Home's "Install Driver" looked for `driver\build\…` under the
+/// working directory, which an installed companion doesn't have, and copied
+/// it into SteamVR's own folder (under Program Files: admin only).
+pub fn bundled_driver_dir(exe_dir: &Path) -> Option<PathBuf> {
+    let installed = exe_dir.join("driver").join("focus_vision_pcvr");
+    if has_driver_dll(&installed) {
+        return Some(installed);
+    }
+    exe_dir
+        .ancestors()
+        .take(4)
+        .map(|dir| dir.join("driver").join("build").join("focus_vision_pcvr"))
+        .find(|dir| has_driver_dll(dir))
+}
+
 /// SteamVR's log directory (vrserver.txt, vrcompositor.txt): `log` in
 /// `openvrpaths.vrpath`, else `logs` under Steam's install path.
 pub fn find_steamvr_log_dir() -> Option<PathBuf> {
@@ -214,64 +234,13 @@ fn vrpath_list(vrpath_json: &str, key: &str) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Install our driver into SteamVR's drivers directory.
-/// `driver_source`: our built driver directory (`driver.vrdrivermanifest`,
-/// `bin/win64/`, `resources/`).
-pub fn install_driver(drivers_dir: &Path, driver_source: &Path) -> Result<(), String> {
-    let target = drivers_dir.join("focus_vision_pcvr");
-
-    // Create directory structure
-    fs::create_dir_all(target.join("bin").join("win64"))
-        .map_err(|e| format!("Failed to create driver directory: {e}"))?;
-
-    // Copy DLL
-    let dll_name = DRIVER_DLL;
-    let src_dll = driver_source.join("bin").join("win64").join(dll_name);
-    if !src_dll.exists() {
-        return Err(format!("Driver DLL not found: {}", src_dll.display()));
-    }
-    fs::copy(&src_dll, target.join("bin").join("win64").join(dll_name))
-        .map_err(|e| format!("Failed to copy DLL: {e}"))?;
-
-    // Copy manifest
-    let manifest = "driver.vrdrivermanifest";
-    let src_manifest = driver_source.join(manifest);
-    if src_manifest.exists() {
-        fs::copy(&src_manifest, target.join(manifest))
-            .map_err(|e| format!("Failed to copy manifest: {e}"))?;
-    }
-
-    // Copy resources directory
-    let src_resources = driver_source.join("resources");
-    if src_resources.exists() {
-        copy_dir_recursive(&src_resources, &target.join("resources"))?;
-    }
-
-    Ok(())
-}
-
-/// Uninstall our driver from SteamVR.
+/// Remove a copy of our driver from SteamVR's `drivers` folder, where older
+/// companions put it (the installer and Install Driver register it instead).
 pub fn uninstall_driver(drivers_dir: &Path) -> Result<(), String> {
     let target = drivers_dir.join("focus_vision_pcvr");
     if target.exists() {
         fs::remove_dir_all(&target)
             .map_err(|e| format!("Failed to remove driver: {e}"))?;
-    }
-    Ok(())
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    fs::create_dir_all(dst).map_err(|e| format!("mkdir failed: {e}"))?;
-    for entry in fs::read_dir(src).map_err(|e| format!("readdir failed: {e}"))? {
-        let entry = entry.map_err(|e| format!("entry error: {e}"))?;
-        let ty = entry.file_type().map_err(|e| format!("filetype error: {e}"))?;
-        let dest = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest)?;
-        } else {
-            fs::copy(entry.path(), &dest)
-                .map_err(|e| format!("copy failed: {e}"))?;
-        }
     }
     Ok(())
 }
@@ -321,6 +290,34 @@ mod tests {
     }
 
     #[test]
+    fn the_driver_next_to_the_installed_exe_is_found() {
+        let install = std::env::temp_dir().join(format!("fv-bundled-installed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&install);
+        let driver = install.join("driver").join("focus_vision_pcvr");
+        fs::create_dir_all(driver.join("bin").join("win64")).unwrap();
+        fs::write(driver.join("bin").join("win64").join(DRIVER_DLL), b"").unwrap();
+        assert_eq!(bundled_driver_dir(&install), Some(driver));
+        let _ = fs::remove_dir_all(&install);
+    }
+
+    #[test]
+    fn a_dev_build_finds_the_driver_above_target() {
+        let repo = std::env::temp_dir().join(format!("fv-bundled-dev-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&repo);
+        let driver = repo.join("driver").join("build").join("focus_vision_pcvr");
+        fs::create_dir_all(driver.join("bin").join("win64")).unwrap();
+        fs::write(driver.join("bin").join("win64").join(DRIVER_DLL), b"").unwrap();
+        let exe_dir = repo.join("target").join("release");
+        fs::create_dir_all(&exe_dir).unwrap();
+        assert_eq!(bundled_driver_dir(&exe_dir), Some(driver));
+
+        // Without the DLL there is nothing to register.
+        fs::remove_file(repo.join("driver").join("build").join("focus_vision_pcvr").join("bin").join("win64").join(DRIVER_DLL)).unwrap();
+        assert_eq!(bundled_driver_dir(&exe_dir), None);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn a_registration_without_the_dll_does_not_count() {
         let stale = TempDriverDir::new("stale", false);
         assert_eq!(registered_driver_in(&vrpath(&[&stale.0])), None);
@@ -346,16 +343,6 @@ mod tests {
         assert_eq!(log_dir_in(&json), Some(logs.0.clone()), "the first that exists");
         assert_eq!(log_dir_in(&format!("\u{feff}{json}")), Some(logs.0.clone()));
         assert_eq!(log_dir_in(r#"{"version": 1}"#), None);
-    }
-
-    #[test]
-    fn install_copies_the_dll_from_the_build_layout() {
-        let source = TempDriverDir::new("source", true);
-        fs::write(source.0.join("driver.vrdrivermanifest"), b"{}").unwrap();
-        let steamvr = TempDriverDir::new("steamvr-drivers", false);
-        install_driver(&steamvr.0, &source.0).unwrap();
-        assert!(is_driver_installed(&steamvr.0));
-        assert!(steamvr.0.join("focus_vision_pcvr").join("driver.vrdrivermanifest").exists());
     }
 
     const LIBRARYFOLDERS: &str = r#""libraryfolders"

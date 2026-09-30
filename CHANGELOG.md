@@ -434,6 +434,15 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   They are now added up until the tick. The burst detector was fed the
   estimator's smoothed loss, which a single bad second barely moves after
   good ones; it now gets the loss of that interval.
+- **Home's "Install Driver" works where the companion is installed.** It
+  shows when the driver isn't registered (the installer ran before
+  SteamVR was there), and it looked for `driver\build\…` under the working
+  directory, which an installed companion doesn't have, then copied it
+  into SteamVR's folder under Program Files (admin only). It now registers
+  the driver installed next to the exe (or a dev build's, above
+  `target\`) with vrpathreg, like the installer. README's setup steps now
+  say so, and that the PIN goes over USB (there is no PIN screen on the
+  headset).
 - **The companion draws Japanese and fits its window** (#19).
   - Japanese text was boxes (no loaded font had kana or kanji). The OS's
     Japanese font (Yu Gothic Medium, else Meiryo or MS Gothic) follows Geist,

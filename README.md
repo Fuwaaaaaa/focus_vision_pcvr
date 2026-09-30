@@ -90,11 +90,11 @@ cargo build --release -p focus-vision-companion
 ### セットアップ
 
 ```
-1. コンパニオンアプリ → 「Install Driver」でSteamVRドライバーをインストール
-2. SteamVRを起動 → 表示されるPINをメモ
+1. インストーラを実行（SteamVRドライバーも登録される。SteamVRより先に入れた場合は、コンパニオンアプリのHomeタブの「Install Driver」）
+2. SteamVRを起動 → コンパニオンアプリのHomeタブにPINが出る
 3. Focus VisionをUSBでPCに接続（開発者モードON）
 4. コンパニオンアプリ → 「Deploy」タブでAPKをインストール
-5. HMDでアプリを起動 → PINを入力
+5. Homeタブの「Send PIN to headset」→ HMDのアプリがPCのアドレスとPINを受け取って接続する
 ```
 
 ---
