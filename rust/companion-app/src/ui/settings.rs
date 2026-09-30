@@ -91,7 +91,9 @@ impl CompanionApp {
                 ui.label(egui::RichText::new("Remove it by uninstalling Focus Vision PCVR from Windows Settings > Apps.")
                     .size(11.0).color(text_muted));
             } else if self.driver_installed
-                && ui.button("Uninstall Driver").clicked() {
+                && ui.add_enabled(!self.demo_mode, egui::Button::new("Uninstall Driver"))
+                    .on_disabled_hover_text("Not in demo mode")
+                    .clicked() {
                     if let Some(ref dir) = self.steamvr_dir {
                         match driver::uninstall_driver(dir) {
                             Ok(()) => {

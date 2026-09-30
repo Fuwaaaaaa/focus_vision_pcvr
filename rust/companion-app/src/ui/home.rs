@@ -42,6 +42,8 @@ impl CompanionApp {
                             .size(12.0)
                             .color(text_muted),
                     );
+                } else if self.is_sim_stopping() {
+                    ui.add_enabled(false, egui::Button::new(egui::RichText::new("Stopping...").color(blue).strong()));
                 } else {
                     if ui
                         .button(egui::RichText::new("▶ Start Simulation").color(blue).strong())
@@ -118,7 +120,14 @@ impl CompanionApp {
             });
 
             // Shown when the installer ran before SteamVR was there.
-            if !self.driver_installed && self.steamvr_dir.is_some() && ui.button("Install Driver").clicked() {
+            // Demo mode leaves the real SteamVR alone. REGRESSION: the button
+            // registered the driver for real there.
+            if !self.driver_installed
+                && self.steamvr_dir.is_some()
+                && ui.add_enabled(!self.demo_mode, egui::Button::new("Install Driver"))
+                    .on_disabled_hover_text("Not in demo mode")
+                    .clicked()
+            {
                 self.register_bundled_driver();
             }
         });
