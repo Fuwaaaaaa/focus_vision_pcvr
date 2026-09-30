@@ -434,6 +434,22 @@ All notable changes to Focus Vision PCVR will be documented in this file.
   They are now added up until the tick. The burst detector was fed the
   estimator's smoothed loss, which a single bad second barely moves after
   good ones; it now gets the loss of that interval.
+- **The companion's Settings save what you set, only that, and keep
+  trying.**
+  - egui clamps a slider's value every frame by default, and the sliders
+    were narrower than what the engine accepts (sleep 30-900 s against
+    30-3600 s, audio 64-256 kbps against 32-512, FT smoothing 0-0.95
+    against 0-0.99): opening Settings turned a hand-set 1800 s into 900 s,
+    and the change check saved it. The sliders now span the engine's
+    ranges (a test checks them against its `validate()`) and clamp only
+    what the user drags.
+  - Every save wrote every section, so saving the APK path pinned the
+    codec, sleep, audio and FT defaults in local.toml over `default.toml`.
+    A save now writes the sections that changed, and "Reset to defaults"
+    takes the companion's keys out of the file instead of writing the
+    defaults into it.
+  - A failed save (the file locked by an editor or a scanner) dropped the
+    change; it is kept and retried every 5 s, and the failure logged once.
 - **Deploy installs on the headset only, and adb can't hang the
   companion.** "Install APK on All Devices" installed the app on, and
   started it on, every device adb listed — a phone plugged in to charge,

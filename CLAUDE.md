@@ -48,7 +48,7 @@ cargo test --workspace                              # 500+ Rust tests
 ```bash
 cargo test --workspace                              # All Rust tests (500+ unit + integration)
 cargo test -p streaming-engine                      # Engine: 450+ tests + integration
-cargo test -p focus-vision-companion --bins         # Companion: 132 tests (config, ADB (deploy targets, timeouts), export/PII mask + collected logs + newest session logs, status_parser, status state machine, demo, svg_export, ui/settings validator, driver detection (any Steam library) + installer CLI + the driver shipped next to the exe, font check, Japanese font fallback + baseline, headset_link, hidden child process, file dialog paths)
+cargo test -p focus-vision-companion --bins         # Companion: 136 tests (config (changed sections only, reset, save retry, slider ranges), ADB (deploy targets, timeouts), export/PII mask + collected logs + newest session logs, status_parser, status state machine, demo, svg_export, ui/settings validator, driver detection (any Steam library) + installer CLI + the driver shipped next to the exe, font check, Japanese font fallback + baseline, headset_link, hidden child process, file dialog paths)
 cargo test -p fvp-common                            # Common: protocol structs / flags / versioning
 cargo bench -p streaming-engine                     # Criterion benchmarks
 cargo clippy --workspace --all-features --all-targets -- -D warnings  # CI clippy gate, fully clean
@@ -104,8 +104,9 @@ it → `%APPDATA%/FocusVisionPCVR/config/local.toml`. Unknown keys are ignored.
 Companion app writes its UI-side overrides
 (`[video] [sleep_mode] [face_tracking] [recording] [audio] [deploy]`) to
 `%APPDATA%/FocusVisionPCVR/config/local.toml` — debounced, atomic, merging only
-its own keys (other keys are preserved; an unparsable file is backed up to
-`local.toml.bak`). A legacy exe/CWD-relative `config/local.toml` is migrated on
+the sections the user changed (other keys are preserved; an unparsable file is
+backed up to `local.toml.bak`; a failed save is retried every 5 s). "Reset to
+defaults" removes the companion's keys so `default.toml` applies. A legacy exe/CWD-relative `config/local.toml` is migrated on
 first load. Changes apply on the next SteamVR start (no hot reload).
 Config values are validated on startup (range checks, NaN rejection, port conflict detection).
 

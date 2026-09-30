@@ -4,12 +4,30 @@
 //! this tab. Keeping the pure validator co-located with its caller makes
 //! the tab independently scannable.
 
+use std::ops::RangeInclusive;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use crate::{config, driver, export, file_dialog, CompanionApp};
+
+// The ranges the engine accepts (streaming-engine config.rs `validate`).
+const AUDIO_BITRATE_KBPS: RangeInclusive<u32> = 32..=512;
+const SLEEP_TIMEOUT_SECONDS: RangeInclusive<u32> = 30..=3600;
+const FT_SMOOTHING: RangeInclusive<f32> = 0.0..=0.99;
+
+/// A slider over one of the engine's ranges. It clamps only what the user
+/// drags or types: a value already outside the range (hand-written in
+/// local.toml) is shown as it is, not pulled into the range.
+///
+/// REGRESSION: egui clamps the value on every frame by default, and the
+/// ranges were narrower than the engine's (sleep 30-900 s against 30-3600
+/// s): opening Settings rewrote a valid 1800 s as 900 s, and the change
+/// check saved it.
+fn setting_slider<Num: egui::emath::Numeric>(value: &mut Num, range: RangeInclusive<Num>) -> egui::Slider<'_> {
+    egui::Slider::new(value, range).clamping(egui::SliderClamping::Edits)
+}
 
 /// Severity tier for the inline recording-dir diagnostic. Two levels keeps
 /// the visual language simple — yellow for "you typed something the engine
@@ -105,7 +123,7 @@ impl CompanionApp {
             if self.audio_enabled {
                 ui.horizontal(|ui| {
                     ui.label("Bitrate:");
-                    ui.add(egui::Slider::new(&mut self.audio_bitrate_kbps, 64..=256).suffix(" kbps"));
+                    ui.add(setting_slider(&mut self.audio_bitrate_kbps, AUDIO_BITRATE_KBPS).suffix(" kbps"));
                 });
                 ui.label(egui::RichText::new("WASAPI loopback — no virtual device needed").size(11.0).color(text_muted));
             }
@@ -137,9 +155,9 @@ impl CompanionApp {
             if self.sleep_enabled {
                 ui.horizontal(|ui| {
                     ui.label("Timeout:");
-                    ui.add(egui::Slider::new(&mut self.sleep_timeout, 30..=900).suffix("s"));
+                    ui.add(setting_slider(&mut self.sleep_timeout, SLEEP_TIMEOUT_SECONDS).suffix("s"));
                 });
-                ui.label(egui::RichText::new(format!("{}m {}s — bitrate drops to 8 Mbps during sleep",
+                ui.label(egui::RichText::new(format!("{}m {}s — bitrate drops to sleep_bitrate_mbps (8 Mbps by default) during sleep",
                     self.sleep_timeout / 60, self.sleep_timeout % 60)).size(11.0).color(text_muted));
             }
 
@@ -165,7 +183,7 @@ impl CompanionApp {
             if self.ft_enabled {
                 ui.horizontal(|ui| {
                     ui.label("Smoothing:");
-                    ui.add(egui::Slider::new(&mut self.ft_smoothing, 0.0..=0.95).fixed_decimals(2));
+                    ui.add(setting_slider(&mut self.ft_smoothing, FT_SMOOTHING).fixed_decimals(2));
                 });
                 ui.label(egui::RichText::new("0.0 = raw, higher = smoother (reduces jitter)").size(11.0).color(text_muted));
             }
@@ -369,11 +387,12 @@ impl CompanionApp {
         ui.label(egui::RichText::new(format!("Focus Vision PCVR v{}", env!("CARGO_PKG_VERSION"))).size(11.0).color(text_muted));
     }
 
-    /// Wipe LocalConfig back to defaults, persist, and re-sync every UI
-    /// shadow field so the on-screen sliders/toggles match what was saved.
-    /// Saved immediately (not debounced) and supersedes any pending change.
-    /// Failure to save is non-fatal: we log it but still apply the in-memory
-    /// reset, so the user at least gets immediate visual feedback.
+    /// Wipe LocalConfig back to defaults, take the companion's keys out of
+    /// local.toml (so `default.toml` applies), and re-sync every UI shadow
+    /// field so the on-screen sliders/toggles match. Done immediately (not
+    /// debounced) and supersedes any pending change. Failure to write is
+    /// non-fatal: we log it but still apply the in-memory reset, so the user
+    /// at least gets immediate visual feedback.
     pub(crate) fn reset_to_defaults(&mut self) {
         self.local_config = config::LocalConfig::default();
         self.config_dirty_since = None;
@@ -390,7 +409,7 @@ impl CompanionApp {
         self.audio_bitrate_kbps = self.local_config.audio.bitrate_kbps;
         self.apk_path = self.local_config.deploy.apk_path.clone();
 
-        match self.local_config.save() {
+        match config::LocalConfig::clear() {
             Ok(()) => self.log("Settings reset to defaults"),
             Err(e) => self.log(&format!("Reset applied in-memory but save failed: {e}")),
         }
@@ -400,6 +419,54 @@ impl CompanionApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_valid_value_outside_the_slider_is_kept_when_drawn() {
+        // 1800 s is valid for the engine; drawing the slider must not change
+        // it (the change check would save whatever it became).
+        let mut timeout: u32 = 1800;
+        let mut smoothing: f32 = 0.99;
+        let mut kbps: u32 = 32;
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(setting_slider(&mut timeout, 30..=900));
+                ui.add(setting_slider(&mut smoothing, FT_SMOOTHING));
+                ui.add(setting_slider(&mut kbps, AUDIO_BITRATE_KBPS));
+            });
+        });
+        assert_eq!((timeout, smoothing, kbps), (1800, 0.99, 32));
+    }
+
+    /// The slider ranges are the engine's: its `validate()` keeps both ends
+    /// and resets what lies just outside. REGRESSION: the sliders stopped at
+    /// 256 kbps, 900 s and 0.95.
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn the_sliders_cover_what_the_engine_accepts() {
+        use streaming_engine::config::AppConfig;
+        let accepts = |set: &dyn Fn(&mut AppConfig)| {
+            let mut cfg = AppConfig::default();
+            set(&mut cfg);
+            cfg.validate().is_empty()
+        };
+        for kbps in [*AUDIO_BITRATE_KBPS.start(), *AUDIO_BITRATE_KBPS.end()] {
+            assert!(accepts(&|c| c.audio.bitrate_kbps = kbps), "{kbps} kbps");
+        }
+        for kbps in [AUDIO_BITRATE_KBPS.start() - 1, AUDIO_BITRATE_KBPS.end() + 1] {
+            assert!(!accepts(&|c| c.audio.bitrate_kbps = kbps), "{kbps} kbps");
+        }
+        for s in [*SLEEP_TIMEOUT_SECONDS.start(), *SLEEP_TIMEOUT_SECONDS.end()] {
+            assert!(accepts(&|c| c.sleep_mode.timeout_seconds = s), "{s} s");
+        }
+        for s in [SLEEP_TIMEOUT_SECONDS.start() - 1, SLEEP_TIMEOUT_SECONDS.end() + 1] {
+            assert!(!accepts(&|c| c.sleep_mode.timeout_seconds = s), "{s} s");
+        }
+        for v in [*FT_SMOOTHING.start(), *FT_SMOOTHING.end()] {
+            assert!(accepts(&|c| c.face_tracking.smoothing = v), "smoothing {v}");
+        }
+        assert!(!accepts(&|c| c.face_tracking.smoothing = FT_SMOOTHING.end() + 0.001));
+    }
 
     #[test]
     fn blank_recording_dir_is_accepted() {

@@ -161,64 +161,110 @@ impl LocalConfig {
         }
     }
 
-    /// Save to `%APPDATA%/FocusVisionPCVR/config/local.toml`.
+    /// Save `sections` (`"audio"`, `"video"`, …: see [`SECTIONS`]) to
+    /// `%APPDATA%/FocusVisionPCVR/config/local.toml`.
     ///
     /// On the first save after upgrading, the legacy file (if any) seeds the
     /// new one so hand-written keys the companion doesn't manage carry over.
-    pub fn save(&self) -> Result<(), String> {
-        let path = config_path().ok_or("cannot locate the user data directory")?;
-        if !path.exists() {
-            if let Some(legacy) = legacy_config_path() {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Err(e) = std::fs::copy(&legacy, &path) {
-                    log::warn!("LocalConfig: cannot copy legacy {:?}: {}", legacy, e);
-                }
+    pub fn save(&self, sections: &[&str]) -> Result<(), String> {
+        self.save_to(&user_file()?, sections)
+    }
+
+    /// Save `sections` to an explicit path.
+    ///
+    /// Only the keys of those sections are overwritten: the existing file is
+    /// read as a TOML table and our values are merged into it, so unknown
+    /// sections/keys (hand-written engine overrides, keys from a newer
+    /// companion) survive. REGRESSION: every save wrote every section, so
+    /// changing the APK path pinned the defaults of the codec, sleep, audio…
+    /// in local.toml, over whatever `default.toml` says.
+    pub(crate) fn save_to(&self, path: &Path, sections: &[&str]) -> Result<(), String> {
+        let mut merged = read_table(path)?;
+        let mut ours = toml::Table::try_from(self).map_err(|e| e.to_string())?;
+        ours.retain(|section, _| sections.contains(&section));
+        merge_tables(&mut merged, ours);
+        write_table(path, &merged)
+    }
+
+    /// Take the keys the companion manages out of local.toml, so the
+    /// engine's `default.toml` applies again. Keys written by hand stay.
+    /// REGRESSION: "Reset to defaults" wrote the companion's defaults into
+    /// the file instead, pinning them.
+    pub fn clear() -> Result<(), String> {
+        clear_from(&user_file()?)
+    }
+}
+
+/// The sections of local.toml the companion manages.
+pub const SECTIONS: [&str; 6] = ["video", "sleep_mode", "face_tracking", "recording", "audio", "deploy"];
+
+/// The per-user local.toml, seeded from the legacy file on first use.
+fn user_file() -> Result<PathBuf, String> {
+    let path = config_path().ok_or("cannot locate the user data directory")?;
+    if !path.exists() {
+        if let Some(legacy) = legacy_config_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::copy(&legacy, &path) {
+                log::warn!("LocalConfig: cannot copy legacy {:?}: {}", legacy, e);
             }
         }
-        self.save_to(&path)
     }
+    Ok(path)
+}
 
-    /// Save to an explicit path.
-    ///
-    /// Only the keys this struct manages are overwritten: the existing file
-    /// is read as a TOML table and our values are merged into it, so unknown
-    /// sections/keys (hand-written engine overrides, keys from a newer
-    /// companion) survive. A file that exists but does not parse is copied to
-    /// `<name>.bak` first. The write itself is atomic (temp file + rename) so
-    /// a crash or a concurrent reader never sees a half-written file.
-    pub(crate) fn save_to(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+/// [`LocalConfig::clear`] on an explicit path.
+pub(crate) fn clear_from(path: &Path) -> Result<(), String> {
+    let mut table = read_table(path)?;
+    let managed = toml::Table::try_from(LocalConfig::default()).map_err(|e| e.to_string())?;
+    for (section, keys) in managed {
+        let toml::Value::Table(ours) = keys else { continue };
+        let Some(toml::Value::Table(existing)) = table.get_mut(&section) else { continue };
+        for key in ours.keys() {
+            existing.remove(key);
         }
-
-        let mut merged = match std::fs::read_to_string(path) {
-            Ok(existing) => match existing.parse::<toml::Table>() {
-                Ok(table) => table,
-                Err(e) => {
-                    let backup = path.with_extension("toml.bak");
-                    std::fs::copy(path, &backup).map_err(|copy_err| {
-                        format!("{:?} is not valid TOML ({e}) and could not be backed up: {copy_err}", path)
-                    })?;
-                    log::warn!(
-                        "LocalConfig: {:?} is not valid TOML ({}); backed up to {:?} before overwriting",
-                        path, e, backup
-                    );
-                    toml::Table::new()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-            // Refuse to overwrite a file we couldn't read: we'd drop whatever
-            // keys it holds that we don't manage.
-            Err(e) => return Err(format!("cannot read existing {:?}: {e}", path)),
-        };
-
-        let ours = toml::Table::try_from(self).map_err(|e| e.to_string())?;
-        merge_tables(&mut merged, ours);
-        let content = toml::to_string_pretty(&merged).map_err(|e| e.to_string())?;
-        write_atomic(path, content.as_bytes())
+        let now_empty = existing.is_empty();
+        if now_empty {
+            table.remove(&section);
+        }
     }
+    write_table(path, &table)
+}
+
+/// The existing file as a table (empty if there is none). A file that
+/// exists but does not parse is copied to `<name>.bak` first.
+fn read_table(path: &Path) -> Result<toml::Table, String> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) => match existing.parse::<toml::Table>() {
+            Ok(table) => Ok(table),
+            Err(e) => {
+                let backup = path.with_extension("toml.bak");
+                std::fs::copy(path, &backup).map_err(|copy_err| {
+                    format!("{:?} is not valid TOML ({e}) and could not be backed up: {copy_err}", path)
+                })?;
+                log::warn!(
+                    "LocalConfig: {:?} is not valid TOML ({}); backed up to {:?} before overwriting",
+                    path, e, backup
+                );
+                Ok(toml::Table::new())
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        // Refuse to overwrite a file we couldn't read: we'd drop whatever
+        // keys it holds that we don't manage.
+        Err(e) => Err(format!("cannot read existing {:?}: {e}", path)),
+    }
+}
+
+/// Write `table` to `path` atomically (temp file + rename), so a crash or a
+/// concurrent reader never sees a half-written file.
+fn write_table(path: &Path, table: &toml::Table) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let content = toml::to_string_pretty(table).map_err(|e| e.to_string())?;
+    write_atomic(path, content.as_bytes())
 }
 
 /// Recursively overlay `overlay` onto `base`: tables merge key by key,
@@ -337,7 +383,7 @@ mod tests {
         let mut config = LocalConfig::default();
         config.video.codec = "h264".to_string();
         config.sleep_mode.timeout_seconds = 120;
-        config.save_to(&tmp.file()).expect("save must create the directory");
+        config.save_to(&tmp.file(), &SECTIONS).expect("save must create the directory");
 
         let loaded = LocalConfig::load_from(&tmp.file());
         assert_eq!(loaded.video.codec, "h264");
@@ -368,14 +414,57 @@ bitrate_mbps = 150
         let mut config = LocalConfig::load_from(&tmp.file());
         assert_eq!(config.video.codec, "h264");
         config.video.codec = "h265".to_string();
-        config.save_to(&tmp.file()).unwrap();
+        config.save_to(&tmp.file(), &["video"]).unwrap();
 
         let table: toml::Table = std::fs::read_to_string(tmp.file()).unwrap().parse().unwrap();
         assert_eq!(table["network"]["tcp_port"].as_integer(), Some(9950));
         assert_eq!(table["video"]["bitrate_mbps"].as_integer(), Some(150));
         assert_eq!(table["video"]["codec"].as_str(), Some("h265"));
-        // Managed sections are still written in full.
-        assert_eq!(table["audio"]["bitrate_kbps"].as_integer(), Some(128));
+    }
+
+    #[test]
+    fn a_save_writes_only_the_sections_that_changed() {
+        // REGRESSION: every save wrote every section, so saving the APK path
+        // pinned the codec, sleep, audio… defaults over default.toml.
+        let tmp = TempDir::new("sections");
+        let mut config = LocalConfig::default();
+        config.deploy.apk_path = r"C:\apk\client.apk".to_string();
+        config.save_to(&tmp.file(), &["deploy"]).unwrap();
+
+        let table: toml::Table = std::fs::read_to_string(tmp.file()).unwrap().parse().unwrap();
+        assert_eq!(table.keys().collect::<Vec<_>>(), ["deploy"]);
+        assert_eq!(table["deploy"]["apk_path"].as_str(), Some(r"C:\apk\client.apk"));
+    }
+
+    #[test]
+    fn reset_takes_out_the_managed_keys_and_keeps_the_rest() {
+        // REGRESSION: "Reset to defaults" wrote the defaults into the file.
+        let tmp = TempDir::new("clear");
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        std::fs::write(
+            tmp.file(),
+            r#"
+[network]
+tcp_port = 9950
+
+[audio]
+enabled = false
+bitrate_kbps = 96
+
+[face_tracking]
+smoothing = 0.8
+osc_port = 9001
+"#,
+        )
+        .unwrap();
+
+        clear_from(&tmp.file()).unwrap();
+
+        let table: toml::Table = std::fs::read_to_string(tmp.file()).unwrap().parse().unwrap();
+        assert_eq!(table["network"]["tcp_port"].as_integer(), Some(9950), "hand-written section kept");
+        assert!(!table.contains_key("audio"), "a section left empty goes");
+        assert_eq!(table["face_tracking"]["osc_port"].as_integer(), Some(9001), "hand-written key kept");
+        assert!(!table["face_tracking"].as_table().unwrap().contains_key("smoothing"));
     }
 
     #[test]
@@ -389,7 +478,7 @@ bitrate_mbps = 150
 
         let config = LocalConfig::load_from(&tmp.file());
         assert_eq!(config.video.codec, "h265", "malformed file falls back to defaults");
-        config.save_to(&tmp.file()).unwrap();
+        config.save_to(&tmp.file(), &SECTIONS).unwrap();
 
         let backup = tmp.0.join("local.toml.bak");
         assert_eq!(std::fs::read_to_string(backup).unwrap(), broken);
