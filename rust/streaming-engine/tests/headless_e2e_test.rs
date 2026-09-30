@@ -94,9 +94,9 @@ fn headless_e2e_basic_video_flow() {
     delete_stale_status();
     let (tcp_port, udp_port) = pick_free_ports();
     let mut config = sim_test_config(tcp_port, udp_port);
-    // Use a small framerate so the test is bounded and the channel
-    // doesn't spam frame drops while waiting for the client.
-    config.video.framerate = 60;
+    // The frames below come at 60/s whatever this says; status.json's fps
+    // must be those, not this.
+    config.video.framerate = 120;
 
     let engine = StreamingEngine::new(config.clone()).expect("engine new");
 
@@ -137,7 +137,9 @@ fn headless_e2e_basic_video_flow() {
     // view (and all live stats) stayed dark -- in the sim AND on real hardware.
     // Poll *during* the session: the mock client disconnects at its 2 s
     // duration, after which the engine reverts status.json to "waiting".
+    // REGRESSION: the fps was the configured framerate, not what was sent.
     let mut streaming_seen = false;
+    let mut status_fps = 0;
     while start.elapsed() < Duration::from_millis(2200) {
         let synth = stream.next_frame();
         let frame = EncodedFrame {
@@ -151,13 +153,15 @@ fn headless_e2e_basic_video_flow() {
         if engine.submit_frame(frame) {
             frames_accepted += 1;
         }
-        if !streaming_seen {
+        if frames_offered.is_multiple_of(6) {
             if let Some(v) = status_path()
                 .and_then(|p| std::fs::read_to_string(&p).ok())
                 .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
             {
-                if v["status"] == "streaming" && v["fps"].as_u64().unwrap_or(0) > 0 {
+                let fps = v["fps"].as_u64().unwrap_or(0);
+                if v["status"] == "streaming" && fps > 0 {
                     streaming_seen = true;
+                    status_fps = status_fps.max(fps);
                 }
             }
         }
@@ -172,6 +176,8 @@ fn headless_e2e_basic_video_flow() {
 
     assert!(streaming_seen,
         "engine must publish status=\"streaming\" with fps>0 during an active session");
+    assert!((30..=75).contains(&status_fps),
+        "status.json's fps must be the frames sent (60/s), not the configured 120: {status_fps}");
 
     // 5. Stop the mock-client (it would also stop on its --duration deadline,
     //    but cancelling makes the test deterministic).

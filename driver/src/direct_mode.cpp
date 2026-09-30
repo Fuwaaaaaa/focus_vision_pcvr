@@ -5,6 +5,8 @@ extern "C" {
 #include "driver_log.h"
 #include "encode_params.h"
 #include "gpu_adapter.h"
+#include <algorithm>
+#include <chrono>
 #include <string>
 #include <thread>
 
@@ -210,6 +212,9 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
         logSometimes(m_syncTimeouts, "Compositor frame not ready in time; frame skipped");
         return;
     }
+    // The frame is ready: from here to NVENC's output is the "encode" the
+    // engine reports.
+    const auto encodeStart = std::chrono::steady_clock::now();
     // Both eyes side by side; often one double-wide texture, each eye's
     // half named by its bounds. The scene, then each layer above it turned
     // to the scene's head pose and blended on.
@@ -239,6 +244,9 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
     }
     if (m_nal.empty())
         return;
+    // REGRESSION: the engine timed nothing as the encode, so it read ~0.
+    const long long encodeUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - encodeStart).count();
 
     // Submit encoded NAL data to Rust streaming engine for RTP packetization,
     // with the head orientation the scene was rendered at: the headset turns
@@ -250,7 +258,8 @@ void CDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
         static_cast<uint32_t>(m_nal.size()),
         m_frameIndex,
         isIdr ? 1 : 0,
-        known ? orientation : nullptr
+        known ? orientation : nullptr,
+        static_cast<uint32_t>(std::clamp(encodeUs, 1LL, 1'000'000LL))  // 0 = unknown
     );
     if (result != 0) {
         logSometimes(m_submitFailures, "fvp_submit_encoded_frame failed");

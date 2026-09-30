@@ -45,12 +45,13 @@ Submit pre-encoded H.264/H.265 NAL units for RTP packetization and UDP transmiss
 - **Returns:** `0` on success, `-1` on error (engine not initialized, null pointer, channel full).
 - **Safety:** `nal_data_ptr` must be valid. Null/zero-length checks are performed.
 - **Performance:** Uses a thread-local buffer to avoid per-frame allocation.
-- Sends the frame without its render pose; the driver uses `fvp_submit_encoded_frame`.
+- Sends the frame without its render pose or encode time; the driver uses `fvp_submit_encoded_frame`.
 
-### `fvp_submit_encoded_frame(nal_data_ptr: *const u8, nal_data_len: u32, frame_index: u32, is_idr: i32, render_orientation: *const f32) -> i32`
-`fvp_submit_encoded_nal` with the head orientation the frame was rendered at (protocol v6).
+### `fvp_submit_encoded_frame(nal_data_ptr: *const u8, nal_data_len: u32, frame_index: u32, is_idr: i32, render_orientation: *const f32, encode_us: u32) -> i32`
+`fvp_submit_encoded_nal` with the head orientation the frame was rendered at (protocol v6) and how long the driver took to compose and encode it.
 - `render_orientation`: 4 floats (x, y, z, w) in the tracking space the headset reports its pose in, or null if unknown. A non-finite value counts as unknown.
 - The engine puts it ahead of the frame's data (`protocol::frame_pose`, 20 bytes) for a client that advertises `hello_caps::FRAME_POSE`; the headset turns the image from there to where the head is when it shows it.
+- `encode_us`: microseconds from the compositor's frame being ready (sync texture acquired) to NVENC's output, `0` if unknown. It is the "encode" of the PC latency: the engine's latency average, status.json's `latency_us`, the session log and HEARTBEAT_ACK (the headset's latency overlay) all count from the frame being ready.
 
 ## Data Queries
 

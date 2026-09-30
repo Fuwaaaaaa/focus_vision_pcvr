@@ -205,7 +205,7 @@
 1. PC 側コンパニオンアプリ → Settings タブ → Diagnostics の **Export Logs (zip)** ボタン
 2. ダウンロードフォルダに ZIP ができる。中身:
    - エンジンのログ (`%APPDATA%\FocusVisionPCVR\engine.log` と前回分の `engine.prev.log`)、status.json、コンパニオンの設定 (`config\local.toml`)
-   - 直近 5 セッションのセッションログ (`%APPDATA%\FocusVisionPCVR\sessions\session_*.jsonl`。配信中 10 秒ごとに PC 側の遅延・ビットレート・ロス率・FEC・HMD の fps とデコード時間・メモリを 1 行ずつ記録。7 日で消える)
+   - 直近 5 セッションのセッションログ (`%APPDATA%\FocusVisionPCVR\sessions\session_*.jsonl`。配信中 10 秒ごとに PC 側の遅延と送信 fps・ビットレート・ロス率・FEC・HMD の fps とデコード時間・メモリを 1 行ずつ記録。7 日で消える)
    - SteamVR のログ (vrserver.txt、vrcompositor.txt と、それぞれ前回分。ドライバのログは vrserver.txt に出る)
    - HMD 側 logcat (ADB で接続しているとき)
    - システム情報 (Windows のバージョン、GPU とドライババージョン)

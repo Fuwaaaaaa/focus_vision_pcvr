@@ -217,9 +217,12 @@ int32_t fvp_submit_encoded_nal(const uint8_t *nal_data_ptr,
 
 /**
  * [`fvp_submit_encoded_nal`] with the head orientation the frame was
- * rendered at (`render_orientation`: x, y, z, w, or null if unknown). A
- * headset that reads it turns the image from there to where its head is
- * when it shows the frame (protocol v6).
+ * rendered at (`render_orientation`: x, y, z, w, or null if unknown) and
+ * how long the driver took to compose and encode it (`encode_us`: from
+ * the compositor's frame being ready to NVENC's output, 0 if unknown). A
+ * headset that reads the orientation turns the image from there to where
+ * its head is when it shows the frame (protocol v6); the encode time is
+ * the "encode" of the latency the engine reports.
  *
  * # Safety
  * As [`fvp_submit_encoded_nal`]; `render_orientation`, if not null, must
@@ -229,7 +232,8 @@ int32_t fvp_submit_encoded_frame(const uint8_t *nal_data_ptr,
                                  uint32_t nal_data_len,
                                  uint32_t frame_index,
                                  int32_t is_idr,
-                                 const float *render_orientation);
+                                 const float *render_orientation,
+                                 uint32_t encode_us);
 
 /**
  * Get the latest tracking data from the connected HMD.

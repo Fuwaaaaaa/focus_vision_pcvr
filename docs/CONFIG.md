@@ -141,7 +141,8 @@ sign in a long session. The figure covers all of vrserver.exe, SteamVR included.
 
 While streaming, the engine writes a line of stats every 10 s to
 `%APPDATA%\FocusVisionPCVR\sessions\session_<UTC start>.jsonl`: the PC side's
-latency (`pc_latency_us`), `bitrate_mbps`, the headset's `loss_pct`, `fec_pct`,
+latency (`pc_latency_us`, from the frame being ready to encode to its packets
+going out), the frames sent in the last second (`pc_fps`), `bitrate_mbps`, the headset's `loss_pct`, `fec_pct`,
 the headset's `hmd_fps` and `hmd_decode_us`, `sleeping`, and vrserver.exe's
 memory (`rss_mb`). Lines are written a minute at a time and when the session
 ends. Files older than 7 days are deleted when the engine starts. The

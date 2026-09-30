@@ -331,6 +331,19 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     the stream is always 10 ms frames of 48 kHz stereo Opus (the headset
     decodes nothing else). They are gone from `default.toml`; files that
     list them still load, and another value is logged as ignored.
+- **The PC latency counts the encode, and the fps is what was sent.**
+  - The engine timed an empty span as the encode, so the headset's latency
+    overlay showed ~0 µs for it, and the PC latency (status.json, the
+    session log) started after NVENC. The driver now measures from the
+    compositor's frame being ready to NVENC's output and passes it with the
+    frame (`fvp_submit_encoded_frame`'s new `encode_us`); the PC latency
+    counts from the frame being ready.
+  - status.json's `fps` was `video.framerate`, the setting: the companion
+    showed 90 fps with SteamVR paused. It is now the frames sent in the last
+    second, and the session log records it as `pc_fps`.
+  - Checked with unit tests and the headless E2E (frames at 60/s with the
+    setting at 120 read as ~60); the encode time on a real NVENC is not
+    yet seen.
 - **The engine notices a dead link and lets the headset back in** (#18).
   - A control connection silent for 3 s (six missed heartbeats) is dropped.
     A Wi-Fi drop that lost the FIN/RST left the session streaming to nobody

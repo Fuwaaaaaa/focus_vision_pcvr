@@ -69,7 +69,8 @@ per-frame (driven by SteamVR compositor):
   → CDirectModeComponent::Present(syncTexture)
     → SyncTexture::acquire (the compositor's keyed mutex)
     → EyeBlit::draw(each eye of the layer → its half of the frame) → release
-    → NvencEncoder::encode() → fvp_submit_encoded_frame() (with the scene's head orientation)
+    → NvencEncoder::encode() → fvp_submit_encoded_frame() (with the scene's head orientation
+      and the time from acquire to here, the "encode" of the PC latency)
   → CDirectModeComponent::PostPresent() — FramePacer: wait out the frame's
     slot at the refresh rate (as ALVR does)
 
