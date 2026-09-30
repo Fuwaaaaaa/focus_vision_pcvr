@@ -319,7 +319,7 @@ jobs:
         - name: Smoke-fuzz each target (30 s budget)
           working-directory: rust/streaming-engine
           run: |
-            for target in fuzz_rtp fuzz_fec fuzz_protocol fuzz_config fuzz_slice fuzz_recording; do
+            for target in fuzz_rtp fuzz_fec fuzz_protocol fuzz_config fuzz_slice fuzz_recording fuzz_control fuzz_frame_fec; do
               echo "=== $target ==="
               cargo +nightly fuzz run "$target" -- -max_total_time=30 -print_final_stats=1
             done

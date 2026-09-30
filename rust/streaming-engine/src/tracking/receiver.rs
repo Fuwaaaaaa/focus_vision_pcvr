@@ -141,7 +141,7 @@ impl TrackingReceiver {
 }
 
 /// Parse head pose from payload (36 bytes: timestamp_ns(8) + position(12) + orientation(16))
-fn parse_head_pose(data: &[u8]) -> Option<TrackingData> {
+pub fn parse_head_pose(data: &[u8]) -> Option<TrackingData> {
     if data.len() < 36 {
         return None;
     }
@@ -176,7 +176,7 @@ fn parse_head_pose(data: &[u8]) -> Option<TrackingData> {
 }
 
 /// Parse controller state from payload
-fn parse_controller(data: &[u8]) -> Option<ControllerState> {
+pub fn parse_controller(data: &[u8]) -> Option<ControllerState> {
     if data.len() < 53 {
         return None;
     }

@@ -53,7 +53,7 @@ cargo test -p fvp-common                            # Common: protocol structs /
 cargo bench -p streaming-engine                     # Criterion benchmarks
 cargo clippy --workspace --all-features --all-targets -- -D warnings  # CI clippy gate, fully clean
 # Fuzz targets (Linux CI / cargo-fuzz):
-cd rust/streaming-engine && cargo fuzz list         # fuzz_rtp, fuzz_fec, fuzz_protocol, fuzz_config, fuzz_slice, fuzz_recording
+cd rust/streaming-engine && cargo fuzz list         # fuzz_rtp, fuzz_fec, fuzz_protocol, fuzz_config, fuzz_slice, fuzz_recording, fuzz_control (what the headset sends), fuzz_frame_fec (encode → reassemble)
 # Headless E2E (simulator feature, runs full TCP+TLS+RTP+FEC+UDP loop in-process):
 cargo run -p streaming-engine --bin focus-vision-headless --features simulator
 cargo test --workspace --features simulator -- --test-threads=1  # includes headless_e2e_test

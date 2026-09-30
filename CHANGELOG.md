@@ -701,6 +701,17 @@ All notable changes to Focus Vision PCVR will be documented in this file.
     read and ignored).
 
 ### Internal
+- **Fuzzing reaches what the headset sends and the video path.** It
+  stopped at the HELLO and the FEC primitives. HEARTBEAT and CONFIG_UPDATE
+  parsing moved into functions (`parse_heartbeat`, `parse_config_update`),
+  and the tracking parsers are public, so the fuzz tests
+  (`tests/fuzz_tests.rs`, and the cargo-fuzz targets `fuzz_control` and
+  `fuzz_frame_fec` in the nightly job) now cover: every control-message
+  and tracking parser on random bytes; the TCP framing, which must give
+  the same messages however the stream is split; face data all the way to
+  the OSC packets (finite, 0..1, whatever came in); and FrameFecEncoder →
+  FecFrameReassembler for bulk, sliced and unprotected frames, with a data
+  packet lost from each code word that has parity.
 - **`run_streaming` split, adaptive state without locks.** The ~440-line
   loop is now `StreamingLoop::{run, accept, run_session, hold}`. The TCP
   control task no longer shares `Arc<Mutex<…>>` state with the frame loop:
