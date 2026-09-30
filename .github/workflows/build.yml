@@ -302,9 +302,11 @@ jobs:
       # Skip on PRs to keep PR latency low; runs on every push to main
       # plus the cron schedule. Cron is wired at the workflow level so this
       # block stays close to the targets it owns.
+      # A crash or a failed assertion here is a bug: it fails the run.
+      # REGRESSION: continue-on-error kept every run green whatever the
+      # fuzzer found.
       if: github.event_name != 'pull_request'
       runs-on: ubuntu-latest
-      continue-on-error: true
       steps:
         - uses: actions/checkout@v4
           with:
@@ -319,7 +321,7 @@ jobs:
         - name: Smoke-fuzz each target (30 s budget)
           working-directory: rust/streaming-engine
           run: |
-            for target in fuzz_rtp fuzz_fec fuzz_protocol fuzz_config fuzz_slice fuzz_recording; do
+            for target in fuzz_rtp fuzz_fec fuzz_protocol fuzz_config fuzz_slice fuzz_recording fuzz_control fuzz_frame_fec; do
               echo "=== $target ==="
               cargo +nightly fuzz run "$target" -- -max_total_time=30 -print_final_stats=1
             done
@@ -334,11 +336,12 @@ jobs:
       name: Long-Run Stability (nightly)
       # 15-minute scenario that exercises FEC under intermittent loss with
       # memory + frame-rate assertions. Excluded from PR / push CI to keep
-      # latency low; only the nightly cron triggers it.
+      # latency low; only the nightly cron triggers it. A failed assertion
+      # (memory growth, frame rate) is a bug: it fails the run (it used to
+      # be continue-on-error).
       if: github.event_name != 'pull_request'
       runs-on: windows-latest
       timeout-minutes: 30
-      continue-on-error: true
       steps:
         - uses: actions/checkout@v4
           with:
@@ -357,6 +360,8 @@ jobs:
       # Coverage instrumentation roughly doubles compile time and the LLVM
       # profile collection isn't free either — skip on PRs to keep CI fast,
       # run on push to main and the nightly cron so we still catch regression.
+      # continue-on-error stays: a failure here is the coverage tooling's,
+      # not the product's (the tests themselves run in the jobs above).
       if: github.event_name != 'pull_request'
       runs-on: windows-latest
       continue-on-error: true

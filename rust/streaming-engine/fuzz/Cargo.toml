@@ -51,3 +51,13 @@ doc = false
 name = "fuzz_recording"
 path = "fuzz_targets/fuzz_recording.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_control"
+path = "fuzz_targets/fuzz_control.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_frame_fec"
+path = "fuzz_targets/fuzz_frame_fec.rs"
+doc = false

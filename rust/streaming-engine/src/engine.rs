@@ -572,8 +572,9 @@ const CONTROL_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_mil
 /// Take the next complete `[length u32 LE][type][payload]` message (type +
 /// payload) off the front of `inbox`. `Ok(None)` until one has fully
 /// arrived; `Err(length)` for a length over MAX_MSG_LEN, after which the
-/// stream can't be trusted.
-fn take_control_message(inbox: &mut Vec<u8>) -> Result<Option<Vec<u8>>, usize> {
+/// stream can't be trusted. Public for the fuzz tests: it reads what the
+/// headset sends.
+pub fn take_control_message(inbox: &mut Vec<u8>) -> Result<Option<Vec<u8>>, usize> {
     loop {
         if inbox.len() < 4 {
             return Ok(None);
@@ -591,6 +592,28 @@ fn take_control_message(inbox: &mut Vec<u8>) -> Result<Option<Vec<u8>>, usize> {
         }
         return Ok(Some(inbox.drain(..4 + len).skip(4).collect()));
     }
+}
+
+/// A HEARTBEAT's stats: after `[sequence u32][timestamp_ms u64]`, packets
+/// received u32, packets lost u32, average decode µs u32, fps u16 (LE; the
+/// client's client_protocol.h). `None` if it is shorter. Public for the
+/// fuzz tests.
+pub fn parse_heartbeat(payload: &[u8]) -> Option<HmdStats> {
+    let s = payload.get(12..26)?;
+    let u32_at = |at: usize| u32::from_le_bytes([s[at], s[at + 1], s[at + 2], s[at + 3]]);
+    Some(HmdStats {
+        packets_received: u32_at(0),
+        packets_lost: u32_at(4),
+        avg_decode_us: u32_at(8),
+        fps: u16::from_le_bytes([s[12], s[13]]),
+    })
+}
+
+/// A CONFIG_UPDATE's `[key u8][value u32 LE]`; `None` if it is shorter.
+/// Public for the fuzz tests.
+pub fn parse_config_update(payload: &[u8]) -> Option<(u8, u32)> {
+    let p = payload.get(..5)?;
+    Some((p[0], u32::from_le_bytes([p[1], p[2], p[3], p[4]])))
 }
 
 /// Serve `ctl`'s connection until it closes, cancelling `ctl.cancel` then.
@@ -681,20 +704,8 @@ async fn handle_tcp_control(
                             }
                         }
                         fvp_common::protocol::msg_type::HEARTBEAT => {
-                            if payload.len() >= 26 {
-                                let stats_offset = 12;
-                                let s = &payload[stats_offset..];
-                                let packets_received = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                                let packets_lost = u32::from_le_bytes([s[4], s[5], s[6], s[7]]);
-                                let avg_decode_us = u32::from_le_bytes([s[8], s[9], s[10], s[11]]);
-                                let fps = u16::from_le_bytes([s[12], s[13]]);
-
-                                ctl.forward(ControlEvent::Heartbeat(HmdStats {
-                                    packets_received,
-                                    packets_lost,
-                                    avg_decode_us,
-                                    fps,
-                                }));
+                            if let Some(stats) = parse_heartbeat(payload) {
+                                ctl.forward(ControlEvent::Heartbeat(stats));
 
                                 // Send HEARTBEAT_ACK with PC-side latency for waterfall overlay
                                 let encode_us = PC_ENCODE_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed);
@@ -738,10 +749,8 @@ async fn handle_tcp_control(
                                 log::warn!("CONFIG_UPDATE rate limited ({:?} since last)", elapsed);
                                 continue;
                             }
-                            if payload.len() >= 5 {
+                            if let Some((key, value)) = parse_config_update(payload) {
                                 last_config_update = std::time::Instant::now();
-                                let key = payload[0];
-                                let value = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
                                 let mut ack_status: u8 = 0x00; // 0=rejected, 1=accepted
                                 match key {
                                     0x01 => { // bitrate_mbps
