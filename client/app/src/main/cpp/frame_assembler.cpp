@@ -54,6 +54,9 @@ void FrameAssembler::onPacket(const uint8_t* packet, size_t len, Clock::time_poi
         return; // a late packet of an older frame
     }
 
+    // REGRESSION: timed from the frame's first packet, so a receive thread
+    // held up mid-frame lost frames whose packets were waiting in the socket.
+    m_lastFramePacket = now;
     const uint8_t* shard = packet + proto::PACKET_HEADER_LEN;
     const int shardLen = static_cast<int>(len - proto::PACKET_HEADER_LEN);
     if (m_frameSliced) {
@@ -66,7 +69,7 @@ void FrameAssembler::onPacket(const uint8_t* packet, size_t len, Clock::time_poi
 }
 
 void FrameAssembler::onTick(Clock::time_point now, Output& out) {
-    if (m_haveFrame && !m_frameFinished && now - m_frameStart > kFrameTimeout) {
+    if (m_haveFrame && !m_frameFinished && now - m_lastFramePacket > kFrameTimeout) {
         m_frameFinished = true;
         loseFrames(1, now, out);
     }
@@ -102,7 +105,7 @@ void FrameAssembler::beginFrame(uint32_t frameIndex, uint16_t flags, uint16_t to
     m_haveFrame = true;
     m_frameIndex = frameIndex;
     m_frameFinished = false;
-    m_frameStart = now;
+    m_lastFramePacket = now;
     const uint8_t slices = fvp_flags::sliceCount(flags);
     const bool keyframe = fvp_flags::isKeyframe(flags);
     m_frameSliced = slices > 0;
